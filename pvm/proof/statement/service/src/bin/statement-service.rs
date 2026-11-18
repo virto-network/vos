@@ -101,8 +101,9 @@ fn fetch_exact(kind: FetchKind, index: u64, len: usize) -> Option<Vec<u8>> {
 }
 
 /// The first `len` bytes of the value `fetch` of `kind` and index `index`
-/// serves, or all of a shorter one: none when there is none.
-fn fetch_prefix(kind: FetchKind, index: u64, len: usize) -> Option<Vec<u8>> {
+/// serves, or all of a shorter one, and the whole value's length: none
+/// when there is none.
+fn fetch_prefix(kind: FetchKind, index: u64, len: usize) -> Option<(Vec<u8>, usize)> {
     let mut bytes: Vec<u8> = Vec::with_capacity(len);
     let whole = hostcall!(
         Call::Fetch,
@@ -118,23 +119,27 @@ fn fetch_prefix(kind: FetchKind, index: u64, len: usize) -> Option<Vec<u8>> {
     let whole = usize::try_from(whole).ok().filter(|_| whole != NONE)?;
     // SAFETY: the host wrote the value's first `min(len, whole)` bytes.
     unsafe { bytes.set_len(len.min(whole)) };
-    Some(bytes)
+    Some((bytes, whole))
 }
 
 /// Accumulate's input `index` as the operand it holds, its authorizer's
 /// trace not fetched: none for a deferred transfer, or for bytes that are
 /// no input.
 fn input_operand(index: u64) -> Option<Operand> {
-    // The input's kind byte, then its operand's head.
-    let head = fetch_prefix(FetchKind::Input, index, 1 + Operand::HEAD)?;
+    // The input's kind byte, then its operand's head; the rest up to the
+    // result's end, which the input must hold.
+    let (head, whole) = fetch_prefix(FetchKind::Input, index, 1 + Operand::HEAD)?;
     if *head.first()? != 0 {
         return None;
     }
     let end = Operand::untraced_len(head.get(1..)?)?.checked_add(1)?;
+    if end > whole {
+        return None;
+    }
     let bytes = if end <= head.len() {
         head
     } else {
-        fetch_prefix(FetchKind::Input, index, end)?
+        fetch_prefix(FetchKind::Input, index, end)?.0
     };
     Operand::decode_untraced(bytes.get(1..end)?)
 }
@@ -201,8 +206,9 @@ impl Storage for Service {
 
     /// A write the host refuses (`FULL`: the service's balance below the
     /// threshold the write would raise, or anything but a length or `NONE`)
-    /// traps, so the whole accumulate reverts: no outcome lands without
-    /// the rows it reports.
+    /// traps, so the accumulate reverts from the last checkpoint, the item
+    /// being applied and those after it: no outcome lands without the rows
+    /// it reports.
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) {
         let value = value.unwrap_or_default();
         let answer = hostcall!(

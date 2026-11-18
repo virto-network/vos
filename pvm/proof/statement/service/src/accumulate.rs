@@ -46,14 +46,15 @@ pub const OUTCOME_KEEP_MS: u64 = 86_400_000;
 
 /// The gas a work item's accumulate must at least carry on the VOS
 /// accumulate host, which prices every call at its flat 10 (a JAM node's
-/// tariff is higher: `write` alone is 2,442 and its length terms). Measured
-/// there, with the drop budget an item adds: a refused item takes 28,620,
-/// a registration of 16 founding keys 64,741, an anchor 91,859, an
-/// accepted statement of two roots 70,577, and a statement grows with the
-/// roots it reads (two reads each), to [`crate::item::MAX_ROOTS`]: this
-/// bound holds that with headroom. An item that runs the shared
-/// invocation out of gas reverts from the last item's checkpoint on, never
-/// the items before it.
+/// tariff is higher: `write` alone is 2,442 and its length terms).
+/// Measured there, with the drop budget an item adds: a refused item takes
+/// 28,620, a registration of 16 founding keys 64,741, an anchor 91,859,
+/// and an accepted statement of two roots 70,577. Estimated, not measured:
+/// a statement grows by its roots' reads, to [`crate::item::MAX_ROOTS`],
+/// and an accumulate after an idle week passes up to [`IDLE_HOURS`] empty
+/// hours, a read each, once; this bound holds both with headroom. An item
+/// that runs the shared invocation out of gas reverts from the last item's
+/// checkpoint on, never the items before it.
 pub const ITEM_GAS_VOS_HOST: u64 = 1_000_000;
 
 /// The rows queued to drop, by the hour they expire in.
@@ -104,16 +105,15 @@ pub fn accumulate(
 
 /// Apply `operand` at the venue's time `now` to `storage`, as the service
 /// `venue`, and keep its outcome for its submitter. An item whose package
-/// already gave an item of its payload an outcome is not applied: the
-/// first item of a package with a payload is the one its outcome reports.
+/// gave an item of its payload an outcome in this accumulate (its time
+/// `now`) is not applied: the first item of a package with a payload is
+/// the one its outcome reports.
 pub fn take(storage: &mut impl Storage, venue: VenueId, now: u64, operand: &Operand) {
-    let at = keys::outcome(&state::outcome_id(
-        &operand.package_hash,
-        &operand.payload_hash,
-    ));
-    if storage.read(&at).is_some() {
+    let id = state::outcome_id(&operand.package_hash, &operand.payload_hash);
+    if state::outcome(storage, &id).is_some_and(|outcome| outcome.time == now) {
         return;
     }
+    let at = keys::outcome(&id);
     let outcome = apply(storage, venue, now, operand);
     storage.write(&at, Some(&outcome.encode()));
     enqueue(storage, now, now.saturating_add(OUTCOME_KEEP_MS), &at);

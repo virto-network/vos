@@ -644,7 +644,8 @@ fn a_later_package_of_the_same_payload_keeps_its_own_outcome() {
 }
 
 /// A storage past what the service's balance holds answers `write` `FULL`:
-/// the program traps, so a JAM node reverts the whole accumulate.
+/// the program traps, so a JAM node reverts the accumulate from its last
+/// checkpoint, the item that wrote and those after it.
 #[test]
 fn a_full_storage_traps_the_accumulate() {
     use vos_pvm::accumulate_host::ServiceStorage;
@@ -681,8 +682,8 @@ fn a_full_storage_traps_the_accumulate() {
 }
 
 /// A row of the service's own that does not decode is a fault: reading it,
-/// the program traps, so the accumulate reverts rather than take it as
-/// absent.
+/// the program traps, so the accumulate reverts from its last checkpoint
+/// rather than take it as absent.
 #[test]
 fn an_undecodable_row_traps_the_accumulate() {
     let space = founded(1);
