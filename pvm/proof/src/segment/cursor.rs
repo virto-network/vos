@@ -6,7 +6,7 @@ use crate::side_note::SideNote;
 
 use super::window::{
     PendingWrite, SegmentMemory, apply_sparse_writes, apply_writes, build_segment,
-    build_sparse_segment, write_of_bytes, writes_of_step,
+    build_sparse_segment, check_sorted, write_of_bytes, writes_of_step,
 };
 
 /// Streaming segment driver: yields [`segment_side_note`](super::segment_side_note)-identical
@@ -51,8 +51,10 @@ pub struct SegmentCursor<'a> {
 }
 
 impl<'a> SegmentCursor<'a> {
-    /// Start a pass over `full`'s windows from its initial memory.
+    /// Start a pass over `full`'s windows from its initial memory. Panics
+    /// if its precompile streams are not in timestamp order.
     pub fn new(full: &'a SideNote) -> Self {
+        check_sorted(full);
         let mem = full.sparse_initial_memory.as_ref().map_or_else(
             || SegmentMemory::Dense(full.initial_memory.clone()),
             |image| SegmentMemory::Sparse(image.clone()),

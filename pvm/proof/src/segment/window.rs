@@ -20,8 +20,11 @@ use crate::side_note::SideNote;
 ///   bytes;
 /// - the captured BLAKE2b precompile records, a parallel
 ///   `call ↔ mem_op` pair, and the Poseidon2 calls, filtered to those whose
-///   timestamp lies in the segment's window `[steps[a].ts, steps[b].ts)`;
-/// - `jump_table` (program-static, shared by all segments).
+///   timestamp lies in the segment's window `[steps[a].ts, steps[b].ts)`,
+///   each stream's slice between two partition points (the streams are
+///   ts-sorted; panics if not);
+/// - the code, bitmask and `jump_table` (program-static), shared with
+///   `full` and every other segment, not copied.
 ///
 /// Lookup-multiplicity counts are NOT carried: the chips re-derive them
 /// from the segment's steps during `prove`.
@@ -40,6 +43,7 @@ pub fn segment_side_note(full: &SideNote, a: usize, b: usize) -> SideNote {
         "invalid segment range [{a}, {b}) over {} steps",
         full.steps.len()
     );
+    check_sorted(full);
     // Memory state entering the segment: replay EVERY write with
     // `ts < ts_lo` in timestamp order — both regular stores
     // (`step.mem_write`) AND precompile output writes (blake2b's
@@ -78,14 +82,19 @@ pub(super) fn build_sparse_segment(
 fn build_segment_with_memory(full: &SideNote, a: usize, b: usize, mem: SegmentMemory) -> SideNote {
     let ts_lo = full.steps[a].timestamp;
     let ts_hi = full.steps.get(b).map(|s| s.timestamp).unwrap_or(u64::MAX);
-    let in_window = move |ts: u64| ts >= ts_lo && ts < ts_hi;
+    // The records of the window `[ts_lo, ts_hi)`: each stream is ts-sorted
+    // (`check_sorted`), so they are the slice between two partition points.
+    let blake2b = full.blake2b_mem_ops.partition_point(|op| op.ts < ts_lo)
+        ..full.blake2b_mem_ops.partition_point(|op| op.ts < ts_hi);
+    let poseidon2 = full.poseidon2_ops.partition_point(|op| op.ts < ts_lo)
+        ..full.poseidon2_ops.partition_point(|op| op.ts < ts_hi);
 
-    let sn = SideNote::new(
+    let sn = SideNote::new_shared(
         full.steps[a..b].to_vec(),
-        full.code.to_vec(),
-        full.bitmask.to_vec(),
+        full.code.clone(),
+        full.bitmask.clone(),
     )
-    .with_jump_table(full.jump_table.to_vec())
+    .with_shared_jump_table(full.jump_table.clone())
     .with_initial_regs(full.steps[a].regs_before);
     let sn = match full.memory_layout() {
         Some(layout) => sn.with_memory_layout(layout),
@@ -95,20 +104,30 @@ fn build_segment_with_memory(full: &SideNote, a: usize, b: usize, mem: SegmentMe
         SegmentMemory::Dense(memory) => sn.with_memory(memory),
         SegmentMemory::Sparse(memory) => sn.with_sparse_memory(memory),
     };
-
-    let (bc, bm) = filter_pair(&full.blake2b_calls, &full.blake2b_mem_ops, |m| {
-        in_window(m.ts)
-    });
-    sn.blake2b_calls = bc;
-    sn.blake2b_mem_ops = bm;
-    sn.poseidon2_ops = full
-        .poseidon2_ops
-        .iter()
-        .filter(|op| in_window(op.ts))
-        .cloned()
-        .collect();
-
+    sn.blake2b_calls = full.blake2b_calls[blake2b.clone()].to_vec();
+    sn.blake2b_mem_ops = full.blake2b_mem_ops[blake2b].to_vec();
+    sn.poseidon2_ops = full.poseidon2_ops[poseidon2].to_vec();
     sn
+}
+
+/// Panics unless `full`'s precompile streams are in timestamp order, the
+/// tracer's (it appends a call's records at its step) and the cut's
+/// assumption: a window's records are a contiguous run of each stream, and
+/// the BLAKE2b calls parallel their memory operations.
+pub(super) fn check_sorted(full: &SideNote) {
+    assert_eq!(
+        full.blake2b_calls.len(),
+        full.blake2b_mem_ops.len(),
+        "BLAKE2b calls and their memory operations must be parallel (1:1)"
+    );
+    assert!(
+        full.blake2b_mem_ops.is_sorted_by_key(|op| op.ts),
+        "BLAKE2b records out of timestamp order"
+    );
+    assert!(
+        full.poseidon2_ops.is_sorted_by_key(|op| op.ts),
+        "Poseidon2 records out of timestamp order"
+    );
 }
 
 /// Replay a `SideNote`'s memory writes over its initial image, in
@@ -231,27 +250,4 @@ pub(super) fn apply_sparse_writes(
             "proof trace write lies outside its sparse memory span"
         );
     }
-}
-
-/// Keep the i-th `(call, mem_op)` pair iff `pred(mem_op)`. The inputs
-/// are parallel (1:1, same order — the tracer pushes the pair together).
-fn filter_pair<C: Clone, M: Clone>(
-    calls: &[C],
-    mem_ops: &[M],
-    pred: impl Fn(&M) -> bool,
-) -> (Vec<C>, Vec<M>) {
-    debug_assert_eq!(
-        calls.len(),
-        mem_ops.len(),
-        "call/mem_op vectors must be parallel (1:1)"
-    );
-    let mut out_calls = Vec::new();
-    let mut out_mem = Vec::new();
-    for (c, m) in calls.iter().zip(mem_ops.iter()) {
-        if pred(m) {
-            out_calls.push(c.clone());
-            out_mem.push(m.clone());
-        }
-    }
-    (out_calls, out_mem)
 }
