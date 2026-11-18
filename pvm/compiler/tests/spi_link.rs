@@ -209,12 +209,11 @@ fn relocated_relative_table_value_is_not_a_raw_call_interior_pointer() {
             ],
         )
     };
-    // Without data relocations this really is a claimed raw interior pointer;
-    // do not weaken the existing fusion-safety rejection to fix the false hit.
-    assert!(matches!(
-        link_elf_spi(&build(&relocations)),
-        Err(TranspileError::InvalidSection(_))
-    ));
+    // An ELF with relocations has one for every code pointer in its data:
+    // the eight bytes no relocation names are plain data, never rewritten.
+    let blob = link_elf_spi(&build(&relocations)).expect("plain data names no code");
+    let parsed = parse_standard_program(&blob).expect("valid standard program");
+    assert_eq!(parsed.ro_data, table, "plain data is not rewritten");
     relocations.extend(relocation(TABLE, 1, 35)); // ADD32 target
     relocations.extend(relocation(TABLE, 2, 39)); // SUB32 table base
     let blob = link_elf_spi(&build(&relocations)).expect("relative table must not split call pair");
@@ -230,16 +229,15 @@ fn relocated_relative_table_value_is_not_a_raw_call_interior_pointer() {
         "relative target must still be rewritten"
     );
 
-    // A relocation covering only the high half also excludes the whole raw
-    // eight-byte candidate, even when its symbolic target is not executable.
-    // Both target discovery and pointer rewriting must honor that ownership.
+    // A relocation covering only the high half leaves the low half's bytes
+    // as they are, even when its symbolic target is not executable.
     let mut high_half = relocation(TEXT, 1, 19);
     high_half.extend(relocation(TABLE + 4, 0, 1)); // ABS32 to null
-    let blob = link_elf_spi(&build(&high_half)).expect("overlapping relocation excludes heuristic");
+    let blob = link_elf_spi(&build(&high_half)).expect("links");
     let parsed = parse_standard_program(&blob).unwrap();
     assert_eq!(
         parsed.ro_data, table,
-        "heuristic must not rewrite relocated scalar bytes"
+        "relocated scalar bytes are not rewritten"
     );
 }
 

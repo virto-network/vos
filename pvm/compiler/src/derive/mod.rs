@@ -19,8 +19,7 @@
 //!
 //! **Reachability follows relocations,** so an ELF without them, or with a
 //! relocation type the linker does not follow, is refused, as is one whose
-//! code lies in more than one section. The heuristic scan for code-like
-//! values in data may add targets, never prune one. A code pointer whose
+//! code lies in more than one section. A code pointer whose
 //! target was pruned becomes an address no jump table reaches, and a branch
 //! to pruned code reaches a trap: a missed target can only trap, never run
 //! something else. A data object reached is kept whole, from the symbol at
@@ -80,8 +79,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use crate::TranspileError;
 use crate::linker::{
     Link, LinkedElf, STT_FUNC, Z_Z, direct_targets, in_ranges, merge_ranges, name_at, name_is,
-    parse_linked_elf, range_at, raw_code_pointers, spi_blob, transpile_with,
-    without_temporary_names, zone_round,
+    parse_linked_elf, range_at, spi_blob, transpile_with, without_temporary_names, zone_round,
 };
 use crate::riscv::rv::{add, addi, auipc, b_type, jal, jalr, ld, lui, sub};
 use crate::riscv::{self, decode_b_imm, decode_j_imm, op};

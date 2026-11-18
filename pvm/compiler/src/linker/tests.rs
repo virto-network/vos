@@ -288,3 +288,21 @@ fn a_lo12_addi_into_another_register_writes_the_auipcs_too() {
     let output = run_relocated(text, &[0], &[4, 8], 0);
     assert_eq!(output.as_deref(), Some(&RW.to_le_bytes()[..]));
 }
+
+/// A word of data equal to a code address is a code pointer only in an
+/// ELF without relocations: in one with them, where every code pointer has
+/// its relocation, it is plain data (a `u64` constant) and kept as it is.
+#[test]
+fn a_code_like_word_is_rewritten_only_without_relocations() {
+    let text = assemble(&[addi(A0, A0, 0), jalr(0, RA)]);
+    let word = (TEXT_VADDR + 4).to_le_bytes().to_vec();
+    let elf = |relocations| LinkedElf {
+        ro_data: word.clone(),
+        relocations,
+        ..LinkedElf::text(TEXT_VADDR, text.clone())
+    };
+    let relocated = transpile_with(&elf(1), Link::Whole).expect("translates");
+    assert_eq!(relocated.ro_data, word, "plain data is kept");
+    let unrelocated = transpile_with(&elf(0), Link::Whole).expect("translates");
+    assert_ne!(unrelocated.ro_data, word, "a code pointer is rewritten");
+}

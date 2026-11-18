@@ -38,9 +38,10 @@ pub(super) fn control_flow_targets(elf: &LinkedElf, values: &[u64]) -> HashSet<u
     );
 
     // The data-pointer rewrite accepts stripped linked ELFs whose only
-    // reference to a function entry is a raw pointer or an orphan SUB32 table
-    // value. Collect those exact accepted targets before translating code so
-    // they receive the same predecessor-fusion barrier as symbolic entries.
+    // reference to a function entry is a raw pointer (in an ELF without
+    // relocations) or an orphan SUB32 table value. Collect those exact
+    // accepted targets before translating code so they receive the same
+    // predecessor-fusion barrier as symbolic entries.
     let absolute: HashSet<u64> = elf
         .abs_code_ptrs
         .iter()
@@ -54,14 +55,16 @@ pub(super) fn control_flow_targets(elf: &LinkedElf, values: &[u64]) -> HashSet<u
             targets.insert(target);
         }
     }
-    targets.extend(
-        raw_code_pointers(
-            elf.initialized(),
-            &elf.data_relocation_ranges,
-            &elf.code_ranges,
-        )
-        .map(|(_, target)| target),
-    );
+    if elf.relocations == 0 {
+        targets.extend(
+            raw_code_pointers(
+                elf.initialized(),
+                &elf.data_relocation_ranges,
+                &elf.code_ranges,
+            )
+            .map(|(_, target)| target),
+        );
+    }
 
     for (_, base, code) in &elf.code_sections {
         for (index, instruction) in riscv::words(code).enumerate() {
@@ -107,9 +110,9 @@ pub(super) fn relative_target(regions: [(u64, &[u8]); 2], vaddr: u64, base: u64)
 
 /// The eight-byte words of `regions`, each a base address and its bytes,
 /// that no relocation (`covered`) defines and that hold an address in
-/// `code`: where each lies, and that address. Relocations normally name
-/// these; the scan also supports stripped-but-still-linked inputs.
-pub(crate) fn raw_code_pointers<'a>(
+/// `code`: where each lies, and that address. Relocations name these in
+/// an ELF that has them; the scan is for an ELF linked without them.
+pub(super) fn raw_code_pointers<'a>(
     regions: impl IntoIterator<Item = (u64, &'a [u8])> + 'a,
     covered: &'a [(u64, u64)],
     code: &'a [(u64, u64)],

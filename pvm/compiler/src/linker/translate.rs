@@ -39,7 +39,10 @@ fn slot_mut(regions: [(u64, &mut [u8]); 2], vaddr: u64, len: usize) -> Option<&m
 /// Detects code pointers via:
 /// 1. R_RISCV_32/64 absolute relocations targeting code sections
 /// 2. R_RISCV_SUB32 relocations (relative jump table entries: value = target - table_base)
-/// 3. Heuristic scan for 8-byte values in initialized data that match code addresses
+/// 3. In an ELF without relocations alone, a heuristic scan for 8-byte
+///    values in initialized data that match code addresses: in one with
+///    them every code pointer has its relocation, and a value the scan
+///    finds is plain data that happens to equal a code address.
 ///
 /// Creates PVM jump table entries for each target and rewrites the data
 /// so that the loaded values are valid PVM djump addresses. A target never
@@ -107,9 +110,11 @@ pub(super) fn rewrite_data_code_ptrs(
     }
 
     // Heuristic: 8-byte values in either initialized region that are code
-    // addresses.
+    // addresses, in an ELF without relocations.
+    let unrelocated =
+        (elf.relocations == 0).then_some([(ro_base, &*ro_data), (rw_base, &*rw_data)]);
     for (vaddr, target) in raw_code_pointers(
-        [(ro_base, &*ro_data), (rw_base, &*rw_data)],
+        unrelocated.into_iter().flatten(),
         &elf.data_relocation_ranges,
         &elf.code_ranges,
     ) {

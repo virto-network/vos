@@ -10,8 +10,8 @@ use vos_pvm_compiler::derive;
 
 const SCHEMA: u64 = 0x1_0000;
 const TEXT: u64 = 0x100_0000;
-/// Eight-byte words in data, each a code address no relocation names: what
-/// the heuristic scan rewrites.
+/// Eight-byte words in data, each equal to a code address no relocation
+/// names: plain data, kept as it is.
 const WORDS: usize = 1 << 20;
 /// A jump table's relative entries, each an ADD32 and SUB32 pair.
 const ENTRIES: usize = 200_000;
