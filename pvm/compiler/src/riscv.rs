@@ -149,7 +149,9 @@ impl TranslationContext {
     /// write to t0 leaves it unknown.
     pub(crate) fn note_write(&mut self, inst: u32) {
         const T0: u8 = 5;
-        if rd(inst) != T0 {
+        // A store or a branch writes no register: its bits 7-11 are an
+        // immediate's.
+        if rd(inst) != T0 || matches!(opcode(inst), op::STORE | op::BRANCH) {
             return;
         }
         let (rs1, imm) = (rs1(inst), i64::from(i_imm(inst)));

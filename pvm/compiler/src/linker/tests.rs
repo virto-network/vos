@@ -330,11 +330,16 @@ fn an_ecalli_takes_the_constant_its_block_loads_into_t0() {
     let addiw = crate::riscv::rv::i_type(0x1b, 0, T0, T0, 1);
     let calls = host_calls(&[lui(T0, 1), addiw, MARK, ECALL, jalr(0, RA)]);
     assert_eq!(calls.unwrap(), [(TEXT_VADDR + 12, 0x1001)]);
+    // A store whose immediate's low bits read as t0 writes no t0.
+    let store = crate::riscv::rv::s_type(3, 2, 0, 5);
+    let calls = host_calls(&[addi(T0, 0, 0x401), store, MARK, ECALL, jalr(0, RA)]);
+    assert_eq!(calls.unwrap(), [(TEXT_VADDR + 12, 0x401)]);
 }
 
 /// A marked ecall whose t0 its block does not fix is refused, naming it:
 /// t0 written after its `li`, loaded in another block, or never loaded.
-/// Each was an `ecalli` of the last `li t0` translated, or of 0.
+/// Taking the last `li t0` in translation order would give each an `ecalli`
+/// of that id, or of 0.
 #[test]
 fn an_ecalli_of_no_constant_t0_is_refused() {
     let written = [
