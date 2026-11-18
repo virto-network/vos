@@ -165,11 +165,12 @@ impl<'a> Reader<'a> {
         Ok((value, least))
     }
 
-    /// A count of items at least `item` bytes each, which the input holds.
+    /// A count of items at least `item` bytes each, and at least one, which
+    /// the input holds: a count is never more than the bytes left.
     pub fn count(&mut self, item: usize) -> Result<usize, DecodeError> {
         let count = self.compact()?;
         let left = self.bytes.len().saturating_sub(self.at) as u64;
-        if count.saturating_mul(item as u64) > left {
+        if count.saturating_mul(item.max(1) as u64) > left {
             return Err(DecodeError::Short);
         }
         Ok(count as usize)
@@ -274,5 +275,11 @@ mod tests {
         let mut huge = encoded(u64::MAX);
         huge.push(0);
         assert_eq!(Reader::new(&huge).count(32), Err(DecodeError::Short));
+        // Items of no bytes are counted as one byte each: a count past the
+        // input is refused whatever the item's size.
+        assert_eq!(Reader::new(&huge).count(0), Err(DecodeError::Short));
+        let mut two = encoded(2);
+        two.extend_from_slice(&[0, 0]);
+        assert_eq!(Reader::new(&two).count(0), Ok(2));
     }
 }
