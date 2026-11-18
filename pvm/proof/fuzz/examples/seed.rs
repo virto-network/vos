@@ -10,8 +10,11 @@
 //! venue guests built in this checkout (`target/riscv64em-vos/release`),
 //! `program_blob` with the device kernel, the actor and kernels derived from
 //! that ELF and a Gray Paper service program (the PVM's accumulate vector),
-//! and `service_item` with each fixture's statement and its proof, and a
-//! registration, an anchor and a control of each golden vector.
+//! `service_item` with each fixture's statement and its proof, and a
+//! registration, an anchor and a control of each golden vector; and
+//! `prove_verify_roundtrip` with a raw run's memory accesses and
+//! compression past the zone, a kernel's compression and a static jump to
+//! the halt address (`roundtrip::seeds`), beside the corpus' programs.
 //!
 //! The golden device proof is kept while the device program accepts it, so
 //! the mutation corpus replays against the same proof; it is proved and
@@ -39,6 +42,8 @@ use vos_statement_service::item::{Control, Item, Op, Register, SignedControl};
 mod device_golden;
 #[path = "../fuzz_targets/device_program.rs"]
 mod device_program;
+#[path = "../fuzz_targets/roundtrip.rs"]
+mod roundtrip;
 #[path = "../fuzz_targets/service.rs"]
 mod service;
 
@@ -112,6 +117,9 @@ fn main() {
         std::fs::create_dir_all(&directory).expect("the corpus' directory");
         std::fs::write(directory.join(name), bytes).expect("writes");
     };
+    for (name, bytes) in roundtrip::seeds() {
+        write("prove_verify_roundtrip", name, &bytes);
+    }
     let directory = fixtures::directory();
     let mut wraps = 0;
     for entry in std::fs::read_dir(&directory).expect("the fixtures' directory") {

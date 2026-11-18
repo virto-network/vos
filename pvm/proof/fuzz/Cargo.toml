@@ -31,6 +31,8 @@ vos-anchor = { path = "../anchor", features = ["vectors"] }
 # program the assembler builds.
 vos-pvm-device = { path = "../device" }
 vos-pvm-compiler = { path = "../../compiler" }
+# A fuzzed code laid out as a kernel.
+vos-pvm-program = { path = "../../program" }
 # The device proof's encoding, its interaction PoW nonce written again.
 postcard = { version = "1", features = ["alloc"] }
 # The JAM statements service's refine, on the work items a JAM node gives.

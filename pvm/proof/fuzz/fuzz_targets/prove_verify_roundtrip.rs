@@ -1,120 +1,43 @@
-//! Fuzz target: random PVM program → trace → prove → verify_standalone.
+//! Fuzz target: random PVM program → trace → prove → verify, as a raw
+//! run and as a kernel's.
 //!
 //! Properties checked:
 //!
-//! 1. **No panics.**  No matter what bytes the fuzzer hands us, the
-//!    interpret → trace → prove → verify pipeline must not panic.
-//!    Panics here are bugs in the AIR, the trace fill, or one of
-//!    the cross-chip lookups.
+//! 1. **No panics.** No matter what bytes the fuzzer hands us, the
+//!    interpret → trace → prove → verify pipeline must not panic. Panics
+//!    here are bugs in the AIR, the trace fill, or one of the cross-chip
+//!    lookups.
 //!
-//! 2. **Roundtrip soundness.**  Whenever a trace successfully
-//!    proves, the resulting proof must `verify_standalone` against
-//!    its own program-commitment hash.  A failure here would mean
-//!    the prover wrote a proof the verifier rejects — i.e. a logup
-//!    imbalance or a constraint that doesn't fire under all valid
-//!    traces.
+//! 2. **Roundtrip soundness.** Whenever a trace proves, the proof
+//!    verifies against its own program's root: the raw run's against its
+//!    preprocessed commitment, each of a kernel's segments against its
+//!    class's.
+//!
+//! 3. **No refusal but the expected kinds** (`roundtrip::refused`): a
+//!    static jump to the halt address, a window no class holds, more
+//!    segments than the gas buys. Any other refusal of an honest trace,
+//!    its constraints unsatisfied among them, panics.
+//!
+//! The raw run's machine has one page past the protected zone, which its
+//! registers may name, so its loads, stores and precompile calls complete;
+//! the kernel's run is laid out as the loader lays a kernel out, its stack
+//! and heap mapped, and runs to its halt (`roundtrip`).
 //!
 //! Run from the workspace root:
 //!     cargo install cargo-fuzz   # one-time
-//!     cd pvm/proof
+//!     cd pvm/proof/fuzz
 //!     cargo fuzz run prove_verify_roundtrip -- -max_total_time=300
 //!
-//! Corpus seeds in `corpus/prove_verify_roundtrip/` accumulate
-//! over runs; each seed is a `FuzzInput`'s `arbitrary` encoding (code,
-//! registers). The gas bounds the run.
+//! Corpus seeds in `corpus/prove_verify_roundtrip/` accumulate over runs;
+//! each seed is a `FuzzInput`'s `arbitrary` encoding (code, registers). The
+//! gas bounds the run.
 
 #![no_main]
 
-use libfuzzer_sys::{arbitrary::Arbitrary, fuzz_target};
+mod roundtrip;
 
-use vos_pvm::instruction::Opcode;
-use vos_pvm::interpreter::Interpreter;
-use vos_pvm::PVM_REGISTER_COUNT;
+use libfuzzer_sys::fuzz_target;
 
-use vos_pvm_proof::core::tracing::TracingPvm;
-use vos_pvm_proof::{prove, SideNote};
-use vos_pvm_proof_verifier::verify_standalone;
-
-/// Bounds for fuzz input — keep proving fast (single-digit seconds
-/// per case) so the fuzzer covers ground.  Tightening these caps
-/// shifts coverage toward shorter executions; widening makes each
-/// case more expensive.
-const MAX_CODE_BYTES: usize = 64;
-const FLAT_MEM_BYTES: usize = 64 * 1024; // 64 KiB
-/// The gas a run gets: a looping program's trace stays a few thousand
-/// steps, proved in seconds.
-const GAS: vos_pvm::Gas = 2_000;
-
-#[derive(Debug, Arbitrary)]
-struct FuzzInput {
-    /// Raw program bytes — at most MAX_CODE_BYTES.  Bitmask is
-    /// derived deterministically (every basic block is one
-    /// instruction) so the fuzzer doesn't have to learn the
-    /// bitmask format separately.
-    code: Vec<u8>,
-    /// Initial register state (low bytes are most interesting; we
-    /// truncate to the actual register count below).
-    regs: Vec<u64>,
-}
-
-fuzz_target!(|input: FuzzInput| {
-    let mut code = input.code;
-    code.truncate(MAX_CODE_BYTES);
-    if code.is_empty() {
-        return;
-    }
-
-    // Always terminate the trace with a Trap so the interpreter
-    // exits cleanly.  Without this, random bytecode tends to walk
-    // off the end of `code` into Trap-by-default, but the result
-    // shape varies and the corpus is harder to seed.
-    if code.last() != Some(&(Opcode::Trap as u8)) {
-        if code.len() == MAX_CODE_BYTES {
-            *code.last_mut().unwrap() = Opcode::Trap as u8;
-        } else {
-            code.push(Opcode::Trap as u8);
-        }
-    }
-
-    // Bitmask: every byte starts a basic block.  This is permissive
-    // (the canonical PVM layout has multi-byte instructions with
-    // skip_len > 0) but guarantees TracingPvm decodes every byte
-    // as a fresh instruction, which exercises the most opcode
-    // permutations.
-    let bitmask: Vec<u8> = vec![1; code.len()];
-
-    let mut regs = [0u64; PVM_REGISTER_COUNT];
-    for (slot, &v) in regs.iter_mut().zip(input.regs.iter()) {
-        *slot = v;
-    }
-
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        regs,
-        vec![0u8; FLAT_MEM_BYTES],
-        GAS,
-    );
-    let mut tracing = TracingPvm::new(pvm);
-    let _exit = tracing.run();
-    let steps = tracing.into_trace();
-    if steps.is_empty() {
-        return;
-    }
-
-    let mut side_note = SideNote::new(steps, code, bitmask);
-    let proof = match prove(&mut side_note) {
-        Ok(p) => p,
-        // `prove` may legitimately fail on traces that the AIR
-        // can't represent at the chosen log_size (e.g. too many
-        // steps).  That's a bound, not a soundness bug — return
-        // and let the fuzzer try a different seed.
-        Err(_) => return,
-    };
-
-    let prog_hash = proof.preprocessed_commitment().unwrap();
-
-    // Property: every successful prove + correct hash must verify.
-    verify_standalone(proof, prog_hash).expect("verify_standalone failed for honest prove output");
+fuzz_target!(|input: roundtrip::FuzzInput| {
+    roundtrip::run(&input);
 });

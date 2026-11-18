@@ -595,7 +595,9 @@ proof_fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_deco
 
 # Each target's checked-in corpus (`replay/<target>.tar` of
 # `pvm/proof/fuzz`, unpacked into its `target/replay/` by `corpus.py`) run
-# once, every input, optimized and without a sanitizer: no crash. `cargo
+# once, every input, optimized and without a sanitizer: no crash, within
+# the memory `fuzz` gives a target (a kernel's segments proved take about
+# 3 GB). `cargo
 # run --example paths` there lists what each input reaches. `cargo fuzz`
 # sets RUSTFLAGS, which replaces the host's `target-cpu=native`
 # (`.cargo/config.toml`), so the recipes pass it again: without it the
@@ -607,7 +609,7 @@ fuzz-replay:
     cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; \
         with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" \
         | split row ' ') { cargo fuzz run -O -s none --target-dir target/no-sanitizer $target \
-        $"target/replay/($target)" -- -runs=0 } }
+        $"target/replay/($target)" -- -runs=0 -rss_limit_mb=8192 } }
 
 # What each replay corpus reaches (`cargo run --example paths` in
 # `pvm/proof/fuzz`), held to `pvm/proof/fuzz/reach.txt`: every verdict it
