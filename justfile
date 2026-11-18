@@ -89,7 +89,7 @@ bench: build-bench-guests
 
 # Gray Paper 0.8.0 conformance vectors on the interpreter and the JIT.
 vectors:
-    cargo test -p vos-pvm --test pvm_vectors
+    cargo test -p vos-pvm --test pvm_vectors --test boundaries
 
 # Prover integration suites, including the soundness gates behind
 # `debug-internals`, the Poseidon2-M31 kernel's leaves on the recursion
