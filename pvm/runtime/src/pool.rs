@@ -557,6 +557,9 @@ struct IdleMachines {
 /// node.
 pub struct MachinePool {
     programs: Mutex<HashMap<CodeHash, Arc<PoolProgram>>>,
+    /// Hashes whose blobs failed to install: no valid program, so asked
+    /// for again they are refused without being read, hashed or parsed.
+    refused: Mutex<std::collections::HashSet<CodeHash>>,
     idle: Mutex<IdleMachines>,
     idle_limit: usize,
     idle_per_program: usize,
@@ -578,6 +581,7 @@ impl MachinePool {
     pub fn with_idle_limits(idle_limit: usize, idle_per_program: usize) -> Self {
         Self {
             programs: Mutex::new(HashMap::new()),
+            refused: Mutex::new(std::collections::HashSet::new()),
             idle: Mutex::new(IdleMachines::default()),
             idle_limit,
             idle_per_program,
@@ -592,9 +596,20 @@ impl MachinePool {
         if lock(&self.programs).contains_key(&hash) {
             return Ok(hash);
         }
-        let program = Arc::new(PoolProgram::new(blob)?);
+        let program = match PoolProgram::new(blob) {
+            Ok(program) => Arc::new(program),
+            Err(error) => {
+                lock(&self.refused).insert(hash);
+                return Err(error);
+            }
+        };
         lock(&self.programs).entry(hash).or_insert(program);
         Ok(hash)
+    }
+
+    /// Whether a blob of this hash failed to install.
+    pub fn refused(&self, hash: &CodeHash) -> bool {
+        lock(&self.refused).contains(hash)
     }
 
     /// Remove an installed program and drop its idle machines. Machines
@@ -797,7 +812,9 @@ impl OuterMachines {
 
 /// Process-wide preparation cache for programs `machine` creates, keyed by
 /// the exact code blob and the backend the selection resolves to. A program
-/// larger than the admission bound is prepared without caching.
+/// larger than the admission bound, or whose preparation holds more than an
+/// eighth of the cache, is prepared without caching, so one large program
+/// never empties the cache for every other.
 /// The largest program the process-wide preparation cache keeps.
 pub(crate) const PREPARED_ADMISSION_BYTES: usize = 2 << 20;
 
@@ -841,6 +858,9 @@ pub(crate) fn prepared_code(
     }
     let execution = prepare()?;
     let footprint = execution.footprint();
+    if footprint > CAPACITY_BYTES / 8 {
+        return Ok(execution);
+    }
     let mut cache = lock(cache);
     if cache.bytes + footprint > CAPACITY_BYTES {
         cache.by_backend.clear();

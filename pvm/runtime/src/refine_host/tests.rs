@@ -346,6 +346,37 @@ fn instantiate_loads_what_its_source_gives_at_the_installed_price() {
         assert_eq!(refused.registers[7], result::WHO, "{why}");
         assert!(pool.program(&hash).is_none(), "{why}: nothing pooled");
     }
+
+    // An invalid program under its own hash is refused once read: asked
+    // for again it is not read, hashed or parsed.
+    struct Counting(core::sync::atomic::AtomicUsize, Vec<u8>);
+    impl ProgramSource for Counting {
+        fn owns(&self, _: &CodeHash) -> bool {
+            true
+        }
+
+        fn program(&self, _: &CodeHash) -> Option<Vec<u8>> {
+            self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Some(self.1.clone())
+        }
+    }
+    let invalid = vec![1, 2, 3];
+    let source = Arc::new(Counting(0.into(), invalid.clone()));
+    let pool = Arc::new(MachinePool::new());
+    for _ in 0..3 {
+        let invocation = RefineContext::load(
+            &instantiating_program(CodeHash::of(&invalid).0),
+            &[],
+            1_000_000,
+        )
+        .unwrap()
+        .with_pool(Arc::clone(&pool))
+        .with_programs(source.clone())
+        .try_run()
+        .unwrap();
+        assert_eq!(invocation.registers[7], result::WHO);
+    }
+    assert_eq!(source.0.load(core::sync::atomic::Ordering::Relaxed), 1);
 }
 
 /// An outer program that calls `instantiate` with the code hash in its

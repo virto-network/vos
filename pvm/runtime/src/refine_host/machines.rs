@@ -76,10 +76,14 @@ impl RefineContext {
             .is_none_or(|source| source.owns(&hash));
         let program = self.inner.pool().filter(|_| owned).and_then(|pool| {
             pool.program(&hash).or_else(|| {
+                if pool.refused(&hash) {
+                    return None;
+                }
                 // Only bytes of the very program asked for, and only a valid
                 // service's code: anything else answers `WHO`, as a missing
                 // one does. Installing it is work for the base price alone,
-                // once a node, bounded by the service-code bound.
+                // once a node whether it succeeds or not, bounded by the
+                // service-code bound.
                 let bytes = self.programs.as_ref()?.program(&hash)?;
                 if !crate::spi::service_fits(&bytes) || crate::pool::CodeHash::of(&bytes) != hash {
                     return None;
