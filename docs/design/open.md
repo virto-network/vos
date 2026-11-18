@@ -244,6 +244,28 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   both (`inner::budget`); the two erratum drafts (the funded flag, the
   budget) are for the text, until which a host serving untrusted refines
   runs them as a VOS host.
+- **The recompiler in a confined worker process:** compiled guest code
+  runs on the host's own threads, guarded in-process only (the guarded
+  window, strict fault attribution, masked dynamic-jump indices, the
+  start-up probe). A worker would hold the guest window, the JIT code and
+  the context, the host keeping its alias of the memfd for host calls,
+  and would also take the kernel's per-process mapping limit and a
+  backend crash off the host. To settle: confinement must not depend on namespaces (rootless
+  Podman breaks them, Docker's default profile denies them), so a
+  seccomp allowlist is the boundary (PolkaVM's worker needs ten system
+  calls) with namespaces and Landlock as extra layers where available;
+  which machines share a worker (inner machines never with their outer
+  program; pooled per-machine workers, as PolkaVM does); write tracking
+  across processes (userfaultfd, which default containers deny, or the
+  worker's own `mprotect` tracking, or a descriptor the host scans); each
+  worker opting into indirect-branch protection with
+  `prctl(PR_SET_SPECULATION_CTRL)`. `seccompiler` and `landlock` for the
+  confinement; PolkaVM's zygote is the design to copy, not a dependency.
+- **KVM as an optional later tier** for high-value bare-metal nodes, not
+  the base (it needs `/dev/kvm`, and is no faster per host call).
+- **`RecompiledPvm`,** the recompiler's test-only machine with its own
+  memory path: retired once the instruction vectors run on
+  `backend::StandardMachine`, the production path, on both backends.
 - **The JAM-only host's package** (`JamRefine`): `fetch` kinds 7 and 10
   serve the encoded package and context as the caller gives them; the
   fixture encodes no work package, so nothing holds them to its items.
