@@ -3,6 +3,7 @@
 //! Implements the single-step state transition Ψ₁ and the full PVM Ψ.
 //! Used as a backend alongside the JIT recompiler.
 
+mod alu;
 pub mod memory;
 
 use alloc::{sync::Arc, vec, vec::Vec};
@@ -1387,54 +1388,25 @@ impl Interpreter {
             }
             Opcode::DivU32 => {
                 if let Args::ThreeReg { ra, rb, rd } = args {
-                    let a = self.registers[ra] as u32;
-                    let b = self.registers[rb] as u32;
-                    self.registers[rd] = a
-                        .checked_div(b)
-                        .map(|q| args::sign_extend_32(q as u64))
-                        .unwrap_or(u64::MAX);
+                    self.registers[rd] = alu::div_u_32(self.registers[ra], self.registers[rb]);
                     self.pc = next_pc;
                 }
             }
             Opcode::DivS32 => {
                 if let Args::ThreeReg { ra, rb, rd } = args {
-                    let a = self.registers[ra] as u32 as i32;
-                    let b = self.registers[rb] as u32 as i32;
-                    self.registers[rd] = if b == 0 {
-                        u64::MAX
-                    } else if a == i32::MIN && b == -1 {
-                        a as i64 as u64 // Z8^-1(Z4(a))
-                    } else {
-                        (a / b) as i64 as u64
-                    };
+                    self.registers[rd] = alu::div_s_32(self.registers[ra], self.registers[rb]);
                     self.pc = next_pc;
                 }
             }
             Opcode::RemU32 => {
                 if let Args::ThreeReg { ra, rb, rd } = args {
-                    let a = self.registers[ra] as u32;
-                    let b = self.registers[rb] as u32;
-                    self.registers[rd] = if b == 0 {
-                        args::sign_extend_32(a as u64)
-                    } else {
-                        args::sign_extend_32((a % b) as u64)
-                    };
+                    self.registers[rd] = alu::rem_u_32(self.registers[ra], self.registers[rb]);
                     self.pc = next_pc;
                 }
             }
             Opcode::RemS32 => {
                 if let Args::ThreeReg { ra, rb, rd } = args {
-                    let a = self.registers[ra] as u32 as i32;
-                    let b = self.registers[rb] as u32 as i32;
-                    self.registers[rd] = if a == i32::MIN && b == -1 {
-                        0
-                    } else if b == 0 {
-                        a as i64 as u64
-                    } else {
-                        // smod: sign of numerator, mod of absolutes
-                        let r = smod_i64(a as i64, b as i64);
-                        r as u64
-                    };
+                    self.registers[rd] = alu::rem_s_32(self.registers[ra], self.registers[rb]);
                     self.pc = next_pc;
                 }
             }
@@ -1484,47 +1456,25 @@ impl Interpreter {
             }
             Opcode::DivU64 => {
                 if let Args::ThreeReg { ra, rb, rd } = args {
-                    self.registers[rd] = self.registers[ra]
-                        .checked_div(self.registers[rb])
-                        .unwrap_or(u64::MAX);
+                    self.registers[rd] = alu::div_u_64(self.registers[ra], self.registers[rb]);
                     self.pc = next_pc;
                 }
             }
             Opcode::DivS64 => {
                 if let Args::ThreeReg { ra, rb, rd } = args {
-                    let a = self.registers[ra] as i64;
-                    let b = self.registers[rb] as i64;
-                    self.registers[rd] = if b == 0 {
-                        u64::MAX
-                    } else if a == i64::MIN && b == -1 {
-                        a as u64
-                    } else {
-                        (a / b) as u64 // Rust truncates toward zero
-                    };
+                    self.registers[rd] = alu::div_s_64(self.registers[ra], self.registers[rb]);
                     self.pc = next_pc;
                 }
             }
             Opcode::RemU64 => {
                 if let Args::ThreeReg { ra, rb, rd } = args {
-                    self.registers[rd] = if self.registers[rb] == 0 {
-                        self.registers[ra]
-                    } else {
-                        self.registers[ra] % self.registers[rb]
-                    };
+                    self.registers[rd] = alu::rem_u_64(self.registers[ra], self.registers[rb]);
                     self.pc = next_pc;
                 }
             }
             Opcode::RemS64 => {
                 if let Args::ThreeReg { ra, rb, rd } = args {
-                    let a = self.registers[ra] as i64;
-                    let b = self.registers[rb] as i64;
-                    self.registers[rd] = if a == i64::MIN && b == -1 {
-                        0
-                    } else if b == 0 {
-                        a as u64
-                    } else {
-                        smod_i64(a, b) as u64
-                    };
+                    self.registers[rd] = alu::rem_s_64(self.registers[ra], self.registers[rb]);
                     self.pc = next_pc;
                 }
             }
@@ -1569,27 +1519,19 @@ impl Interpreter {
             }
             Opcode::MulUpperSS => {
                 if let Args::ThreeReg { ra, rb, rd } = args {
-                    let a = self.registers[ra] as i64 as i128;
-                    let b = self.registers[rb] as i64 as i128;
-                    self.registers[rd] = ((a * b) >> 64) as i64 as u64;
+                    self.registers[rd] = alu::mul_upper_s_s(self.registers[ra], self.registers[rb]);
                     self.pc = next_pc;
                 }
             }
             Opcode::MulUpperUU => {
                 if let Args::ThreeReg { ra, rb, rd } = args {
-                    let a = self.registers[ra] as u128;
-                    let b = self.registers[rb] as u128;
-                    self.registers[rd] = ((a * b) >> 64) as u64;
+                    self.registers[rd] = alu::mul_upper_u_u(self.registers[ra], self.registers[rb]);
                     self.pc = next_pc;
                 }
             }
             Opcode::MulUpperSU => {
                 if let Args::ThreeReg { ra, rb, rd } = args {
-                    let a = self.registers[ra] as i64 as i128;
-                    let b = self.registers[rb] as u128;
-                    // Z8(φA) * φB, signed * unsigned
-                    let result = (a * b as i128) >> 64;
-                    self.registers[rd] = result as i64 as u64;
+                    self.registers[rd] = alu::mul_upper_s_u(self.registers[ra], self.registers[rb]);
                     self.pc = next_pc;
                 }
             }
@@ -2300,90 +2242,37 @@ impl Interpreter {
 
                 // === Div/Rem (three reg, common in crypto) ===
                 Opcode::DivU32 => {
-                    let b = self.registers[rb] as u32;
-                    self.registers[rd] = (self.registers[ra] as u32)
-                        .checked_div(b)
-                        .map(|q| args::sign_extend_32(q as u64))
-                        .unwrap_or(u64::MAX);
+                    self.registers[rd] = alu::div_u_32(self.registers[ra], self.registers[rb]);
                 }
                 Opcode::DivU64 => {
-                    let b = self.registers[rb];
-                    self.registers[rd] = self.registers[ra].checked_div(b).unwrap_or(u64::MAX);
+                    self.registers[rd] = alu::div_u_64(self.registers[ra], self.registers[rb]);
                 }
                 Opcode::DivS32 => {
-                    let a = self.registers[ra] as i32;
-                    let b = self.registers[rb] as i32;
-                    self.registers[rd] = if b == 0 {
-                        u64::MAX
-                    } else if a == i32::MIN && b == -1 {
-                        a as u64
-                    } else {
-                        args::sign_extend_32((a / b) as i64 as u64)
-                    };
+                    self.registers[rd] = alu::div_s_32(self.registers[ra], self.registers[rb]);
                 }
                 Opcode::DivS64 => {
-                    let a = self.registers[ra] as i64;
-                    let b = self.registers[rb] as i64;
-                    self.registers[rd] = if b == 0 {
-                        u64::MAX
-                    } else if a == i64::MIN && b == -1 {
-                        a as u64
-                    } else {
-                        (a / b) as u64
-                    };
+                    self.registers[rd] = alu::div_s_64(self.registers[ra], self.registers[rb]);
                 }
                 Opcode::RemU32 => {
-                    let b = self.registers[rb] as u32;
-                    self.registers[rd] = if b == 0 {
-                        args::sign_extend_32(self.registers[ra] as u32 as u64)
-                    } else {
-                        args::sign_extend_32((self.registers[ra] as u32 % b) as u64)
-                    };
+                    self.registers[rd] = alu::rem_u_32(self.registers[ra], self.registers[rb]);
                 }
                 Opcode::RemU64 => {
-                    let b = self.registers[rb];
-                    self.registers[rd] = if b == 0 {
-                        self.registers[ra]
-                    } else {
-                        self.registers[ra] % b
-                    };
+                    self.registers[rd] = alu::rem_u_64(self.registers[ra], self.registers[rb]);
                 }
                 Opcode::RemS32 => {
-                    let a = self.registers[ra] as i32;
-                    let b = self.registers[rb] as i32;
-                    self.registers[rd] = if b == 0 {
-                        a as u64
-                    } else if a == i32::MIN && b == -1 {
-                        0
-                    } else {
-                        args::sign_extend_32((a % b) as i64 as u64)
-                    };
+                    self.registers[rd] = alu::rem_s_32(self.registers[ra], self.registers[rb]);
                 }
                 Opcode::RemS64 => {
-                    let a = self.registers[ra] as i64;
-                    let b = self.registers[rb] as i64;
-                    self.registers[rd] = if b == 0 {
-                        a as u64
-                    } else if a == i64::MIN && b == -1 {
-                        0
-                    } else {
-                        (a % b) as u64
-                    };
+                    self.registers[rd] = alu::rem_s_64(self.registers[ra], self.registers[rb]);
                 }
                 Opcode::MulUpperSS => {
-                    self.registers[rd] = ((self.registers[ra] as i64 as i128)
-                        .wrapping_mul(self.registers[rb] as i64 as i128)
-                        >> 64) as u64;
+                    self.registers[rd] = alu::mul_upper_s_s(self.registers[ra], self.registers[rb]);
                 }
                 Opcode::MulUpperUU => {
-                    self.registers[rd] = ((self.registers[ra] as u128)
-                        .wrapping_mul(self.registers[rb] as u128)
-                        >> 64) as u64;
+                    self.registers[rd] = alu::mul_upper_u_u(self.registers[ra], self.registers[rb]);
                 }
                 Opcode::MulUpperSU => {
-                    self.registers[rd] = ((self.registers[ra] as i64 as i128)
-                        .wrapping_mul(self.registers[rb] as u128 as i128)
-                        >> 64) as u64;
+                    self.registers[rd] = alu::mul_upper_s_u(self.registers[ra], self.registers[rb]);
                 }
 
                 // === Two immediates (store_imm: addr = imm1, value = imm2) ===
@@ -2612,16 +2501,6 @@ impl Interpreter {
                 None => continue,
             }
         }
-    }
-}
-
-/// Signed modulo: sign of numerator, mod of absolute values (eq A.33).
-fn smod_i64(a: i64, b: i64) -> i64 {
-    if b == 0 {
-        a
-    } else {
-        let sign = if a < 0 { -1i64 } else { 1 };
-        sign * ((a.unsigned_abs() % b.unsigned_abs()) as i64)
     }
 }
 
