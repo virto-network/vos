@@ -85,9 +85,8 @@ impl RefineContext {
     }
 
     /// Explicit execution backend for both the outer runtime and its inner
-    /// actors. Use [`Self::try_run`] (or [`Self::try_run_with_host`]) so backend
-    /// failures remain host errors, never signed guest outcomes or retries on
-    /// another backend.
+    /// actors. Backend failures remain host errors ([`Self::try_run`]),
+    /// never signed guest outcomes or retries on another backend.
     pub fn load_with_backend(
         program: &[u8],
         args: &[u8],
@@ -163,13 +162,11 @@ impl RefineContext {
     }
 
     /// Run the outer program, transparently servicing host calls 9 through
-    /// 14. Other host calls are returned to the embedder unchanged.
-    pub fn run(self) -> Invocation {
-        self.run_with_host(|id, _| Err(ExitReason::HostCall(id)))
-    }
-
-    /// Execute the selected backend, preserving backend errors separately from
-    /// a completed guest invocation. No execution fault triggers a fallback.
+    /// 14. Other host calls are returned to the embedder unchanged. A
+    /// backend failure, which a guest may provoke (an executable mapping or
+    /// a page permission the host cannot give), is
+    /// [`RefineError::Backend`], a host error never a guest outcome: no
+    /// failure triggers a fallback or a panic.
     pub fn try_run(self) -> Result<Invocation, RefineError> {
         self.try_run_with_host(|id, _| Err(ExitReason::HostCall(id)))
     }
@@ -177,20 +174,12 @@ impl RefineContext {
     /// Service embedder-owned outer calls without restarting this execution or
     /// discarding its inner-machine dictionary. Built-in calls 9 through 14
     /// remain exclusively owned by Refine. Returning Ok advances past exactly
-    /// the pending host call; an error stops at that call's counter.
+    /// the pending host call; an error stops at that call's counter. Backend
+    /// failures are errors, as [`Self::try_run`]'s.
     ///
     /// The embedder must admit the call, validate memory ranges and charge gas
     /// and its own I/O budgets before doing work. This is not a storage ABI or
     /// an authorization grant.
-    pub fn run_with_host(
-        self,
-        host: impl FnMut(u64, &mut Machine) -> Result<(), ExitReason>,
-    ) -> Invocation {
-        self.try_run_with_host(host)
-            .expect("reference Refine execution; selected backends must use try_run_with_host")
-    }
-
-    /// Fallible counterpart of [`Self::run_with_host`] for a selected backend.
     pub fn try_run_with_host(
         mut self,
         mut host: impl FnMut(u64, &mut Machine) -> Result<(), ExitReason>,

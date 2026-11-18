@@ -33,7 +33,10 @@ pub fn guest_program(name: &str) -> Vec<u8> {
 /// Run on a VOS refine host, which serves precompiles in place, at the VOS
 /// node profile's prices.
 pub fn run_vos(program: &[u8], args: &[u8]) -> Vec<u8> {
-    let invocation = RefineContext::load(program, args, GAS).expect("load").run();
+    let invocation = RefineContext::load(program, args, GAS)
+        .expect("load")
+        .try_run()
+        .expect("the interpreter runs");
     assert_eq!(invocation.exit, ExitReason::Halt, "guest did not halt");
     invocation.output_bounded(1 << 20).expect("output")
 }

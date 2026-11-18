@@ -59,12 +59,14 @@ fn a_nested_run_is_the_same_reused_and_recompiled() {
     let args = inner_program();
     let expected = RefineContext::load_with(&outer, &args, 1_000_000, MemoryModel::Sparse)
         .unwrap()
-        .run();
+        .try_run()
+        .unwrap();
     let prepared = crate::refine::PreparedProgram::new(&outer).unwrap();
     for _ in 0..2 {
         let reused = RefineContext::load_prepared(&prepared, &args, 1_000_000, MemoryModel::Sparse)
             .unwrap()
-            .run();
+            .try_run()
+            .unwrap();
         assert_eq!(reused.exit, expected.exit);
         assert_eq!(reused.pc, expected.pc);
         assert_eq!(reused.registers, expected.registers);
@@ -107,7 +109,8 @@ fn outer_machine_create_and_expunge_run_to_halt() {
     let outer = standard_program(&[10, 9, 10, 14, 50, 0], &[0, 2, 4]);
     let invocation = RefineContext::load(&outer, &inner_program(), 1_000_000)
         .unwrap()
-        .run();
+        .try_run()
+        .unwrap();
     assert_eq!(invocation.exit, ExitReason::Halt);
     assert_eq!(invocation.registers[7], 0, "expunge returned entry PC");
     assert!(invocation.gas_used > 0);
@@ -125,7 +128,8 @@ fn machine_rejects_runtime_only_opcode_three_as_huh() {
     let outer = standard_program(&[10, 9, 50, 0], &[0, 2]);
     let invocation = RefineContext::load(&outer, &runtime_only, 1_000_000)
         .unwrap()
-        .run();
+        .try_run()
+        .unwrap();
 
     assert_eq!(invocation.exit, ExitReason::Halt);
     assert_eq!(invocation.registers[7], result::HUH);
@@ -174,7 +178,8 @@ fn precompile_price_is_charged_identically_on_every_path() {
         PvmBackend::ForceInterpreter,
     )
     .unwrap()
-    .run();
+    .try_run()
+    .unwrap();
     let gas = check(&interpreted, "interpreter");
     #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
     {
@@ -195,10 +200,11 @@ fn precompile_price_is_charged_identically_on_every_path() {
     // the embedder: identical instructions and blocks, minus the price.
     let unpriced = RefineContext::load(&compression_program(0x4ff), &[], 1_000_000)
         .unwrap()
-        .run_with_host(|id, _| {
+        .try_run_with_host(|id, _| {
             assert_eq!(id, 0x4ff);
             Ok(())
-        });
+        })
+        .unwrap();
     assert_eq!(unpriced.exit, ExitReason::Halt);
     assert_eq!(
         gas,
@@ -232,7 +238,8 @@ fn precompile_output_is_a_dirty_page_on_every_path() {
             PvmBackend::ForceInterpreter,
         )
         .unwrap()
-        .run();
+        .try_run()
+        .unwrap();
         check(invocation, "interpreter");
     }
     #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
@@ -459,7 +466,8 @@ fn instantiate_lends_pooled_machines_and_takes_them_back() {
     // Without a pool the call reaches the embedder, as on a JAM host.
     let reached = RefineContext::load(&instantiating_program(hash.0), &[], 1_000_000)
         .unwrap()
-        .run();
+        .try_run()
+        .unwrap();
     assert_eq!(
         reached.exit,
         ExitReason::HostCall(u64::from(crate::inner::host_call::INSTANTIATE))
@@ -528,7 +536,8 @@ fn state_read_serves_the_nodes_state_and_falls_back_to_what() {
     let served = RefineContext::load(&program, &[], 1_000_000)
         .unwrap()
         .with_state(alloc::sync::Arc::new(Fixed))
-        .run();
+        .try_run()
+        .unwrap();
     assert_eq!(served.exit, ExitReason::Halt);
     assert_eq!(served.registers[7], 5, "the value's whole length");
     let mut out = [0u8; 5];
@@ -552,7 +561,8 @@ fn state_read_serves_the_nodes_state_and_falls_back_to_what() {
     let long = RefineContext::load(&program, &[], 1_000_000)
         .unwrap()
         .with_state(alloc::sync::Arc::new(Long))
-        .run();
+        .try_run()
+        .unwrap();
     assert_eq!(long.registers[7], 1000);
     assert_eq!(
         long.gas_used - served.gas_used,
@@ -562,7 +572,10 @@ fn state_read_serves_the_nodes_state_and_falls_back_to_what() {
 
     // Without a reader the call reaches the embedder, and a JAM-only
     // run answers it with `WHAT`.
-    let reached = RefineContext::load(&program, &[], 1_000_000).unwrap().run();
+    let reached = RefineContext::load(&program, &[], 1_000_000)
+        .unwrap()
+        .try_run()
+        .unwrap();
     assert_eq!(
         reached.exit,
         ExitReason::HostCall(u64::from(crate::inner::host_call::STATE_READ))
@@ -584,7 +597,10 @@ fn gas_reports_what_is_left() {
         50, 0,                        // jump_ind φ0 (halt)
     ];
     let program = standard_program_with_rw(&code, &[0, 2], &[]);
-    let invocation = RefineContext::load(&program, &[], 1_000_000).unwrap().run();
+    let invocation = RefineContext::load(&program, &[], 1_000_000)
+        .unwrap()
+        .try_run()
+        .unwrap();
     assert_eq!(invocation.exit, ExitReason::Halt);
     let left = invocation.registers[7];
     // The block gas and the call's own 10 are spent before φ7 is set.
@@ -594,7 +610,10 @@ fn gas_reports_what_is_left() {
 #[test]
 fn unpayable_precompile_stops_out_of_gas_unserved() {
     let program = compression_program(crate::precompile::BLAKE2B_COMPRESS as u16);
-    let full = RefineContext::load(&program, &[], 1_000_000).unwrap().run();
+    let full = RefineContext::load(&program, &[], 1_000_000)
+        .unwrap()
+        .try_run()
+        .unwrap();
     assert_eq!(full.exit, ExitReason::Halt);
     // Funds every block but not the price.
     let budget = full.gas_used - crate::precompile::BLAKE2B_COMPRESS_GAS;
@@ -606,7 +625,8 @@ fn unpayable_precompile_stops_out_of_gas_unserved() {
         PvmBackend::ForceInterpreter,
     )
     .unwrap()
-    .run();
+    .try_run()
+    .unwrap();
     assert_eq!(invocation.exit, ExitReason::OutOfGas);
     assert_eq!(invocation.pc, 10, "stops on the call's own counter");
     assert_eq!(invocation.gas_used, budget);
@@ -659,7 +679,8 @@ fn the_live_poseidon2_call_is_served_and_a_word_at_or_above_p_traps() {
     let expected = crate::precompile::poseidon2_compress(&input).unwrap();
     let unpriced = RefineContext::load(&compression_program(0x4ff), &[], 1_000_000)
         .unwrap()
-        .run_with_host(|_, _| Ok(()));
+        .try_run_with_host(|_, _| Ok(()))
+        .unwrap();
     for backend in backends {
         let served = run(&poseidon2_program(&input), backend);
         assert_eq!(served.exit, ExitReason::Halt, "{backend:?}");
@@ -711,7 +732,7 @@ fn invoke_inner_call(id: u16, gas: u64, precompiles: bool) -> (u64, u64) {
     if !precompiles {
         context = context.without_precompiles();
     }
-    let invocation = context.run();
+    let invocation = context.try_run().unwrap();
     assert_eq!(invocation.exit, ExitReason::Halt);
     let mut left = [0u8; 8];
     invocation.memory().read_bytes(RW_BASE, &mut left);
@@ -741,11 +762,12 @@ fn an_inner_machines_precompile_reaches_its_agent() {
     let invocation = RefineContext::load(&outer, &[], 1_000_000)
         .unwrap()
         .without_precompiles()
-        .run_with_host(|call, machine| {
+        .try_run_with_host(|call, machine| {
             seen.push(call);
             machine.registers_mut()[7] = result::WHAT;
             Ok(())
-        });
+        })
+        .unwrap();
     assert_eq!(seen, [u64::from(id)]);
     assert_eq!(invocation.exit, ExitReason::Halt);
 }
@@ -753,7 +775,10 @@ fn an_inner_machines_precompile_reaches_its_agent() {
 #[test]
 fn unknown_host_call_is_returned_to_the_embedder() {
     let outer = standard_program(&[51, 2, 9, 10, 77, 0], &[0, 3, 5]);
-    let invocation = RefineContext::load(&outer, &[], 1_000_000).unwrap().run();
+    let invocation = RefineContext::load(&outer, &[], 1_000_000)
+        .unwrap()
+        .try_run()
+        .unwrap();
     assert_eq!(invocation.exit, ExitReason::HostCall(77));
     assert_eq!(invocation.pc, 3, "unknown host call stays on its cause");
     assert_eq!(invocation.registers[2], 9);
@@ -766,7 +791,7 @@ fn embedder_calls_resume_without_reexecuting_prior_instructions() {
     let mut calls = 0;
     let invocation = RefineContext::load(&outer, &[], 1_000_000)
         .unwrap()
-        .run_with_host(|id, machine| {
+        .try_run_with_host(|id, machine| {
             assert_eq!(id, 77);
             calls += 1;
             if !machine.charge(50) {
@@ -774,7 +799,8 @@ fn embedder_calls_resume_without_reexecuting_prior_instructions() {
             }
             machine.registers_mut()[2] += 1;
             Ok(())
-        });
+        })
+        .unwrap();
     assert_eq!(calls, 2);
     assert_eq!(invocation.exit, ExitReason::Halt);
     assert_eq!(invocation.registers[2], 11);
@@ -787,10 +813,11 @@ fn embedder_refusal_keeps_exact_call_counter_and_stops_execution() {
     let mut calls = 0;
     let invocation = RefineContext::load(&outer, &[], 1_000_000)
         .unwrap()
-        .run_with_host(|id, _| {
+        .try_run_with_host(|id, _| {
             calls += 1;
             Err(ExitReason::HostCall(id))
-        });
+        })
+        .unwrap();
     assert_eq!(calls, 1);
     assert_eq!(invocation.exit, ExitReason::HostCall(77));
     assert_eq!(invocation.pc, 3);
@@ -810,7 +837,8 @@ fn embedder_calls_preserve_inner_machines_and_cannot_intercept_builtins() {
     );
     let expected = RefineContext::load(&baseline, &inner_program(), 1_000_000)
         .unwrap()
-        .run();
+        .try_run()
+        .unwrap();
     let outer = standard_program_with_rw(
         &[10, 9, 10, 77, 51, 8, b0, b1, b2, 10, 13, 10, 77, 50, 0],
         &[0, 2, 4, 9, 11, 13],
@@ -819,11 +847,12 @@ fn embedder_calls_preserve_inner_machines_and_cannot_intercept_builtins() {
     let mut calls = 0;
     let invocation = RefineContext::load(&outer, &inner_program(), 1_000_000)
         .unwrap()
-        .run_with_host(|id, _| {
+        .try_run_with_host(|id, _| {
             assert_eq!(id, 77);
             calls += 1;
             Ok(())
-        });
+        })
+        .unwrap();
     assert_eq!(calls, 2);
     assert_eq!(expected.exit, ExitReason::Halt);
     assert_eq!(invocation.exit, expected.exit);
@@ -844,7 +873,10 @@ fn failed_host_dispatch_does_not_advance_the_outer_counter() {
     // Dispatch fails before Continue, so the owner must retain that
     // ecalli counter rather than exposing its pc-10 successor.
     let outer = standard_program(&[51, 7, 0, 0, 3, 51, 8, 1, 10, 9, 0], &[0, 5, 8, 10]);
-    let invocation = RefineContext::load(&outer, &[], 1_000_000).unwrap().run();
+    let invocation = RefineContext::load(&outer, &[], 1_000_000)
+        .unwrap()
+        .try_run()
+        .unwrap();
     assert_eq!(invocation.exit, ExitReason::Panic);
     assert_eq!(invocation.pc, 8);
 }
@@ -957,7 +989,8 @@ fn state_scan_charges_by_the_byte_and_reads_no_row_it_cannot_pay_for() {
         let invocation = RefineContext::load(&program, &[], gas)
             .unwrap()
             .with_state(rows.clone())
-            .run();
+            .try_run()
+            .unwrap();
         (
             invocation,
             rows.read.load(core::sync::atomic::Ordering::Relaxed),
@@ -1133,7 +1166,7 @@ fn pages_past_the_budget_answer_full_on_a_vos_host_alone() {
     let outer = standard_program(&code, &[0, 2, 5, 10, 13, 15]);
     let gas = 100_000_000;
     let load = || RefineContext::load_with(&outer, &inner_program(), gas, MemoryModel::Sparse);
-    let vos = load().unwrap().run();
+    let vos = load().unwrap().try_run().unwrap();
     assert_eq!(vos.exit, ExitReason::Halt);
     assert_eq!(vos.registers[7], result::FULL);
     let jam = load().unwrap().try_run_jam(JamRefine::default()).unwrap();
@@ -1161,7 +1194,8 @@ fn state_read_of_key(len: u64, max: u64, reader: alloc::sync::Arc<dyn StateReade
     let invocation = RefineContext::load(&program, &[], 1_000_000)
         .unwrap()
         .with_state(reader)
-        .run();
+        .try_run()
+        .unwrap();
     assert_eq!(invocation.exit, ExitReason::Halt);
     (invocation.registers[7], invocation.gas_used)
 }

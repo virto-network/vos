@@ -549,7 +549,10 @@ mod tests {
             .try_run_jam(JamRefine::default())
             .unwrap()
             .invocation;
-        let node = RefineContext::load(&program, &[], 1_000_000).unwrap().run();
+        let node = RefineContext::load(&program, &[], 1_000_000)
+            .unwrap()
+            .try_run()
+            .unwrap();
         assert_eq!(jam.gas_used - node.gas_used, jam_gas::GAS - BASE_CALL_GAS);
         for (id, price) in [(100, jam_gas::LOG), (0x47, jam_gas::UNSERVED)] {
             let (charged, run) = jam_price(id, [0; 5], JamRefine::default());
