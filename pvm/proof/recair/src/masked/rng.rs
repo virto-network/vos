@@ -103,7 +103,11 @@ pub(crate) fn wipe_stream(stream: &mut ChaCha20Rng) {
 
 /// Each of `polys`' coefficients wiped (`vos_pvm_proof::masked::wipe_column`):
 /// a witness's unmasked columns once they are masked.
-pub(crate) fn wipe_polys(polys: &mut [stwo::prover::poly::circle::CircleCoefficients<stwo::prover::backend::simd::SimdBackend>]) {
+pub(crate) fn wipe_polys(
+    polys: &mut [stwo::prover::poly::circle::CircleCoefficients<
+        stwo::prover::backend::simd::SimdBackend,
+    >],
+) {
     for poly in polys {
         vos_pvm_proof::masked::wipe_column(&mut poly.coeffs);
     }

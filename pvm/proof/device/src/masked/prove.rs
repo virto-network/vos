@@ -105,9 +105,7 @@ where
             return Err(Error::Layout);
         }
         let code = vos_pvm_proof::kernel::kernel_side_note(blob).map_err(|_| Error::Layout)?;
-        if active
-            != device_chips_of_code(&code.code, &code.bitmask).ok_or(Error::Precompile)?
-        {
+        if active != device_chips_of_code(&code.code, &code.bitmask).ok_or(Error::Precompile)? {
             return Err(Error::Chips);
         }
         let shape = DeviceShape {

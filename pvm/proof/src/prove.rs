@@ -105,10 +105,10 @@ impl core::fmt::Display for SegmentError {
                 overflow: false,
             } => write!(formatter, "chip {chip} is another size than its shape"),
             Self::MalformedShape => formatter.write_str("the shape is not one of the segment AIR"),
-            Self::Transfer => {
-                formatter.write_str("the code jumps statically to the halt address")
+            Self::Transfer => formatter.write_str("the code jumps statically to the halt address"),
+            Self::RunLength => {
+                formatter.write_str("the run is longer than a proof's ledgers order")
             }
-            Self::RunLength => formatter.write_str("the run is longer than a proof's ledgers order"),
             Self::Segments => formatter.write_str("the run takes more segments than its gas buys"),
         }
     }
@@ -159,7 +159,10 @@ pub(crate) fn check_run_length(side_note: &SideNote) -> Result<(), SegmentError>
 ///
 /// Returns the number of threads the prover's pool has.
 pub fn install_thread_pool() -> usize {
-    prover_pool().map_or_else(rayon::current_num_threads, rayon::ThreadPool::current_num_threads)
+    prover_pool().map_or_else(
+        rayon::current_num_threads,
+        rayon::ThreadPool::current_num_threads,
+    )
 }
 
 /// The prover's own pool, when the global one is not the prover's: `None`
@@ -620,11 +623,12 @@ where
     {
         return Err(refusal(0, true));
     }
-    let traces = generate_component_traces(side_note, components, sizes.floors(), pinned)
-        .map_err(|(position, log_size)| {
+    let traces = generate_component_traces(side_note, components, sizes.floors(), pinned).map_err(
+        |(position, log_size)| {
             let pinned = sizes.floors().get(position).copied().unwrap_or(0);
             refusal(position, log_size > pinned)
-        })?;
+        },
+    )?;
     let log_sizes = traced_sizes(&traces, sizes, component_mask)?;
     let trace_gen = t.elapsed();
 
@@ -878,7 +882,10 @@ mod tests {
             SideNote::new(Vec::new(), code, vec![1, 0, 0, 0, 0, 1])
         };
         let mut halt = jump(vos_pvm::PVM_HALT_ADDR as u32);
-        assert!(matches!(check_transfers(&halt), Err(SegmentError::Transfer)));
+        assert!(matches!(
+            check_transfers(&halt),
+            Err(SegmentError::Transfer)
+        ));
         assert!(matches!(prove(&mut halt), Err(SegmentError::Transfer)));
         let shape = crate::shape::ProofShape {
             components: crate::chip_idx::ALWAYS,

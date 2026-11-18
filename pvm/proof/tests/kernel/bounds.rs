@@ -11,8 +11,7 @@ use vos_pvm_proof::kernel::{KernelTraceError, trace_kernel, trace_kernel_within}
 use vos_pvm_proof::segment::{SegmentCursor, segment_bounds_budgeted};
 use vos_pvm_proof::shape::KernelShape;
 use vos_pvm_proof::{
-    MAX_RUN_STEPS, SEGMENT_GAS, SegmentError, max_segments, plan_kernel, prove_kernel,
-    prove_shaped,
+    MAX_RUN_STEPS, SEGMENT_GAS, SegmentError, max_segments, plan_kernel, prove_kernel, prove_shaped,
 };
 
 /// `build` at the heap's base, which a program of no read-only data lays
@@ -37,7 +36,8 @@ fn halt(asm: &mut Assembler) {
 fn page_walk(rounds: i32, stride: i32) -> Vec<u8> {
     at_heap(|base| {
         let mut asm = Assembler::new();
-        asm.set_heap_pages((64 * stride) as u32 + 1).set_stack_pages(1);
+        asm.set_heap_pages((64 * stride) as u32 + 1)
+            .set_stack_pages(1);
         asm.load_imm_64(Reg::S0, base)
             .load_imm(Reg::T2, 0)
             .fallthrough();

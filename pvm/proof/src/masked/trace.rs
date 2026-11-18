@@ -139,20 +139,18 @@ pub fn masked_device_trace(
     let pinned = matches!(sizes, DeviceSizes::Pinned(_));
     // A run is refused at its first chip past its size, before any later
     // chip is traced: the CPU, a row a step, before any.
-    if pinned
-        && chips.first() == Some(&chip_idx::CPU)
-        && !steps_fit(side_note, log_sizes[0])
-    {
+    if pinned && chips.first() == Some(&chip_idx::CPU) && !steps_fit(side_note, log_sizes[0]) {
         return Err(SegmentError::Shape {
             chip: chip_idx::CPU,
             overflow: true,
         });
     }
-    let mut traces = generate_component_traces(side_note, &components, log_sizes, pinned)
-        .map_err(|(position, log_size)| SegmentError::Shape {
+    let mut traces = generate_component_traces(side_note, &components, log_sizes, pinned).map_err(
+        |(position, log_size)| SegmentError::Shape {
             chip: chips[position],
             overflow: log_size > log_sizes[position],
-        })?;
+        },
+    )?;
     if let Some(cpu) = &cpu {
         assert_eq!(
             chips.first(),

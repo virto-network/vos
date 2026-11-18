@@ -413,7 +413,8 @@ mod tests {
     fn the_fixed_tables_are_their_chips_sizes() {
         let side_note = crate::SideNote::new(vec![], vec![0], vec![1]);
         for (chip, least) in FIXED_TABLES {
-            let trace = crate::BASE_COMPONENTS[chip].generate_component_trace_immut_min(&side_note, 0);
+            let trace =
+                crate::BASE_COMPONENTS[chip].generate_component_trace_immut_min(&side_note, 0);
             assert_eq!(trace.log_size(), u32::from(least), "chip {chip}");
         }
     }

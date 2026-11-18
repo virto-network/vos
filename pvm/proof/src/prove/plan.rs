@@ -148,12 +148,14 @@ pub(crate) fn page_sizes(window: &mut SideNote) -> [(usize, u32); 3] {
         window.ingest_memory_pages();
     }
     let compressions = window.merkle_blake2b_calls.len();
-    let (merges, pages) = window
-        .memory_pages
-        .as_ref()
-        .map_or((0, 0), |pages| (pages.multiproof.merges.len(), pages.pages.len()));
+    let (merges, pages) = window.memory_pages.as_ref().map_or((0, 0), |pages| {
+        (pages.multiproof.merges.len(), pages.pages.len())
+    });
     [
-        (chip_idx::BLAKE2B_BOUNDARY, lanes(COMPRESSION_ROWS * compressions)),
+        (
+            chip_idx::BLAKE2B_BOUNDARY,
+            lanes(COMPRESSION_ROWS * compressions),
+        ),
         (chip_idx::MEMORY_MERKLE, lanes(merges)),
         (chip_idx::MEMORY_PAGE, lanes(PAGE_ROWS * pages)),
     ]
@@ -258,8 +260,13 @@ mod tests {
                 .with_memory_layout(crate::memory_layout::MemoryLayout::writable());
             let sizes = page_sizes(&mut window);
             for (chip, size) in sizes {
-                let trace = crate::BASE_COMPONENTS[chip].generate_component_trace_min(&mut window, 0);
-                assert_eq!(trace.log_size(), size, "chip {chip} at stride {stride}, {seeded}");
+                let trace =
+                    crate::BASE_COMPONENTS[chip].generate_component_trace_min(&mut window, 0);
+                assert_eq!(
+                    trace.log_size(),
+                    size,
+                    "chip {chip} at stride {stride}, {seeded}"
+                );
             }
         }
     }

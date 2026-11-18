@@ -347,7 +347,10 @@ impl<'de, T: serde::Deserialize<'de> + Held> serde::Deserialize<'de> for Seq<T> 
             fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 f.write_str("a sequence")
             }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Seq<T>, A::Error> {
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Seq<T>, A::Error> {
                 let mut held = core::mem::size_of::<Vec<T>>();
                 while let Some(element) = seq.next_element::<T>()? {
                     held = held
