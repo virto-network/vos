@@ -398,9 +398,103 @@ impl PreparedExecution {
     }
 }
 
+/// One standard machine over any memory map, run through the path a
+/// service's machine takes: a prepared program, its backend's memory (on
+/// the recompiler the native window, with permission sync and write
+/// tracking) and its slices. For conformance vectors and differential
+/// tests, which set memory and permissions directly.
+pub struct StandardMachine {
+    execution: PreparedExecution,
+    /// The machine's architectural state and memory.
+    pub interpreter: crate::Interpreter,
+}
+
+impl StandardMachine {
+    /// A machine at instruction counter 0 with `span` bytes of memory, all
+    /// pages readable and writable until set otherwise.
+    pub fn new(
+        code: &[u8],
+        bitmask: &[u8],
+        jump_table: &[u32],
+        registers: [u64; crate::PVM_REGISTER_COUNT],
+        gas: crate::Gas,
+        span: u64,
+        backend: PvmBackend,
+    ) -> Result<Self, String> {
+        let execution = PreparedExecution::new_standard(code, bitmask, jump_table, backend)?;
+        let sparse = execution.backend() == PvmBackend::ForceInterpreter;
+        let memory = execution.allocate_memory(span, sparse)?;
+        let interpreter = crate::Interpreter::from_predecoded(
+            execution.interpreter_program(),
+            registers,
+            memory,
+            gas,
+        );
+        Ok(Self {
+            execution,
+            interpreter,
+        })
+    }
+
+    /// The backend the program was prepared on.
+    pub fn backend(&self) -> PvmBackend {
+        self.execution.backend()
+    }
+
+    /// Run one slice: to the next exit. An error is the host's failure,
+    /// never a guest outcome.
+    pub fn run(&mut self) -> Result<crate::ExitReason, String> {
+        self.execution.run(&mut self.interpreter)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store, a fault on an unmapped page and the state after it are the
+    /// same on every backend's production path.
+    #[test]
+    fn a_standard_machine_runs_alike_on_every_backend() {
+        // store_imm_u32 [0x10000], 0x2a; then load_u8 φ0 from 0x20000,
+        // whose page is unmapped.
+        let code = [32, 4, 0, 0, 1, 0, 42, 52, 0, 0, 0, 2, 0];
+        let bitmask = [1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0];
+        let outcomes: Vec<_> = crate::test_support::backends()
+            .into_iter()
+            .map(|backend| {
+                let mut machine =
+                    StandardMachine::new(&code, &bitmask, &[], [0; 13], 1_000, 0x30000, backend)
+                        .unwrap();
+                assert_eq!(machine.backend(), backend);
+                let mut perms = alloc::vec![crate::interpreter::PERM_RW; 0x30];
+                perms[0x20] = crate::interpreter::PERM_NONE;
+                machine.interpreter.set_page_perms(perms);
+                let exit = machine.run().unwrap();
+                let mut stored = [0; 4];
+                machine
+                    .interpreter
+                    .memory()
+                    .read_bytes(0x10000, &mut stored);
+                (
+                    exit,
+                    machine.interpreter.gas,
+                    machine.interpreter.pc,
+                    stored,
+                )
+            })
+            .collect();
+        assert_eq!(
+            outcomes[0],
+            (
+                crate::ExitReason::PageFault(0x20000),
+                outcomes[0].1,
+                7,
+                [42, 0, 0, 0]
+            )
+        );
+        assert!(outcomes.iter().all(|outcome| *outcome == outcomes[0]));
+    }
 
     /// A host without the recompiler refuses a demand for it, rather than
     /// running something else under its name.

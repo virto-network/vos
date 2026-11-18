@@ -40,21 +40,21 @@ pub(crate) fn run_standard(
         flat_perms,
         fast_reentry: 0,
     };
+    // Native code writes the context page while it runs, so no reference
+    // to it lives across the run: it is written, borrowed to prepare the
+    // entry, and read back by value.
     // SAFETY: native_window reserves an aligned, writable context page; the
     // guest alias excludes it. All metadata pointers remain owned throughout
     // this synchronous execution and host access holds exclusive ownership.
-    let context = unsafe {
-        context_pointer.write(context);
-        &mut *context_pointer
-    };
-    if prepare_external_entry(
-        context,
+    unsafe { context_pointer.write(context) };
+    // SAFETY: as above; the borrow ends with the call.
+    let prepared = prepare_external_entry(
+        unsafe { &mut *context_pointer },
         &compiled.fault_resume_offsets,
         &compiled.gas_block_start_by_pc,
         &compiled.block_gas_costs,
-    )
-    .is_none()
-    {
+    );
+    if prepared.is_none() {
         if let Err(error) = signal::ensure_installed() {
             // Nothing native ran: the interpreter takes the slice.
             tracing::debug!(%error, "interpreting without a fault handler");
@@ -97,6 +97,8 @@ pub(crate) fn run_standard(
             return Err("native code faulted outside a guest access".into());
         }
     }
+    // SAFETY: native code has returned, and nothing else refers to the page.
+    let context = unsafe { context_pointer.read() };
     vm.registers = context.regs;
     vm.gas = context.gas;
     vm.pc = context.pc;
