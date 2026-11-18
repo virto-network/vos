@@ -166,13 +166,15 @@ verification (39) run Stwo's own quotient, which refuses the point.
   `debug-internals`), which `just ci-full` runs: not `check`, `gate` or
   `ci`.
 - **Not yet under a forgery gate of that kind:** PROGRAM_MEMORY's decode
-  binding, JUMP_TABLE (one padding fix), MEMORY_MERKLE, the boundary-binding argument
-  (the boundary states recomputed into the boundary chips' claimed sums),
-  the segment cut and closing-flag rule. These are in the
-  external audit's scope (below). The lookup tables are held to their
-  functions (`lookup_table_gate`), not by a forgery; MEMORY_PAGE (a page
-  listed twice, its closing timestamp) and the witness input (a chain off
-  its call) have theirs.
+  binding, JUMP_TABLE (one padding fix), MEMORY_MERKLE, the
+  boundary-binding argument (the boundary states recomputed into the
+  boundary chips' claimed sums), the segment cut and closing-flag rule.
+  These are in the external audit's scope (below). The lookup tables are
+  held to their functions (`lookup_table_gate`), not by a forgery;
+  MEMORY_PAGE (a page listed twice; pages closing at two timestamps, the
+  chip holding one closing timestamp across its rows, which value only
+  the claimed-sum binding holds) and the witness input (a chain off its
+  call) have theirs.
 - **Recorded, unfixed:** an invalid dynamic jump cannot be proved (no
   kernel needs it); a run past 2^27 − 1 steps cannot be proved; a
   BLAKE2b pointer within 256 bytes of 2^32 cannot be proved. Each makes
@@ -504,13 +506,15 @@ panic-free on every input by construction:
   table below with what guards it. Two had no guard upstream and are the
   fork's fix (DIVERGENCE-013), in the pinned revision. The table is
   format 39's; format 47 (the device verifier, natively at a node's
-  ingress, where a panic is the caller's to catch, above) runs the same
-  masked verifier and Stwo path, so its "shape" rows hold through the
-  same `check_shape`, but every row that cites 39's parameters (its
+  ingress, which refuses its own panic as `Refusal::Panic`, above) runs
+  the same masked verifier and Stwo path, so its "shape" rows hold
+  through the same `check_shape`, but every row that cites 39's parameters (its
   trees' heights, its 16 queries, its fold step 3 and its subsets, its
   last layer of 2^6 and 64 coefficients, its circle draw's odds) is to be
   re-derived at 47's (fold step 1, last layer 2^0, 47 queries, its own
-  heights), an audit item ([AUDIT.md](AUDIT.md)).
+  heights), an audit item ([AUDIT.md](AUDIT.md)); an independent read
+  of those rows at 47's parameters found no reachable panic, which the
+  audit is to confirm.
 - **Fuzzing:** twelve targets (`fuzz/`, the justfile's
   `proof_fuzz_targets`): the final verifier on arbitrary bytes
   (`final_verifier_bytes`), on the golden wraps mutated

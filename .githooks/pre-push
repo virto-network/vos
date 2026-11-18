@@ -17,7 +17,7 @@ zero=0000000000000000000000000000000000000000
 head=$(git rev-parse HEAD)
 while read -r local_ref local_sha remote_ref remote_sha; do
     [ "$local_sha" = "$zero" ] && continue
-    if [ "$local_sha" != "$head" ]; then
+    if [ "$(git rev-parse "$local_sha^{commit}")" != "$head" ]; then
         echo "pre-push: $local_ref ($local_sha) is not HEAD: push HEAD, or --no-verify" >&2
         exit 1
     fi

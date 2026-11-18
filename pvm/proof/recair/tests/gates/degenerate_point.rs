@@ -5,6 +5,11 @@
 //! z̄.y − z.y` to have an inverse at every point of the plan: the OODS
 //! point, each mask offset's and each periodicity point.
 //!
+//! The gate builds the DEEP sub-circuit (`deep::prepare` and `answer`)
+//! over the real plans, not a whole leaf or fold: that is complete, since
+//! `verify_rest` (`verifier/stark.rs`) is its only caller, and the leaf's
+//! segment verifier and the fold's child verifier both reach it there.
+//!
 //! The forger chooses the OODS point so that one point of the plan at a
 //! time lands on a degenerate `z`, over the plans of the window kernel's
 //! leaf (format 41) and of the fold's and the wrap's child (format 32):
