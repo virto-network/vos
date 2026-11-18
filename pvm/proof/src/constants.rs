@@ -42,7 +42,7 @@ pub const PREDICATE_PROGRAM: [u32; 8] = [
 /// `H_fold`: the fold circuit's hash over the padded shape, the fold word
 /// every node of a tree carries and the wrap checks.
 pub const H_FOLD: [u32; 8] = [
-    1926018953, 708720600, 521533944, 511795374, 1724860191, 691497565, 1028082666, 1483953229,
+    432279264, 1157161350, 1252342881, 268022195, 1782745271, 1221220570, 741909909, 271327132,
 ];
 
 /// The final wrap's preprocessed root under `format::MASKED_WRAP`, on the

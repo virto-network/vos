@@ -467,13 +467,13 @@ attribution). Its full design is `recursion-air.md`.
   block and length sets the fee.
 - **Built, format 39 at 16 queries** [measured, compumax, 2026-11-18,
   `just repin`'s runs of the fixtures' tests, test profile]: `wrap.proof`
-  is 103,236 bytes; on the JAM-only host the `valid` fixture's verify
-  60.5M gas (60,451,863), a statement judged 62.6M (62,555,733) and the
-  JAM statements service's refine of one 62.6M (62,578,151), the pins of
+  is 103,748 bytes; on the JAM-only host the `valid` fixture's verify
+  61.2M gas (61,182,113), a statement judged 62.8M (62,765,041) and the
+  JAM statements service's refine of one 62.8M (62,791,395), the pins of
   `pvm/proof/counts.txt`; over 12 seeds of the one-segment run's wrap
-  (`just repin-proof`, sigma, 2026-11-18) the verify at most 61.8M gas
-  and in Wasm under the PVF's semantics 35.0M instructions, at the fitted
-  worst shape 63.8M gas and 36.1M instructions of the 50M budget;
+  (`just repin-proof`, sigma, 2026-11-18) the verify at most 62.1M gas
+  and in Wasm under the PVF's semantics 35.2M instructions, at the fitted
+  worst shape 63.9M gas and 36.2M instructions of the 50M budget;
 - **Built, format 39 at 24 queries** [measured, x86 dev machine,
   2026-10-19 and 2026-10-24], its proof decoded from a fixed layout
   (`vos_pvm_final_verifier::masked`), never postcard:
@@ -1014,7 +1014,7 @@ last for decades.**
     verifier stack vendored into Kreivo with a sync check against a VOS
     tag (VOS's kit, `pvm/proof/kit`); frame-contrib and crates.io later.
 - **The JAM statements service** (`vos-statement-service`): a dedicated
-  service; refine verifies anchors' signatures and statements (62.6M gas
+  service; refine verifies anchors' signatures and statements (62.8M gas
   a statement on the JAM-only host [measured]; a report's accumulate has
   10M); accumulate
   holds the spaces,
@@ -1926,10 +1926,10 @@ that narrows the inner proof makes folds cheaper too.
 | signed multiplicities in the wiring are new soundness surface | the `Context`'s static checks; the audit of the wiring argument (`recursion-air.md` §1.1) |
 | the gate compiler is wrong | equivalence tests (constraint ≡ gate) on every chip; tamper tests |
 | a kernel's leaf is too big for the padded shape | `derive` computes each kernel's leaf rows and refuses one over the limit (§3.3); the levers of §3.4 |
-| the final wrap misses its gas or size | **retired:** the masked wrap verified on the JAM-only host in 60.5M gas and in Wasm in 36.1M instructions at the worst shape (§3.5) [measured] |
+| the final wrap misses its gas or size | **retired:** the masked wrap verified on the JAM-only host in 61.2M gas and in Wasm in 36.2M instructions at the worst shape (§3.5) [measured] |
 | the multi-step FRI path, or the Blake2b channel, is unsound | a review plus tamper tests before a format admits them |
 | the wrap is weaker than the inner formats | **retired:** 16 queries, 106 / 65 proven bits (65.79), above the weakest inner format's 104 / 62.81 (§3.5) [model] |
-| masking the wrap costs more than (c)'s factor | **retired:** format 39 at a 3.6 GiB heap and 79.3M gas at 24 queries, 60.5M at 16 [measured], within the design's budget of 24 GiB and 200M gas and the tests' tighter bounds (A.7); leakage and soundness tests |
+| masking the wrap costs more than (c)'s factor | **retired:** format 39 at a 3.6 GiB heap and 79.3M gas at 24 queries, 61.2M at 16 [measured], within the design's budget of 24 GiB and 200M gas and the tests' tighter bounds (A.7); leakage and soundness tests |
 | the cut and held build fail under failover | the cut and the held build across a leader change |
 | the prover worker falls behind the window cadence | the worker measured against the cadence |
 | the teammate's pallet diverges from the design | the pallet against the conformance vectors |
@@ -2195,7 +2195,7 @@ output; its `public_args` a venue's id and a nonce, which the io-hash
 binds and no venue reads apart) in three segments, folds them and wraps
 the root under format 39, masked from the seeded test seam
 (`MaskRng::Seeded`, so the bytes are its own every run; `wrap.proof` is
-103,236 bytes, a size that moves a few percent with the seed); and it
+103,748 bytes, a size that moves a few percent with the seed); and it
 wraps two roots that are not a whole run, as a cheating prover would,
 the wrap's checks failing (`wrap-prefix.proof`, `wrap-midway.proof`). The
 generator makes the same bytes in every build of the prover: a kernel's
@@ -2211,7 +2211,7 @@ changed. Every verdict is the same natively, in Wasm (PVF and client;
 
 | case | verdict | JAM-only host [measured, 2026-11-18] |
 |---|---|---|
-| valid | accepted | 62.6M gas |
+| valid | accepted | 62.8M gas |
 | tampered | `0x112` | 39.2M |
 | wrong io-hash; the nonce; the roots' order; a root dropped | `0x108` | 10.8M |
 | wrong program; prefix; mid-way | `0x109` | 10.9M |

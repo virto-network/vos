@@ -9,8 +9,8 @@ pub const LOG_SIZES: [u32; 3] = [14, 15, 11];
 /// trees, as `format::MASKED_WRAP` commits it: its columns one level up
 /// (`n + 1`), under blowup 32.
 pub const PREPROCESSED_ROOT_39: [u8; 32] = [
-    242, 222, 64, 119, 8, 117, 210, 231, 91, 134, 186, 46, 66, 17, 191, 228, 202, 180, 196, 8, 255,
-    79, 80, 233, 170, 53, 248, 208, 10, 0, 176, 135,
+    235, 181, 144, 217, 124, 170, 219, 26, 45, 153, 22, 7, 5, 112, 52, 14, 196, 20, 210, 130, 185,
+    148, 36, 99, 250, 170, 77, 242, 141, 133, 217, 224,
 ];
 
 /// `format::MASKED_WRAP`'s trees' widths: preprocessed 57; main 381 (373

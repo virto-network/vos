@@ -1,6 +1,6 @@
 # Every pinned guest blob's SHA-256, its symbols and relocations stripped,
 # as `just build-blobs` builds it: `just blobs-lock` writes it, `just
 # check-blobs` checks it (the justfile's `_blob-hashes` says which blobs).
-d35498cde318e9a4c9cda826d5058c611646f24d2ebaf101ad1bbb9b6181d9ca  target/riscv64em-vos/release/final-verify.elf
-a6129d9755bb9df24ffa7b25158ad0cfd910305a85164421fe8127baf0489ddd  target/riscv64em-vos/release/statement-service.elf
-8b3f3252ffbbb127e7b6903cc02a95c5f002bd762eb67b4e2f9f92fff78ec6bf  pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
+bf5d23e443567cefd61b8f378bbbfd409a218cb26f13492be06dff79e651d98b  target/riscv64em-vos/release/final-verify.elf
+f37969a9fdb612449b1af7e36d9fd6bcc179ab25378bd5da1d59f4e27bafbd04  target/riscv64em-vos/release/statement-service.elf
+837573e8638918d55e33aed08b5b5204b74defa6b5d1f1acf60105e31176417d  pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
