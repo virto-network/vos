@@ -696,7 +696,7 @@ and fold layout of §1.1 is unchanged.
 | | value | tag |
 |---|---|---|
 | rows p2 / qm31 / h8 | 15,311 / 20,766 / 1,794 → 2^14 / 2^15 / 2^11, tallest **2^15** (≤ 2^17) | model |
-| own parameters | blowup 32, 16 queries, PoW 26, interaction PoW 8, fold step 3, last layer 2^6, Blake2b-256 Merkle and channel, affine DEEP batching, 106 / 65 bits (the weakest inner format's floor, 104 / 63), masked under variant (c) (`proving.md` §3.5) | decided (format 39) |
+| own parameters | blowup 32, 16 queries, PoW 26, interaction PoW 8, fold step 3, last layer 2^6, Blake2b-256 Merkle and channel, affine DEEP batching, 106 / 65 bits (conjectured / proven, the least term, one wrap's; the weakest inner format's floor, 104 / 63), masked under variant (c) (`proving.md` §3.5) | decided (format 39) |
 | cells, extended cells | 7.5M, 481M | model |
 | memory, time | 2.2–4.9 GiB, 4.4–9.5 s unmasked [projected]; masked (format 39) as built: a 3.6 GiB heap [measured] | projected, measured |
 | JAM gas, unmasked | 81.1M with the model's Blake2s; **85.2M Blake2b-256 in software (×1.05); 64.1M through `0x400` (×0.79)** | model |

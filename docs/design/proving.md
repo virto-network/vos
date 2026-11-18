@@ -400,20 +400,20 @@ attribution). Its full design is `recursion-air.md`.
 - **Parameters** (format 39, masked under variant (c), A.4): blowup 32,
   16 queries, PoW 26, interaction PoW 8, fold step 3, a 2^6 last layer,
   and **affine DEEP batching** (an independent coefficient a sampled
-  value). That is 106 conjectured and 65 proven bits (65.80, the query
-  term binding; batching 65.86, the first FRI fold 66.05) [model].
-- **Why 16 queries:** inner soundness carries through (§4), so the
-  system's proven bound is the weakest inner format's, 62.81 bits, and
-  no wrap count above it buys the system a bit. Format 39's floor is
+  value). That is 106 conjectured and 65 proven bits (65.79, the query
+  term binding; batching 65.85, the first FRI fold 66.05) [model].
+- **Why 16 queries:** a statement is no stronger than its weakest inner
+  proof (§4), 62.81 bits, so no wrap count above that buys a statement a
+  bit. Format 39's floor is
   therefore the weakest inner format's on either count, 104 / 63, and 16
-  queries is the least that clears it: 15 count 101 / 63 (63.37), below
+  queries is the least that clears it: 15 count 101 / 63 (63.36), below
   the segments' 104 conjectured; 24, as format 39 first took for a
-  proven 80, counted 146 / 82 (82.70) at about 40% more bytes. Blowup 64
+  proven 80, counted 146 / 82 at about 40% more bytes. Blowup 64
   at 13 queries counts 104 / 64 at twice the prover's memory [model].
 - **Why affine batching:** Stwo batches the sampled values by powers of one
   coefficient, and that term's error is the values' count times a
   proximity-gap error that grows with the blowup. Batched by powers, the
-  masked wrap caps at 76.98 proven bits at blowup 32 and 74.48 at blowup
+  masked wrap caps at 76.97 proven bits at blowup 32 and 74.47 at blowup
   64 however many queries are taken, and at 16 queries counts 65.33,
   above the floor too [model]: the floor does not need affine batching,
   and the wrap keeps it, as the device format does.
@@ -628,20 +628,24 @@ last for decades.**
     3–15% more queries, and the parameters below carry at least 5% of
     that margin.
   - **"Proven" bits** are the Johnson-bound count, including the DEEP,
-    ALI and logup error terms. One tool computes both counts for a
+    ALI and logup error terms, taken as the least term (soundcalc's
+    rule). Every proven figure in this document is that rule's, for one
+    proof at its format's reference shape; `pvm/proof/SECURITY.md`'s
+    format table gives the summed terms beside it, and no figure is a
+    statement's. One tool computes both counts for a
     shape; the format tests pin its output, and the verifier checks
     both.
   - Grover halves the search against a quantum prover. That is a
     heuristic, not a theorem.
 - **What 60 proven bits buy:** about 2^60 hash evaluations. Inner proofs
-  sit at that floor, and the final proof at 80.
+  sit at that floor, and the final proof at 63.
 
-| proof | target | example | conjectured / proven |
+| proof | target | example | conjectured / proven, the least term |
 |---|---|---|---|
 | segment proofs (format 41) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.81) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
-| device proofs (47; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4, 47 queries, PoW 16, interaction PoW 8; variant (c), `h = 256` (§8, "The device parameters") | 110 / 62 (62.82, each) |
-| the final wrap, masked (39) | ≥ 104 / ≥ 63, the weakest inner format's | blowup 32 (log 5), 16 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5); variant (c) | 106 / 65 (65.80) |
+| device proofs (47; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4, 47 queries, PoW 16, interaction PoW 8; variant (c), `h = 256` (§8, "The device parameters") | 110 / 62 (62.81, each) |
+| the final wrap, masked (39) | ≥ 104 / ≥ 63, the weakest inner format's | blowup 32 (log 5), 16 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5); variant (c) | 106 / 65 (65.79) |
 
 - **The counts** are the security tool's (`pvm/proof/src/security.rs`) at
   each format's reference shape [model], pinned by the format tests.
@@ -671,19 +675,22 @@ last for decades.**
   segment's width times its queries. At 44 over the window kernel's 8,009
   columns the leaf needs 64,717 of `p2`'s 65,536 rows; at 40, 59,300, 9.5%
   to spare [model, `recursion-air.md`, Appendix: the verifier cost
-  model]. PoW 24 keeps the proven count, 62.86
-  against 62.74 at 44 queries and PoW 20, where the batching term binds.
+  model]. PoW 24 keeps the proven count: 44 queries at PoW 20 count
+  62.74, where the batching term binds.
   Counted on format 41's own reference (every chip at 2^20 rows, the
   Poseidon2 chip among them; 11,091 sampled values, 5,750 constraints): 40
   queries and PoW 24 count 62.81 proven bits, so they stand.
 - **Devices:** §8, "The device parameters".
 
 - **Inner soundness carries through:** forging a fold's input forges the
-  final proof. **The system's proven bound is therefore the weakest inner
-  format's, 62.81 bits (format 41), not the wrap's 65.80;** its conjectured
-  bound is 104. Under Grover's heuristic that is about 31 proven and 52
-  conjectured bits against a quantum prover, so post-quantum readiness
-  rests on the conjectured count. All counts are the security tool's own
+  final proof. **A statement is therefore no stronger than its weakest
+  inner proof, 62.81 bits (format 41), not the wrap's 65.79;** 104
+  conjectured. That is a ceiling: a statement's bound needs a composition
+  argument over its proof count, its recursion depth and PoW counted as
+  bits, which is open (the audit below). Under Grover's heuristic a
+  proof's figures are about halved against a quantum prover (31 proven
+  and 52 conjectured for 41's), so post-quantum readiness rests on the
+  conjectured count. All counts are the security tool's own
   [model], pinned by tests and not yet reviewed outside.
 - **Salts:** 8 M31 (248 bits).
 - **Interaction PoW** applies to every proof with logup, folds included.
@@ -699,7 +706,8 @@ last for decades.**
     decode binding, JUMP_TABLE, the lookup tables, MEMORY_PAGE and
     MEMORY_MERKLE, the witness-input chip, the boundary-binding argument;
   - the fork's divergences (below);
-  - the security tool's counts (`security.rs`);
+  - the security tool's counts (`security.rs`), and the composition
+    argument from one proof's figures to a statement's;
   - the leaf's binding, the wrap, `vos-pvm-final-verifier` and
     `vos-statement`, and `derive` with the program id's derivation;
   - the mobile proofs: the masked chips
@@ -1579,7 +1587,7 @@ and floors (below) over the per-program CPU (the columns the program's
 code sets, `CpuColumns::of_code`) and the word ledger (WordMemoryChip, a
 row an 8-byte word), counted on its own masked reference (the word set
 with the full CPU at 2^17 rows: 7,470 DEEP values, 4,309 constraints):
-110 conjectured and 62.82 proven bits; a per-program CPU's cut drops
+110 conjectured and 62.81 proven bits; a per-program CPU's cut drops
 columns and constraints, which only raises the count (a gate counts the
 cut set too). The word ledger's last row is padding
 (`IsLast · (1 − IsPadding) = 0`, degree 2, `open.md`). Its kernels are
@@ -1876,7 +1884,7 @@ that narrows the inner proof makes folds cheaper too.
 | a kernel's leaf is too big for the padded shape | `derive` computes each kernel's leaf rows and refuses one over the limit (§3.3); the levers of §3.4 |
 | the final wrap misses its gas or size | **retired:** the masked wrap verified on the JAM-only host in 59.2M gas and in Wasm in 36.1M instructions at the worst shape (§3.5) [measured] |
 | the multi-step FRI path, or the Blake2b channel, is unsound | a review plus tamper tests before a format admits them |
-| the wrap is weaker than the inner formats | **retired:** 16 queries, 106 / 65 proven bits (65.80), above the weakest inner format's 104 / 62.81 (§3.5) [model] |
+| the wrap is weaker than the inner formats | **retired:** 16 queries, 106 / 65 proven bits (65.79), above the weakest inner format's 104 / 62.81 (§3.5) [model] |
 | masking the wrap costs more than (c)'s factor | **retired:** format 39 at a 3.6 GiB heap and 79.3M gas at 24 queries, 59.2M at 16 [measured], within the design's budget of 24 GiB and 200M gas and the tests' tighter bounds (A.7); leakage and soundness tests |
 | the cut and held build fail under failover | the cut and the held build across a leader change |
 | the prover worker falls behind the window cadence | the worker measured against the cadence |
@@ -2026,14 +2034,15 @@ alike.
 
 **A.4 The format registry,** `pvm/proof/src/format.rs`. Parameters
 as log blowup, queries, PoW, fold step, log last layer, interaction PoW;
-counts as conjectured / proven at the reference shape [model]:
+counts as conjectured / proven (the least term) at the reference shape
+[model]:
 
 | number | proofs | channel | parameters | floors | counts | status |
 |---|---|---|---|---|---|---|
 | 41 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 | admitted |
 | 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | internal: proved and verified inside the prover alone, refused where a proof names it (`Status::Internal`) |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 16, 26, 3, 6, 8, affine DEEP batching | 104 / 63 | 106 / 65 | admitted: the final format |
-| 47 | device proofs, masked (variant (c)), `h = 256`, the per-program CPU and the word ledger | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.82), on its masked shape | admitted: the device format |
+| 47 | device proofs, masked (variant (c)), `h = 256`, the per-program CPU and the word ledger | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.81), on its masked shape | admitted: the device format |
 
 - **A number names one AIR and one set of parameters,** and is never
   reused: every number not in the table is refused. 38 is held by no

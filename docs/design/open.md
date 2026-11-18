@@ -102,7 +102,8 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   kernel.
 - **The Stwo fork's divergence citation** behind the affine DEEP batching
   of formats 39 and 47 needs a cryptographer's review; format 39's floor
-  holds without it (65.33 proven bits batched by powers).
+  holds without it (65.33 proven bits, the least term, batched by
+  powers).
 - **The Blake2b host hook** (`0x400`, Kreivo's `blake2_256`) for the final
   verifier, deferred until a venue's compute weight binds.
 - **The segment format's `component_mask`:** format 41's header mixes no
