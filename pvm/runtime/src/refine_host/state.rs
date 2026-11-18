@@ -14,13 +14,14 @@ pub trait StateReader: Send + Sync {
     /// no value. A read of `max` 0 copies nothing.
     fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)>;
 
-    /// Rows whose key starts with `prefix`, in key order, after `after`
-    /// when given.
+    /// The keys of the rows whose key starts with `prefix`, in key order,
+    /// after `after` when given, each with its value's length: a scan reads
+    /// a value ([`StateReader::read`]) only once it serves its row.
     fn rows<'a>(
         &'a self,
         prefix: &'a [u8],
         after: Option<&'a [u8]>,
-    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a>;
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a>;
 }
 
 /// `value`'s whole length and its bytes from `offset` on, at most `max`
@@ -40,12 +41,12 @@ impl StateReader for alloc::collections::BTreeMap<Vec<u8>, Vec<u8>> {
         &'a self,
         prefix: &'a [u8],
         after: Option<&'a [u8]>,
-    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a> {
         alloc::boxed::Box::new(
             self.range(prefix.to_vec()..)
                 .take_while(move |(key, _)| key.starts_with(prefix))
                 .filter(move |(key, _)| after.is_none_or(|after| key.as_slice() > after))
-                .map(|(key, value)| (key.clone(), value.clone())),
+                .map(|(key, value)| (key.clone(), value.len())),
         )
     }
 }
@@ -125,8 +126,8 @@ impl RefineContext {
         let mut out = Vec::new();
         let mut full = false;
         let mut unpaid = None;
-        for (key, value) in reader.rows(&prefix, after) {
-            let row = 8 + key.len() + value.len();
+        for (key, value_len) in reader.rows(&prefix, after) {
+            let row = 8 + key.len() + value_len;
             if out.len() + row > capacity {
                 full = out.is_empty();
                 break;
@@ -142,9 +143,16 @@ impl RefineContext {
                 unpaid = Some(len);
                 break;
             }
+            // The row is served: only now is its value read.
+            let Some((_, value)) = reader
+                .read(&key, 0, value_len)
+                .filter(|(len, value)| *len == value_len && value.len() == value_len)
+            else {
+                return Err(PANIC);
+            };
             out.extend_from_slice(&(key.len() as u32).to_le_bytes());
             out.extend_from_slice(&key);
-            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(value_len as u32).to_le_bytes());
             out.extend_from_slice(&value);
         }
         if let Some(len) = unpaid {

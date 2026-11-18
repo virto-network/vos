@@ -556,7 +556,7 @@ impl StateReader for Fixed {
         &'a self,
         _: &'a [u8],
         _: Option<&'a [u8]>,
-    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a> {
         alloc::boxed::Box::new(core::iter::empty())
     }
 }
@@ -585,7 +585,7 @@ fn state_read_serves_the_nodes_state_and_falls_back_to_what() {
             &'a self,
             _: &'a [u8],
             _: Option<&'a [u8]>,
-        ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+        ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a> {
             alloc::boxed::Box::new(core::iter::empty())
         }
     }
@@ -984,27 +984,43 @@ fn state_scanning_program() -> Vec<u8> {
     standard_program_with_rw(&code, &starts, &[0; 0x60])
 }
 
-/// `count` rows of sixteen bytes each, a two-byte key and a six-byte
-/// value, counting the rows read.
+/// `count` rows of a two-byte key and a `value`-byte value (sixteen bytes
+/// a row at six), counting the rows read and the value bytes copied.
 struct Rows {
     count: usize,
+    value: usize,
     read: core::sync::atomic::AtomicUsize,
+    copied: core::sync::atomic::AtomicUsize,
+}
+
+impl Rows {
+    fn new(count: usize, value: usize) -> Self {
+        Self {
+            count,
+            value,
+            read: 0.into(),
+            copied: 0.into(),
+        }
+    }
 }
 
 impl StateReader for Rows {
-    fn read(&self, _: &[u8], _: usize, _: usize) -> Option<(usize, Vec<u8>)> {
-        None
+    fn read(&self, _: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+        let (len, window) = value_window(&vec![0; self.value], offset, max);
+        self.copied
+            .fetch_add(window.len(), core::sync::atomic::Ordering::Relaxed);
+        Some((len, window))
     }
 
     fn rows<'a>(
         &'a self,
         _: &'a [u8],
         _: Option<&'a [u8]>,
-    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a> {
         alloc::boxed::Box::new((0..self.count).map(|row| {
             self.read
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            ((row as u16).to_le_bytes().to_vec(), vec![0; 6])
+            ((row as u16).to_le_bytes().to_vec(), self.value)
         }))
     }
 }
@@ -1013,10 +1029,7 @@ impl StateReader for Rows {
 fn state_scan_charges_by_the_byte_and_reads_no_row_it_cannot_pay_for() {
     let program = state_scanning_program();
     let scan = |count, gas| {
-        let rows = alloc::sync::Arc::new(Rows {
-            count,
-            read: 0.into(),
-        });
+        let rows = alloc::sync::Arc::new(Rows::new(count, 6));
         let invocation = RefineContext::load(&program, &[], gas)
             .unwrap()
             .with_state(rows.clone())
@@ -1046,6 +1059,29 @@ fn state_scan_charges_by_the_byte_and_reads_no_row_it_cannot_pay_for() {
     let (short, read) = scan(1 << 20, empty.gas_used + 40 * STATE_READ_BYTE_GAS);
     assert_eq!(short.exit, ExitReason::OutOfGas);
     assert_eq!(read, 3);
+}
+
+/// A row the call does not serve has no byte of its value read: a 16 MiB
+/// value past the writable output stops the call (a panic) having copied
+/// nothing (gathering a row before its checks would copy all of it for the
+/// base price); a served row's value is copied once.
+#[test]
+fn state_scan_reads_no_value_of_a_row_it_does_not_serve() {
+    let program = state_scanning_program();
+    let scan = |value| {
+        let rows = alloc::sync::Arc::new(Rows::new(1, value));
+        let invocation = RefineContext::load(&program, &[], 1_000_000)
+            .unwrap()
+            .with_state(rows.clone())
+            .try_run()
+            .unwrap();
+        (
+            invocation.exit,
+            rows.copied.load(core::sync::atomic::Ordering::Relaxed),
+        )
+    };
+    assert_eq!(scan(16 << 20), (ExitReason::Panic, 0));
+    assert_eq!(scan(6), (ExitReason::Halt, 6));
 }
 
 /// The JAM-only host serves no VOS extension whatever the context holds:
@@ -1245,7 +1281,7 @@ impl StateReader for Recording {
         &'a self,
         _: &'a [u8],
         _: Option<&'a [u8]>,
-    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a> {
         alloc::boxed::Box::new(core::iter::empty())
     }
 }
