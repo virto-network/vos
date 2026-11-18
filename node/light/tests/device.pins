@@ -1,5 +1,5 @@
 # The stock kernels' device programs under the device format: a line a
 # kernel, its chips, its log sizes and its id. Written by `just repin`
 # (`the_stock_kernels_programs_are_pinned` under `VOS_PINS=write`).
-auth 1022619925 11,10,11,10,10,12,10,10,11,10,11,10,10,10,10,10,10,10 5f3669d140ea85aa2ac9cdecd87e0557c890b0519207f08b46bff8d2bac33973
-owner 1022619925 10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10 c1afec58e1ce6a46a7ce719411bffb134c97cb5220729a58d24df3205761bbd6
+auth 1022619925 11,10,11,10,10,12,10,10,11,10,11,10,10,10,10,10,10,10 40d567ab0a48117bdd7e730b6309f58ab6d3de48450ef9009a4fd8896566e8cd
+owner 1022619925 10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10 eb7d7bdae58897403ece20e096e9294ee79ac3ac82ab32c5f0421c7f00c5e3d3
