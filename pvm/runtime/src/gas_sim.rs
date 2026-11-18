@@ -384,8 +384,10 @@ impl GasSimulator {
     }
 }
 
+/// The literal, allocation-heavy transcription of the v0.8.0 scheduler
+/// (A.49--A.57) the online state is held to, over at most 64 costs.
 #[cfg(test)]
-fn reference_conformance_cost(costs: &[FastCost]) -> u32 {
+pub(crate) fn reference_conformance_cost(costs: &[FastCost]) -> u32 {
     use alloc::vec::Vec;
 
     #[derive(Clone, Copy, PartialEq, Eq)]
