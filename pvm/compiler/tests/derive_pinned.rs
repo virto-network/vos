@@ -20,7 +20,7 @@ use vos_pvm_compiler::{TRANSPILER_VERSION, derive};
 /// `named`.
 const PINNED: (u32, &str, u32, [(u32, &str); 3]) = (
     1,
-    "8fc93b969fd4044ff82e3b8ae0a7c7bfb46cac3399c9d7dcb35400ff0911dd79",
+    "e66e2b68f72b6bcfeb12a56a90eeffb82de42af7f1f7b83d3b8cbf25a9ee1d0a",
     896,
     [
         (

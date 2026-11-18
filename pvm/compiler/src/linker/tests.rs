@@ -273,3 +273,18 @@ fn a_lui_before_a_hi20_survives_the_fusion_of_its_load() {
     let output = run_relocated(text, &[8], &[], 0);
     assert_eq!(output.as_deref(), Some(&0x5000u64.to_le_bytes()[..]));
 }
+
+/// `auipc a0; addi a1, a0, %pcrel_lo` writes both registers: a second LO12
+/// site of the pair, which reads `a0`, finds the address there.
+#[test]
+fn a_lo12_addi_into_another_register_writes_the_auipcs_too() {
+    let text = assemble(&[
+        auipc(A0, 0),    // 0: HI20, a0 = RW
+        addi(A1, A0, 0), // 4: LO12, a1 = RW
+        sd(A1, A0, 0),   // 8: LO12, [RW] = a1
+        addi(A1, 0, 8),  // 12
+        jalr(0, RA),     // 16
+    ]);
+    let output = run_relocated(text, &[0], &[4, 8], 0);
+    assert_eq!(output.as_deref(), Some(&RW.to_le_bytes()[..]));
+}

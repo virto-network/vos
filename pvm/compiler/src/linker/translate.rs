@@ -228,9 +228,14 @@ pub(super) fn translate_section_linked(
                     {
                         // LO12 ADDI: address is already complete from HI20.
                         // Load it into the ADDI's destination register,
-                        // pending for cascading fusion.
+                        // pending for cascading fusion, and into the
+                        // AUIPC's own when the ADDI's is another: a later
+                        // LO12 site of this HI20 reads the AUIPC's.
                         let next_rd = riscv::rd(next_inst);
                         let dest = if next_rd != 0 { next_rd } else { rd };
+                        if dest != rd {
+                            ctx.load_address(rd, target_addr)?;
+                        }
                         ctx.load_address(dest, target_addr)?;
                         ctx.address_map.insert(next_addr, ctx.code.len() as u32);
                         offset += 8;
