@@ -216,6 +216,51 @@ pub(crate) fn term_bits(params: &FormatParams, shape: &SecurityShape) -> Option<
     })
 }
 
+/// The summed-terms count at multiplicity `m`: `-log2` of the sum of every
+/// term's error, the query phase's, the batching's, each FRI fold's apart,
+/// ALI's, DEEP's and logup's. A union bound over one proof's terms, where
+/// the proven count takes the least term; it is reported beside that
+/// count, never held to a floor. `None` outside the analysis.
+#[cfg(test)]
+pub(crate) fn summed_bits_at(params: &FormatParams, shape: &SecurityShape, m: u32) -> Option<f64> {
+    let analysis = Analysis::new(params, shape)?;
+    let other = analysis.other_errors(m);
+    let mut query = pow2(-(params.pow_bits as i32));
+    for _ in 0..params.n_queries {
+        query *= 1.0 - analysis.gamma(m);
+    }
+    let sum = query
+        + other.batching
+        + analysis.fold_errors(m).sum::<f64>()
+        + other.ali
+        + other.deep
+        + other.logup;
+    Some(-log2(sum))
+}
+
+/// The summed-terms count at the multiplicity that maximizes it, and that
+/// multiplicity: every `m` from 3 to `2^12` is tried, far past where the
+/// sum's terms balance for the registered formats.
+#[cfg(test)]
+pub(crate) fn summed_count(params: &FormatParams, shape: &SecurityShape) -> Option<(u32, f64)> {
+    (M_MIN..=1 << 12)
+        .map(|m| summed_bits_at(params, shape, m).map(|bits| (m, bits)))
+        .try_fold((M_MIN, f64::NEG_INFINITY), |best, at| {
+            at.map(|at| if at.1 > best.1 { at } else { best })
+        })
+}
+
+/// Each FRI fold's term in bits at multiplicity `m`, in round order.
+#[cfg(test)]
+pub(crate) fn fold_term_bits(
+    params: &FormatParams,
+    shape: &SecurityShape,
+    m: u32,
+) -> Option<alloc::vec::Vec<f64>> {
+    let analysis = Analysis::new(params, shape)?;
+    Some(analysis.fold_errors(m).map(|error| -log2(error)).collect())
+}
+
 /// BCHKS25 Theorem 4.2 takes `m ≥ 3`.
 const M_MIN: u32 = 3;
 /// Far past where any term balances for our parameters.
@@ -230,7 +275,8 @@ fn field_size() -> f64 {
     p * p * p * p
 }
 
-/// Every term but the query phase's, in bits.
+/// Every term but the query phase's, in bits (`Analysis::other_terms`) or
+/// as soundness errors (`Analysis::other_errors`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OtherTerms {
     /// The DEEP batching.
@@ -363,6 +409,17 @@ impl Analysis {
     }
 
     fn other_terms(&self, m: u32) -> OtherTerms {
+        let errors = self.other_errors(m);
+        OtherTerms {
+            batching: -log2(errors.batching),
+            folds: -log2(errors.folds),
+            ali: -log2(errors.ali),
+            deep: -log2(errors.deep),
+            logup: -log2(errors.logup),
+        }
+    }
+
+    fn other_errors(&self, m: u32) -> OtherTerms {
         let shape = &self.shape;
         let field = field_size();
         let batched = match self.batching {
@@ -370,12 +427,8 @@ impl Analysis {
             DeepBatching::Affine => 1.0,
         };
         let batching = batched * self.linear_error(m, self.log_k);
-        let mut folded = 0;
         let mut folds = 0.0f64;
-        for &log_factor in &self.folds {
-            folded += log_factor;
-            let error = (pow2(log_factor as i32) - 1.0)
-                * self.linear_error(m, self.log_k.saturating_sub(folded));
+        for error in self.fold_errors(m) {
             if error > folds {
                 folds = error;
             }
@@ -394,12 +447,23 @@ impl Analysis {
             / field
             * pow2(-(self.interaction_pow_bits as i32));
         OtherTerms {
-            batching: -log2(batching),
-            folds: -log2(folds),
-            ali: -log2(ali),
-            deep: -log2(deep),
-            logup: -log2(logup),
+            batching,
+            folds,
+            ali,
+            deep,
+            logup,
         }
+    }
+
+    /// Each FRI round's fold error, in round order.
+    fn fold_errors(&self, m: u32) -> impl Iterator<Item = f64> + '_ {
+        self.folds.iter().scan(0, move |folded, &log_factor| {
+            *folded += log_factor;
+            Some(
+                (pow2(log_factor as i32) - 1.0)
+                    * self.linear_error(m, self.log_k.saturating_sub(*folded)),
+            )
+        })
     }
 
     fn bits_at(&self, m: u32) -> f64 {

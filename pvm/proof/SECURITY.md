@@ -24,28 +24,59 @@ Two paths verify in production, and one is a reference:
 ## Formats and their bit counts
 
 Each number names one AIR, one channel and one set of parameters
-(`src/format.rs`). Counts are conjectured / proven bits at the format's
-reference shape, from the security tool (`src/security.rs`):
+(`src/format.rs`):
 
-| format | proofs | channel | counts | floors | status |
-|---|---|---|---|---|---|
-| 41 | segments, the shared chip set (the Poseidon2 call among a node kernel's) | Poseidon2-M31 | 104 / 62.81 | 100 / 60 | admitted |
-| 32 | leaves and folds | Poseidon2-M31 | 108 / 63 | 100 / 60 | internal (`Status::Internal`): proved and verified inside the recursion, refused by every outside verifier |
-| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 106 / 65.80 | 104 / 63 | admitted: what venues accept |
-| 47 | device proofs, masked (variant (c)), `h = 256`, the per-program CPU and the word ledger | Blake2s-M31 | 110 / 62.82 | 100 / 60 | admitted: proven calls at a space's ingress, a device kernel's run each |
+| format | proofs | channel | status |
+|---|---|---|---|
+| 41 | segments, the shared chip set (the Poseidon2 call among a node kernel's) | Poseidon2-M31 | admitted |
+| 32 | leaves and folds | Poseidon2-M31 | internal (`Status::Internal`): proved and verified inside the recursion, refused by every outside verifier |
+| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | admitted: what venues accept |
+| 47 | device proofs, masked (variant (c)), `h = 256`, the per-program CPU and the word ledger | Blake2s-M31 | admitted: proven calls at a space's ingress, a device kernel's run each |
 
-- **Conjectured** bits are PoW plus queries times log blowup (the ethSTARK
-  conjecture, refuted as stated in 2025; the parameters carry a margin for
-  its salvaged form). **Proven** bits are the Johnson-bound count with the
-  DEEP, ALI and logup terms. The counts are the tool's own model, pinned by
-  the format tests; no one outside has reviewed them.
+Each format's figures, from the security tool (`src/security.rs`) at the
+format's reference shape (`src/format/reference.rs`). The table is
+rendered from the registry and those shapes, and a test
+(`the_security_notes_hold_the_rendered_format_table`) fails when it
+differs from this copy; every figure is rounded down:
+
+<!-- the format table: rendered by `src/format/table_tests.rs` -->
+| format | each figure bounds | log blowup, queries, PoW, fold step, last layer, interaction PoW, DEEP batching | reference shape | conjectured | proven, least term (counted) | proven, summed terms: at their best m; at the least term's m | floors | status |
+|---|---|---|---|---|---|---|---|---|
+| 32 | one leaf or fold proof | 2, 44, 20, 1, 0, 8, powers | `LEAF_FOLD_REFERENCE` | 108 | 63.36 (m = 50) | 62.91 (m = 35); 62.41 | 100 / 60 | internal |
+| 39 | one wrap | 5, 16, 26, 3, 6, 8, affine | `MASKED_WRAP_REFERENCE` | 106 | 65.79 (m = 57) | 65.52 (m = 29); 64.25 | 104 / 63 | admitted |
+| 41 | one segment proof | 2, 40, 24, 1, 0, 8, powers | `SEGMENT_REFERENCE` | 104 | 62.81 (m = 24) | 62.22 (m = 19); 61.93 | 100 / 60 | admitted |
+| 47 | one device proof | 2, 47, 16, 1, 0, 8, affine | `DEVICE_REFERENCE` | 110 | 62.81 (m = 187) | 62.56 (m = 92); 61.24 | 100 / 60 | admitted |
+<!-- end of the format table -->
+
+- **Two models.** **Conjectured** bits are PoW plus queries times log
+  blowup (the ethSTARK conjecture, refuted as stated in 2025; the
+  parameters carry a margin for its salvaged form). **Proven** bits are
+  the Johnson-bound count (BCHKS25's proximity gaps) with the query, DEEP
+  batching, FRI fold, ALI, DEEP and logup terms, each the `-log2` of a
+  soundness error, at the integer multiplicity `m ≥ 3` the column names.
+  Both are the tool's own model, pinned by the format tests; no one
+  outside has reviewed them.
+- **Two rules for the proven figure.** **The least term** is the counted
+  one, soundcalc's rule: the smallest of the terms, the worst FRI fold
+  standing for the folds, at the `m` that maximizes it. It is what
+  `COUNTS` holds, what the floors and the verifiers' checks compare, and
+  what every other proven figure in these notes and in `proving.md` is.
+  **The summed terms** are a union bound over the same terms, every fold
+  its own: `-log2` of the errors' sum, below the least term by up to
+  `log2` of the terms' count. Its best `m` is another than the least
+  term's, so it is given at both; it is reported, never held to a floor,
+  and every summed figure clears its format's proven floor. Which rule a
+  claim needs is the audit's (below).
+- **One proof each.** A figure bounds a forgery of one proof of its format
+  at or under its reference shape, under the tool's model: not a
+  statement, which holds many proofs (below).
 - **The batch `B`** the count by powers takes is every value the DEEP
   quotient batches, one coefficient each: a column's samples and, for a
   column sampled at two points, the periodicity value the fork adds
   (`deep_values_of_column`); `c`, the most of one column, is counted the
   same way, 3. The segment shape batches 11,091 values; 41's query term
-  binds, 62.81. The masked device reference (every device chip at 2^17
-  rows) batches 7,470; 47 counts 62.82 by affine batching.
+  binds. The masked device reference (every device chip at 2^17 rows)
+  batches 7,470, and 47 batches affinely.
 - A verifier rejects a number the registry does not admit
   (`format::lookup`), and a proof on another channel than its format's. The proof's configuration must equal
   the format's. The segment's and the recursion's verifiers count again at
@@ -72,11 +103,19 @@ reference shape, from the security tool (`src/security.rs`):
   `thumbv7em` and the PVM guest, whose `f64` is software) all round so;
   only an x87 FPU (an `i586` target) would not, and nothing builds for one.
 
-**End to end, the proven bound is the weakest inner format's: 62.81 bits,
-not the wrap's 65.80.** Forging a leaf's segment forges the statement. The
-conjectured bound is 104. Under Grover's heuristic that is about 31 proven
-and 52 conjectured bits against a quantum prover: post-quantum readiness
-rests on the conjectured count.
+**No figure here is a statement's.** A statement holds a segment proof
+and a leaf for each segment, a fold for each pair, and the wrap, and
+forging any one of them forges the statement: a statement is no stronger
+than its weakest proof, 41's 62.81 least term (104 conjectured), not the
+wrap's 65.79. That is a ceiling, not a bound. A bound for the statement
+needs a composition argument, which is open and in the external audit's
+scope: how the per-proof errors add over the proofs one statement holds
+and over the recursion's depth, where a fold's soundness is about proofs
+it verifies rather than about the run, and what counting PoW as bits
+assumes of a prover who grinds across those proofs. Under Grover's
+heuristic a proof's figures are about halved against a quantum prover (31
+proven and 52 conjectured bits for 41's): post-quantum readiness rests on
+the conjectured count.
 
 ## The segment AIR
 
@@ -396,7 +435,7 @@ doc-check` fails when the pin moves and this line does not).
 | 9 | `verify_values`: `zip_eq` trees × decommitments × queried values × query positions | shape: four decommitments and four queried trees |
 | 10 | `vcs_lifted/verifier.rs` `verify`: `col_vals[idx]` | the fork's `QueriedValuesShapeMismatch` (`ca20894`) first: one column a committed column, one value a query |
 | 11 | `verify`: `chunk[0]`, `chunk[1]`, `unreachable!` on `idx & 1` | `chunk_by` yields non-empty runs of at most a sibling pair |
-| 12 | `verify`: the root layer's `try_into().unwrap()` | ours: the positions drawn below `2^height` (tree 0's mapped into its height), 24 of them, so one root remains; a witness too short or long is an error |
+| 12 | `verify`: the root layer's `try_into().unwrap()` | ours: the positions drawn below `2^height` (tree 0's mapped into its height), 16 of them, so one root remains; a witness too short or long is an error |
 | 13 | `pcs/quotients.rs` `fri_answers`: `assert!` every queried column one value a query; `col[idx]` | every tree's Merkle `verify` (10) passed first, tree 0's on as many positions |
 | 14 | `build_samples_with_randomness_and_periodicity`: `expect(ONE_COEFFICIENT_A_VALUE)` | ours: the affine coefficients drawn by `n_deep_values` over the same samples (powers are unbounded) |
 | 15 | `accumulate_row_quotients`: `queried_values_at_row[column_index]`; `zip_eq` of a batch's columns × its line coefficients | shape: the sampled columns (whose indices these are) and the queried columns both the trees' widths; the coefficients built from the same batch |
@@ -513,8 +552,8 @@ panic-freedom does:
   circle fold in it. The security tool counts it so; a model counting the
   circle fold as its own round would differ by about 0.8 bits on the fold
   term. Format 39's FRI tests `2^17`, so its rounds are `[3, 3, 3, 2]` to
-  the `2^6` last layer; its fold term sits 0.19 bits
-  above its batching term (66.05 against 65.86). Under the other model the
+  the `2^6` last layer; its fold term sits about 0.2 bits
+  above its batching term (66.05 against 65.85). Under the other model the
   fold term would bind first, at about 65.3, still above its floor, 63. The round
   list the tool counts must equal the one the fork's `FriVerifier::commit`
   derives from the largest column.
@@ -526,10 +565,11 @@ panic-freedom does:
   spaces carries BCHKS25 Theorem 4.2's improved `ε_lin`. It needs a
   cryptographer's review of the citation and the count. At 16 queries
   format 39 does not rest on it: batched by powers the wrap counts 65.33
-  proven bits, against 65.80 batched affinely, both above its floor, 63
-  (and the end-to-end bound, 62.81, is the inner formats' either way).
+  proven bits, against 65.79 batched affinely, both above its floor, 63
+  (and a statement is no stronger than the inner formats' 62.81 either
+  way).
   - **What it holds:** batched by powers, the batching term caps 39 at
-    76.98 (74.48 at blowup 64), at its 538 batched values, however many
+    76.97 (74.47 at blowup 64), at its 538 batched values, however many
     queries are taken.
   - **Its premise in the masked transcript:** every batched function, the
     masked columns' quotients, the FRI mask's and the blinding columns'
@@ -611,9 +651,9 @@ Its count is the security tool's under (c):
   term takes `k = 2N`, `d = 3` and a factor 2 for `π(z)`, and every other
   formula stays. The salts enter no term (Blake2b-256's collision resistance, which the tool does
   not model, binds them as it binds every tree).
-- **106 / 65.80** at 16 queries, PoW 26, the query term binding at
+- **106 / 65.79** at 16 queries, PoW 26, the query term binding at
   `m = 57`; 16 queries is the least that clears its floor, 104 / 63 (15
-  count 101 / 63, 63.37). The DEEP term is 94.17, ALI 104.87, logup
+  count 101 / 63, 63.36). The DEEP term is 94.16, ALI 104.86, logup
   111.60: the interaction PoW does not bind.
 - **Derived, not cited:** the DEEP term's three (c) inputs (`k = 2N`,
   `d = 3`, the factor `2^j`), against Theorem 8 of eprint 2022/1216 with
@@ -626,7 +666,7 @@ Its count is the security tool's under (c):
   analyses the lifted variant.
 - **The integer multiplicity:** counts are taken at the best integer
   `m ≥ 3`, as soundcalc takes them, so a small parameter move jumps the
-  count (15 queries 63.37, 16 65.80).
+  count (15 queries 63.36, 16 65.79).
 - **The reference shape** counts R2's blinding (12 main and 8 interaction
   columns, 2 constraints, a fraction a row a component) and the FRI mask's
   8 columns as designed, and the batch exactly: 538 values, one a sampled
@@ -767,15 +807,24 @@ scope to files and functions. Its scope:
 - the fork's divergences: the Blake2b channel, fold step 3, affine DEEP
   batching, the completeness backport;
 - the security tool's counts (`src/security.rs`), variant (c)'s among
-  them. The tool takes soundcalc's convention, the least term binds; a
-  union bound over the terms puts format 39 at about 81.2 bits, still
-  above 80, but it would not hold at 23 queries, so the 24-query pin is
-  the robust one;
+  them, and the rule a claim takes: the counted least term (soundcalc's)
+  or the summed terms reported beside it (§ Formats and their bit
+  counts);
+- the composition argument, open: a bound for a statement from its
+  proofs' figures. It has to account for the proofs one statement holds
+  (a segment proof and a leaf a segment, a fold a pair, the wrap), for
+  the recursion's depth (a fold's soundness is about the child proofs it
+  verifies in circuit, so a run is reached only through every level of
+  the tree), and for the assumptions behind counting PoW as bits (a
+  grind's cost on each format's channel, and a prover grinding across a
+  statement's many proofs, or many statements, at once). No figure in
+  these notes is a statement's until it is made;
 - the recursion AIR: the in-AIR verifier, the gate compiler (constraint ≡
   gate), the claimed-sum handling, the `Gate` relation's signed
   multiplicities, the fold;
-- the leaf's binding (its entry constants, the io-hash's range checks),
-  the wrap, `vos-pvm-final-verifier` and `vos-statement`;
+- the leaf's binding (its entry constants, the io-hash's range checks,
+  the two inductions and the state digest's collision resistance they
+  rest on), the wrap, `vos-pvm-final-verifier` and `vos-statement`;
 - `derive` (layout to preprocessed columns, its refusals) and the program
   id's derivation;
 - the masking: the masked transcript's order, R1 to R4, the blinding's

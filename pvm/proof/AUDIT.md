@@ -111,6 +111,24 @@ leaf). Read it as trusted:
   `security.rs` takes. The final verifier's `masked::CONFIG` is the
   registry's `MASKED_WRAP.pcs_config()`.
 
+## The counts, and the argument still to make
+
+- **The counts:** `src/security.rs` (every term, and `proven_count`, the
+  least term at its best multiplicity, the counted rule; beside it, in its
+  tests alone, `summed_bits_at` and `summed_count`, the summed terms the
+  notes report), `src/format/reference.rs` (each format's reference
+  shape: the segment's, the masked wrap's and the device's held to the
+  built chips by `src/format/tests.rs`, `recair/tests/circuit/masked.rs`
+  and `device/tests/device/format.rs`) and `src/format.rs` (`COUNTS`, what the
+  floors and the verifiers' checks compare). `src/format/table_tests.rs`
+  renders SECURITY.md's format table from them and fails when the copy
+  differs.
+- **The composition argument is open:** nothing in the tree states a
+  bound for a statement. The floors hold each proof alone; SECURITY.md's
+  "The external audit" says what the argument must account for (the
+  proofs one statement holds, the recursion's depth, PoW counted as
+  bits). It is the audit's to make, not to read.
+
 ## The four production paths
 
 | path | who checks it | entry | code that decides what is checked | what pins it |

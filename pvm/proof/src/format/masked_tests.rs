@@ -4,7 +4,7 @@
 
 use super::reference::WRAP_REFERENCE;
 use super::*;
-use crate::security::{proven_count, security_bits, term_bits};
+use crate::security::{proven_count, security_bits, summed_bits_at, summed_count, term_bits};
 
 fn count(params: &FormatParams, shape: &SecurityShape) -> f64 {
     proven_count(params, shape).unwrap()
@@ -89,11 +89,12 @@ fn the_unmasked_counts_do_not_move() {
     );
 }
 
-/// Format 39 counts 106 / 65 (65.80), the query term binding at `m = 57`:
-/// the DEEP batching 0.06 bits above it, the worst FRI fold, the first
-/// round's, 0.19 above that, and ALI, DEEP and logup far above. 16 queries
-/// is the least that clears its floor, 104 / 63: 15 count 101 / 63 (63.37),
-/// below the segments' 104 conjectured.
+/// Format 39 counts 106 / 65 (65.79), the query term binding at `m = 57`:
+/// the DEEP batching about 0.06 bits above it, the worst FRI fold, the
+/// first round's, about 0.2 above that, and ALI, DEEP and logup far above; its terms
+/// summed, 64.25 at that `m` and 65.52 at the sum's best, `m = 29`. 16
+/// queries is the least that clears its floor, 104 / 63: 15 count 101 / 63
+/// (63.36), below the segments' 104 conjectured.
 #[test]
 fn format_39_counts_106_and_65() {
     let params = MASKED_WRAP.params;
@@ -140,6 +141,14 @@ fn format_39_counts_106_and_65() {
     assert!(within(terms.other.ali, 104.86, 104.87), "{terms:?}");
     assert!(within(terms.other.deep, 94.16, 94.17), "{terms:?}");
     assert!(within(terms.other.logup, 111.60, 111.61), "{terms:?}");
+    // Summed rather than least, at the same m: the query term, the
+    // batching, each of the four folds, ALI, DEEP and logup together.
+    let summed = summed_bits_at(&params, &MASKED_WRAP_REFERENCE, terms.m).unwrap();
+    assert!(within(summed, 64.25, 64.26), "{summed}");
+    // The sum's own best m is another.
+    let (m, summed) = summed_count(&params, &MASKED_WRAP_REFERENCE).unwrap();
+    assert_eq!(m, 29);
+    assert!(within(summed, 65.52, 65.53), "{summed}");
 
     assert_eq!(least_queries(params), Some(16));
     let fewer = masked(5, 15, 26, 3, 6);
@@ -211,7 +220,7 @@ fn the_interaction_pow_does_not_bind() {
 
 /// Format 39 batches affinely (`DIVERGENCE-012`), as the device format
 /// does; its floor does not need it. Batched by powers, the batching term
-/// caps a count at 76.98 at blowup 32 and 74.48 at blowup 64, however many
+/// caps a count at 76.97 at blowup 32 and 74.47 at blowup 64, however many
 /// queries are taken, above the floor: by powers the wrap counts 65.33 at
 /// its 16 queries, the least that clears 104 / 63 by powers too.
 #[test]
