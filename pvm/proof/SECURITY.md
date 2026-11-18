@@ -348,22 +348,13 @@ along the fold chain, not in a leaf alone (`recair/src/leaf/mod.rs`):
   and a register write's limbs Range256-checked, a memory root the
   BLAKE2b boundary compression's output, an XOR of byte pairs the bitwise
   table fixes, the chip under `blake2b_boundary_gate`) or
-  a copy of its entry, but for the pc. The exit pc's limbs are the last
-  row's `next_pc`, which the CPU does not range-check: a sequential
-  step's carry bits are boolean, so a prover may publish a limb of 256
-  or more with its carry dropped, and a leaf accepts it. That is
-  harmless: a next segment cannot step from such a pc (its first row's
-  pc is looked up in the program memory, whose entries are bytes), and
-  it is not the halt pc the halt flag asserts, so no statement continues
-  or ends from it.
+  a copy of its entry.
 - **Timestamps stay in the ledgers' range.** The register and memory
   ledgers compare `2·ts + is_write` reduced mod p, so two accesses about
   2^30 steps apart alias; no gas is proved and the CPU's timestamp is a
   64-bit counter. Every chain of a segment starts at a `ts = 0` write, so
   a segment whose timestamps lie in `[2^27, p/2)` is unprovable, and a
-  run, contiguous from ts 1, cannot cross that zone: a run's length is
-  bounded by about 2^27 steps, and the prover refuses a longer one before
-  proving any segment. The native verifier
+  run, contiguous from ts 1, cannot cross that zone. The native verifier
   states the bound for a segment alone (both boundary timestamps under
   2^28); the leaf does not range-check the timestamp's bytes, and a leaf
   alone accepts a first limb of `p − 1`, which the fold chain then cannot
