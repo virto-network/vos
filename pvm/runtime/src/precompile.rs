@@ -64,9 +64,10 @@ pub const fn price(id: u64) -> Option<crate::Gas> {
 /// A kernel's witness input: φ\[7\] the destination, φ\[8\] the capacity. It
 /// writes the next `min(capacity, remaining)` bytes of the run's input at
 /// the destination and returns their count in φ\[7\]; 0 means the end of
-/// input. Only the agent serves it, to the kernels it runs, from the input
-/// it records with their attest; a node's refine host serves it to no
-/// machine of its own.
+/// input live (or a capacity of 0); a proof binds no end, see
+/// `pvm/proof/SECURITY.md`. Only the agent serves it, to the kernels it
+/// runs, from the input it records with their attest; a node's refine host
+/// serves it to no machine of its own.
 pub const WITNESS_INPUT: u64 = 0x401;
 
 /// Gas for one witness-input call, before its bytes: the agent's copy into

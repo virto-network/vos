@@ -603,6 +603,11 @@ pub mod precompile {
     /// records what the kernel read in the attest. It serves it to kernels
     /// alone: a handler's call of it is an id the agent does not serve.
     ///
+    /// A proof binds only each call's count (at most the capacity) and its
+    /// writes, not how the stream splits: a kernel frames its input by
+    /// content and never takes a short or zero read for the end of an input
+    /// it acts on (`pvm/proof/SECURITY.md`, "Three boundaries").
+    ///
     /// **One call's pages are one segment's:** a node cuts a kernel's run
     /// before a step, never inside one, so the pages a call writes, with
     /// the other pages of its step, must fit its shape's largest class: 24

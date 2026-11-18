@@ -252,8 +252,8 @@ pub const MASKED_WRAP_MASKING: Masking = Masking {
 
 /// Format 39's floor: no weaker than the weakest inner format on either
 /// count (segments, 41: 104 conjectured, 62.81 proven), since forging a
-/// fold's input forges the final proof and the system's bound is the
-/// weakest inner format's.
+/// fold's input forges the final proof: a statement is no stronger than
+/// its weakest inner format, whatever the wrap's count.
 const WRAP_FLOOR: SecurityFloor = SecurityFloor {
     conjectured: 104,
     proven: 63,
