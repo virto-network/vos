@@ -77,5 +77,5 @@ pub use permutation::{
 };
 pub use sponge::{Digest, LeafSponge, RATE, compress, digest_of};
 pub use transcript::{
-    DRAW_DOMAIN, Observer, PermKind, Transcript, pow_passes, u32_limbs, u64_limbs,
+    DRAW_DOMAIN, MAX_POW_BITS, Observer, PermKind, Transcript, pow_passes, u32_limbs, u64_limbs,
 };
