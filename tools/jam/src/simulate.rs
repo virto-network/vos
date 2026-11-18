@@ -1,10 +1,10 @@
 //! The recording simulation: a batch refined as a VOS node refines it, on
-//! the JAM-only host, with its state served from the builder's store and
-//! every row it reads and every range it scans recorded; then its work
-//! result applied to the store's rows, recording what that reads and
-//! writes. A JAM refine of the same batch touches exactly these rows, or
-//! traps, so a package whose witness covers them refines to the same work
-//! result.
+//! the JAM-only host's state stand-in, with its state served from the
+//! builder's store and every row it reads and every range it scans
+//! recorded; then its work result applied to the store's rows, recording
+//! what that reads and writes. A JAM refine of the same batch touches
+//! exactly these rows, or traps, so a package whose witness covers them
+//! refines to the same work result.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -145,7 +145,7 @@ pub(crate) fn simulate(
     let run = RefineContext::load_prepared(&runner.program, &arguments, gas, MemoryModel::Auto)
         .map_err(Error::Load)?
         .with_state(reader)
-        .try_run_jam(runner.jam(payload, Vec::new()))
+        .try_run_jam_with_state_stand_in(runner.jam(payload, Vec::new()))
         .map_err(Error::Load)?;
     let invocation = run.invocation;
     let log = std::mem::take(&mut *recorder.log.lock().expect("the log"));

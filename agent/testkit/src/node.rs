@@ -179,7 +179,7 @@ impl Node {
     /// A JAM node's host, the runtime's JAM-only host: no pool, no
     /// precompile computed, PolkaJam's prices, and the agent's programs as
     /// its preimages. With `serves_state`, it reads applied state as a
-    /// package's witness gives it.
+    /// package's witness gives it, on the host's state stand-in.
     pub fn jam(serves_state: bool) -> Self {
         Self {
             precompiles: false,
@@ -310,7 +310,12 @@ impl Node {
         }
         if self.jam {
             let jam = self.jam_refine(work.encode(), Some(scope));
-            return context.try_run_jam(jam).unwrap().invocation;
+            let run = if self.serves_state {
+                context.try_run_jam_with_state_stand_in(jam)
+            } else {
+                context.try_run_jam(jam)
+            };
+            return run.unwrap().invocation;
         }
         if !self.precompiles {
             context = context.without_precompiles();
