@@ -647,8 +647,8 @@ fn a_full_storage_traps_the_accumulate() {
     use vos_pvm::accumulate_host::ServiceStorage;
     struct Full(BTreeMap<Vec<u8>, Vec<u8>>);
     impl ServiceStorage for Full {
-        fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
-            self.0.get(key).cloned()
+        fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+            self.0.read(key, offset, max)
         }
         fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize> {
             let previous = match value {

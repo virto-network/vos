@@ -60,8 +60,9 @@ pub mod host_call {
     /// VOS extension: read the agent's applied state by key, served when the
     /// node supplies a state reader. φ7/φ8 hold the key, φ9 the output, φ10
     /// the offset into the value and φ11 the output length; φ7 becomes the
-    /// value's length, or `NONE`. On JAM the call answers `WHAT` and state
-    /// comes from witnesses in the work package.
+    /// value's length, `NONE`, or `HUH` for a key past
+    /// `refine_host::MAX_STATE_KEY`. On JAM the call answers `WHAT` and
+    /// state comes from witnesses in the work package.
     pub const STATE_READ: u32 = 0x481;
     /// VOS extension: rows of the agent's applied state under a prefix, in
     /// key order, served when the node supplies a state reader; `WHAT` on

@@ -1,5 +1,6 @@
 use super::*;
 use crate::PVM_HALT_ADDR;
+use crate::test_support::backends;
 
 fn compact_blob(code: &[u8], starts: &[usize]) -> Vec<u8> {
     let mut packed = vec![0u8; code.len().div_ceil(8)];
@@ -272,19 +273,6 @@ fn invoke_resumes_after_host_call_then_panics_on_trap() {
     let second = machines.invoke(id, first.state).unwrap();
     assert_eq!(second.exit, InnerExit::Panic);
     assert_eq!(machines.expunge(id), Ok(0));
-}
-
-/// The backends this host runs.
-fn backends() -> Vec<PvmBackend> {
-    let mut backends = vec![PvmBackend::ForceInterpreter];
-    if cfg!(all(
-        feature = "std",
-        target_os = "linux",
-        target_arch = "x86_64"
-    )) {
-        backends.push(PvmBackend::ForceRecompiler);
-    }
-    backends
 }
 
 /// A machine of `n` one-byte `load_imm`s and a `trap`, one block, run

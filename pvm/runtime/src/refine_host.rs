@@ -9,7 +9,7 @@ pub use jam::{FetchKind, JamItem, JamRefine, JamRun, MAX_EXPORTS, Preimages, SEG
 pub use lookup::{LOOKUP_GAS, serve_lookup};
 #[cfg(feature = "std")]
 pub use machines::ProgramSource;
-pub use state::StateReader;
+pub use state::{MAX_STATE_KEY, StateReader, value_window};
 
 use alloc::vec::Vec;
 

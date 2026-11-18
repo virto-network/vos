@@ -12,6 +12,17 @@ pub(super) fn standard_program_with_rw(
     starts: &[usize],
     rw_data: &[u8],
 ) -> Vec<u8> {
+    standard_program_with_heap(args_code, starts, rw_data, 0)
+}
+
+/// [`standard_program_with_rw`] with `heap_pages` zero pages after the
+/// read-write data, readable and writable from load.
+fn standard_program_with_heap(
+    args_code: &[u8],
+    starts: &[usize],
+    rw_data: &[u8],
+    heap_pages: u16,
+) -> Vec<u8> {
     let mut packed = alloc::vec![0u8; args_code.len().div_ceil(8)];
     for &i in starts {
         packed[i / 8] |= 1 << (i % 8);
@@ -23,7 +34,7 @@ pub(super) fn standard_program_with_rw(
     let mut blob = Vec::new();
     blob.extend_from_slice(&[0; 3]);
     blob.extend_from_slice(&(rw_data.len() as u32).to_le_bytes()[..3]);
-    blob.extend_from_slice(&0u16.to_le_bytes());
+    blob.extend_from_slice(&heap_pages.to_le_bytes());
     blob.extend_from_slice(&4096u32.to_le_bytes()[..3]);
     blob.extend_from_slice(rw_data);
     blob.extend_from_slice(&(code_blob.len() as u32).to_le_bytes());
@@ -498,8 +509,8 @@ fn state_reading_program() -> Vec<u8> {
 
 struct Fixed;
 impl StateReader for Fixed {
-    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
-        (key == b"abc").then(|| b"value".to_vec())
+    fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+        (key == b"abc").then(|| value_window(b"value", offset, max))
     }
 
     fn rows<'a>(
@@ -526,8 +537,8 @@ fn state_read_serves_the_nodes_state_and_falls_back_to_what() {
 
     struct Long;
     impl StateReader for Long {
-        fn read(&self, _: &[u8]) -> Option<Vec<u8>> {
-            Some(vec![7; 1000])
+        fn read(&self, _: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+            Some(value_window(&[7; 1000], offset, max))
         }
 
         fn rows<'a>(
@@ -918,7 +929,7 @@ struct Rows {
 }
 
 impl StateReader for Rows {
-    fn read(&self, _: &[u8]) -> Option<Vec<u8>> {
+    fn read(&self, _: &[u8], _: usize, _: usize) -> Option<(usize, Vec<u8>)> {
         None
     }
 
@@ -1091,15 +1102,7 @@ fn a_panicked_inner_machine_is_rerun_unpaid_only_on_the_jam_only_host() {
     const PANIC_STATUS: u64 = 1;
     const OUT_OF_GAS_STATUS: u64 = 4;
     let (outer, inner) = panic_then_invoke_unpaid(10_000);
-    let mut backends = vec![PvmBackend::ForceInterpreter];
-    if cfg!(all(
-        feature = "std",
-        target_os = "linux",
-        target_arch = "x86_64"
-    )) {
-        backends.push(PvmBackend::ForceRecompiler);
-    }
-    for backend in backends {
+    for backend in crate::test_support::backends() {
         let load = || {
             RefineContext::load_with_backend(&outer, &inner, 1_000_000, MemoryModel::Auto, backend)
                 .unwrap()
@@ -1136,4 +1139,70 @@ fn pages_past_the_budget_answer_full_on_a_vos_host_alone() {
     let jam = load().unwrap().try_run_jam(JamRefine::default()).unwrap();
     assert_eq!(jam.invocation.exit, ExitReason::Halt);
     assert_eq!(jam.invocation.registers[7], result::OK);
+}
+
+/// A key of `len` bytes at the read-write data's start, behind 65,535 heap
+/// pages (256 MiB, readable at load for no gas), read by `state_read` with
+/// φ11 bytes `max` asked for: φ7 at the halt and the gas used.
+fn state_read_of_key(len: u64, max: u64, reader: alloc::sync::Arc<dyn StateReader>) -> (u64, u64) {
+    let [lo, hi] = (crate::inner::host_call::STATE_READ as u16).to_le_bytes();
+    let [l0, l1, l2, l3, ..] = len.to_le_bytes();
+    let [m0, m1, m2, m3, ..] = max.to_le_bytes();
+    let (code, starts) = crate::test_support::code(&[
+        &[51, 7, 0x00, 0x00, 0x02], // load_imm φ7, 0x2_0000 (key)
+        &[51, 8, l0, l1, l2, l3],   // load_imm φ8, len
+        &[51, 9, 0x10, 0x00, 0x02], // load_imm φ9, 0x2_0010 (output)
+        &[51, 10, 0],               // load_imm φ10, 0
+        &[51, 11, m0, m1, m2, m3],  // load_imm φ11, max
+        &[10, lo, hi],              // ecalli state_read
+        &[50, 0],                   // jump_ind φ0 (halt)
+    ]);
+    let program = standard_program_with_heap(&code, &starts, b"abc", u16::MAX);
+    let invocation = RefineContext::load(&program, &[], 1_000_000)
+        .unwrap()
+        .with_state(reader)
+        .run();
+    assert_eq!(invocation.exit, ExitReason::Halt);
+    (invocation.registers[7], invocation.gas_used)
+}
+
+/// Records the most bytes each read asked the reader to copy.
+#[derive(Default)]
+struct Recording(std::sync::Mutex<Vec<usize>>);
+
+impl StateReader for Recording {
+    fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+        self.0.lock().unwrap().push(max);
+        Fixed.read(key, offset, max)
+    }
+
+    fn rows<'a>(
+        &'a self,
+        _: &'a [u8],
+        _: Option<&'a [u8]>,
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+        alloc::boxed::Box::new(core::iter::empty())
+    }
+}
+
+/// A key is read only within [`MAX_STATE_KEY`] bytes and charged by the
+/// byte before it is read: a 255 MiB key, readable for no gas, answers
+/// `HUH` for the base price, where the node read and copied all of it for
+/// 10 gas. The reader copies no byte past what the call asks and the gas
+/// left pays for: a zero-length read copies nothing.
+#[test]
+fn state_read_bounds_its_key_and_its_copy() {
+    let reader = alloc::sync::Arc::new(Recording::default());
+    let (answer, base) = state_read_of_key(255 << 20, 0, reader.clone());
+    assert_eq!(answer, result::HUH);
+    let (answer, bounded) = state_read_of_key(MAX_STATE_KEY, 0, reader.clone());
+    assert_eq!(answer, result::NONE, "no such key");
+    assert_eq!(bounded - base, MAX_STATE_KEY * STATE_READ_BYTE_GAS);
+    let (answer, _) = state_read_of_key(3, 0, reader.clone());
+    assert_eq!(answer, 5, "the value's length, nothing copied");
+    let (answer, _) = state_read_of_key(3, u64::from(u32::MAX), reader.clone());
+    assert_eq!(answer, 5);
+    let asked = reader.0.lock().unwrap().clone();
+    assert_eq!(asked[..2], [0, 0], "a zero-length read asks for nothing");
+    assert!(asked[2] < 1_000_000, "no more than the gas left pays for");
 }
