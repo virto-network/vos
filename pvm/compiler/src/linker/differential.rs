@@ -695,10 +695,15 @@ fn check(items: &[Item], registers: &[u64; 11]) -> Result<(), TestCaseError> {
     }
 
     // A load into x0 the code after it leaves no register free for is
-    // refused (`a_discarded_load_keeps_its_access`), not translated.
+    // refused (`a_discarded_load_keeps_its_access`), not translated: the
+    // case is rejected, and too many rejections fail the property.
     let elf = LinkedElf::text(TEXT, assemble(body));
     let program = match transpile_with(&elf, Link::Whole) {
-        Err(TranspileError::DiscardedLoad { .. }) => return Ok(()),
+        Err(TranspileError::DiscardedLoad { .. }) => {
+            return Err(TestCaseError::reject(
+                "no register free for a discarded load",
+            ));
+        }
         translated => spi_blob(translated.expect("translates")).expect("links"),
     };
     let invocation = refine::execute(&program, &args, 10_000_000).expect("executes");

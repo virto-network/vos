@@ -776,6 +776,35 @@ fn an_indirect_jump_clears_bit_zero_of_its_target() {
     assert_eq!(registers[T1_PVM] & 1, 1);
 }
 
+/// A displacement of ±1 of the other parity names the source's address
+/// two bytes past the pointer's, where the source faults: -1 from an even
+/// pointer and +1 from a tagged one stop, from a call and from a jump,
+/// and never reach a neighbouring function.
+#[test]
+fn a_displacement_of_the_other_parity_stops() {
+    for (tag, imm) in [(0, -1), (1, 1)] {
+        for rd in [RA, 0] {
+            let text = [
+                auipc(T0, 0),      //  0
+                addi(T0, T0, 20),  //  4: t0 = &F (20)
+                ori(T0, T0, tag),  //  8
+                jalr(rd, T0, imm), // 12
+                ret(),             // 16
+                addi(A4, A4, 1),   // 20: F, and its neighbours either side
+                addi(A4, A4, 1),   // 24
+                ret(),             // 28
+            ];
+            let blob = link_elf_spi(&text_elf(&text, None)).expect("links");
+            let (exit, registers) = run_both(&blob);
+            assert!(
+                matches!(exit, ExitReason::Panic),
+                "tag {tag}, displacement {imm}, rd {rd}: {exit:?}"
+            );
+            assert_eq!(registers[11], 0, "no function ran");
+        }
+    }
+}
+
 /// A target known at translation is cleared alike: an AUIPC or a LUI with
 /// the `jalr` after it, the LUI's register keeping its value.
 #[test]
@@ -856,10 +885,17 @@ fn a_discarded_load_keeps_its_access() {
             "a discarded load of an unreadable address stops: {exit:?}"
         );
     }
-    // Every register read before it is written: nothing takes the value.
-    let text = [ld0(SP, -8), ret()];
-    assert!(matches!(
-        link_elf_spi(&text_elf(&text, None)),
-        Err(TranspileError::DiscardedLoad { .. })
-    ));
+    // No register written before control flow, or every one read before
+    // it is written: nothing takes the value.
+    let every_read: Vec<u32> = [ld0(SP, -8)]
+        .into_iter()
+        .chain([RA, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].map(|r| sd(r, SP, -16)))
+        .chain([addi(A5, A5, 1), ret()])
+        .collect();
+    for text in [vec![ld0(SP, -8), ret()], every_read] {
+        assert!(matches!(
+            link_elf_spi(&text_elf(&text, None)),
+            Err(TranspileError::DiscardedLoad { .. })
+        ));
+    }
 }

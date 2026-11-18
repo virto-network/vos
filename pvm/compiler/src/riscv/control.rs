@@ -13,11 +13,13 @@ impl TranslationContext {
     /// A target known at translation (an AUIPC or LUI pair, or base x0) is
     /// a code address, cleared in that domain. A register holds a code
     /// pointer as its jump-table address, `2·(index + 1)`: even, with one
-    /// entry per code address. A displacement of 0 or ±1 from it lands, bit
-    /// 0 cleared, on the entry itself or (with the pointer's bit 0 set) on
-    /// the same entry as in the source; a larger one names a different
-    /// instruction of the source but a different entry of the table, and
-    /// is refused.
+    /// entry per code address. A displacement of 0 from it, or of ±1 that
+    /// bit 0's clearing takes back (+1 from an even pointer, -1 from one
+    /// with bit 0 set), lands on the entry itself, as the source lands on
+    /// its code address. A ±1 of the other parity names the source's
+    /// misaligned address two bytes on, where the source faults, and traps;
+    /// a displacement of 2 or more names a different instruction of the
+    /// source but a different entry of the table, and is refused.
     pub(super) fn translate_jalr(
         &mut self,
         rd: u8,
@@ -80,6 +82,8 @@ impl TranslationContext {
             // return address overwrites; `load_imm_jump_ind` jumps through
             // the register's value before it writes it.
             let pvm_rd = self.require_reg(rd)?;
+            // A ±1 of the wrong parity branches to a trap after the call.
+            let wrong_parity = (imm != 0).then(|| self.emit_parity_branch(pvm_rs1, imm));
             let mut source = pvm_rs1;
             if imm != 0 {
                 self.emit_op(Opcode::AddImm64);
@@ -98,45 +102,82 @@ impl TranslationContext {
             self.emit_data(lx as u8); // lx: byte count for imm_x (return addr)
             self.emit_var_imm(jt_addr); // imm_x: jump table return address
             self.emit_var_imm(0); // imm_y: offset added to rb
+
+            if let Some(branch) = wrong_parity {
+                self.patch_branch(branch);
+                self.emit_rotate(pvm_rs1, 63);
+                self.emit_op(Opcode::Trap);
+            }
         }
         Ok(())
+    }
+
+    /// `r` rotated right by one, its bit 0 in the sign, then a branch taken
+    /// when that bit is the one a displacement `imm` of ±1 does not clear
+    /// (set for +1, clear for -1), then `r` restored on the fall-through.
+    /// The branch's target is left to [`Self::patch_branch`]; its path
+    /// starts with `r` still rotated.
+    fn emit_parity_branch(&mut self, r: u8, imm: i32) -> (usize, usize) {
+        self.emit_rotate(r, 1);
+        let branch_pc = self.code.len();
+        self.emit_op(if imm > 0 {
+            Opcode::BranchLtSImm
+        } else {
+            Opcode::BranchGeSImm
+        });
+        self.emit_data(r); // lx = 0: the immediate 0
+        let offset_at = self.code.len();
+        self.emit_imm32(0);
+        self.emit_rotate(r, 63);
+        (branch_pc, offset_at)
+    }
+
+    /// Point a branch from [`Self::emit_parity_branch`] at the next
+    /// instruction emitted.
+    fn patch_branch(&mut self, (branch_pc, offset_at): (usize, usize)) {
+        let relative = (self.code.len() - branch_pc) as i32;
+        self.code[offset_at..offset_at + 4].copy_from_slice(&relative.to_le_bytes());
+    }
+
+    fn emit_rotate(&mut self, r: u8, by: i32) {
+        self.emit_op(Opcode::RotR64Imm);
+        self.emit_data(r | (r << 4));
+        self.emit_var_imm(by);
     }
 
     /// `jump_ind` to `(r + imm) & !1` with no register to clear bit 0 in:
     /// `r` rotated right by one puts its bit 0 in the sign, a branch on it
     /// picks the displacement that clears the sum's bit 0, and a rotation
     /// by 63 restores `r` on both paths, so the jump leaves every register
-    /// as RISC-V leaves it.
+    /// as RISC-V leaves it. For a displacement of ±1, the parity bit 0's
+    /// clearing does not take back traps instead (see
+    /// [`Self::translate_jalr`]).
     fn emit_masked_jump_ind(&mut self, r: u8, imm: i32) {
-        // The displacement for an even `r`, and for an odd one: the sum's
-        // bit 0 is `r`'s xor `imm`'s.
-        let (even, odd) = if imm & 1 == 0 {
-            (imm, imm - 1)
-        } else {
-            (imm - 1, imm)
+        // The displacement for an even `r`, and for an odd one; `None`
+        // where the source's target is two bytes past the pointer's.
+        let (even, odd) = match imm {
+            0 => (Some(0), Some(-1)),
+            1 => (Some(0), None),
+            _ => (None, Some(-1)),
         };
-        let rotate = |ctx: &mut Self, by: i32| {
-            ctx.emit_op(Opcode::RotR64Imm);
-            ctx.emit_data(r | (r << 4));
-            ctx.emit_var_imm(by);
+        let jump = |ctx: &mut Self, displacement: Option<i32>| match displacement {
+            Some(displacement) => {
+                ctx.emit_op(Opcode::JumpInd);
+                ctx.emit_data(r);
+                ctx.emit_var_imm(displacement);
+            }
+            None => ctx.emit_op(Opcode::Trap),
         };
-        let jump = |ctx: &mut Self, displacement: i32| {
-            ctx.emit_op(Opcode::JumpInd);
-            ctx.emit_data(r);
-            ctx.emit_var_imm(displacement);
-        };
-        rotate(self, 1);
+        self.emit_rotate(r, 1);
         let branch_pc = self.code.len();
         self.emit_op(Opcode::BranchLtSImm);
         self.emit_data(r); // lx = 0: the immediate 0
         let offset_at = self.code.len();
         self.emit_imm32(0);
-        rotate(self, 63);
+        self.emit_rotate(r, 63);
         jump(self, even);
-        let odd_pc = self.code.len();
-        let relative = (odd_pc - branch_pc) as i32;
-        self.code[offset_at..offset_at + 4].copy_from_slice(&relative.to_le_bytes());
-        rotate(self, 63);
+        self.patch_branch((branch_pc, offset_at));
+        self.emit_rotate(r, 63);
         jump(self, odd);
     }
 

@@ -426,21 +426,27 @@ impl TranslationContext {
     /// pointers (vtables, callbacks, switch tables), to its jump-table
     /// address (= (index+1)*2): the PVM's `jump_ind` takes jump-table
     /// addresses, not code offsets. A target the code already gave an entry
-    /// keeps it; a new one gets an entry in `targets`' order. Run after
-    /// [`Self::apply_fixups`]; a target never translated has none.
+    /// keeps it, translated or not (a pruned kernel function's entry is the
+    /// shared trap), so data and code hold one value for it; a new one gets
+    /// an entry in `targets`' order. Run after [`Self::apply_fixups`]; a
+    /// target neither translated nor given an entry by the code has none.
     pub(crate) fn build_function_pointer_map(
         &mut self,
         targets: &BTreeSet<u64>,
     ) -> HashMap<u64, u32> {
         let mut rv_to_jt = HashMap::new();
         for rv_addr in targets {
-            let Some(&pvm_offset) = self.address_map.get(rv_addr) else {
-                continue;
+            let index = match self.code_slots.get(rv_addr) {
+                Some(&index) => index,
+                None => {
+                    let Some(&pvm_offset) = self.address_map.get(rv_addr) else {
+                        continue;
+                    };
+                    self.jump_table.push(pvm_offset);
+                    self.code_slots.insert(*rv_addr, self.jump_table.len() - 1);
+                    self.jump_table.len() - 1
+                }
             };
-            let index = *self.code_slots.entry(*rv_addr).or_insert_with(|| {
-                self.jump_table.push(pvm_offset);
-                self.jump_table.len() - 1
-            });
             rv_to_jt.insert(*rv_addr, jump_table_address(index));
         }
         rv_to_jt

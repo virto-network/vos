@@ -59,7 +59,8 @@ pub enum TranspileError {
     #[error("jalr at {at:#x}: displacement {imm} from a register target is not representable")]
     IndirectDisplacement { at: u64, imm: i32 },
     /// A load into x0 at `at` with no register free to receive it: the
-    /// straight-line code after it reads every register before writing it.
+    /// straight-line code after it, up to its first branch, jump or call,
+    /// writes no register it has not read first.
     #[error("load into x0 at {at:#x}: no register is free to receive its value")]
     DiscardedLoad { at: u64 },
 }

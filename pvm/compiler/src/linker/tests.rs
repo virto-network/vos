@@ -1,6 +1,6 @@
 use super::relocs::overlaps_data_relocation;
 use super::*;
-use crate::riscv::rv::{addi, auipc, jal, jalr, ld, lui, sd};
+use crate::riscv::rv::{addi, auipc, jal, jalr, ld, lui, sd, sub};
 use vos_pvm::{ExitReason, refine};
 
 #[test]
@@ -71,6 +71,33 @@ fn a_pointer_into_pruned_code_cannot_be_jumped_to() {
     // Linked whole, the pointer is left as it was.
     let whole = transpile_with(&elf, Link::Whole).expect("translates");
     assert_eq!(whole.ro_data, target.to_le_bytes());
+}
+
+/// A kernel's code address it pruned, named by an immediate and by data,
+/// is one value in both: the entry the immediate took.
+#[test]
+fn a_pruned_address_is_one_value_from_code_and_data() {
+    const T1: u32 = 6;
+    let text = assemble(&[
+        auipc(T0, 0),        //  0
+        addi(T0, T0, 0x100), //  4: t0 = the pruned address, an immediate
+        lui(T1, 0x10),       //  8: the pointer's address, the read-only base
+        ld(T1, T1, 0),       // 12: t1 = the same address, from data
+        sub(A0, T0, T1),     // 16: zero iff equal
+        jalr(0, RA),         // 20
+    ]);
+    let target = TEXT_VADDR + 0x100;
+    let elf = pruned(
+        &text,
+        target.to_le_bytes().to_vec(),
+        vec![(0x1_0000, target, 8)],
+    );
+    let kernel = transpile_with(&elf, Link::Kernel).expect("translates");
+    assert_ne!(kernel.ro_data, u64::from(PRUNED).to_le_bytes());
+    let blob = spi_blob(kernel).expect("links");
+    let invocation = refine::execute(&blob, &[], 10_000_000).expect("executes");
+    assert_eq!(invocation.exit, ExitReason::Halt);
+    assert_eq!(invocation.registers[7], 0, "one value from code and data");
 }
 
 /// A kernel's branch to code it pruned reaches a trap, and code that
