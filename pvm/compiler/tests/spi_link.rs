@@ -612,3 +612,115 @@ fn refine_convention_guest_round_trips_args() {
         Some(&RO_CONST.to_le_bytes()[..])
     );
 }
+
+// ---------------------------------------------------------------------------
+// Code pointers, indirect jumps and discarded loads keep RISC-V's meaning.
+// ---------------------------------------------------------------------------
+
+const T0_PVM: usize = 2;
+const T1_PVM: usize = 3;
+const A2_PVM: usize = 9;
+const A3: u32 = 13; // → φ10
+const A4: u32 = 14; // → φ11
+const A5: u32 = 15; // → φ12
+
+fn xor(rd: u32, rs1: u32, rs2: u32) -> u32 {
+    (rs2 << 20) | (rs1 << 15) | (4 << 12) | (rd << 7) | 0x33
+}
+fn auipc(rd: u32, imm20: u32) -> u32 {
+    (imm20 << 12) | (rd << 7) | 0x17
+}
+fn nop() -> u32 {
+    addi(0, 0, 0)
+}
+
+/// `text` at [`TEXT_VADDR`], with `rodata` at [`RO_VADDR`] when given.
+fn text_elf(text: &[u32], rodata: Option<&[u8]>) -> Vec<u8> {
+    let text = assemble(text);
+    let mut sections: Vec<Section<'_>> = vec![(".text", 1, 0x6, TEXT_VADDR, &text)];
+    if let Some(rodata) = rodata {
+        sections.push((".rodata", 1, 0x2, RO_VADDR, rodata));
+    }
+    build_elf(TEXT_VADDR, &sections)
+}
+
+/// `blob` run on both backends, each run's exit and registers, the two
+/// the same.
+fn run_both(blob: &[u8]) -> (ExitReason, [u64; 13]) {
+    use vos_pvm::PvmBackend;
+    let mut runs = Vec::new();
+    for backend in [PvmBackend::ForceInterpreter, PvmBackend::Default] {
+        let mut machine =
+            refine::Machine::load_with_backend(blob, &[], GAS, MemoryModel::Auto, backend)
+                .expect("loads");
+        let exit = machine.resume();
+        let invocation = machine.finish(exit);
+        runs.push((invocation.exit, invocation.registers));
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "the interpreter and the default backend differ"
+    );
+    runs.remove(0)
+}
+
+/// One function's address taken at two instruction sites, held in data,
+/// and passed as a return address: each form is one value, so pointers to
+/// one function compare equal, and every one of them dispatches to it.
+#[test]
+fn a_code_address_has_one_value_in_every_form() {
+    const F: u64 = 64;
+    let text = [
+        addi(T2, RA, 0),   //  0: preserve the host return address
+        auipc(T0, 0),      //  4
+        addi(T0, T0, 60),  //  8: t0 = &F, materialized
+        auipc(T1, 0),      // 12
+        addi(T1, T1, 52),  // 16: t1 = &F, materialized at another site
+        lui(A2, 0x10),     // 20
+        ld(A2, A2, 0),     // 24: a2 = &F, from data
+        jal(RA, 52),       // 28: call G (80), returning to 32
+        jalr(RA, T0, 0),   // 32: F through each pointer
+        jalr(RA, T1, 0),   // 36
+        jalr(RA, A2, 0),   // 40
+        addi(RA, T2, 0),   // 44
+        ret(),             // 48
+        nop(),             // 52
+        nop(),             // 56
+        nop(),             // 60
+        addi(A4, A4, 1),   // 64: F counts its calls
+        ret(),             // 68
+        nop(),             // 72
+        nop(),             // 76
+        auipc(A3, 0),      // 80: G: a3 = the address 32, materialized
+        addi(A3, A3, -48), // 84
+        xor(A5, RA, A3),   // 88: zero iff the return address is that value
+        ret(),             // 92
+    ];
+    let elf = text_elf(&text, Some(&(TEXT_VADDR + F).to_le_bytes()));
+    let blob = link_elf_spi(&elf).expect("links");
+    let (exit, registers) = run_both(&blob);
+    assert_eq!(exit, ExitReason::Halt);
+    assert_eq!(
+        registers[T0_PVM], registers[T1_PVM],
+        "two immediates of one address"
+    );
+    assert_eq!(
+        registers[T0_PVM], registers[A2_PVM],
+        "an immediate and a data pointer"
+    );
+    assert_eq!(
+        registers[12], 0,
+        "a return address and the same address as an immediate"
+    );
+    assert_eq!(registers[11], 3, "every pointer reaches the function");
+
+    let program = parse_standard_program(&blob).expect("parses");
+    let mut entries = program.code.jump_table.clone();
+    entries.sort_unstable();
+    entries.dedup();
+    assert_eq!(
+        entries.len(),
+        program.code.jump_table.len(),
+        "one entry per code address"
+    );
+}
