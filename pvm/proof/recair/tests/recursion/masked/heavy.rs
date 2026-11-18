@@ -342,7 +342,9 @@ fn heavy_the_verify_gates_hold_over_seeds() {
         "the maximum over {GATE_SEEDS} seeds: {max} instructions; at the worst shape, by \
          the seeds' fit: {wasm_worst:.0}"
     );
-    jam::pinned(&counts, "masked-wrap-wasm-instructions-max", max, 0);
+    // Within 1%: the runner's count of the same proofs moves by an
+    // instruction or so from run to run.
+    jam::pinned(&counts, "masked-wrap-wasm-instructions-max", max, 1);
     jam::pinned(
         &counts,
         "masked-wrap-wasm-instructions-worst",

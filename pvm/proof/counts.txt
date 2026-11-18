@@ -1,6 +1,8 @@
 # The proving gates' deterministic counts, each `name value`: a gate holds
 # its measured count equal to its pin (a fixture's, or a seeded proof's), or
-# within 2% for a count fitted across seeds; `VOS_PINS=write` on the test
+# within 2% for a count fitted across seeds (within 1% for the Wasm
+# instructions over seeds, which move by an instruction or so from run to
+# run); `VOS_PINS=write` on the test
 # that measures it writes it (`just repin`). JAM gas on the JAM-only host
 # (`final-verify.elf`, `statement-service.elf`), Wasm instructions under the
 # PVF's semantics (`just judge-wasm`'s blob).

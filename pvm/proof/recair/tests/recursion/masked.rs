@@ -112,7 +112,7 @@ fn the_masked_wrap_verifies_under_the_registrys_entry() {
     );
     assert_eq!(entry.status, Status::Admitted);
     assert_eq!(entry.bytes, ProofBytes::FixedLayout);
-    assert_eq!(MAX_PROOF_BYTES, 256 << 10);
+    assert_eq!(MAX_PROOF_BYTES, 140 << 10);
     assert_eq!(
         WrapCircuit::get().masked_preprocessed_root(),
         Blake2bHash(PREPROCESSED_ROOT_39)
