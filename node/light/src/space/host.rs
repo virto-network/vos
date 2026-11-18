@@ -14,9 +14,10 @@ use crate::{AuthWitness, Call, DeviceSecret};
 
 /// The app's side of the personal space.
 pub trait Host: Send + Sync + 'static {
-    /// `request` (a `vos-api` request) sent to the space whose handle is
-    /// `space`, under `purpose`, its own connection's: the answer's body,
-    /// or why there is none.
+    /// `request` (a `vos-api` request) sent over the routes kept under
+    /// `space` (an enrolled space's handle, or a home's key,
+    /// [`crate::route::home`]), under `purpose`, its own connection's: the
+    /// answer's body, or why there is none.
     fn request(
         &self,
         space: &[u8; 32],
@@ -24,11 +25,12 @@ pub trait Host: Send + Sync + 'static {
         request: &[u8],
     ) -> Result<Vec<u8>, String>;
 
-    /// The routes of the home whose handle is `home`: its `onions`, onion
-    /// only.
+    /// The routes of a home, kept under its key `home`
+    /// ([`crate::route::home`]): its `onions`, onion only.
     fn pin(&self, home: &[u8; 32], onions: &[Onion]);
 
-    /// The route a request of `purpose` to `space` takes now.
+    /// The route a request of `purpose` over the routes kept under `space`
+    /// takes now.
     fn route(&self, space: &[u8; 32], purpose: Purpose) -> Route;
 
     /// `proof` made, one at a time beside the app's other proofs: the
@@ -91,6 +93,19 @@ pub struct AdminKey {
     pub key: [u8; 32],
     pub hardware: bool,
     pub verified_boot: bool,
+}
+
+impl AdminKey {
+    /// The class the device set records it in: a strong admin only when
+    /// the key is hardware-backed, a delayed one otherwise. The flags are
+    /// the device's own report until an attestation is verified.
+    pub fn class(&self) -> vos_wire::personal::AdminClass {
+        if self.hardware {
+            vos_wire::personal::AdminClass::Strong
+        } else {
+            vos_wire::personal::AdminClass::Delayed
+        }
+    }
 }
 
 /// A kit's card, shown with it: the home a restore goes to, by its handle

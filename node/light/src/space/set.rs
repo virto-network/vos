@@ -603,11 +603,11 @@ impl<H: Host> Personal<H> {
     }
 }
 
-/// An admin key as an admin call names it: a strong one, its attestation.
+/// An admin key as an admin call names it: its class and attestation.
 fn new_admin(key: AdminKey) -> NewAdmin {
     NewAdmin {
         key: key.key,
-        class: AdminClass::Strong,
+        class: key.class(),
         attestation: Attestation {
             hardware: key.hardware,
             verified_boot: key.verified_boot,

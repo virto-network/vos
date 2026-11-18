@@ -178,7 +178,8 @@ pub fn node_over(
     .unwrap()
 }
 
-/// The s4 session's gateway, as the client verified it.
+/// The s4 session's gateway, as the client verified it, the session
+/// carried by the facility.
 pub fn gateway() -> vos_facility::Gateway {
     vos_facility::Gateway {
         host: "gateway.test".into(),
@@ -186,6 +187,7 @@ pub fn gateway() -> vos_facility::Gateway {
         fingerprint: "SHA256:test".into(),
         application: "vos.test".into(),
         host_key: None,
+        carried: true,
     }
 }
 

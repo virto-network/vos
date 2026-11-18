@@ -63,6 +63,9 @@ pub struct Phone {
     pub decline_check: Mutex<bool>,
     /// How long the user takes to compare a pairing's check.
     pub comparing: Mutex<std::time::Duration>,
+    /// The admin keys made from now on are software keys, as a keystore
+    /// with no Ed25519 in its TEE makes them.
+    pub software: Mutex<bool>,
 }
 
 impl Phone {
@@ -88,6 +91,7 @@ impl Phone {
             checks: Mutex::new(Vec::new()),
             decline_check: Mutex::new(false),
             comparing: Mutex::new(std::time::Duration::ZERO),
+            software: Mutex::new(false),
         }
     }
 
@@ -265,11 +269,13 @@ impl Prompts for Phone {
         let key = SigningKey::from_bytes(&[self.next(); 32]);
         let public = key.verifying_key().to_bytes();
         self.admins.lock().unwrap().insert(public, key);
-        // Hardware-backed, verified boot.
+        // Hardware-backed with verified boot, unless the phone makes
+        // software keys.
+        let hardware = !*self.software.lock().unwrap();
         Ok(AdminKey {
             key: public,
-            hardware: true,
-            verified_boot: true,
+            hardware,
+            verified_boot: hardware,
         })
     }
 

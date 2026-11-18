@@ -321,6 +321,10 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     );
     world.enroll(AGENT, &member);
     node.granted(session).unwrap();
+    // Sign-ins on a session of their own: the enrolling one showed the
+    // digests, and pays.
+    let signing = node.open_session(gateway());
+    node.granted(signing).unwrap();
 
     // A sign-in on the tree kept apart.
     let login = SignIn::read(&object(&[
@@ -332,7 +336,7 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     .unwrap();
     let signed = loop {
         shown.will_confirm(&[]);
-        match node.sign_in(session, login.clone(), prompts()) {
+        match node.sign_in(signing, login.clone(), prompts()) {
             Err(refusal) if refusal.code == Code::NoPath => {
                 shown.confirms.lock().unwrap().clear();
                 std::thread::sleep(Duration::from_millis(200));
@@ -376,7 +380,7 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     shown.will_confirm(&[]);
     failed(
         "a refused source",
-        node.sign_in(session, login.clone(), prompts())
+        node.sign_in(signing, login.clone(), prompts())
             .map(Outcome::SignedIn),
         Code::Declined,
     );
@@ -384,7 +388,7 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     shown.will_confirm(&[]);
     failed(
         "a failed source",
-        node.sign_in(session, login.clone(), prompts())
+        node.sign_in(signing, login.clone(), prompts())
             .map(Outcome::SignedIn),
         Code::Source,
     );
@@ -399,7 +403,7 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     failed(
         "a malformed request",
         node.sign_in(
-            session,
+            signing,
             SignIn {
                 method: "log in".into(),
                 ..login

@@ -8,7 +8,7 @@ use vos_wire::books::{DeviceHandle, Enrolled as BookEntry, credential_book};
 use vos_wire::credentials::CredentialError;
 
 use super::{CREDENTIAL_BOOK, EXPIRY_MS, Enrolled, Error, Host, Personal, Prompts, Proof};
-use super::{failed, secret, store_failed};
+use super::{To, failed, secret, store_failed};
 use crate::pairing::Membership as Offered;
 use crate::route::Purpose;
 use crate::{Call, Light, memberships};
@@ -146,11 +146,11 @@ impl<H: Host> Personal<H> {
         enrollment: &Enrolled,
         call: impl FnOnce(u64) -> Result<Call, crate::DeviceError>,
     ) -> Result<Outcome, Error> {
-        let now = self.time(enrollment.handle, Purpose::Fetch)?;
+        let now = self.time(To::Space(enrollment.handle), Purpose::Fetch)?;
         let call = call(now + EXPIRY_MS).map_err(failed)?;
         let secret = secret(prompts, &enrollment.source, &enrollment.handle)?;
         let request = self.host.prove(Proof::Owner { secret, call })?;
-        self.proven(enrollment.handle, &request)
+        self.proven(To::Space(enrollment.handle), &request)
     }
 
     /// The device a pairing added enrolled in `membership`'s space, by

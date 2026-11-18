@@ -530,3 +530,110 @@ fn a_cosigns_lost_evidence_is_posted_after_the_maturity_it_caused() {
     let passed = second.pass();
     assert!(passed.alarms.is_empty(), "{:?}", passed.alarms);
 }
+
+/// A phone whose admin key is a software key (a keystore with no Ed25519
+/// in its TEE) is a delayed admin, as its own report says: the set
+/// records it so, claimed or paired, and it opens no pairing (a strong
+/// admin's phone pairs it).
+#[test]
+fn a_software_admin_key_is_a_delayed_admin() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let first = device(&world, 0xc1);
+    *first.phone.software.lock().unwrap() = true;
+    first.claim(&world, home);
+    let strong = |device: &Device, id: u32| {
+        let devices = device.space.devices().unwrap();
+        devices
+            .iter()
+            .find(|device| device.id == id)
+            .unwrap()
+            .strong
+    };
+    assert!(
+        !strong(&first, 0),
+        "a software key claims as a delayed admin"
+    );
+    // Its add would wait as an operation past any slot: it opens none.
+    assert_eq!(first.space.pair_offer().unwrap_err(), Error::DelayedAdmin);
+
+    let other = world.home([0x62; 32], 2, 1);
+    let opener = device(&world, 0xc2);
+    opener.claim(&world, other);
+    let joiner = device(&world, 0xc3);
+    *joiner.phone.software.lock().unwrap() = true;
+    let id = opener.pair(&joiner);
+    assert!(strong(&opener, 0));
+    assert!(
+        !strong(&opener, id),
+        "a software key joins as a delayed admin"
+    );
+}
+
+/// The home's onion set is read again from its registrar by a pass: a
+/// second onion the home names is pinned, under the home's own routes'
+/// key, after a reopen too; a later read that no longer names the first
+/// keeps it pinned beside the new set for a while. The home's routes are
+/// never the handle's, which an enrolled space's routes are kept under.
+#[test]
+fn a_pass_reads_the_homes_onions_again_and_keeps_them() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let directory = tempfile::tempdir().unwrap();
+    let phone = Phone::new(0xd1);
+    let space = Personal::open(directory.path(), artifacts(), Reach::new(&world, 0xd1)).unwrap();
+    space.set_wait(30_000);
+    space
+        .claim(
+            &phone,
+            Claim {
+                home: world.home_of(home),
+                kit: KitKind::SecurityKey,
+                label: "phone".into(),
+            },
+        )
+        .unwrap();
+    let keys = |space: &Personal<Reach>| -> Vec<u8> {
+        let routes = space
+            .host()
+            .client()
+            .routes(&vos_light::route::home(&HOME))
+            .expect("the home's routes");
+        routes.onions.iter().map(|onion| onion.key[0]).collect()
+    };
+    assert_eq!(keys(&space), vec![2]);
+    assert!(
+        space.host().client().routes(&HOME).is_none(),
+        "not the handle's"
+    );
+    world
+        .state
+        .lock()
+        .unwrap()
+        .spaces
+        .get_mut(&home)
+        .unwrap()
+        .onions = vec![world.onion(2), world.onion(5)];
+    space.pass(vos_light::testing::wall()).unwrap();
+    assert_eq!(keys(&space), vec![2, 5]);
+    drop(space);
+    let space = Personal::open(directory.path(), artifacts(), Reach::new(&world, 0xd1)).unwrap();
+    assert_eq!(keys(&space), vec![2, 5], "kept across a reopen");
+    // A day on, the home names the second alone: the first stays pinned
+    // beside it.
+    world
+        .state
+        .lock()
+        .unwrap()
+        .spaces
+        .get_mut(&home)
+        .unwrap()
+        .onions = vec![world.onion(5)];
+    let day = vos_light::space::ONIONS_EVERY_MS;
+    space.pass(vos_light::testing::wall() + day).unwrap();
+    assert_eq!(keys(&space), vec![5, 2]);
+    // Past the time a dropped onion is kept, the next read leaves it out.
+    let later = vos_light::testing::wall() + day + vos_light::space::ONIONS_KEPT_MS + day;
+    space.pass(later).unwrap();
+    assert_eq!(keys(&space), vec![5]);
+}

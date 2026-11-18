@@ -4,13 +4,15 @@
 
 use vos_abi::Encode;
 use vos_wire::books::DeviceHandle;
-use vos_wire::personal::{DeviceView, InboxItem, Overview, PersonalError, Status, method};
+use vos_wire::personal::{
+    AdminClass, DeviceView, InboxItem, Overview, PersonalError, Status, method,
+};
 use zeroize::Zeroizing;
 
 use super::link::Signer;
 use super::{
-    Acked, CREDENTIAL_BOOK, Error, Held, Host, Kept, POLL, Paired, Personal, Prompts, failed, link,
-    secret, store_failed, unreached,
+    Acked, AdminKey, CREDENTIAL_BOOK, Error, Held, Host, Kept, POLL, Paired, Personal, Prompts,
+    failed, link, secret, store_failed, unreached,
 };
 use crate::group::{DeviceGroup, Prepared};
 use crate::memberships;
@@ -60,6 +62,23 @@ impl<H: Host> Personal<H> {
             held.state.agent.ok_or(Error::NoSpace)?,
         );
         let me = group.id().ok_or(Error::NoSpace)?;
+        // A delayed admin's add waits as an operation first, past any
+        // pairing's slot: it opens none.
+        if held
+            .state
+            .admin
+            .is_some_and(|(key, hardware, verified_boot)| {
+                AdminKey {
+                    key,
+                    hardware,
+                    verified_boot,
+                }
+                .class()
+                    != AdminClass::Strong
+            })
+        {
+            return Err(Error::DelayedAdmin);
+        }
         let item_bytes = group.policy().inbox_item_bytes;
         let ttl = group.policy().slot_ttl_ms;
         self.book(&held.light, me);
@@ -470,7 +489,7 @@ impl<H: Host> Personal<H> {
         let group =
             DeviceGroup::join_with(held.light.store(), device, *pairing, rows).map_err(failed)?;
         held.group = Some(group);
-        held.state = next;
+        self.adopt(&mut held, next);
         held.sync = Signer::new(held.light.sync_key().verifying_key().to_bytes());
         slot_put(&mut slot_signer, ack.arguments())?;
         held.state.acked = None;

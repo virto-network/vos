@@ -249,6 +249,9 @@ public final class Words {
         return "a device does not sign its own key's replacement";
       case Why.NOT_IN_SET:
         return "that device is not in the set";
+      case Why.DELAYED_ADMIN:
+        return "this phone's admin key is not kept in hardware: open the pairing on a phone"
+            + " whose key is";
       case Why.SOURCE:
         return "the phone's key failed";
       case Why.NO_OPEN_CLAIM:

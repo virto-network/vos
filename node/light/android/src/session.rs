@@ -127,6 +127,9 @@ pub(crate) trait Paired: Send + Sync {
     fn owed_source(&self, handle: &[u8; 32]) -> Result<Option<Reference>, String>;
     /// An enrollment made: the credential book records it.
     fn enrolled(&self);
+    /// The home the device's agent is at: its handle, its space and its
+    /// onion set.
+    fn home(&self) -> Option<([u8; 32], [u8; 32], Vec<vos_wire::credentials::Onion>)>;
 }
 
 /// One enrollment's credential tree, its refresher while a session holds
@@ -442,6 +445,7 @@ impl Facility {
             },
             gateway,
             held: Mutex::new(None),
+            learned: Mutex::new(Learned::Nothing),
         }
     }
 }
@@ -691,6 +695,22 @@ pub struct Session {
     gateway: Gateway,
     /// The tree this session holds since its grant.
     held: Mutex<Option<Arc<Tree>>>,
+    /// What the session's server learned of the device: its digests (an
+    /// enrollment's answer) or its account (a payment's owner proof), or
+    /// a sign-in's pseudonym. One session never carries both, so its
+    /// server cannot join an anonymous sign-in to the member it named.
+    learned: Mutex<Learned>,
+}
+
+/// What a session's server learned of the device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Learned {
+    #[default]
+    Nothing,
+    /// The device's member or owner digest.
+    Named,
+    /// A sign-in's pseudonym.
+    SignedIn,
 }
 
 impl Drop for Session {
@@ -817,6 +837,54 @@ impl Session {
         secret_of(&*self.inner.source, enrollment).await
     }
 
+    /// Refused, before any prompt, a proof for a session the facility does
+    /// not carry, unless the user opted the space out of Tor: its server
+    /// would join the device's network address to it. After an
+    /// enrollment, s4 connects again, carried.
+    fn carried(&self, enrollment: &Enrollment) -> Result<(), Refusal> {
+        if self.gateway.carried || self.inner.net.opted_out(&enrollment.handle) {
+            return Ok(());
+        }
+        Err(refused(
+            Code::Refused,
+            "this session is not carried over Tor: reconnect, and s4 reaches this gateway over \
+             Tor",
+        ))
+    }
+
+    /// Refused, before any prompt, what would join a sign-in to the member
+    /// in this session: a sign-in after the device was named in it (`to`
+    /// [`Learned::SignedIn`]), or naming it after a sign-in.
+    fn apart(&self, to: Learned) -> Result<(), Refusal> {
+        let learned = *self.learned.lock().expect("learned poisoned");
+        let joined = match to {
+            Learned::SignedIn => learned == Learned::Named,
+            Learned::Named => learned == Learned::SignedIn,
+            Learned::Nothing => false,
+        };
+        if !joined {
+            return Ok(());
+        }
+        Err(refused(
+            Code::Refused,
+            match to {
+                Learned::SignedIn => {
+                    "this session was shown this device's digests or account: sign in from a new \
+                     session, so the sign-in is not joined to them"
+                }
+                _ => {
+                    "this session holds a sign-in: show the digests or pay from a new session, \
+                     so the sign-in is not joined to them"
+                }
+            },
+        ))
+    }
+
+    /// What the session's server learned now.
+    fn learn(&self, learned: Learned) {
+        *self.learned.lock().expect("learned poisoned") = learned;
+    }
+
     fn origin_line(&self) -> String {
         format!(
             "{} at {}:{} asks",
@@ -826,6 +894,7 @@ impl Session {
     /// `enroll`: this device enrolled in the request's space, the digests
     /// shown in the chrome and answered.
     pub async fn enroll(&self, request: Enroll, chrome: &dyn Chrome) -> Result<Enrolled, Refusal> {
+        self.apart(Learned::Named)?;
         let store = &self.inner.store;
         let existing = store.get(&self.origin).map_err(store_error)?;
         if existing
@@ -848,6 +917,22 @@ impl Session {
                 Code::NotPinned,
                 "this space is enrolled on this device through another server",
             ));
+        }
+        // A server naming this device's home could take the personal
+        // agent's traffic, were their routes one: they are apart, and an
+        // enrollment naming the home is refused unless it names the home's
+        // own onion set (a home in a space the user belongs to).
+        if let Some((handle, space, home_onions)) = self.inner.personal().and_then(|p| p.home()) {
+            let named = crate::enrollment::onions(&request.onions);
+            let same = |a: &[vos_wire::credentials::Onion], b: &[vos_wire::credentials::Onion]| {
+                a.len() == b.len() && a.iter().all(|onion| b.contains(onion))
+            };
+            if (request.handle == handle || request.space == space) && !same(&named, &home_onions) {
+                return Err(refused(
+                    Code::NotPinned,
+                    "this server names this device's home, through onions other than the home's",
+                ));
+            }
         }
         let kinds = self.inner.source.kinds();
         // A handle a pairing gave this device here is enrolled already, by
@@ -973,6 +1058,7 @@ impl Session {
                 choices: vec!["Done".into()],
             })
             .await;
+        self.learn(Learned::Named);
         Ok(Enrolled {
             member: member.to_bytes(),
             owner: owner.to_bytes(),
@@ -1013,6 +1099,8 @@ impl Session {
             &request.method,
             |method| matches!(method.guard, Guard::Auth { .. }),
         )?;
+        self.carried(&enrollment)?;
+        self.apart(Learned::SignedIn)?;
         let Guard::Auth { scope, once } = &method.guard else {
             unreachable!("an auth guard, filtered above")
         };
@@ -1077,6 +1165,7 @@ impl Session {
         if !matches!(chrome.confirm(form).await, Answer::Confirmed { .. }) {
             return Err(declined());
         }
+        self.learn(Learned::SignedIn);
         // The secret is held until the node took a proof or refused it
         // for good: a root it no longer judges current is proved against
         // again, once, with no second prompt. The call is made before the
@@ -1193,6 +1282,8 @@ impl Session {
             &request.method,
             |method| method.guard == Guard::Owner && method.name == TRANSFER,
         )?;
+        self.carried(&enrollment)?;
+        self.apart(Learned::Named)?;
         self.inner
             .admits(&enrollment, &self.inner.stock.owner)
             .await?;
@@ -1249,6 +1340,7 @@ impl Session {
             payee: values.0.clone(),
             amount: values.1,
         };
+        self.learn(Learned::Named);
         // The same payment asked again while its last proof may still run
         // (a relay that withheld it, then asked anew) is that proof again:
         // its binding runs once.

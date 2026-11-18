@@ -18,6 +18,7 @@ use std::collections::HashSet;
 
 use common::phone::*;
 use common::*;
+use vos_facility::Enroll;
 use vos_facility::personal::{Claim, KitKind, Owed, Why};
 use vos_light::tor::Target;
 
@@ -1210,4 +1211,56 @@ fn a_device_a_move_left_pairs_again_at_the_new_home() {
         assert_eq!(space.recorded(1), 1, "the second's book at the new home");
     }
     assert!(!world.carrying(moved.agent).is_empty());
+}
+
+/// A gateway's enrollment naming the device's home is refused unless it
+/// names the home's own onions (a home in a space the user belongs to);
+/// one that does keeps routes of its own: the user's opt-out of it moves
+/// none of the home's traffic, which goes to the home's onion alone, never
+/// the clearnet, after a reopen too.
+#[test]
+fn an_enrollment_naming_the_home_takes_none_of_its_routes() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let phone = phone(&world, 0xe1);
+    phone.claim(&world, home, KitKind::Phrase, "phone");
+    let enroll = |onion: u8| {
+        let session = phone.node.open_session(vos_facility::Gateway {
+            host_key: Some(ssh_host_key()),
+            ..gateway()
+        });
+        let enrolled = phone.node.enroll(
+            session,
+            Enroll::read(&enrollment_at(HOME, [0x53; 32], AGENT, IDENTITY, onion)).unwrap(),
+            Arc::clone(&phone.hand) as Arc<dyn vos_facility::node::Prompts>,
+        );
+        phone.node.close(session);
+        enrolled
+    };
+    let refused = enroll(1).unwrap_err();
+    assert_eq!(refused.code, Code::NotPinned);
+    assert!(refused.message.contains("home"), "{refused:?}");
+    enroll(2).unwrap();
+    phone.node.opt_out(HOME, true).unwrap();
+    // The open claim's key-signed calls to the home stay on its onion.
+    let personal = phone.node.space().unwrap();
+    assert_eq!(
+        personal.home_route(vos_light::route::Purpose::Member),
+        Some(vos_light::route::Route::Onion)
+    );
+    let before = world.state.lock().unwrap().seen.len();
+    phone.node.sync_personal().unwrap();
+    let seen = world.state.lock().unwrap().seen[before..].to_vec();
+    assert!(!seen.is_empty());
+    for seen in &seen {
+        assert_eq!(
+            vos_light::testing::onion_of(&seen.target),
+            Some(vos_light::testing::address(&world, 2)),
+            "the home's onion alone: {seen:?}"
+        );
+    }
+    assert_eq!(
+        personal.home_route(vos_light::route::Purpose::Member),
+        Some(vos_light::route::Route::Onion)
+    );
 }

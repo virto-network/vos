@@ -55,4 +55,5 @@ enum Why {
     STORE = 46,
     ARGUMENTS = 47,
     FAILED = 48,
+    DELAYED_ADMIN = 49,
 }

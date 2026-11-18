@@ -293,6 +293,9 @@ byte_enum! {
         Arguments = 47 as ARGUMENTS,
         /// The facility failed: `detail` says how.
         Failed = 48 as FAILED,
+        /// This device is a delayed admin: a pairing is opened on a strong
+        /// admin's device.
+        DelayedAdmin = 49 as DELAYED_ADMIN,
     }
 }
 

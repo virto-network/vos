@@ -12,7 +12,7 @@ use vos_wire::personal::{Body, Entry};
 use super::link::Signer;
 use super::{
     Claim, Claimed, EXPIRY_MS, Error, Held, Host, Kept, PERSONAL, POLL, Personal, Prompts, Proof,
-    failed, link, new_kit, secret, store_failed,
+    To, failed, link, new_kit, secret, store_failed,
 };
 use crate::home::{self, Claim as Claiming, Home};
 use crate::route::Purpose;
@@ -34,7 +34,7 @@ impl<H: Host> Personal<H> {
         method: MethodId,
         arguments: Vec<u8>,
     ) -> Result<T, Error> {
-        let now = self.time(home.handle, purpose)?;
+        let now = self.time(To::Home(home.handle), purpose)?;
         let request = wire::query_request(
             home.agent,
             &home.identity,
@@ -44,12 +44,16 @@ impl<H: Host> Personal<H> {
             now + EXPIRY_MS,
         )
         .map_err(failed)?;
-        wire::query_answer(&self.ask(home.handle, purpose, &request)?).map_err(failed)
+        wire::query_answer(&self.ask(To::Home(home.handle), purpose, &request)?).map_err(failed)
     }
 
     /// The identity of `agent`, from its record, as the home's node says.
     pub(super) fn identity(&self, home: &Home, agent: u32) -> Result<[u8; 32], Error> {
-        let answer = self.ask(home.handle, Purpose::Personal, &wire::agent_request(agent))?;
+        let answer = self.ask(
+            To::Home(home.handle),
+            Purpose::Personal,
+            &wire::agent_request(agent),
+        )?;
         wire::agent_answer(&answer)
             .map_err(failed)?
             .ok_or(Error::UnknownAgent)
@@ -74,10 +78,10 @@ impl<H: Host> Personal<H> {
             terms.difficulty,
             WORK_THREADS,
         );
-        let now = self.time(home.handle, Purpose::Member)?;
+        let now = self.time(To::Home(home.handle), Purpose::Member)?;
         let request = home::open_claim(home, member, nonce, now).map_err(failed)?;
-        let outcome =
-            wire::outcome(&self.ask(home.handle, Purpose::Member, &request)?).map_err(failed)?;
+        let outcome = wire::outcome(&self.ask(To::Home(home.handle), Purpose::Member, &request)?)
+            .map_err(failed)?;
         match &outcome {
             Outcome::Done(_) => Ok(()),
             Outcome::Failed { detail, .. }
@@ -111,7 +115,7 @@ impl<H: Host> Personal<H> {
     /// page by page, each under a time the node gave.
     fn read_tree(&self, home: &Home, keeper: &mut TreeKeeper) -> Result<(), Error> {
         for _ in 0..FEED_PAGES {
-            let now = self.time(home.handle, Purpose::Feed)?;
+            let now = self.time(To::Home(home.handle), Purpose::Feed)?;
             let query = keeper
                 .request(
                     home.agent,
@@ -120,7 +124,7 @@ impl<H: Host> Personal<H> {
                     now + EXPIRY_MS,
                 )
                 .map_err(failed)?;
-            let answer = self.ask(home.handle, Purpose::Feed, &query)?;
+            let answer = self.ask(To::Home(home.handle), Purpose::Feed, &query)?;
             let read = keeper.ingest(&answer, self.host.now()).map_err(failed)?;
             if !read.more {
                 break;
@@ -143,14 +147,14 @@ impl<H: Host> Personal<H> {
             witness: Box::new(witness),
             call,
         })?;
-        let outcome = self.proven(home.handle, &request)?;
+        let outcome = self.proven(To::Home(home.handle), &request)?;
         wire::answer(&outcome).map_err(|_| failed(format!("`Homes` answered {outcome:?}")))
     }
 
-    /// The proven call `request` sent to the space whose handle is
-    /// `space`: the outcome it ran to.
-    pub(super) fn proven(&self, space: [u8; 32], request: &[u8]) -> Result<Outcome, Error> {
-        let answer = self.ask(space, Purpose::Proven, request)?;
+    /// The proven call `request` sent `to` a home or a space: the outcome
+    /// it ran to.
+    pub(super) fn proven(&self, to: To, request: &[u8]) -> Result<Outcome, Error> {
+        let answer = self.ask(to, Purpose::Proven, request)?;
         if wire::format_refused(&answer) {
             return Err(Error::Update);
         }
@@ -265,13 +269,13 @@ impl<H: Host> Personal<H> {
                     next.rows(),
                 )
                 .map_err(failed)?;
-                held.state = next;
+                self.adopt(held, next);
                 claim
             }
         };
         let agent = claim.agent();
         let witness = self.home_witness(&home, &member)?;
-        let now = self.time(home.handle, Purpose::Fetch)?;
+        let now = self.time(To::Home(home.handle), Purpose::Fetch)?;
         let call = claim.call(&home, now + EXPIRY_MS).map_err(failed)?;
         match self.prove_home::<u32>(&home, secret, witness, call)? {
             Ok(_) | Err(HomesError::Claimed) => {}
@@ -281,7 +285,7 @@ impl<H: Host> Personal<H> {
                 claim
                     .abandon_with(held.light.store(), next.rows())
                     .map_err(store_failed)?;
-                held.state = next;
+                self.adopt(held, next);
                 return Err(Error::HomeRefused(error));
             }
         }

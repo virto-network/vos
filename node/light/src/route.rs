@@ -18,8 +18,22 @@
 //!   carries nothing else, so a credentialed call never rides a key-signed
 //!   connection that may be on the clearnet.
 
+use blake2::Blake2b;
+use blake2::digest::Digest as _;
+use blake2::digest::consts::U32;
 use vos_api::Kind;
 use vos_wire::credentials::Onion;
+
+/// The key the routes of the home whose handle is `handle` are kept under,
+/// apart from every enrolled space's (each kept under its handle): a
+/// space whose enrollment names a home's handle reaches none of the home's
+/// routes, and the home's refresh none of its.
+pub fn home(handle: &[u8; 32]) -> [u8; 32] {
+    Blake2b::<U32>::new_with_prefix(b"vos.light.home-routes")
+        .chain_update(handle)
+        .finalize()
+        .into()
+}
 
 /// How a request reaches a space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,10 +136,15 @@ pub struct Clearnet {
     pub ssh_host_key: [u8; 32],
 }
 
-/// What the chrome shows before a space's opt-out takes effect.
+/// What the chrome shows before a space's opt-out takes effect. The
+/// space's screens are key-signed too (s4's session with its gateway), so
+/// a sign-in or payment asked there is asked over the clearnet: its proof
+/// still travels over Tor, but the operators can join the device's
+/// address to it.
 pub const OPT_OUT_WARNING: &str = "Without Tor, this space's operators see this device's network \
-     address with every call it signs. Sign-ins and other anonymous calls, and your personal \
-     space, stay on Tor.";
+     address with every call it signs and on this space's screens, so they can tell which \
+     sign-ins and payments asked there came from this device. Proofs still travel over Tor, \
+     and your personal space stays on Tor.";
 
 /// A space's routes: the onions it pins, the clearnet port it may offer,
 /// and the choices the space and the user made.
@@ -364,5 +383,29 @@ mod tests {
         }
         assert!(Purpose::Member.admits(Kind::Call) && Purpose::Personal.admits(Kind::Call));
         assert!(!Purpose::Member.admits(Kind::Install));
+    }
+
+    /// An opted-out space's screens take the clearnet with its key-signed
+    /// calls, so the warning says what that hands its operators: the
+    /// device's address beside the sign-ins its screens ask for.
+    #[test]
+    fn the_opt_out_moves_the_screens_and_its_warning_says_so() {
+        let mut routes = Routes::new(vec![onion(1)], Some(clearnet()), false);
+        assert_eq!(routes.route(Purpose::Screens), Ok(Route::Onion));
+        routes.opt_out().unwrap();
+        assert_eq!(routes.route(Purpose::Screens), Ok(Route::Clearnet));
+        assert_eq!(routes.route(Purpose::Proven), Ok(Route::Onion));
+        assert!(OPT_OUT_WARNING.contains("screens"));
+        assert!(OPT_OUT_WARNING.contains("sign-ins"));
+        assert!(!OPT_OUT_WARNING.contains("Sign-ins and other anonymous calls"));
+    }
+
+    /// A home's routes are kept under a key of their own, never a handle
+    /// an enrollment could name.
+    #[test]
+    fn a_homes_routes_key_is_not_its_handle() {
+        let handle = [9; 32];
+        assert_ne!(home(&handle), handle);
+        assert_ne!(home(&handle), home(&[8; 32]));
     }
 }

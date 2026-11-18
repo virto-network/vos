@@ -415,6 +415,7 @@ pub fn refusal(error: Error) -> Refused {
             device: by,
             ..Refused::default()
         },
+        Error::DelayedAdmin => why(Why::DelayedAdmin),
         Error::NotEnrolled => why(Why::NotEnrolled),
         Error::NothingOwed => why(Why::NothingOwed),
         Error::Spent => why(Why::Spent),
@@ -593,6 +594,23 @@ impl Space {
     #[doc(hidden)]
     pub fn set_wait(&self, ms: u64) {
         self.0.set_wait(ms);
+    }
+
+    /// The route a request of `purpose` to the device's home takes now.
+    #[doc(hidden)]
+    pub fn home_route(
+        &self,
+        purpose: vos_light::route::Purpose,
+    ) -> Option<vos_light::route::Route> {
+        let kept = self.0.home()?;
+        let routes = self
+            .0
+            .host()
+            .facility
+            .net()
+            .client()
+            .routes(&vos_light::route::home(&kept.home.handle))?;
+        routes.route(purpose).ok()
     }
 
     pub fn scope_key(&self, name: &[u8]) -> Result<[u8; 32], Refused> {
@@ -864,5 +882,11 @@ impl crate::session::Paired for Space {
 
     fn enrolled(&self) {
         self.0.enrolled();
+    }
+
+    fn home(&self) -> Option<([u8; 32], [u8; 32], Vec<vos_wire::credentials::Onion>)> {
+        self.0
+            .home()
+            .map(|kept| (kept.home.handle, kept.home.space, kept.onions))
     }
 }

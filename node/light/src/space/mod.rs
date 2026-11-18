@@ -110,6 +110,18 @@ pub struct Kept {
     pub onions: Vec<Onion>,
 }
 
+impl State {
+    /// The onions of the home whose handle is `handle` that its last read
+    /// no longer named, while they stay pinned at `now`.
+    fn previous(&self, handle: &[u8; 32], now: u64) -> Vec<Onion> {
+        self.onions
+            .as_ref()
+            .filter(|refreshed| refreshed.handle == *handle && now < refreshed.until)
+            .map(|refreshed| refreshed.previous.clone())
+            .unwrap_or_default()
+    }
+}
+
 impl Kept {
     /// A home known by its handle and onions alone, as a pairing code
     /// names it: the rest comes in the opener's offer.
@@ -196,7 +208,27 @@ struct State {
     /// The kit's calls on the device set as signed, kept before they leave
     /// until their evidence is posted.
     kit_calls: Vec<KitCall>,
+    /// The home's onion set's last read from its registrar.
+    onions: Option<Refreshed>,
 }
+
+/// The home's onion set as last read from its registrar (the current set
+/// is the kept home's): when, and the onions it no longer named, still
+/// pinned beside it until `until`, so one forged answer cannot leave the
+/// device without a way home. Of the home whose handle it names alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+struct Refreshed {
+    handle: [u8; 32],
+    at: u64,
+    previous: Vec<Onion>,
+    until: u64,
+}
+
+/// How often the home's onion set is read again, as an enrolled space's
+/// is: once a day.
+pub const ONIONS_EVERY_MS: u64 = 24 * 60 * 60 * 1000;
+/// How long the onions a read no longer names stay pinned.
+pub const ONIONS_KEPT_MS: u64 = 7 * ONIONS_EVERY_MS;
 
 /// A kit's call on the device set at the agent `identity`, as signed.
 #[derive(Clone, Encode, Decode)]
@@ -479,6 +511,8 @@ pub struct Personal<H: Host> {
     /// The light node's store and the source kept, as an enrollment asks
     /// them while a flow holds the rest.
     owed: (Mutex<crate::Store>, Mutex<Option<Vec<u8>>>),
+    /// The home kept, as an enrollment asks it while a flow holds the rest.
+    home: Mutex<Option<Kept>>,
     /// The personal space's directory, and the artifacts a store made anew
     /// installs (`Personal::leave`).
     directory: PathBuf,
@@ -522,6 +556,7 @@ impl<H: Host> Personal<H> {
             Mutex::new(light.store().clone()),
             Mutex::new(state.source.clone()),
         );
+        let home = Mutex::new(state.home.clone());
         let space = Self {
             host,
             held: Mutex::new(Held {
@@ -536,6 +571,7 @@ impl<H: Host> Personal<H> {
             waiting: Waiting::default(),
             wait: AtomicU64::new(WAIT_MS),
             owed,
+            home,
             directory: directory.to_path_buf(),
             artifacts: artifacts.clone(),
         };
@@ -544,7 +580,10 @@ impl<H: Host> Personal<H> {
             space.keep(&held.light, &held.state)?;
         }
         if let Some(kept) = &held.state.home {
-            space.pin(kept);
+            space.pin_with(
+                kept,
+                &held.state.previous(&kept.home.handle, space.host.now()),
+            );
         }
         drop(held);
         Ok(space)
@@ -559,9 +598,93 @@ impl<H: Host> Personal<H> {
         &self.host
     }
 
-    /// A home's routes: its onions, onion-only (E17).
+    /// A home's routes: its onions, onion-only (E17), under the home's
+    /// own key ([`crate::route::home`]).
     fn pin(&self, kept: &Kept) {
-        self.host.pin(&kept.home.handle, &kept.onions);
+        self.pin_with(kept, &[]);
+    }
+
+    /// The same, the onions a read no longer names beside them.
+    fn pin_with(&self, kept: &Kept, previous: &[Onion]) {
+        let mut onions = kept.onions.clone();
+        for onion in previous {
+            if !onions.iter().any(|kept| kept.key == onion.key) {
+                onions.push(*onion);
+            }
+        }
+        self.host
+            .pin(&crate::route::home(&kept.home.handle), &onions);
+    }
+
+    /// The home's onion set read again from its registrar, once a day
+    /// ([`ONIONS_EVERY_MS`]), through the set pinned: a usable set (1 to
+    /// [`vos_wire::credentials::MAX_ONIONS`] distinct onions) becomes the
+    /// kept home's, the onions it no longer names pinned beside it for
+    /// [`ONIONS_KEPT_MS`]. The answer is the gateway's word.
+    fn refresh_onions(&self, held: &mut Held, now: u64) -> Result<(), Error> {
+        let Some(kept) = held.state.home.clone() else {
+            return Ok(());
+        };
+        let handle = kept.home.handle;
+        let last = held
+            .state
+            .onions
+            .as_ref()
+            .filter(|refreshed| refreshed.handle == handle)
+            .map_or(0, |refreshed| refreshed.at);
+        if now.saturating_sub(last) < ONIONS_EVERY_MS {
+            return Ok(());
+        }
+        let onions: Vec<Onion> = self.home_query(
+            &kept.home,
+            Purpose::Fetch,
+            kept.home.credentials.0,
+            vos_wire::credentials::method::ONIONS,
+            Vec::new(),
+        )?;
+        let repeated = onions
+            .iter()
+            .enumerate()
+            .any(|(at, onion)| onions[..at].iter().any(|seen| seen.key == onion.key));
+        if onions.is_empty() || onions.len() > vos_wire::credentials::MAX_ONIONS || repeated {
+            return Err(failed("the home's registrar served an unusable onion set"));
+        }
+        let mut previous: Vec<Onion> = Vec::new();
+        for onion in held
+            .state
+            .previous(&handle, now)
+            .into_iter()
+            .chain(kept.onions.iter().copied())
+        {
+            let known = previous
+                .iter()
+                .chain(&onions)
+                .any(|seen| seen.key == onion.key);
+            if !known {
+                previous.push(onion);
+            }
+        }
+        previous.truncate(vos_wire::credentials::MAX_ONIONS);
+        let until = match previous.is_empty() {
+            true => 0,
+            false if onions == kept.onions => held
+                .state
+                .onions
+                .as_ref()
+                .map_or(0, |refreshed| refreshed.until),
+            false => now.saturating_add(ONIONS_KEPT_MS),
+        };
+        let kept = Kept { onions, ..kept };
+        held.state.home = Some(kept.clone());
+        held.state.onions = Some(Refreshed {
+            handle,
+            at: now,
+            previous: previous.clone(),
+            until,
+        });
+        self.keep(&held.light, &held.state)?;
+        self.pin_with(&kept, &previous);
+        Ok(())
     }
 
     /// What `state` keeps written to `light`'s store, in one batch.
@@ -570,8 +693,21 @@ impl<H: Host> Personal<H> {
             .store()
             .write_group_rows(state.rows())
             .map_err(store_failed)?;
-        *self.owed.1.lock().unwrap_or_else(|e| e.into_inner()) = state.source.clone();
+        self.mirror(state);
         Ok(())
+    }
+
+    /// `next` the device's state, its rows written in a flow's batch.
+    fn adopt(&self, held: &mut Held, next: State) {
+        self.mirror(&next);
+        held.state = next;
+    }
+
+    /// What an enrollment reads while a flow holds the rest, as `state`
+    /// keeps it.
+    fn mirror(&self, state: &State) {
+        *self.owed.1.lock().unwrap_or_else(|e| e.into_inner()) = state.source.clone();
+        *self.home.lock().unwrap_or_else(|e| e.into_inner()) = state.home.clone();
     }
 
     /// Whether the device holds a personal space's group.
@@ -601,7 +737,7 @@ impl<H: Host> Personal<H> {
         held.admin = Signer::new([0; 32]);
         held.group = None;
         held.pairing = None;
-        held.state = state;
+        self.adopt(held, state);
         held.light = light;
         held.generation = generation;
         drop_stores(&self.directory, generation);
@@ -683,6 +819,9 @@ impl<H: Host> Personal<H> {
         if let Some(device) = group.id() {
             self.book(light, device);
         }
+        if let Err(error) = self.refresh_onions(&mut held, now) {
+            failures.push(format!("the home's onions: {error}"));
+        }
         Ok(Passed {
             notices: pass.notices(),
             alarms: pass.alarms.clone(),
@@ -725,6 +864,12 @@ impl<H: Host> Personal<H> {
             .ok_or_else(|| failed("a confirmation is owed with no source kept"))
     }
 
+    /// The home the device's agent is at, as kept: its handle and its
+    /// onion set. Read while a flow holds the rest.
+    pub fn home(&self) -> Option<Kept> {
+        self.home.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// An enrollment made: the credential book records it.
     pub fn enrolled(&self) {
         let held = self.held();
@@ -747,16 +892,16 @@ impl<H: Host> Personal<H> {
         Ok(source)
     }
 
-    /// `request` to the space whose handle is `space`, under `purpose`.
-    fn ask(&self, space: [u8; 32], purpose: Purpose, request: &[u8]) -> Result<Vec<u8>, Error> {
+    /// `request` sent `to` a home or a space, under `purpose`.
+    fn ask(&self, to: To, purpose: Purpose, request: &[u8]) -> Result<Vec<u8>, Error> {
         self.host
-            .request(&space, purpose, request)
+            .request(&to.routes(), purpose, request)
             .map_err(Error::Unreachable)
     }
 
-    /// The node's time at `space`, under `purpose`.
-    fn time(&self, space: [u8; 32], purpose: Purpose) -> Result<u64, Error> {
-        wire::time_answer(&self.ask(space, purpose, &wire::time_request())?).map_err(failed)
+    /// The node's time at `to`, under `purpose`.
+    fn time(&self, to: To, purpose: Purpose) -> Result<u64, Error> {
+        wire::time_answer(&self.ask(to, purpose, &wire::time_request())?).map_err(failed)
     }
 
     /// A link to the agent the device's group is at.
@@ -816,7 +961,12 @@ impl<H: Host> Personal<H> {
         Ok(NewDevice {
             sync: held.light.sync_key().verifying_key().to_bytes(),
             admin,
-            class: vos_wire::personal::AdminClass::Strong,
+            class: AdminKey {
+                key: admin,
+                hardware,
+                verified_boot,
+            }
+            .class(),
             attestation: vos_wire::personal::Attestation {
                 hardware,
                 verified_boot,
@@ -824,6 +974,24 @@ impl<H: Host> Personal<H> {
             nullifier: home.nullifier(secret),
             label: label.as_bytes().to_vec(),
         })
+    }
+}
+
+/// Where a flow's request goes: the home whose handle it names, or the
+/// space an enrollment names; their routes are kept apart.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum To {
+    Home([u8; 32]),
+    Space([u8; 32]),
+}
+
+impl To {
+    /// The key of the routes it takes.
+    fn routes(self) -> [u8; 32] {
+        match self {
+            To::Home(handle) => crate::route::home(&handle),
+            To::Space(handle) => handle,
+        }
     }
 }
 
@@ -839,7 +1007,7 @@ fn link<'a, H: Host>(
 ) -> AgentLink<'a, H> {
     AgentLink::new(
         host,
-        home.home.handle,
+        To::Home(home.home.handle).routes(),
         purpose,
         Agent {
             agent: agent.0,

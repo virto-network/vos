@@ -65,6 +65,28 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
     let refused = session.ask("enroll", &other, &chrome).await.unwrap_err();
     assert_eq!(refused.code, Code::NotPinned);
 
+    // The session that showed the digests signs in nothing: its server
+    // would join the sign-in to them. A new session signs in, and pays
+    // nothing; the first pays.
+    let login = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(POLL)),
+        ("method", Value::from("login")),
+        ("arguments", Value::Bytes(Vec::new())),
+    ]);
+    let forms = chrome.shown.lock().unwrap().len();
+    let refused = session.ask("sign_in", &login, &chrome).await.unwrap_err();
+    assert_eq!(refused.code, Code::Refused);
+    assert!(refused.message.contains("new session"), "{refused:?}");
+    assert_eq!(
+        chrome.shown.lock().unwrap().len(),
+        forms,
+        "before any prompt"
+    );
+    let named = session;
+    let session = facility.session(gateway());
+    session.granted();
+
     // The tree arrives apart, from its feed; a sign-in proves on it.
     let login = object(&[
         ("agent", Value::from(AGENT)),
@@ -156,6 +178,25 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
     assert_eq!(refused.code, Code::NotPinned);
     assert_eq!(chrome.shown.lock().unwrap().len(), forms);
 
+    // The session that signed in pays nothing; the one that enrolled does.
+    let refused = session
+        .ask(
+            "pay",
+            &object(&[
+                ("agent", Value::from(AGENT)),
+                ("instance", Value::from(PAYMENTS)),
+                ("method", Value::from("transfer")),
+                ("payee", Value::from("shop")),
+                ("amount", Value::from(1u64)),
+            ]),
+            &chrome,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, Code::Refused);
+    assert!(refused.message.contains("sign-in"), "{refused:?}");
+    let session = named;
+
     // A hostile pre-fill: the server asks for 500 to "mallory"; the user
     // confirms 20 to "shop", after a first answer the form refuses.
     let pay = object(&[
@@ -213,7 +254,11 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
         ("method", Value::from("vote")),
         ("arguments", Value::Bytes(vec![2])),
     ]);
-    let refused = session.ask("sign_in", &ballot, &chrome).await.unwrap_err();
+    let refused = facility
+        .session(gateway())
+        .ask("sign_in", &ballot, &chrome)
+        .await
+        .unwrap_err();
     assert_eq!(refused.code, Code::Arguments);
 
     // A `refresh` makes the feed due again at a drawn delay (at most the
@@ -265,6 +310,66 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
             "{proof:?}"
         );
     }
+}
+
+/// A proof is made only for a session the facility carries: on one s4
+/// made itself (the enrolling one, over the clearnet), a sign-in and a
+/// payment are refused before any prompt, "reconnect over Tor", unless
+/// the user opted the space out of Tor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_not_carried_over_tor_proves_nothing() {
+    let world = world();
+    let directory = tempfile::tempdir().unwrap();
+    let source = Arc::new(Phone::new(9));
+    let facility = facility(
+        &world,
+        directory.path(),
+        Arc::clone(&source) as Arc<dyn Source>,
+    );
+    let clearnet = || vos_facility::Gateway {
+        host_key: Some(ssh_host_key()),
+        carried: false,
+        ..gateway()
+    };
+    let enrolling = facility.session(clearnet());
+    let chrome = Scripted::default();
+    chrome.will(confirm(&[]));
+    chrome.will(confirm(&[]));
+    let enrolled = enrolling
+        .ask("enroll", &enrollment(), &chrome)
+        .await
+        .unwrap();
+    let member: [u8; 32] = bytes(field(&enrolled, "member")).try_into().unwrap();
+    world.enroll(AGENT, &member);
+    let session = facility.session(clearnet());
+    session.granted();
+    let login = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(POLL)),
+        ("method", Value::from("login")),
+        ("arguments", Value::Bytes(Vec::new())),
+    ]);
+    let pay = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(PAYMENTS)),
+        ("method", Value::from("transfer")),
+        ("payee", Value::from("shop")),
+        ("amount", Value::from(1u64)),
+    ]);
+    let (forms, uses) = (
+        chrome.shown.lock().unwrap().len(),
+        *source.uses.lock().unwrap(),
+    );
+    for (operation, request) in [("sign_in", &login), ("pay", &pay)] {
+        let refused = session.ask(operation, request, &chrome).await.unwrap_err();
+        assert_eq!(refused.code, Code::Refused, "{operation}");
+        assert!(refused.message.contains("reconnect"), "{refused:?}");
+    }
+    assert_eq!(chrome.shown.lock().unwrap().len(), forms, "no prompt");
+    assert_eq!(*source.uses.lock().unwrap(), uses, "no use of the secret");
+    // Opted out of Tor, the user accepted the clearnet's session.
+    facility.net().opt_out(HANDLE, true).unwrap();
+    signed_in(&session, &login, &chrome).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -568,6 +673,8 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
         AGENT,
         &bytes(field(&enrolled, "member")).try_into().unwrap(),
     );
+    // A session apart from the enrolling one, which showed the digests.
+    let session = facility.session(gateway());
     session.granted();
     let login = object(&[
         ("agent", Value::from(AGENT)),
@@ -710,6 +817,8 @@ async fn a_window_without_this_apps_programs_is_refused_before_proving() {
         AGENT,
         &<[u8; 32]>::try_from(bytes(field(&enrolled, "member"))).unwrap(),
     );
+    // A session apart from the enrolling one, which showed the digests.
+    let session = facility.session(gateway());
     session.granted();
     let login = object(&[
         ("agent", Value::from(AGENT)),

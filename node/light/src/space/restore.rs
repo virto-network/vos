@@ -128,7 +128,7 @@ impl<H: Host> Personal<H> {
                     },
                 )
                 .map_err(failed)?;
-                held.state = next;
+                self.adopt(&mut held, next);
                 agent
             }
         };

@@ -98,6 +98,9 @@ pub enum Error {
     /// Device `by`'s regroup starts a new group of it alone: this device
     /// pairs again from it.
     Regrouped { by: u32 },
+    /// This device is a delayed admin (its admin key is not
+    /// hardware-backed): a pairing is opened on a strong admin's device.
+    DelayedAdmin,
 
     // ----- other spaces -----
     /// This device is not enrolled in that space here yet.
@@ -194,6 +197,10 @@ impl std::fmt::Display for Error {
                 f,
                 "device {by}'s regroup starts a new group of it alone: this device pairs again \
                  from it"
+            ),
+            Error::DelayedAdmin => f.write_str(
+                "this device's admin key is not hardware-backed: open the pairing on a device \
+                 whose key is",
             ),
             Error::NotEnrolled => f.write_str("this device is not enrolled in that space here yet"),
             Error::NothingOwed => f.write_str("nothing is owed there"),

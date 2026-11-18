@@ -7,7 +7,7 @@
 
 use vos_abi::{Decode, Encode};
 
-use super::{Acked, Error, Kept, Restoring, State};
+use super::{Acked, Error, Kept, Refreshed, Restoring, State};
 use crate::store::{Change, Store};
 
 /// The home the device's agent is at and the agent, written in the batch
@@ -28,6 +28,8 @@ const RESTORING: &[u8] = b"p/restoring";
 const ACKED: &[u8] = b"p/acked";
 /// The kit's calls as signed, until their evidence is posted.
 const KIT_CALLS: &[u8] = b"p/kit-calls";
+/// The home's onion set's last read from its registrar.
+const ONIONS: &[u8] = b"p/onions";
 /// Written in a store's first batch: the store is the device's from then
 /// on ([`super::Personal::open`] takes the newest store that holds it).
 const READY: &[u8] = b"p/ready";
@@ -56,6 +58,7 @@ impl State {
             restoring: row::<Restoring>(store, RESTORING)?,
             acked: row::<Acked>(store, ACKED)?,
             kit_calls: row(store, KIT_CALLS)?.unwrap_or_default(),
+            onions: row::<Refreshed>(store, ONIONS)?,
         })
     }
 
@@ -81,6 +84,7 @@ impl State {
                 KIT_CALLS.to_vec(),
                 (!self.kit_calls.is_empty()).then(|| self.kit_calls.encode()),
             ),
+            (ONIONS.to_vec(), some(&self.onions)),
         ]
     }
 

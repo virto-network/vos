@@ -271,11 +271,22 @@ pub(crate) fn create_private(directory: &Path) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", directory.display()))
 }
 
-/// `bytes` at `path`, through a sibling file renamed into place, the file
-/// and its directory synced.
+/// The sibling `path` is written through: its whole name's, so two files
+/// whose names differ by their extension alone write through two.
+fn partial(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(".partial");
+    path.with_file_name(name)
+}
+
+/// `bytes` at `path`, through a sibling file of its own renamed into
+/// place, the file and its directory synced; one write at a time in the
+/// process, so two threads writing one file never interleave in it.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
-    let partial = path.with_extension("partial");
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let partial = partial(path);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -296,6 +307,29 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// Two files whose names differ by their extension alone are written
+    /// through two siblings, and each holds what was written to it.
+    #[test]
+    fn two_files_write_through_siblings_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, text) = (
+            dir.path().join("rendezvous.state"),
+            dir.path().join("rendezvous.txt"),
+        );
+        assert_ne!(super::partial(&state), super::partial(&text));
+        std::thread::scope(|scope| {
+            for (path, byte) in [(&state, 1u8), (&text, 2u8)] {
+                scope.spawn(move || {
+                    for _ in 0..50 {
+                        super::write_private(path, &[byte; 4096]).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(std::fs::read(&state).unwrap(), vec![1; 4096]);
+        assert_eq!(std::fs::read(&text).unwrap(), vec![2; 4096]);
+    }
+
     use super::*;
 
     fn enrollment() -> Enrollment {

@@ -220,6 +220,9 @@ fn a_client_gone_during_an_operation_costs_only_that_operation() {
         .unwrap();
     world.enroll(AGENT, &enrolled.member);
     node.sync().unwrap();
+    // Signed in on a session of its own: the enrolling one showed the
+    // digests.
+    let session = node.open_session(gateway());
     let gone = node.sign_in(session, login(), client(true)).unwrap_err();
     assert_eq!(gone.code, Code::Declined);
     // A session of an earlier process names nothing here.
