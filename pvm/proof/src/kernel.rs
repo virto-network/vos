@@ -197,7 +197,15 @@ pub fn trace_kernel_within(
     gas: u64,
     max_steps: usize,
 ) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, &[], Some(input), gas, max_steps, Contract::Kernel, |_| {})
+    trace(
+        blob,
+        &[],
+        Some(input),
+        gas,
+        max_steps,
+        Contract::Kernel,
+        |_| {},
+    )
 }
 
 /// [`trace_kernel`] with the machine's memory changed by `forge` before
