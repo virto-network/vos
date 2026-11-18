@@ -1,6 +1,6 @@
 //! The Gray Paper's skip function (v0.8.0 `pvm.tex`, eq. skip): the one
-//! definition the interpreter, the predecoder, the JIT, the gas model and
-//! the proof tracer share.
+//! definition the interpreter, the predecoder, the JIT, the gas model, the
+//! loaders' validation, the compiler's peephole and the proof tracer call.
 
 /// The cap on skip: the most argument bytes an instruction is read with.
 pub const SKIP_MAX: usize = 24;
