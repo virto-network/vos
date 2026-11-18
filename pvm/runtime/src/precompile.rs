@@ -72,7 +72,7 @@ pub const WITNESS_INPUT: u64 = 0x401;
 
 /// Gas for one witness-input call, before its bytes: the agent's copy into
 /// the kernel, the work of an actor's `input` (`vos_abi::abi::price::INPUT`).
-pub const WITNESS_INPUT_GAS: crate::Gas = 2_500;
+pub const WITNESS_INPUT_GAS: crate::Gas = 2_700;
 
 /// Gas for each byte a witness-input call writes, an actor's per-byte price
 /// (`vos_abi::abi::price::PER_BYTE`).

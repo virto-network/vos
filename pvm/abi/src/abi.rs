@@ -527,11 +527,11 @@ pub mod price {
     /// agent's checks of its unit's effects.
     pub const SECTION: u64 = 3_000;
     /// The request's arguments, copied out with a `poke`.
-    pub const INPUT: u64 = 2_500;
+    pub const INPUT: u64 = 2_700;
     pub const RANDOM: u64 = 6_000;
     pub const CALLER: u64 = 6_200;
     pub const LOG: u64 = 4_000;
-    pub const SEND: u64 = 5_300;
+    pub const SEND: u64 = 5_450;
     /// A pause: its message, its await and its row in the due index.
     pub const PAUSE: u64 = 9_000;
     /// A row operation hashes its key under a hashed table's transform,
