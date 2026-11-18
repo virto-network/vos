@@ -1931,9 +1931,10 @@ skip expired items, each write deletes a few; no timer).
    `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2b` with A through the slot, the code
    its pre-shared key.
 3. **The check, before anything is handed over** [decided 2026-11-12,
-   built]: once the handshake is done, both devices show a six-digit check
-   derived from its hash, and A's user confirms that B shows the same
-   before A hands anything over; declined, A closes the slot. Someone who
+   built]: once A has read B's handshake message, both devices show a
+   six-digit check derived from the handshake's hash, and A's user confirms
+   that B shows the same before A writes anything more (the handshake's
+   last message carries A's offer); declined, A closes the slot. Someone who
    photographed the QR and answered first holds a handshake of its own,
    whose check the user's new phone does not show, so the slot grants
    nothing until the user has seen whom it pairs.
