@@ -236,6 +236,12 @@ impl App for Screens {
                     None => page,
                 }
             }
+            // A session the device's digests were shown in signs in
+            // nothing: this server would join the sign-in to them.
+            Screen::SignIn if self.digests.is_some() => page.text(
+                "This session showed your device's digests: reconnect, and sign in from the \
+                 new session, so this server cannot join the sign-in to them.",
+            ),
             Screen::SignIn => page
                 .text("Sign in with your device")
                 .button("Sign in with my device", Message::SignIn),
@@ -308,7 +314,8 @@ impl App for Screens {
             Message::Claimed(output) => match output {
                 EffectOutput::HostService(Ok(slot)) => {
                     self.status = format!(
-                        "Claimed: member at slot {}, account {}",
+                        "Claimed: member at slot {}, account {}. Pay from here; sign in from a \
+                         new session.",
                         display(&slot),
                         self.account
                     );

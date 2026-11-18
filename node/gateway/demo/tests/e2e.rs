@@ -213,6 +213,9 @@ impl Headless {
                 fingerprint,
                 application: String::new(),
                 host_key,
+                // The facility's dial plays Tor's part: the session is
+                // carried.
+                carried: true,
             },
             session: None,
             user,
@@ -455,6 +458,45 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
     assert!(claimed.starts_with("Claimed: member at slot"), "{claimed}");
     tokio::task::block_in_place(|| space.mint("alice", 50).unwrap());
 
+    // Pay: the document's fields say 999 to mallory; the user confirms 20
+    // to shop in the chrome, and that is what is paid.
+    let at = phone.click("Pay").await;
+    phone.settle(at, &["Pay from this device's account"]).await;
+    phone.type_into("To account", "mallory").await;
+    phone.type_into("Amount", "999").await;
+    user.will(confirm(&["shop", "20"]));
+    let at = phone.click("Send the payment").await;
+    let paid = phone
+        .settle(at, &["Paid", "Not done", "refused", "failed"])
+        .await;
+    assert!(paid.starts_with("Paid 20 to shop"), "{paid}");
+    let form = user.shown.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        form.fields[0].value, "mallory",
+        "the document's pre-fill, shown"
+    );
+    assert_eq!(form.fields[1].value, "999");
+    phone.settle(0, &["Balance of alice: 30"]).await;
+    let balances = tokio::task::block_in_place(|| {
+        (
+            space.balance("alice").unwrap(),
+            space.balance("shop").unwrap(),
+            space.balance("mallory").unwrap(),
+        )
+    });
+    assert_eq!(balances, (Some(30), Some(70), Some(0)));
+
+    // This session showed the device's digests: it signs in nothing, so
+    // the server cannot join the sign-in to them. A new session signs in.
+    let at = phone.click("Sign in").await;
+    phone
+        .settle(at, &["reconnect, and sign in from the new session"])
+        .await;
+    let facility = phone.facility.clone();
+    let address =
+        std::net::SocketAddr::new(phone.gateway.host.parse().unwrap(), phone.gateway.port);
+    drop(phone);
+    let mut phone = Headless::connect(address, facility, Arc::clone(&user)).await;
     // Sign in, on the path the device fetched apart from its proofs: tried
     // again while the device is still fetching it.
     let at = phone.click("Sign in").await;
@@ -484,34 +526,6 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
             .iter()
             .any(|(_, value)| value.contains("login (scope “login”)"))
     );
-
-    // Pay: the document's fields say 999 to mallory; the user confirms 20
-    // to shop in the chrome, and that is what is paid.
-    let at = phone.click("Pay").await;
-    phone.settle(at, &["Pay from this device's account"]).await;
-    phone.type_into("To account", "mallory").await;
-    phone.type_into("Amount", "999").await;
-    user.will(confirm(&["shop", "20"]));
-    let at = phone.click("Send the payment").await;
-    let paid = phone
-        .settle(at, &["Paid", "Not done", "refused", "failed"])
-        .await;
-    assert!(paid.starts_with("Paid 20 to shop"), "{paid}");
-    let form = user.shown.lock().unwrap().last().cloned().unwrap();
-    assert_eq!(
-        form.fields[0].value, "mallory",
-        "the document's pre-fill, shown"
-    );
-    assert_eq!(form.fields[1].value, "999");
-    phone.settle(0, &["Balance of alice: 30"]).await;
-    let balances = tokio::task::block_in_place(|| {
-        (
-            space.balance("alice").unwrap(),
-            space.balance("shop").unwrap(),
-            space.balance("mallory").unwrap(),
-        )
-    });
-    assert_eq!(balances, (Some(30), Some(70), Some(0)));
 }
 
 /// A client that answers the sign-in with a request of its own, for another

@@ -25,6 +25,13 @@ pub struct Service {
     session: Mutex<Option<(Session, u64)>>,
 }
 
+/// How long a claim waits for the session, held by another client's: the
+/// session is one for all clients.
+const SESSION_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long a call under the session may take: past it, the session is
+/// dropped, as its sequence's fate is unknown.
+const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn failed(message: impl Into<String>) -> HostServiceError {
     HostServiceError::new(identifier("vos.gateway.failed"), message)
 }
@@ -212,7 +219,11 @@ impl Service {
     }
 
     /// One call under the app's key, in its session: a new session when the
-    /// agent refuses the one held for good.
+    /// agent refuses the one held for good, and after any answer that does
+    /// not say whether the call ran (a frame error, an answer that does not
+    /// decode, a call past [`CALL_DEADLINE`]), so no later call reuses a
+    /// sequence that may be taken. Waits for the session at most
+    /// [`SESSION_WAIT`].
     async fn call(
         &self,
         instance: u32,
@@ -221,7 +232,9 @@ impl Service {
         errors: Errors,
     ) -> Result<Vec<u8>, HostServiceError> {
         let space = self.space().await?;
-        let mut held = self.session.lock().await;
+        let mut held = tokio::time::timeout(SESSION_WAIT, self.session.lock())
+            .await
+            .map_err(|_| failed("the app is busy with another claim: try again"))?;
         for _ in 0..2 {
             let (session, sequence) = match *held {
                 Some(kept) => kept,
@@ -236,21 +249,31 @@ impl Service {
                     (session, 1)
                 }
             };
-            let body = answered(
-                self.app
-                    .call(
-                        self.agent(),
-                        &space.identity,
-                        session,
-                        sequence,
-                        InstanceId(instance),
-                        method(name),
-                        arguments.clone(),
-                    )
-                    .await,
-            )?;
-            let answer = Response::decode_exact(&body)
-                .ok_or_else(|| failed("an answer that does not decode"))?;
+            let called = self.app.call(
+                self.agent(),
+                &space.identity,
+                session,
+                sequence,
+                InstanceId(instance),
+                method(name),
+                arguments.clone(),
+            );
+            let answer = tokio::time::timeout(CALL_DEADLINE, called)
+                .await
+                .map_err(|_| failed("the node did not answer in time"))
+                .and_then(answered)
+                .and_then(|body| {
+                    Response::decode_exact(&body)
+                        .ok_or_else(|| failed("an answer that does not decode"))
+                });
+            let answer = match answer {
+                Ok(answer) => answer,
+                Err(error) => {
+                    // The call may have run under this sequence.
+                    *held = None;
+                    return Err(error);
+                }
+            };
             match answer {
                 Response::Ran { .. } => {
                     *held = Some((session, sequence + 1));
