@@ -39,6 +39,7 @@ pub(crate) mod probe;
 pub mod signal;
 mod standard;
 pub(crate) mod write_tracking;
+pub use memory::{OWN_PROTECTION_RUNS, PROCESS_PROTECTION_RUNS, PROTECTION_RUNS};
 pub(crate) use standard::run_standard;
 
 use crate::ExitReason;
@@ -1357,7 +1358,7 @@ mod tests {
     fn a_fault_outside_a_guest_access_is_a_backend_failure() {
         let (control, machine) = run_wild(None);
         assert_eq!(control, Ok(Some(ExitReason::Panic)));
-        assert!(!machine.memory().tracking_failed());
+        assert!(!machine.memory().retired());
         for wild in [
             codegen::Wild::Untrapped,
             codegen::Wild::TrappedBelow,
@@ -1366,7 +1367,7 @@ mod tests {
         ] {
             let (outcome, machine) = run_wild(Some(wild));
             assert!(outcome.is_err(), "{wild:?}: {outcome:?}");
-            assert!(machine.memory().tracking_failed(), "{wild:?}");
+            assert!(machine.memory().retired(), "{wild:?}");
             assert_eq!(
                 machine.registers, [7; 13],
                 "{wild:?}: no guest state leaves"

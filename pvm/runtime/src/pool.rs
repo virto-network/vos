@@ -512,7 +512,7 @@ impl PooledMachine {
     /// Return the machine to a fresh build's state. False when it cannot
     /// be: its backend failed, so it must be dropped.
     fn reset(&mut self) -> bool {
-        if self.vm.memory().tracking_failed() {
+        if self.vm.memory().retired() {
             return false;
         }
         let permissions_changed =
@@ -528,7 +528,7 @@ impl PooledMachine {
         }
         self.vm.reset_state(0);
         self.permissions_revision = self.vm.memory().permissions_revision();
-        !self.vm.memory().tracking_failed()
+        !self.vm.memory().retired()
     }
 
     /// Whether a reset machine is worth keeping idle, claiming its kernel

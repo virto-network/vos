@@ -1199,7 +1199,9 @@ impl Memory {
         let FlatBytes::Native(bytes) = &mut memory.bytes else {
             return Ok(None);
         };
-        bytes.sync_permissions(&mut memory.perms)?;
+        if !bytes.sync_permissions(&mut memory.perms)? {
+            return Ok(None);
+        }
         // Native stores bypass checked host writes. Invalidate cached value
         // commitments at every execution boundary, including fault boundaries.
         memory.value_revision = memory
@@ -1410,16 +1412,17 @@ impl Memory {
         }
     }
 
-    /// Whether native write tracking has failed: the memory reports every
-    /// page from then on, and must not be reused.
-    pub(crate) fn tracking_failed(&self) -> bool {
+    /// Whether this memory must not be reused: its native write tracking
+    /// failed (it reports every page from then on), or its native window was
+    /// retired and it runs on the interpreter for good.
+    pub(crate) fn retired(&self) -> bool {
         #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
         if let Memory::Flat(FlatMem {
             bytes: FlatBytes::Native(bytes),
             ..
         }) = self
         {
-            return bytes.tracking_failed();
+            return bytes.retired();
         }
         false
     }
