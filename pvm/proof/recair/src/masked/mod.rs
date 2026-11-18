@@ -502,7 +502,9 @@ where
     };
     for attempt in 0..MAX_ATTEMPTS {
         let mut stream = rng.attempt(&witness, attempt)?;
-        if let Some((proof, r1)) = prove_once::<MC, C>(&setup, &preprocessed, &mut stream)? {
+        let proved = prove_once::<MC, C>(&setup, &preprocessed, &mut stream);
+        rng::wipe_stream(&mut stream);
+        if let Some((proof, r1)) = proved? {
             let stats = MaskStats {
                 attempts: attempt + 1,
                 rank_check: r1.took,

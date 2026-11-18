@@ -1397,9 +1397,19 @@ impl TreeKeeper {
   read links to no client key; a proof uses the path `TreeKeeper`
   computes, and no read precedes it.
 - **No logging of witnesses,** and no `seeded-masks` feature in a
-  production build (`just check-no-seeded-masks`). The client's bridge zero-fills its `byte[]` of `o` once
-  the library has copied it; the library zeroizes its copies of `o` and
-  `s`, and a kernel's arguments once its run is proved.
+  production build (`just check-no-seeded-masks`). The client's bridge
+  zero-fills its `byte[]` of `o` once the library has copied it; the
+  library zeroizes its own copies of `o` and `s`, and its copy of a
+  kernel's arguments once its run is proved. The masked prover wipes, by
+  volatile writes: each attempt's operating-system bytes, its seed and
+  its ChaCha20 stream; each column's mask seed and stream, and the salt
+  and `R` columns' seeds and streams; the unmasked main and interaction
+  coefficients once they are masked; and the run's main trace columns
+  when its trace is dropped. It does not wipe the run's side note (its
+  steps, its memory images, the witness bytes its tracer read), the
+  copies inside the commitment scheme (Stwo's: the masked columns and
+  their evaluations, the composition polynomial), nor the hasher's state
+  the seed is derived in: they are freed unwiped.
 - **Built** (`node/light`, its `SECURITY.md`): as sketched; the masks
   always the operating system's, a `seeded-masks` test seam
   (`Prover::seeded`) for the phone bench's byte comparison alone;

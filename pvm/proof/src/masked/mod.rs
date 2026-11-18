@@ -50,7 +50,7 @@ mod trace;
 #[cfg(feature = "prover")]
 pub use trace::{
     ChipTraces, DeviceSizes, Evaluations, MaskedDeviceTrace, device_preprocessed,
-    masked_device_trace,
+    masked_device_trace, wipe_column,
 };
 
 /// A chip's evaluation as the masked segment proves it: the chip's

@@ -21,7 +21,8 @@ where
     let widths: Vec<usize> = (0..setup.log_sizes.len())
         .map(|component| (setup.main)(component).len() + BLIND_COLUMNS)
         .collect();
-    let mut seeds = layout::seeds(widths.iter().sum(), rng).into_iter();
+    let mut seeds = layout::seeds(widths.iter().sum(), rng);
+    let mut drawn = 0;
     let mut masked = Vec::with_capacity(widths.iter().sum());
     for (component, ((&value, &log_size), &log_mask_rows)) in blinding
         .iter()
@@ -30,22 +31,30 @@ where
         .enumerate()
     {
         let domain = CanonicCoset::new(log_size).circle_domain();
-        let own = SimdBackend::interpolate_columns(
+        let mut own = SimdBackend::interpolate_columns(
             (setup.main)(component)
                 .into_iter()
                 .map(|column| CircleEvaluation::new(domain, column.clone()))
                 .collect(),
             setup.twiddles,
         );
-        let blinding = blinding_polys(value, log_size, setup.twiddles);
+        let mut blinding = blinding_polys(value, log_size, setup.twiddles);
         let columns: Vec<(&CircleCoefficients<SimdBackend>, u32)> = own
             .iter()
             .chain(&blinding)
             .map(|column| (column, log_mask_rows))
             .collect();
-        let seeds: Vec<[u8; 32]> = seeds.by_ref().take(columns.len()).collect();
-        masked.extend(layout::mask_with(&columns, seeds, setup.layouts)?);
+        let column_seeds = seeds[drawn..drawn + columns.len()].to_vec();
+        drawn += columns.len();
+        let component_masked = layout::mask_with(&columns, column_seeds, setup.layouts);
+        rng::wipe_polys(&mut own);
+        rng::wipe_polys(&mut blinding);
+        if component_masked.is_err() {
+            rng::wipe_seeds(&mut seeds);
+        }
+        masked.extend(component_masked?);
     }
+    rng::wipe_seeds(&mut seeds);
     salts::commit_salted(
         scheme,
         masked,
@@ -103,8 +112,10 @@ where
     );
     let columns: Vec<(&CircleCoefficients<SimdBackend>, u32)> =
         polys.iter().zip(column_rows).collect();
-    let masked = layout::mask_columns(&columns, setup.layouts, rng)?;
-    drop(polys);
+    let masked = layout::mask_columns(&columns, setup.layouts, rng);
+    let mut polys = polys;
+    rng::wipe_polys(&mut polys);
+    let masked = masked?;
     channel.mix_felts(&claimed_sums);
     salts::commit_salted(
         scheme,
@@ -143,7 +154,7 @@ where
         ));
     }
     let mut polys = composition_poly.into_coordinate_polys().to_vec();
-    let seeds: Vec<[u8; 32]> = (0..setup.masking.fri_mask_columns)
+    let mut seeds: Vec<[u8; 32]> = (0..setup.masking.fri_mask_columns)
         .map(|_| rng.r#gen())
         .collect();
     for seed in &seeds {
@@ -151,9 +162,10 @@ where
     }
     polys.extend(
         seeds
-            .into_iter()
-            .map(|seed| salts::uniform_poly(seed, setup.composition)),
+            .iter()
+            .map(|&seed| salts::uniform_poly(seed, setup.composition)),
     );
+    rng::wipe_seeds(&mut seeds);
     salts::commit_salted(
         scheme,
         polys,

@@ -54,6 +54,7 @@ pub(crate) fn uniform_column(seed: [u8; 32], log_size: u32) -> BaseColumn {
                     *word = rng.next_u32() & P;
                 }
             }
+            super::rng::wipe_stream(&mut rng);
         });
     BaseColumn { data, length }
 }
@@ -82,15 +83,16 @@ pub(crate) fn commit_salted<MC: MerkleChannel>(
         scheme.store_polynomials_coefficients,
         &scheme.base_column_pool,
     );
-    let seeds: Vec<[u8; 32]> = (0..salt_columns).map(|_| rng.r#gen()).collect();
+    let mut seeds: Vec<[u8; 32]> = (0..salt_columns).map(|_| rng.r#gen()).collect();
     for seed in &seeds {
         super::drawn::note("a salt column's seed", seed);
     }
     let domain = CanonicCoset::new(lifting_log_size).circle_domain();
     let salts: Vec<BaseColumn> = seeds
-        .into_par_iter()
-        .map(|seed| uniform_column(seed, lifting_log_size))
+        .par_iter()
+        .map(|&seed| uniform_column(seed, lifting_log_size))
         .collect();
+    super::rng::wipe_seeds(&mut seeds);
     polynomials.extend(salts.into_iter().map(|values| {
         Poly::new(
             None,

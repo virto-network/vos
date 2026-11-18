@@ -39,6 +39,28 @@ pub struct ChipTraces {
     cpu: Option<crate::chips::ProgramCpuChip>,
 }
 
+/// `column`'s values overwritten with zeros by volatile writes, which the
+/// compiler keeps though nothing reads them after: a witness's column, once
+/// it is no longer needed. The allocator gets the zeros back.
+pub fn wipe_column(column: &mut BaseColumn) {
+    use stwo::prover::backend::simd::m31::PackedBaseField;
+    for packed in &mut column.data {
+        // SAFETY: `packed` is a valid, aligned, exclusive reference.
+        unsafe { core::ptr::write_volatile(packed, PackedBaseField::zero()) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Each chip's main columns, the witness, wiped when the traces are
+/// dropped ([`wipe_column`]); the preprocessed columns are the program's.
+impl Drop for ChipTraces {
+    fn drop(&mut self) {
+        for trace in &mut self.traces {
+            trace.original_trace.iter_mut().for_each(wipe_column);
+        }
+    }
+}
+
 /// A run's chips, traced as the device's segment (`crate::device`).
 pub struct MaskedDeviceTrace {
     /// The chips, as a device mask.

@@ -194,15 +194,15 @@ pub(crate) fn seeds(n: usize, rng: &mut ChaCha20Rng) -> Vec<[u8; 32]> {
 /// `h` from its seed in `seeds`, in parallel.
 pub(crate) fn mask_with(
     polys: &[(&CircleCoefficients<SimdBackend>, u32)],
-    seeds: Vec<[u8; 32]>,
+    mut seeds: Vec<[u8; 32]>,
     layouts: &[Arc<MaskLayout>],
 ) -> Result<Vec<CircleCoefficients<SimdBackend>>, CircuitError> {
     if seeds.len() != polys.len() {
         return Err(CircuitError::Masking("a seed for each column"));
     }
-    polys
+    let masked = polys
         .par_iter()
-        .zip(seeds)
+        .zip(&mut seeds)
         .map(|(&(poly, log_mask_rows), seed)| {
             let layout = layouts
                 .iter()
@@ -210,9 +210,15 @@ pub(crate) fn mask_with(
                     layout.log_size == poly.log_size() && layout.log_mask_rows == log_mask_rows
                 })
                 .ok_or(CircuitError::Masking("a column of a size with no layout"))?;
-            layout.mask(poly, &mut ChaCha20Rng::from_seed(seed))
+            let mut stream = ChaCha20Rng::from_seed(*seed);
+            super::rng::wipe(seed);
+            let masked = layout.mask(poly, &mut stream);
+            super::rng::wipe_stream(&mut stream);
+            masked
         })
-        .collect()
+        .collect();
+    super::rng::wipe_seeds(&mut seeds);
+    masked
 }
 
 /// Each of `polys`, with its `log2 h`, masked by its size's layout at that
