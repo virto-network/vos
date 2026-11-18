@@ -7,6 +7,12 @@
 //! cmp_sub_result emit from here too.
 //!
 //! Lookup tuple (17 limbs): val_b\[8\] + val_d\[8\] + cmp_lt_flag.
+//!
+//! The operands are not range-checked here: each is a register's value
+//! (bytes, as every register write is: `cpu::constraints::memory::result_bytes`,
+//! `tests/gates/register_writes_gate.rs`), an immediate of the program's
+//! preprocessed code, a table's entry, or the CPU's bytes over these (a
+//! low word and its sign's extension).
 
 use crate::prelude::*;
 use num_traits::One;

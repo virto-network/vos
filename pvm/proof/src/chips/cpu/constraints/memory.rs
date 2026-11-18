@@ -59,7 +59,10 @@ pub(in crate::chips::cpu) fn address_validity<E: EvalAtRow>(eval: &mut E, row: &
     }
 }
 
-/// Range256 checks of the result bytes.
+/// Range256 checks of the result bytes: with the boundary chips' initial
+/// writes, the only register writes, so every register read is bytes. The
+/// multiply, divide and compare chips rest on it and do not check their
+/// operands (`tests/gates/register_writes_gate.rs` lists every producer).
 pub(in crate::chips::cpu) fn result_bytes<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
@@ -94,7 +97,9 @@ pub(in crate::chips::cpu) fn memory_access<E: EvalAtRow>(
     // MemoryChip ledger's canonical address and the memory logup wouldn't
     // balance. The carries telescope (numeric address is always
     // `base + byte_idx`), and matching the canonical ledger bytes pins
-    // them; the booleanity constraints below keep them in {0,1}.
+    // them; the booleanity constraints below keep them in {0,1}. The word
+    // ledger's group test by 16-bit halves rests on these limbs being bytes
+    // (`word_memory`).
     for byte_idx in 0..WORD_SIZE {
         let byte_offset = E::F::from(BaseField::from(byte_idx as u32));
         let c1 = row.mem_byte_addr_carry1[byte_idx].clone();

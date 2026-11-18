@@ -35,5 +35,6 @@ mod operand_binding_gate;
 mod page_permission_gate;
 mod register_ledger_gate;
 mod register_ledger_negative;
+mod register_writes_gate;
 mod witness_input_gate;
 mod word_ledger_gate;

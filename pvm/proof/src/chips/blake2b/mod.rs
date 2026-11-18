@@ -154,6 +154,9 @@ impl BuiltInComponent for Blake2bChip {
         m_addr.add_range_lookups(eval, range256_lookup, &init_gate);
 
         // ── Memory-access tuples (addr[4], value, ts[8], is_write, is_closing) ──
+        // Their address limbs are bytes by the addresses' carry identity and
+        // range checks above, which the word ledger's group test by 16-bit
+        // halves rests on (`word_memory`).
         let f_zero = E::F::zero();
         let mut access = |addr: [E::F; 4], value: E::F, is_write: E::F, mult: &E::F| {
             let mut tuple: Vec<E::F> = Vec::with_capacity(15);
