@@ -3,7 +3,7 @@
 # check-blobs` checks it (the justfile's `_blob-hashes` says which blobs).
 d35498cde318e9a4c9cda826d5058c611646f24d2ebaf101ad1bbb9b6181d9ca  target/riscv64em-vos/release/final-verify.elf
 a6129d9755bb9df24ffa7b25158ad0cfd910305a85164421fe8127baf0489ddd  target/riscv64em-vos/release/statement-service.elf
-9d58077633ff7bf1b5b0c44c686ab36c016a3fd2d842aa700aaa3f30a6210dde  agent/programs/target/riscv64em-vos/release/vos-agent.elf
+53fc6bde8425b3779539ccea1b2a00cf8bb2fdf66b1871bba6377cc368d10695  agent/programs/target/riscv64em-vos/release/vos-agent.elf
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 103a4c6edaced84091565a8d49526d464848ccc83fb51b03df6b95296fd853df  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
 2193af90c3f817fa1a094cc723b2e04c7b3ce16be414156d3be1ca47f6a1b922  agent/programs/target/riscv64em-vos/release/vos-personal.elf
@@ -43,6 +43,6 @@ f7208f6573045180e7d29832f887b32e6448a32d8e3d20a64d05a35f731443f5  agent/test-act
 0c034f372c3c394d1bfd66f757d5fe8d2c353e8de503c4698e8e1495164b55a4  agent/test-actors/target/riscv64em-vos/release/shard.elf
 ffc8287fb43a3dd63cb1c736ffa0df687fd09a4263255e697955c4d0c5033536  agent/test-actors/target/riscv64em-vos/release/shop.elf
 b8bdd4c909f8631c39e3ed28857a870aa0879fb574d53e906fe00f9f2a137919  agent/test-actors/target/riscv64em-vos/release/tainted.elf
-a2fc98a29b354a5004bea8262b968c8ba6ca86176b1c54f474ef0921f1d6018f  agent/test-actors/target/riscv64em-vos/release/tracker.elf
+39244cc7b6fc435da54cc06b36c8542169c345baf31f23ecdcf305c38f823538  agent/test-actors/target/riscv64em-vos/release/tracker.elf
 3765eff5025c0247ab1d81745d2d90b56f5d96a3cc4e6d7f09321eeca2bf0d60  agent/test-actors/target/riscv64em-vos/release/wide.elf
 0e7cf9fdaba7457d22b21da239349fcef0cdcd8f633f6b5383a047c6d822df07  agent/test-actors/target/riscv64em-vos/release/window.elf
