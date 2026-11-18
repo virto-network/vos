@@ -274,7 +274,9 @@ pub fn composition_point(
 /// The sample points, tree by tree: the components' masks at the AIR's level
 /// (none for a salt column); the composition's coordinates at
 /// [`composition_point`], `R`'s columns at `z`, none for the composition
-/// tree's salts. `None` when the set's masks do not fit its trees.
+/// tree's salts. `None` when the set's masks do not fit its trees, or a
+/// column is sampled at more than two points: the size binding gives a
+/// twice-sampled column its periodicity value, and a third point none.
 pub fn sample_points(
     set: &impl MaskedComponents,
     oods_point: CirclePoint<SecureField>,
@@ -299,7 +301,7 @@ pub fn sample_points(
         n_preprocessed_columns: n_preprocessed,
     }
     .mask_points(oods_point, air_level, false);
-    if points.len() > AIR_TREES {
+    if points.len() > AIR_TREES || points.iter().flatten().any(|column| column.len() > 2) {
         return None;
     }
     points.resize(AIR_TREES, Vec::new());

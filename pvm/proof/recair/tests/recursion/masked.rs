@@ -96,6 +96,21 @@ fn refusal(verify: impl FnOnce() -> Result<PublicWords, Error>) -> Result<Error,
     }
 }
 
+/// A masking without salts pins no format: its trees could stand below the
+/// composition's height, which the lifted Merkle verifier meets with a
+/// panic on a hostile proof.
+#[test]
+fn a_masking_without_salts_pins_no_format() {
+    let mut entry = format::MASKED_WRAP;
+    let mut masking = entry.masking.expect("a masked format");
+    masking.salt_columns = 0;
+    entry.masking = Some(masking);
+    assert_eq!(
+        verifier_format(&entry, &vos_pvm_final_verifier::LOG_SIZES, &layout()),
+        None
+    );
+}
+
 /// The verifier's constants are the registry's entry for 39, field for
 /// field: the format as the verifier pins it from the built wrap set, its
 /// status, its bytes and its circuit's root; FRI's rounds the security

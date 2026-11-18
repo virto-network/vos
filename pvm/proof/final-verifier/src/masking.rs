@@ -112,14 +112,26 @@ pub fn shape_of(
 /// ([`MaskedFormat`]): its number, its
 /// configuration and interaction PoW, its masking, `log_sizes`, and the
 /// trees' widths and DEEP values of the component set laid out as `layout`
-/// at them. `None` for an unmasked format or a set whose masks do not fit
-/// its trees.
+/// at them. `None` for an unmasked format, a masking without salts, a set
+/// whose masks do not fit its trees, or one whose main or interaction tree
+/// stands below the composition tree's height: Stwo's lifted Merkle
+/// verifier takes every tree to that height, and a lower one makes it panic
+/// on a hostile proof instead of refusing it.
 pub fn verifier_format<'a>(
     format: &Format,
     log_sizes: &'a [u32],
     layout: &impl MaskedComponents,
 ) -> Option<MaskedFormat<'a>> {
     let masking = format.masking?;
+    if masking.salt_columns == 0 {
+        return None;
+    }
+    let committed = committed_log_sizes(layout, &masking)?;
+    let height = |tree: usize| committed.get(tree)?.iter().copied().max();
+    let composition = height(TREES - 1)?;
+    if height(1)? < composition || height(2)? < composition {
+        return None;
+    }
     let (tree_widths, deep_values) = shape_of(layout, &masking)?;
     Some(MaskedFormat {
         number: format.number,
