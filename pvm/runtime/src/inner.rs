@@ -17,8 +17,9 @@ use crate::{ExitReason, Gas, PVM_PAGE_SIZE, PVM_REGISTER_COUNT};
 /// Maximum live inner machines in one Refine invocation.
 pub const MAX_INNER_MACHINES: usize = 63;
 
-/// Number of pages in the 32-bit PVM address space.
-pub const INNER_ADDRESS_PAGES: usize = (1u64 << 32) as usize / PVM_PAGE_SIZE as usize;
+/// Number of pages in the 32-bit PVM address space, 2^20, whatever the
+/// host's pointer width (the division is in u64, before any narrowing).
+pub const INNER_ADDRESS_PAGES: u32 = ((1u64 << 32) / PVM_PAGE_SIZE as u64) as u32;
 
 /// The first page an inner machine may map.
 pub const INNER_FIRST_MAPPABLE_PAGE: u32 = 16;
@@ -563,7 +564,7 @@ impl InnerMachines {
     ) -> Result<(), InnerError> {
         let machine = self.machines.get_mut(&id).ok_or(InnerError::Unknown)?;
         let end = first.checked_add(count).ok_or(InnerError::Invalid)?;
-        if first < INNER_FIRST_MAPPABLE_PAGE || end as usize >= INNER_ADDRESS_PAGES {
+        if first < INNER_FIRST_MAPPABLE_PAGE || end >= INNER_ADDRESS_PAGES {
             return Err(InnerError::Invalid);
         }
 

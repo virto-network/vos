@@ -873,3 +873,20 @@ fn a_vos_host_bounds_the_pages_an_invocation_maps() {
             .unwrap();
     }
 }
+
+/// The address space has 2^20 pages on every host, a 32-bit one too.
+#[test]
+fn the_address_space_has_two_to_the_twenty_pages() {
+    assert_eq!(INNER_ADDRESS_PAGES, 1 << 20);
+    let mut machines = InnerMachines::new();
+    let id = machines.create(&host_then_trap(), 0).unwrap();
+    let last = INNER_ADDRESS_PAGES - 1;
+    assert_eq!(
+        machines.pages(id, last - 1, 1, PageMode::AllocateReadOnly),
+        Ok(())
+    );
+    assert_eq!(
+        machines.pages(id, last, 1, PageMode::AllocateReadOnly),
+        Err(InnerError::Invalid)
+    );
+}
