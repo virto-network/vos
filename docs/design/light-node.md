@@ -3790,7 +3790,7 @@ device's crates faster); Q9's size argument for it is small.
   leaves first when the device holds another personal space, or this
   one's while the set no longer holds it live (the agent admits its key
   no more), and is refused while the set holds it live. The light node's
-  store is laid out anew (`LAYOUT` 7): a phone of an earlier build clears
+  store is laid out anew (`LAYOUT` 8): a phone of an earlier build clears
   the facility's data and claims or pairs again.
 - **One engine, the flows in `vos-light`** [built, `vos_light::space`]:
   every flow is `vos_light::space::Personal`'s, over a `Host` (requests,

@@ -26,6 +26,8 @@ const LABEL: &[u8] = b"p/label";
 const RESTORING: &[u8] = b"p/restoring";
 /// A joiner's acknowledgement, until it is put in its slot.
 const ACKED: &[u8] = b"p/acked";
+/// The kit's calls as signed, until their evidence is posted.
+const KIT_CALLS: &[u8] = b"p/kit-calls";
 /// Written in a store's first batch: the store is the device's from then
 /// on ([`super::Personal::open`] takes the newest store that holds it).
 const READY: &[u8] = b"p/ready";
@@ -53,6 +55,7 @@ impl State {
             next_admin: row(store, NEXT_ADMIN)?.unwrap_or_default(),
             restoring: row::<Restoring>(store, RESTORING)?,
             acked: row::<Acked>(store, ACKED)?,
+            kit_calls: row(store, KIT_CALLS)?.unwrap_or_default(),
         })
     }
 
@@ -74,6 +77,10 @@ impl State {
             ),
             (RESTORING.to_vec(), some(&self.restoring)),
             (ACKED.to_vec(), some(&self.acked)),
+            (
+                KIT_CALLS.to_vec(),
+                (!self.kit_calls.is_empty()).then(|| self.kit_calls.encode()),
+            ),
         ]
     }
 

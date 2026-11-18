@@ -681,8 +681,8 @@ fn a_delayed_admins_add_waits_its_delay() {
 /// signs the replacement, the new key signs from its maturity, the old one
 /// no more, and the device's next commit renews its leaf to the new key,
 /// which every device confirms, and the commits after it. A replacement
-/// whose evidence comes after its maturity: the new key's commit waits for
-/// it on every device, refused by none, and is confirmed once it comes.
+/// whose evidence never comes is cancelled at its due time: its key signs
+/// nothing.
 #[test]
 fn a_replaced_admin_key_signs_and_renews_its_leaf() {
     let (mut home, mut phones) = seasoned(3);
@@ -729,9 +729,10 @@ fn a_replaced_admin_key_signs_and_renews_its_leaf() {
     }
     agree(&mut all(&mut phones), epoch + 2);
 
-    // The evidence after the maturity.
+    // A replacement whose evidence never comes is cancelled at its due
+    // time, as every device closes it: its key signs nothing.
     let late = new_admin(2);
-    let (index, message, signature) = unevidenced(
+    let (index, _, _) = unevidenced(
         &mut home,
         &phones[0].admin,
         "replace",
@@ -742,27 +743,21 @@ fn a_replaced_admin_key_signs_and_renews_its_leaf() {
         phone.alive(&mut home);
     }
     signed(&settle(&mut home, &mut all(&mut phones)));
+    assert!(matches!(
+        home.query::<vos_wire::personal::Operation>(
+            phones[0].sync_key(),
+            "operation",
+            index.encode()
+        )
+        .unwrap()
+        .state,
+        vos_wire::personal::OpState::Cancelled {
+            why: vos_wire::personal::Cancel::Unevidenced,
+            ..
+        }
+    ));
     phones[1].admin = late;
-    let epoch = phones[0].group().confirmed() + 1;
-    phones[1].update(&mut home).unwrap();
-    let events = settle(&mut home, &mut all(&mut phones));
-    for events in &events {
-        assert!(
-            !events.iter().any(|event| matches!(
-                event,
-                Event::Alarm(Alarm::Refused { .. } | Alarm::Unsigned { .. })
-                    | Event::Confirmed { .. }
-            )),
-            "it waits: {events:?}"
-        );
-    }
-    post(&mut home, &phones[0].sync, index, message, signature, None);
-    let events = settle(&mut home, &mut all(&mut phones));
-    signed(&events);
-    for events in &events {
-        assert!(events.contains(&Event::Confirmed { epoch }), "{events:?}");
-    }
-    agree(&mut all(&mut phones), epoch);
+    assert_eq!(phones[1].update(&mut home), Err(PersonalError::NotAdmitted));
 }
 
 /// E29: a replacement contested and resolved upheld, by the kit, still

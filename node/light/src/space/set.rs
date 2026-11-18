@@ -450,21 +450,33 @@ impl<H: Host> Personal<H> {
     /// it alone.
     pub fn update(&self, prompts: &dyn Prompts) -> Result<(), Error> {
         let mut held = self.held();
-        // What fell due settled first, so the log shows every matured
-        // removal the commit must carry.
-        self.wake(&mut held)?;
-        self.settle(&mut held)?;
-        self.follow(&mut held)?;
-        self.drop_unsent(&mut held)?;
-        let now = self.host.now();
-        let group = held.group.as_mut().ok_or(Error::NoSpace)?;
-        let prepared = match group.regrouper() {
-            Some(regrouper) if Some(regrouper) == group.id() => group.regroup(now),
-            Some(regrouper) => return Err(Error::Regrouped { by: regrouper }),
-            None => group.commit(None, now),
+        // A removal that matured between the reading and the call is
+        // refused as the commit's to carry: read again, commit once more.
+        for again in [true, false] {
+            // What fell due settled first, so the log shows every matured
+            // removal the commit must carry.
+            self.wake(&mut held)?;
+            self.settle(&mut held)?;
+            self.follow(&mut held)?;
+            self.drop_unsent(&mut held)?;
+            let now = self.host.now();
+            let group = held.group.as_mut().ok_or(Error::NoSpace)?;
+            let prepared = match group.regrouper() {
+                Some(regrouper) if Some(regrouper) == group.id() => group.regroup(now),
+                Some(regrouper) => return Err(Error::Regrouped { by: regrouper }),
+                None => group.commit(None, now),
+            }
+            .map_err(failed)?;
+            match self.commit(&mut held, prompts, &prepared) {
+                Err(Error::AgentRefused(
+                    PersonalError::MissingRemoval(_) | PersonalError::NotMatured(_),
+                )) if again => {}
+                done => {
+                    done?;
+                    break;
+                }
+            }
         }
-        .map_err(failed)?;
-        self.commit(&mut held, prompts, &prepared)?;
         for _ in 0..3 {
             self.follow(&mut held)?;
         }
@@ -472,8 +484,10 @@ impl<H: Host> Personal<H> {
     }
 
     /// The admin call of `method` with `arguments`, signed by the admin key
-    /// at its prompt, its evidence posted under the sync key with `r2`
-    /// beside it.
+    /// at its prompt and held in the group before it leaves, its evidence
+    /// posted under the sync key with `r2` beside it: an evidence post that
+    /// fails on the way is posted again by the next pass, from the held
+    /// call ([`crate::group::DeviceGroup::sending`]).
     fn operate(
         &self,
         held: &mut Held,
@@ -486,20 +500,45 @@ impl<H: Host> Personal<H> {
         let admin = held.state.admin.ok_or(Error::NoSpace)?.0;
         let mut signer = held.admin;
         let sign = admin_sign(prompts, admin);
-        let recorded = self.with_link(held, Purpose::Personal, |link, _| {
+        let recorded = self.with_link(held, Purpose::Personal, |link, held| {
+            let group = held.group.as_mut().ok_or(Error::NoSpace)?;
+            // A call signed again after `Settling` replaces the one before,
+            // which the agent did not take.
+            let mut previous: Option<Vec<u8>> = None;
+            let mut hold = |message: &[u8], signature: &[u8; 64]| {
+                if let Some(previous) = previous.replace(message.to_vec()) {
+                    group.unsent(&previous).map_err(|error| error.to_string())?;
+                }
+                group
+                    .sending(message.to_vec(), *signature, r2)
+                    .map_err(|error| error.to_string())
+            };
             let called = link
-                .settled(&mut signer, &sign, method, arguments)
+                .settled_held(&mut signer, &sign, method, arguments, &mut hold)
                 .map_err(unreached)?;
-            let recorded = answer::<Recorded>(&called.outcome)
-                .map_err(failed)?
-                .map_err(agent_refused)?;
-            evidence(
+            let recorded = match answer::<Recorded>(&called.outcome).map_err(failed)? {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    group.unsent(&called.message).map_err(failed)?;
+                    return Err(agent_refused(error));
+                }
+            };
+            group
+                .made(recorded.index, &called.message)
+                .map_err(failed)?;
+            match evidence(
                 link,
                 recorded.index,
                 (&called.message, &called.signature),
                 Attached { welcome: None, r2 },
-            )?;
-            Ok(recorded)
+            ) {
+                // Held: the next pass posts it.
+                Ok(()) | Err(Error::Unreachable(_)) => Ok(recorded),
+                Err(error) => {
+                    group.evidence_refused(recorded.index).map_err(failed)?;
+                    Err(error)
+                }
+            }
         });
         held.admin = signer;
         self.posted(held, recorded?)
@@ -551,6 +590,9 @@ impl<H: Host> Personal<H> {
             match answer::<Candidacy>(&called.outcome).map_err(failed)? {
                 Ok(candidacy) => {
                     group.called(candidacy.at);
+                    group
+                        .made(candidacy.index, &called.message)
+                        .map_err(failed)?;
                     let Event::Evidence {
                         index,
                         message,

@@ -98,10 +98,6 @@ impl DeviceGroup {
                 events.push(Event::Alarm(Alarm::View { index: next }));
             }
         }
-        let Some(at) = self.state.made.iter().position(|made| made.index == index) else {
-            return;
-        };
-        let made = &self.state.made[at];
         let call = match &entry.body {
             Body::Operation { call, .. }
             | Body::Candidate { call, .. }
@@ -110,6 +106,21 @@ impl DeviceGroup {
             | Body::Resolve { call, .. } => Some(call),
             _ => None,
         };
+        // A call held before it left and never answered (a kill, a lost
+        // answer) is found here: its evidence is posted from now on.
+        if let Some(call) = call
+            && let Some(sent) = self
+                .state
+                .sent
+                .iter_mut()
+                .find(|sent| sent.index.is_none() && sent.is(call))
+        {
+            sent.index = Some(index);
+        }
+        let Some(at) = self.state.made.iter().position(|made| made.index == index) else {
+            return;
+        };
+        let made = &self.state.made[at];
         let held = call.is_some_and(|call| {
             call.origin == made.origin
                 && call.method == made.method
@@ -166,8 +177,14 @@ impl DeviceGroup {
                 upheld,
             } => self.call(index, at, call, by, Act::Resolve { op, upheld }),
             Body::Settled { op, state } => match state {
-                OpState::Matured { at } => self.claim(index, op, at, events)?,
-                OpState::Cancelled { .. } => self.cancelled(op),
+                OpState::Matured { at } => {
+                    self.state.sent.retain(|sent| !sent.about(op));
+                    self.claim(index, op, at, events)?
+                }
+                OpState::Cancelled { .. } => {
+                    self.state.sent.retain(|sent| !sent.about(op));
+                    self.cancelled(op)
+                }
                 OpState::Pending | OpState::Contested | OpState::Carried { .. } => {}
             },
             Body::Matured { device } => self.matured(index, device, events)?,
@@ -182,7 +199,10 @@ impl DeviceGroup {
                 message,
                 signature,
                 welcome,
-            } => self.evidence(of, &message, &signature, welcome, events)?,
+            } => {
+                self.state.sent.retain(|sent| sent.index != Some(of));
+                self.evidence(of, &message, &signature, welcome, events)?
+            }
             Body::Vote {
                 device,
                 epoch,
@@ -489,14 +509,17 @@ impl DeviceGroup {
                 // epoch this device confirmed leaves its `R` unheld: the
                 // agent installed no `R2` for it, and the `R` before is a
                 // removed device's, so nothing is pushed under either and
-                // the next commit re-seals the kit.
+                // the next commit, which the device asks its user for
+                // ([`DeviceGroup::reseal_owed`]), re-seals the kit.
                 if let Some((rekeyed, hash)) = self.state.rekeyed
                     && rekeyed == epoch
-                    && confirmed
-                    && self.state.decided == Some((epoch, true))
                 {
-                    self.state.rekeyed = None;
-                    self.name_recovery(index, hash, false);
+                    if confirmed && self.state.decided == Some((epoch, true)) {
+                        self.state.rekeyed = None;
+                        self.name_recovery(index, hash, false);
+                    } else {
+                        self.state.reseal = true;
+                    }
                 }
             }
         }
@@ -817,6 +840,7 @@ impl DeviceGroup {
                     && self.state.kit_is(&rekey.entries)
                 {
                     self.state.rekeyed = Some((pending.epoch, rekey.r_hash));
+                    self.state.reseal = false;
                 }
                 // Its epoch is decided: any commit of this device's for it
                 // is void, the swap deleting the held one.
@@ -967,9 +991,33 @@ impl DeviceGroup {
         Ok(())
     }
 
-    /// What the device has to post again: its vote until the log holds it,
-    /// and its own commit's evidence until the log holds it.
+    /// What the device has to post again: `alive` first while a restore
+    /// is open, its vote until the log holds it, its own commit's evidence
+    /// and each held admin call's until the log holds them.
     fn reposts(&self, events: &mut Vec<Event>) {
+        // A restore open asserts every device lost: a device with a voice
+        // answers with `alive` until the log cancels it, whatever it makes
+        // of the restore's evidence (liveness needs no judgement), and
+        // before anything else it posts, which a refusal may stop.
+        let state = &self.state;
+        let me = state.id.filter(|me| state.voiced(*me));
+        let restoring = state.set.operations.iter().find(|call| {
+            !state.set.closed.contains(&call.index)
+                && matches!(
+                    &call.act,
+                    Act::Op {
+                        op: Op::Restore { .. },
+                        ..
+                    }
+                )
+        });
+        if let (Some(me), Some(restore)) = (me, restoring)
+            && state
+                .known(me)
+                .is_some_and(|known| known.alive < restore.index)
+        {
+            events.push(Event::Alive);
+        }
         if let Some(pending) = &self.state.pending
             && let Some(vote) = pending.mine
             && !pending.logged
@@ -1000,27 +1048,18 @@ impl DeviceGroup {
                 },
             });
         }
-        // A restore pending asserts every device lost: a device with a
-        // voice answers with `alive` until the log cancels it.
-        let state = &self.state;
-        let me = state.id.filter(|me| state.voiced(*me));
-        let restoring = state.set.operations.iter().find(|call| {
-            call.evidence != Check::Invalid
-                && !state.set.closed.contains(&call.index)
-                && matches!(
-                    &call.act,
-                    Act::Op {
-                        op: Op::Restore { .. },
-                        ..
-                    }
-                )
-        });
-        if let (Some(me), Some(restore)) = (me, restoring)
-            && state
-                .known(me)
-                .is_some_and(|known| known.alive < restore.index)
-        {
-            events.push(Event::Alive);
+        for sent in &self.state.sent {
+            if let Some(index) = sent.index {
+                events.push(Event::Evidence {
+                    index,
+                    message: sent.message.clone(),
+                    signature: sent.signature,
+                    attached: Attached {
+                        welcome: None,
+                        r2: sent.r2,
+                    },
+                });
+            }
         }
     }
 

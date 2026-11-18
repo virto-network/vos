@@ -30,7 +30,8 @@
 //! **What the chrome raises** ([`Pass::notices`]): the device set's open
 //! operations, each a local notification while it can be vetoed; a
 //! pending restore; this device's removal, and that it cannot follow, for
-//! as long as either holds; and every alarm kept,
+//! as long as either holds; a commit owed, for the matured removals it
+//! carries or the kit it re-seals, until one is taken; and every alarm kept,
 //! from the batch that consumed its evidence until the chrome, its user
 //! having seen it, acknowledges it ([`DeviceGroup::acknowledge`]): a pass
 //! killed or stopped after an alarm loses none.
@@ -169,7 +170,23 @@ pub enum Notice {
     /// This device cannot follow the confirmed epoch: removed from another
     /// device, it pairs again; or it regroups.
     Stuck,
+    /// A commit is owed, which the user makes ("commit now", behind the
+    /// biometric): what it carries.
+    Commit(Commit),
     Alarm(Alarm),
+}
+
+/// What an owed commit carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Commit {
+    /// The removals that matured: until a commit carries them, the removed
+    /// devices hold the epoch's keys, every device seals under it, and no
+    /// recovery envelope is pushed.
+    Removals,
+    /// The kit re-sealed under a new `R`: the agent's verdict on the epoch
+    /// that re-sealed it did not confirm it, so the `R` before, a removed
+    /// device's, stands, and nothing is pushed to the recovery scope.
+    Reseal,
 }
 
 /// A device-set operation's kind, as a notification names it.
@@ -230,6 +247,8 @@ pub struct Pass {
     pub at: u64,
     /// Where the device is after the pass.
     pub course: group::Course,
+    /// The commit owed after the pass, if one is.
+    pub commit: Option<Commit>,
 }
 
 impl Pass {
@@ -259,6 +278,9 @@ impl Pass {
             group::Course::Out => notices.push(Notice::Removed),
             group::Course::Stuck { .. } => notices.push(Notice::Stuck),
             group::Course::Following => {}
+        }
+        if let Some(commit) = self.commit {
+            notices.push(Notice::Commit(commit));
         }
         notices.extend(self.alarms.iter().copied().map(Notice::Alarm));
         notices
@@ -293,6 +315,7 @@ pub fn run<L: Control>(
     let done = passing(light, group, link, instances, now, &mut pass);
     pass.course = group.course();
     pass.operations = group.operations();
+    pass.commit = owed_commit(group);
     // Every alarm raised was kept in the batch that consumed its evidence;
     // the rest (the clock's) are kept now, and the pass reports every one
     // kept until the chrome acknowledges it.
@@ -316,6 +339,20 @@ pub fn run<L: Control>(
             pass: Box::new(pass),
             error,
         }),
+    }
+}
+
+/// The commit `group` owes, if it follows and is in the set.
+pub fn owed_commit(group: &DeviceGroup) -> Option<Commit> {
+    if group.course() != group::Course::Following || group.id().is_none() {
+        return None;
+    }
+    if !group.owed().is_empty() {
+        Some(Commit::Removals)
+    } else if group.reseal_owed() {
+        Some(Commit::Reseal)
+    } else {
+        None
     }
 }
 
@@ -414,7 +451,10 @@ fn follow<L: Control>(
             }
         }
         let mut posted = false;
-        for event in group.follow(entries)? {
+        let mut events = group.follow(entries)?;
+        // `alive` first: a later post refused stops the pass.
+        events.sort_by_key(|event| *event != Event::Alive);
+        for event in events {
             let post = match event {
                 Event::Vote {
                     epoch,
@@ -458,10 +498,19 @@ fn follow<L: Control>(
                 }
             };
             // Taken before (a kill between the post and its answer), or its
-            // candidate decided meanwhile: the log says which, read on.
-            if let Some(at) = post_settled(link, &post)? {
-                group.called(at);
-                pass.posts += 1;
+            // candidate decided meanwhile: the log says which, read on. An
+            // evidence the agent refuses is posted no more, and the pass
+            // goes on: the operation it is of is cancelled at its due time.
+            match (post_settled(link, &post), &post) {
+                (Ok(Some(at)), _) => {
+                    group.called(at);
+                    pass.posts += 1;
+                }
+                (Ok(None), _) => {}
+                (Err(SyncError::Refused(_)), Post::Evidence { index, .. }) => {
+                    group.evidence_refused(*index)?;
+                }
+                (Err(error), _) => return Err(error),
             }
             posted = true;
         }

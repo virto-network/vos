@@ -8,6 +8,7 @@
 //! recovery scope holds after it (§3.6, D3).
 
 use vos_light::group::{Alarm, Archive, DeviceGroup, Event, Restored};
+use vos_light::job::{Commit, owed_commit};
 use vos_light::kit::{self, KitKey, KitSecret, Split};
 use vos_light::personal::recover;
 use vos_wire::personal::{
@@ -501,6 +502,13 @@ fn r_rotates_at_a_removal_and_the_removed_device_opens_nothing_after() {
     let (admin, sync) = (phones[1].admin.clone(), phones[1].sync.clone());
     operate(&mut home, &admin, &sync, "cosign", removal.encode(), None);
     settle(&mut home, &mut phones[..2]);
+    for phone in &mut phones[..2] {
+        assert_eq!(
+            owed_commit(phone.group()),
+            Some(Commit::Removals),
+            "the matured removal is owed a commit"
+        );
+    }
     let epoch = phones[0].group().confirmed() + 1;
     let prepared = phones[0].group().commit(None, home.now()).unwrap();
     assert_eq!(prepared.effect.remove, vec![2]);
@@ -585,6 +593,11 @@ fn a_void_verdict_after_a_confirmed_removal_rotates_r_all_the_same() {
         assert_eq!(phone.group().confirmed(), epoch);
         assert!(!phone.group().holds_recovery());
         assert_eq!(
+            owed_commit(phone.group()),
+            Some(Commit::Reseal),
+            "the user is asked for the commit that re-seals the kit"
+        );
+        assert_eq!(
             with(&mut home, phone, &[], |sync| sync.recovery()).unwrap(),
             Default::default(),
             "nothing pushed under an R the removed device holds"
@@ -598,6 +611,90 @@ fn a_void_verdict_after_a_confirmed_removal_rotates_r_all_the_same() {
         next.effect.rekey.is_some(),
         "the next commit re-seals the kit"
     );
+}
+
+/// A restore whose evidence a device judges invalid (its view of the kit
+/// or the policy is not the agent's) is answered with `alive` all the
+/// same: liveness needs no judgement, so the restore is cancelled.
+#[test]
+fn a_restore_a_device_judges_invalid_is_answered_alive() {
+    let leaked = KitSecret::phrase().unwrap();
+    let (mut home, mut phones, _) = household_with(2, vec![leaked.key()]);
+    let next = KitSecret::phrase().unwrap();
+    let restoring = Phone::new(9);
+    let split =
+        vos_light::group::restoring(&restoring.store, &[next.key()], &home.agent()).unwrap();
+    let signing = leaked.signing();
+    let reply = home.call(
+        &signing,
+        "restore",
+        (restoring.keys.clone(), split.kit.clone()).encode(),
+    );
+    let index = reply.answer::<Recorded>().unwrap().index;
+    // Its evidence as the agent stores it, its signature not the call's.
+    home.call(
+        &signing,
+        "evidence",
+        (
+            (index, reply.message),
+            (
+                [0x5a_u8; 64],
+                Attached {
+                    welcome: None,
+                    r2: Some(*split.r2()),
+                },
+            ),
+        )
+            .encode(),
+    )
+    .answer::<Recorded>()
+    .unwrap();
+    phones[0].read(&mut home);
+    assert!(matches!(
+        state(&home, phones[0].sync_key(), index),
+        OpState::Cancelled {
+            why: vos_wire::personal::Cancel::Alive,
+            ..
+        }
+    ));
+}
+
+/// An admin call whose evidence post is lost (a kill between the call and
+/// its evidence, its answer never read) is held before it leaves: the next
+/// reading finds it in the log and posts its evidence, so the removal
+/// matures rather than being cancelled for want of it, and the next
+/// commit carries it.
+#[test]
+fn a_held_calls_evidence_is_posted_again_after_a_kill() {
+    let key = KitSecret::security_key(&mut Touch(8)).unwrap();
+    let (mut home, mut phones, _) = household_with(3, vec![key.key()]);
+    let admin = phones[0].admin.clone();
+    let signed = home.sign(&admin, "remove", 2u32.encode());
+    phones[0]
+        .group()
+        .sending(signed.message.clone(), signed.signature, None)
+        .unwrap();
+    let removal = home.send(signed).answer::<Recorded>().unwrap().index;
+    crate::restart(&mut phones[0]);
+    phones[0].read(&mut home);
+    let entries = home.log(phones[0].sync_key(), removal).unwrap();
+    assert!(
+        entries.iter().any(|(_, entry)| matches!(
+            entry.body,
+            vos_wire::personal::Body::Evidence { index, .. } if index == removal
+        )),
+        "the evidence posted from the held call"
+    );
+    home.pass(policy().operation_delay_ms);
+    phones[0].alive(&mut home);
+    assert!(matches!(
+        state(&home, phones[0].sync_key(), removal),
+        OpState::Matured { .. }
+    ));
+    settle(&mut home, &mut phones[..2]);
+    let prepared = phones[0].group().commit(None, home.now()).unwrap();
+    assert_eq!(prepared.effect.remove, vec![2]);
+    phones[0].send(&mut home, &prepared).unwrap();
 }
 
 /// `phone` reading the log, posting what it asks for, with the verdict on

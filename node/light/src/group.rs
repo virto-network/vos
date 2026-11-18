@@ -61,8 +61,8 @@ use vos_abi::{Decode, Encode};
 use vos_mls::{Mls, Namespace};
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
-    AdminClass, Attached, DeviceId, DeviceView, Effect, KitEntry, NewDevice, Op, Policy, Scope,
-    Signer, Status, Vote, welcome_hash,
+    AdminCall, AdminClass, Attached, DeviceId, DeviceView, Effect, KitEntry, NewDevice, Op, Policy,
+    Scope, Signer, Status, Vote, welcome_hash,
 };
 use zeroize::Zeroize;
 
@@ -84,6 +84,8 @@ const CALLS: usize = 32;
 /// writers' views past its cursor it keeps to check.
 const MADE: usize = 16;
 const VIEWS: usize = 16;
+/// The admin calls a device holds whose evidence the log has yet to show.
+const SENT: usize = 8;
 /// The MLS state's rows.
 const MLS: &[u8] = b"mls/";
 /// The log's chain through each entry read, by the next index: the views
@@ -598,6 +600,40 @@ impl Made {
     }
 }
 
+/// An admin call of this device's, signed as `message`, held before it
+/// leaves: its evidence (with `r2` beside it) is posted until the log holds
+/// it, from the agent's answer or, after a crash, from the call found in
+/// the log (`index`).
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct Sent {
+    pub(crate) message: Vec<u8>,
+    pub(crate) signature: [u8; 64],
+    pub(crate) r2: Option<[u8; 32]>,
+    pub(crate) index: Option<u64>,
+}
+
+impl Sent {
+    /// Whether `call` is this one's, as the log holds it.
+    pub(crate) fn is(&self, call: &AdminCall) -> bool {
+        CallMessage::parse(&self.message).is_some_and(|signed| {
+            signed.session.key == call.origin
+                && signed.method.0 == call.method
+                && signed.arguments == call.arguments
+        })
+    }
+
+    /// Whether it is the operation at `op`, or a veto, cosign or
+    /// resolution of it: settled, its evidence decides nothing more.
+    pub(crate) fn about(&self, op: u64) -> bool {
+        use vos_wire::personal::method::{COSIGN, RESOLVE, VETO};
+        self.index == Some(op)
+            || CallMessage::parse(&self.message).is_some_and(|signed| {
+                [VETO, COSIGN, RESOLVE].contains(&signed.method)
+                    && signed.arguments.starts_with(&op.encode())
+            })
+    }
+}
+
 /// Where the device is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub enum Course {
@@ -678,6 +714,13 @@ pub(crate) struct State {
     pub(crate) rekeyed: Option<(u64, [u8; 32])>,
     /// The admin calls of this device's the log has yet to show.
     pub(crate) made: Vec<Made>,
+    /// The admin calls of this device's whose evidence the log has yet to
+    /// show.
+    pub(crate) sent: Vec<Sent>,
+    /// The agent's verdict on the epoch whose commit re-sealed the kit
+    /// (`rekeyed`) did not confirm it: the `R` is unheld until a commit
+    /// re-seals the kit again, which the device asks its user for.
+    pub(crate) reseal: bool,
     /// Writers' views past the cursor, checked as the device reads on.
     pub(crate) views: Vec<(u64, [u8; 32])>,
     /// A head the agent named past the cursor, which the next reading of
@@ -787,6 +830,34 @@ pub struct Restored {
     pub kit: Vec<KitKey>,
     pub r_hash: [u8; 32],
     pub devices: Vec<DeviceView>,
+}
+
+/// The policy the control log `entries` set, read from its start in
+/// order, as a device following it takes it: the claim's configuration
+/// (one before its assignment, or the one beside it) whole, each later one
+/// over it ([`Policy::over`]); `None` before any. A restored device starts
+/// from it, never from a policy of its own.
+pub fn configured<'a>(
+    entries: impl IntoIterator<Item = &'a (u64, vos_wire::personal::Entry)>,
+) -> Option<Policy> {
+    use vos_wire::personal::Body;
+    let mut assigned = None;
+    let mut policy: Option<Policy> = None;
+    for (index, entry) in entries {
+        match &entry.body {
+            Body::Assigned { device: 0, .. } if assigned.is_none() => assigned = Some(*index),
+            Body::Configured(configured) => {
+                policy = Some(match (assigned, policy) {
+                    (Some(assigned), Some(held)) if *index != assigned + 1 => {
+                        configured.over(&held)
+                    }
+                    _ => *configured,
+                });
+            }
+            _ => {}
+        }
+    }
+    policy
 }
 
 impl Pairing {
@@ -939,6 +1010,8 @@ impl DeviceGroup {
             recovery: None,
             rekeyed: None,
             made: Vec::new(),
+            sent: Vec::new(),
+            reseal: false,
             views: Vec::new(),
             ahead: None,
             assigned: None,
@@ -1034,6 +1107,8 @@ impl DeviceGroup {
             recovery,
             rekeyed: None,
             made: Vec::new(),
+            sent: Vec::new(),
+            reseal: false,
             views: Vec::new(),
             ahead: None,
             assigned,
@@ -1128,6 +1203,8 @@ impl DeviceGroup {
             }),
             rekeyed: None,
             made: Vec::new(),
+            sent: Vec::new(),
+            reseal: false,
             views: Vec::new(),
             ahead: None,
             assigned: Some(0),
@@ -1408,15 +1485,95 @@ impl DeviceGroup {
         }
     }
 
+    /// This device's admin call signed as `message` with `signature`,
+    /// held before it leaves, with the `R2` its evidence carries: from the
+    /// agent's answer ([`DeviceGroup::made`]) or the call found in the log,
+    /// [`DeviceGroup::follow`] gives its evidence to post until the log
+    /// holds it, so an evidence post lost to a kill or the network is made
+    /// again (an operation due without it is cancelled).
+    pub fn sending(
+        &mut self,
+        message: Vec<u8>,
+        signature: [u8; 64],
+        r2: Option<[u8; 32]>,
+    ) -> Result<(), GroupError> {
+        let sent = &mut self.state.sent;
+        sent.retain(|sent| sent.message != message);
+        // A call never found in the log goes first.
+        if sent.len() >= SENT {
+            let oldest = sent
+                .iter()
+                .position(|sent| sent.index.is_none())
+                .unwrap_or(0);
+            sent.remove(oldest);
+        }
+        sent.push(Sent {
+            message,
+            signature,
+            r2,
+            index: None,
+        });
+        self.mls.write(rows(&self.state, None))?;
+        Ok(())
+    }
+
+    /// The agent refused this device's admin call signed as `message`: it
+    /// is held no more.
+    pub fn unsent(&mut self, message: &[u8]) -> Result<(), GroupError> {
+        let before = self.state.sent.len();
+        self.state.sent.retain(|sent| sent.message != message);
+        if self.state.sent.len() < before {
+            self.mls.write(rows(&self.state, None))?;
+        }
+        Ok(())
+    }
+
+    /// The agent refused the evidence posted for the call at `index`, past
+    /// any retry: neither a held call's nor the held commit's is posted
+    /// again.
+    pub fn evidence_refused(&mut self, index: u64) -> Result<(), GroupError> {
+        self.state.sent.retain(|sent| sent.index != Some(index));
+        if let Some(own) = self.state.own.as_mut()
+            && own.index == Some(index)
+        {
+            own.evidenced = true;
+        }
+        self.mls.write(rows(&self.state, None))?;
+        Ok(())
+    }
+
+    /// Whether a commit is owed that re-seals the kit under a new `R`: the
+    /// agent's verdict on the epoch whose commit re-sealed it did not
+    /// confirm it, so the `R` before, a removed device's, stands until one
+    /// does, and nothing is pushed to the recovery scope meanwhile.
+    pub fn reseal_owed(&self) -> bool {
+        self.state.reseal && self.state.rekeyed.is_some()
+    }
+
+    /// The matured removals the next commit must carry.
+    pub fn owed(&self) -> Vec<DeviceId> {
+        self.state.owed()
+    }
+
     /// The agent took this device's admin call, signed as `message`, at
     /// log index `index`: the log must hold that call there, and a veto in
-    /// it holds its operation back until it does ([`Alarm::Dropped`]).
+    /// it holds its operation back until it does ([`Alarm::Dropped`]); the
+    /// call held ([`DeviceGroup::sending`]) has its evidence posted there.
     /// Given before the device follows the log past `index`.
     pub fn made(&mut self, index: u64, message: &[u8]) -> Result<(), GroupError> {
         let Some(signed) = CallMessage::parse(message) else {
             return Ok(());
         };
+        if let Some(sent) = self
+            .state
+            .sent
+            .iter_mut()
+            .find(|sent| sent.message == message)
+        {
+            sent.index = Some(index);
+        }
         if index < self.state.next {
+            self.mls.write(rows(&self.state, None))?;
             return Ok(());
         }
         let made = &mut self.state.made;

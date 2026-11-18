@@ -43,6 +43,7 @@ mod claim;
 mod error;
 mod files;
 mod host;
+mod kit;
 pub mod link;
 mod members;
 mod pairing;
@@ -75,6 +76,7 @@ use link::{Agent, AgentLink, Signer};
 pub use error::Error;
 pub(crate) use error::{failed, store_failed, unreached};
 pub use host::{AdminKey, Approval, Card, Enrolled, Host, Prompts, Proof};
+pub use kit::KitView;
 pub use pairing::PairCode;
 pub use set::{AdminOffer, Device};
 pub use status::{Phase, Status};
@@ -191,6 +193,17 @@ struct State {
     /// A joiner's acknowledgement of its pairing's handover, kept before
     /// it is put in the slot, until it is.
     acked: Option<Acked>,
+    /// The kit's calls on the device set as signed, kept before they leave
+    /// until their evidence is posted.
+    kit_calls: Vec<KitCall>,
+}
+
+/// A kit's call on the device set at the agent `identity`, as signed.
+#[derive(Clone, Encode, Decode)]
+struct KitCall {
+    identity: [u8; 32],
+    message: Vec<u8>,
+    signature: [u8; 64],
 }
 
 /// The directory of the light node's store of `generation` under
@@ -654,7 +667,12 @@ impl<H: Host> Personal<H> {
         };
         let key = light.sync_key().clone();
         let mut link = link(&self.host, home, Purpose::Background, agent, &key, sync);
-        let instances = light.instances().map_err(store_failed)?;
+        // The log is followed and `alive` posted even when the scopes
+        // cannot be read.
+        let instances = light.instances().unwrap_or_else(|error| {
+            failures.push(format!("the local actors: {error}"));
+            Vec::new()
+        });
         let pass = match crate::job::run(light, group, &mut link, &instances, now) {
             Ok(pass) => pass,
             Err(stopped) => {

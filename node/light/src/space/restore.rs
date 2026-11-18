@@ -262,7 +262,7 @@ impl<H: Host> Personal<H> {
         }
         let key = held.light.sync_key().clone();
         let mut sync = held.sync;
-        let (view, envelopes, overview, devices) = {
+        let (view, envelopes, overview, devices, policy) = {
             let mut link = link(&self.host, &kept, Purpose::Personal, agent, &key, &mut sync);
             for _ in 0..WAKES {
                 let woken = link.wake().map_err(unreached)?.map_err(agent_refused)?;
@@ -298,17 +298,25 @@ impl<H: Host> Personal<H> {
                 .query(method::DEVICES, ())
                 .map_err(unreached)?
                 .map_err(agent_refused)?;
-            (view, envelopes, overview, devices)
+            // The log's policy, as every device of the set follows it.
+            let entries = link.log_all(0).map_err(unreached)?.map_err(agent_refused)?;
+            let policy = crate::group::configured(
+                entries.iter().filter(|(index, _)| *index < overview.next),
+            )
+            .ok_or_else(|| failed("a log that configures no policy"))?;
+            (view, envelopes, overview, devices, policy)
         };
         held.sync = sync;
         let archive = recover(&kit, &view, &agent.1, &envelopes).ok_or(Error::WrongKit)?;
         let device = device_of(&held, &devices)?;
+        // The agent's batch time, not this device's clock: no entry after
+        // goes back on it.
         let read = Restored {
             next: overview.next,
             chain: overview.chain,
-            time: self.host.now(),
+            time: overview.at,
             confirmed: overview.confirmed,
-            policy: vos_wire::personal::Policy::DEFAULT,
+            policy,
             kit: vec![next],
             r_hash,
             devices,
