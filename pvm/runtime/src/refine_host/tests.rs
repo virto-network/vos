@@ -1221,8 +1221,8 @@ impl StateReader for Recording {
 
 /// A key is read only within [`MAX_STATE_KEY`] bytes and charged by the
 /// byte before it is read: a 255 MiB key, readable for no gas, answers
-/// `HUH` for the base price, where the node read and copied all of it for
-/// 10 gas. The reader copies no byte past what the call asks and the gas
+/// `HUH` for the base price (unbounded, the host reads and copies all of
+/// it for 10 gas). The reader copies no byte past what the call asks and the gas
 /// left pays for: a zero-length read copies nothing.
 #[test]
 fn state_read_bounds_its_key_and_its_copy() {

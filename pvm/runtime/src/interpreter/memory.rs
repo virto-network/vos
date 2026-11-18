@@ -1780,8 +1780,8 @@ mod tests {
     }
 
     /// Scattered pages captured one at a time are coalesced a logarithmic
-    /// number of times, not on every capture past the floor (20,000
-    /// captures sorted the whole list about 16,000 times).
+    /// number of times, not on every capture past the floor (which, for
+    /// 20,000 captures, sorts the whole list about 16,000 times).
     #[test]
     fn scattered_captures_coalesce_rarely() {
         let mut captured = Captured::default();

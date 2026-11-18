@@ -528,8 +528,8 @@ mod tests {
     }
 
     /// A key read from the guest is charged a gas a byte before it is
-    /// read, so a 255 MiB key, readable for no gas, is out of gas unread,
-    /// where the node copied all of it for 10 gas. The storage copies no
+    /// read, so a 255 MiB key, readable for no gas, is out of gas unread
+    /// (unpriced, the host copies all of it for 10 gas). The storage copies no
     /// byte past what the call asks and the gas left pays for: a
     /// zero-length read copies nothing.
     #[test]

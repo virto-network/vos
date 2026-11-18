@@ -171,9 +171,9 @@ impl ConformanceState {
     /// releasing its units, each following tick only decrements every EXE
     /// entry's cycles and counts a cycle. So `least - 1` of them run
     /// together, `least` the fewest cycles an EXE entry has left, give the
-    /// state the ticks one by one give: a block of long divisions costs a
-    /// step per instruction, not a step per cycle. Runs of one tick are
-    /// left to `tick`.
+    /// state the ticks one by one give: simulating a block of long
+    /// divisions takes a few ticks an instruction, not one a cycle. Runs of
+    /// one tick are left to `tick`.
     fn skip_quiet_ticks(&mut self) {
         #[cfg(test)]
         if !self.skips {

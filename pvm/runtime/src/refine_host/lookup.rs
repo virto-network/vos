@@ -111,7 +111,7 @@ mod tests {
     }
 
     /// A hash or an output pointer past the 32-bit address space panics,
-    /// where it was truncated to an address in it.
+    /// never read or written at its truncation to 32 bits.
     #[test]
     fn a_pointer_past_the_address_space_panics() {
         let blob = build_standard_program(&StandardProgram {

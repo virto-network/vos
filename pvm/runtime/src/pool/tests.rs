@@ -699,8 +699,8 @@ fn uninstalled_programs_and_full_programs_keep_no_machines() {
 /// the zero pages of its regions a tenant only read, which no write
 /// tracking sees, are discarded at reset with those it wrote, and the
 /// machine still equals a fresh one. (Reading 4,096 never-written heap
-/// pages of a native machine's shared mapping made them resident, 16 MiB
-/// that every idle machine kept.)
+/// pages of a native machine's shared mapping makes them resident: 16 MiB
+/// an idle machine would keep.)
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn a_returned_native_machine_keeps_no_page_a_tenant_touched() {

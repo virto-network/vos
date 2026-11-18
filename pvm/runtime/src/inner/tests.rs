@@ -321,8 +321,8 @@ fn run_again_after_a_panic(
 /// On a VOS host a machine that panicked restarts with its first block
 /// unfunded: invoked again with no gas it is out of gas, and with gas it
 /// pays the whole block again. (Under the Gray Paper's text, the same
-/// machine given no gas panicked again having run its million-instruction
-/// block for nothing.)
+/// machine given no gas panics again, its block of a million instructions
+/// run for nothing.)
 #[test]
 fn a_panicked_machine_pays_its_first_block_again_on_a_vos_host() {
     const N: usize = 100_000;
@@ -793,8 +793,8 @@ fn blob_of_len(len: usize) -> Vec<u8> {
 /// A VOS host bounds what one invocation's programs make it prepare and
 /// hold, counted in blob bytes before any backend sees them, so both
 /// backends refuse alike; the Gray Paper's rules take any valid program.
-/// (Unbounded, four 4 MiB programs held about 1 GiB of host memory for
-/// about 2 M gas, and distinct blobs were each prepared anew.)
+/// (Unbounded, four 4 MiB programs hold about 1 GiB of host memory for
+/// about 2 M gas, and each distinct blob is prepared anew.)
 #[test]
 fn a_vos_host_bounds_the_programs_an_invocation_prepares_and_holds() {
     let big = blob_of_len(budget::MACHINE_BLOB + 1);
@@ -828,8 +828,8 @@ fn a_vos_host_bounds_the_programs_an_invocation_prepares_and_holds() {
 
 /// A VOS host bounds the pages an invocation's machines hold mapped,
 /// counted from the mappings the guest asks for, alike on both backends.
-/// (Unbounded, a page became resident for about 130 gas: a refine's gas
-/// committed over 100 GiB.)
+/// (Unbounded, a page becomes resident for about 130 gas: a refine's gas
+/// commits over 100 GiB.)
 #[test]
 fn a_vos_host_bounds_the_pages_an_invocation_maps() {
     let first = INNER_FIRST_MAPPABLE_PAGE;
