@@ -385,17 +385,17 @@ fn instantiate_lays_out_what_a_loader_builds() {
     // for two stack pages.
     let code = program.code_blob().len() as u64;
     let expected = gas::MACHINE_BASE
-        + gas::memory(gas::MACHINE_PER_KIB, code)
+        + (gas::MACHINE_PER_KIB * code).div_ceil(1024)
         + gas::PAGES_ALLOC_BASE
         + gas::PAGES_ALLOC_PER_PAGE
         + gas::POKE_BASE
-        + gas::memory(gas::POKE_PER_KIB, 300)
+        + (gas::POKE_PER_KIB * 300).div_ceil(1024)
         + gas::PAGES_SET_MODE_BASE
         + gas::PAGES_SET_MODE_PER_PAGE
         + gas::PAGES_ALLOC_BASE
         + 4 * gas::PAGES_ALLOC_PER_PAGE
         + gas::POKE_BASE
-        + gas::memory(gas::POKE_PER_KIB, 5000)
+        + (gas::POKE_PER_KIB * 5000).div_ceil(1024)
         + gas::PAGES_ALLOC_BASE
         + 2 * gas::PAGES_ALLOC_PER_PAGE;
     assert_eq!(program.price(), expected);

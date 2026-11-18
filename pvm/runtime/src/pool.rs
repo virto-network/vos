@@ -245,21 +245,33 @@ impl PoolProgram {
         // What the same layout costs a loader in `machine`, `pages` and
         // `poke` calls: read-only data is mapped writable, poked and then
         // made read-only.
-        let allocate =
-            |pages: u64| gas::PAGES_ALLOC_BASE.saturating_add(pages * gas::PAGES_ALLOC_PER_PAGE);
-        let poke = |bytes: usize| {
-            gas::POKE_BASE.saturating_add(gas::memory(gas::POKE_PER_KIB, bytes as u64))
+        // A layout's sizes fit the 32-bit address space, so no term is past
+        // u64.
+        let whole = |gas: Option<Gas>| gas.unwrap_or(Gas::MAX);
+        let allocate = |pages: u64| {
+            whole(gas::linear(
+                gas::PAGES_ALLOC_BASE,
+                gas::PAGES_ALLOC_PER_PAGE,
+                pages,
+            ))
         };
-        let mut price = gas::MACHINE_BASE
-            .saturating_add(gas::memory(gas::MACHINE_PER_KIB, code_blob.len() as u64));
+        let poke =
+            |bytes: usize| whole(gas::memory(gas::POKE_BASE, gas::POKE_PER_KIB, bytes as u64));
+        let mut price = whole(gas::memory(
+            gas::MACHINE_BASE,
+            gas::MACHINE_PER_KIB,
+            code_blob.len() as u64,
+        ));
         if layout.ro.size > 0 {
             let pages = layout.ro.size / page;
             price = price
                 .saturating_add(allocate(pages))
                 .saturating_add(poke(layout.ro_data.len()))
-                .saturating_add(
-                    gas::PAGES_SET_MODE_BASE.saturating_add(pages * gas::PAGES_SET_MODE_PER_PAGE),
-                );
+                .saturating_add(whole(gas::linear(
+                    gas::PAGES_SET_MODE_BASE,
+                    gas::PAGES_SET_MODE_PER_PAGE,
+                    pages,
+                )));
         }
         if layout.rw.size > 0 {
             price = price.saturating_add(allocate(layout.rw.size / page));
@@ -660,7 +672,7 @@ impl OuterMachines {
         memory.take_dirty_pages();
         vm.registers = layout.registers;
         vm.gas = gas;
-        let mut machine = Machine::lent(vm, execution, gas, ticket);
+        let mut machine = Machine::lent(vm, execution, gas, &layout, ticket);
         machine.enter_at(&self.standard.code, entry);
         Ok(machine)
     }

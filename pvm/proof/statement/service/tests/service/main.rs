@@ -1,6 +1,7 @@
 //! The JAM statements service's program (`statement-service.elf`, built by
-//! `just check-no-std`) on the JAM-only host, refine and accumulate, each
-//! item a work package's: a proof read from a 140 KiB extrinsic; every
+//! `just check-no-std`), its refine on the JAM-only host (the Gray Paper's
+//! tariff) and its accumulate on the VOS accumulate host (the VOS profile's
+//! flat price a call), each item a work package's: a proof read from a 140 KiB extrinsic; every
 //! golden fixture judged as every venue judges it; registrations, anchors
 //! and an equivocation, which ends the space; the controller's controls;
 //! a row that does not decode, or a write past the balance, trapping the
@@ -47,8 +48,8 @@ fn a_140_kib_extrinsic_is_read_as_the_proof() {
     assert_eq!(landed.outcome.code, 0);
     assert_eq!(landed.outcome.subject, valid.input.statement.id().0);
     eprintln!(
-        "valid, {} B proof: refine {:.2}M gas by the host, {:.2}M by its own count; accumulate \
-         {} gas",
+        "valid, {} B proof: refine {:.2}M gas by the JAM-only host, {:.2}M by its own count; accumulate \
+         {} gas on the VOS accumulate host",
         valid.proof.len(),
         landed.refine as f64 / 1e6,
         landed.outcome.refine_gas as f64 / 1e6,
@@ -72,7 +73,7 @@ fn a_140_kib_extrinsic_is_read_as_the_proof() {
     let none = rig.item(submit(&statement), Vec::new());
     assert_eq!(none.outcome.code >> 8, 1, "an empty proof's");
     eprintln!(
-        "a {} B extrinsic read: refine {} gas; a byte more, unread: {} gas; none: {} gas",
+        "a {} B extrinsic read: refine {} gas on the JAM-only host; a byte more, unread: {} gas; none: {} gas",
         MAX_PROOF_BYTES, full.refine, over.refine, none.refine
     );
     assert!(full.refine > over.refine + 96 * 140, "the 140 KiB fetched");
@@ -89,7 +90,7 @@ fn every_fixture_is_judged_by_the_service_as_recorded() {
         let statement = fixture.input.statement.encode();
         let landed = rig.item(submit(&statement), vec![fixture.proof.clone()]);
         eprintln!(
-            "{}: {:#x}, refine {:.2}M gas, accumulate {} gas",
+            "{}: {:#x}, refine {:.2}M gas (JAM-only host), accumulate {} gas (VOS accumulate host)",
             fixture.name,
             landed.outcome.code,
             landed.refine as f64 / 1e6,
@@ -356,7 +357,7 @@ fn a_space_registers_once_from_the_venues_next_window() {
     assert_eq!(landed.outcome.code, RegisterCode::Registered as u32);
     assert_eq!(landed.outcome.subject, space.id.0);
     eprintln!(
-        "register: refine {:.2}M gas, accumulate {} gas",
+        "register: refine {:.2}M gas (JAM-only host), accumulate {} gas (VOS accumulate host)",
         landed.refine as f64 / 1e6,
         landed.accumulate
     );
@@ -430,7 +431,7 @@ fn anchors_follow_the_venue_rules() {
     let landed = rig.item(payload.clone(), Vec::new());
     assert_eq!(landed.outcome.code, AnchorCode::New as u32);
     eprintln!(
-        "anchor: refine {:.2}M gas, accumulate {} gas",
+        "anchor: refine {:.2}M gas (JAM-only host), accumulate {} gas (VOS accumulate host)",
         landed.refine as f64 / 1e6,
         landed.accumulate
     );
@@ -548,7 +549,7 @@ fn the_controller_adds_and_removes_keys() {
     let landed = rig.item(added.clone(), Vec::new());
     assert_eq!(landed.outcome.code, ControlCode::Done as u32);
     eprintln!(
-        "control: refine {:.2}M gas, accumulate {} gas",
+        "control: refine {:.2}M gas (JAM-only host), accumulate {} gas (VOS accumulate host)",
         landed.refine as f64 / 1e6,
         landed.accumulate
     );

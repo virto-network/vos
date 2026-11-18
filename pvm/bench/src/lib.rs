@@ -30,19 +30,21 @@ pub fn guest_program(name: &str) -> Vec<u8> {
     vos_pvm_compiler::link_elf_spi(&guest_elf(name)).expect("link guest")
 }
 
-/// Run on a VOS refine host, which serves precompiles in place.
+/// Run on a VOS refine host, which serves precompiles in place, at the VOS
+/// node profile's prices.
 pub fn run_vos(program: &[u8], args: &[u8]) -> Vec<u8> {
     let invocation = RefineContext::load(program, args, GAS).expect("load").run();
     assert_eq!(invocation.exit, ExitReason::Halt, "guest did not halt");
     invocation.output_bounded(1 << 20).expect("output")
 }
 
-/// Gas Gray Paper charges for a host call the host does not know.
-pub const UNKNOWN_CALL_GAS: u64 = 10;
+/// Gas Gray Paper v0.8.0 charges for a host call the host does not know,
+/// `C_unknown`.
+pub const UNKNOWN_CALL_GAS: u64 = vos_pvm::refine_host::jam_gas::UNSERVED;
 
-/// Run on a JAM-like host: every host call is unknown, costs
-/// [`UNKNOWN_CALL_GAS`] and answers `WHAT`. Returns the output and the number
-/// of instructions executed.
+/// Run on a host that serves no call, as a JAM node meets a precompile:
+/// every host call is unknown, costs [`UNKNOWN_CALL_GAS`] and answers
+/// `WHAT`. Returns the output and the number of instructions executed.
 pub fn run_jam(program: &[u8], args: &[u8]) -> (Vec<u8>, u64) {
     let mut machine = Machine::load(program, args, GAS).expect("load");
     let mut steps = 0u64;

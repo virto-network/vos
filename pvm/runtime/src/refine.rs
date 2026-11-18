@@ -152,6 +152,10 @@ pub struct Machine {
     interp: Interpreter,
     terminal_exit: Option<ExitReason>,
     execution: Option<PreparedExecution>,
+    /// The pages a standard program's read-write data may grow over
+    /// (`grow_heap`): from its first read-write page up to a zone below its
+    /// stack. None for a machine of a bare code blob.
+    heap: Option<core::ops::Range<u32>>,
     /// What returns the memory to the outer machines that lent it.
     #[cfg(feature = "std")]
     lent: Option<crate::pool::PoolTicket>,
@@ -214,6 +218,7 @@ impl Machine {
             interp,
             terminal_exit,
             execution: None,
+            heap: None,
             #[cfg(feature = "std")]
             lent: None,
         }
@@ -360,6 +365,7 @@ impl Machine {
             // retaining cold preparation here would duplicate those tables.
             execution: (prepared.backend() != PvmBackend::ForceInterpreter)
                 .then(|| prepared.clone()),
+            heap: Some(heap_pages(&layout)),
             #[cfg(feature = "std")]
             lent: None,
         })
@@ -371,6 +377,7 @@ impl Machine {
         interp: Interpreter,
         execution: PreparedExecution,
         gas: Gas,
+        layout: &crate::spi::StandardLayout<'_>,
         ticket: crate::pool::PoolTicket,
     ) -> Self {
         Self {
@@ -378,6 +385,7 @@ impl Machine {
             interp,
             terminal_exit: None,
             execution: (execution.backend() != PvmBackend::ForceInterpreter).then_some(execution),
+            heap: Some(heap_pages(layout)),
             lent: Some(ticket),
         }
     }
@@ -451,6 +459,12 @@ impl Machine {
 
     pub fn gas_remaining(&self) -> Gas {
         self.interp.gas
+    }
+
+    /// The pages a standard program's heap may grow over, `grow_heap`'s
+    /// `[a, b)`; none for a machine of a bare code blob.
+    pub fn heap_pages(&self) -> Option<core::ops::Range<u32>> {
+        self.heap.clone()
     }
 
     /// Whether the block containing the current counter is already funded.
@@ -538,6 +552,17 @@ impl Machine {
             lent: self.lent.take(),
         }
     }
+}
+
+/// Gray Paper v0.8.0 `grow_heap`'s page range `[a, b)` of `layout`
+/// (`pvm_invocations.tex`): from the first read-write page,
+/// `(2 Z_Z + rnq(|o|)) / Z_P`, to `(2^32 - 3 Z_Z - Z_I - rnp(s)) / Z_P`, a
+/// zone below the stack's first page.
+fn heap_pages(layout: &crate::spi::StandardLayout<'_>) -> core::ops::Range<u32> {
+    let page = u64::from(PVM_PAGE_SIZE);
+    let first = layout.rw.base / page;
+    let end = (layout.stack.base - u64::from(crate::PVM_ZONE_SIZE)) / page;
+    first as u32..end as u32
 }
 
 /// Why a halt's output is not handed over: the run's exit, an embedder's

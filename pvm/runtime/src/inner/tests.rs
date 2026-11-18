@@ -547,10 +547,76 @@ fn pins_host_call_ids_and_gas_schedule() {
         [0x480, 0x481, 0x482],
         "VOS extensions sit in the node block, past the precompiles"
     );
-    assert_eq!(gas::memory(112, 0), 0);
-    assert_eq!(gas::memory(112, 1), 1);
-    assert_eq!(gas::memory(112, 1024), 112);
-    assert_eq!(gas::memory(112, 1025), 113);
+    assert_eq!(gas::memory(0, 112, 0), Some(0));
+    assert_eq!(gas::memory(0, 112, 1), Some(1));
+    assert_eq!(gas::memory(0, 112, 1024), Some(112));
+    assert_eq!(gas::memory(0, 112, 1025), Some(113));
+}
+
+/// Memory-sized gas, `base + ceil(rate · bytes / 1024)`, against a u128
+/// reference at every rate a host call uses and at the boundaries of the
+/// product and the sum; literal values pin the reference itself.
+#[test]
+fn memory_sized_gas_is_exact_at_every_rate() {
+    use super::gas::{linear, memory};
+    let reference = |base: u64, rate: u64, bytes: u64| {
+        let total = u128::from(base) + (u128::from(rate) * u128::from(bytes)).div_ceil(1024);
+        u64::try_from(total).ok()
+    };
+    assert_eq!(memory(0, 96, u64::MAX), Some(1_729_382_256_910_270_464));
+    assert_eq!(memory(95, 96, u64::MAX), Some(1_729_382_256_910_270_559));
+    assert_eq!(memory(0, 1024, u64::MAX), Some(u64::MAX));
+    assert_eq!(memory(1, 1024, u64::MAX), None, "one past u64");
+    assert_eq!(memory(0, 1025, u64::MAX), None);
+    assert_eq!(memory(10, 96, 1), Some(11), "a byte rounds up");
+    assert_eq!(memory(10, 96, 0), Some(10));
+    let rates = [
+        0,
+        96,
+        112,
+        224,
+        264,
+        336,
+        344,
+        400,
+        1023,
+        1024,
+        1025,
+        u64::MAX,
+    ];
+    let lengths = [
+        0,
+        1,
+        1023,
+        1024,
+        1025,
+        u64::from(u32::MAX),
+        u64::MAX / 1024,
+        u64::MAX / 96,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    for base in [0, 95, 1_862, u64::MAX - 1, u64::MAX] {
+        for rate in rates {
+            for bytes in lengths {
+                assert_eq!(
+                    memory(base, rate, bytes),
+                    reference(base, rate, bytes),
+                    "{base} + {rate} × {bytes}"
+                );
+            }
+        }
+    }
+    assert_eq!(linear(0, 118, u64::MAX / 118), Some(u64::MAX / 118 * 118));
+    assert_eq!(linear(63, 118, u64::MAX / 118), Some(u64::MAX));
+    assert_eq!(
+        linear(64, 118, u64::MAX / 118),
+        None,
+        "the base tips it past u64"
+    );
+    assert_eq!(linear(275, 121, u64::MAX), None);
+    assert_eq!(linear(u64::MAX, 0, u64::MAX), Some(u64::MAX));
+    assert_eq!(linear(u64::MAX, 1, 1), None);
 }
 
 /// An inner machine's code past the interpreter's preparation bound is a

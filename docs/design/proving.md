@@ -23,7 +23,11 @@ proofs a phone makes. The recursion AIR's own design is
   (`.cargo/config.toml`: AVX2 and the host's other features). A release
   build, or a portable one without AVX2, differs. The runs: a test or
   recipe of `pvm/` (the prover's suites, `just test-proof`; the wrap's
-  gas on the JAM-only host, `vos-pvm-recair`'s `recursion` test, in
+  gas on the JAM-only host, `vos_pvm::refine_host::RefineContext::try_run_jam`:
+  Gray Paper v0.8.0's refine calls at its tariff, where a VOS node's
+  refine host charges the VOS profile's 10 for `gas` and `log` and its
+  accumulate host a flat 10 for every call;
+  `vos-pvm-recair`'s `recursion` test, in
   `gate`; the fixtures' gas, `vos-statement`'s `fixtures` test, in
   `check`; the Wasm counts, `just judge-wasm`), or **[node side]**: the
   node side's tests and tools (`node/kernel-tests`' kernels and
@@ -982,7 +986,8 @@ last for decades.**
     tag (VOS's kit, `pvm/proof/kit`); frame-contrib and crates.io later.
 - **The JAM statements service** (`vos-statement-service`): a dedicated
   service; refine verifies anchors' signatures and statements (61.3M gas
-  a statement [measured]; a report's accumulate has 10M); accumulate
+  a statement on the JAM-only host [measured]; a report's accumulate has
+  10M); accumulate
   holds the spaces,
   anchors and repeats, and records, checking an anchor's signer against
   the space's registered keys, through the venue rules
@@ -1396,8 +1401,8 @@ reporting every window (§7).
   checks, about 1,060 columns a row once its single-denominator fractions
   are paired. At its floor of 2^10 rows a device kernel's 43 calls cost
   the chip's floor, not its calls.
-- **The host serves Poseidon2 natively** [built], at 3,000 gas a
-  call: one compression takes 1,925 cycles natively against BLAKE2b's
+- **The VOS host serves Poseidon2 natively** [built], at 3,000 gas a
+  call (the VOS node profile's price; a JAM node serves no precompile): one compression takes 1,925 cycles natively against BLAKE2b's
   about 410 (×4.7) [measured, x86 dev machine (Intel Core Ultra 7 155H),
   2026-11-12], about 2,800 at BLAKE2b's gas a cycle, and 3,000 is the
   round price above it with headroom [decided]. A JAM-deployed agent pays it in software, about 37,600 gas a

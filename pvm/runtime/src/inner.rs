@@ -75,6 +75,8 @@ pub mod host_call {
 /// places `machine` at 9.
 pub mod gp_call {
     pub const GAS: u32 = 0;
+    /// Refine's: grow the read-write data's writable pages.
+    pub const GROW_HEAP: u32 = 1;
     pub const FETCH: u32 = 2;
     pub const LOOKUP: u32 = 3;
     pub const READ: u32 = 4;
@@ -105,15 +107,28 @@ pub mod gas {
     pub const INVOKE_BASE: u64 = 968;
     pub const EXPUNGE: u64 = 335;
 
-    /// The standard memory-sized gas function, `ceil(rate * bytes / 1024)`.
-    pub const fn memory(rate: u64, bytes: u64) -> u64 {
-        let Some(product) = rate.checked_mul(bytes) else {
-            return u64::MAX;
-        };
-        let Some(rounded) = product.checked_add(1023) else {
-            return u64::MAX;
-        };
-        rounded / 1024
+    /// A host call's gas with base `base` and a memory-sized term of
+    /// `bytes` at `rate` a KiB, `base + ceil(rate · bytes / 1024)`
+    /// (`pvm_invocations.tex`, eq. `fnmemgas`): the product widened, divided
+    /// up, then added to the base whole. `None` when the total is past
+    /// u64, more than any machine's gas, so the call is out of gas.
+    pub const fn memory(base: u64, rate: u64, bytes: u64) -> Option<u64> {
+        let term = (rate as u128 * bytes as u128).div_ceil(1024);
+        narrow(base as u128 + term)
+    }
+
+    /// A host call's gas with base `base` and a term of `rate` for each of
+    /// `count` items (pages), whole; `None` past u64, as [`memory`].
+    pub const fn linear(base: u64, rate: u64, count: u64) -> Option<u64> {
+        narrow(base as u128 + rate as u128 * count as u128)
+    }
+
+    const fn narrow(total: u128) -> Option<u64> {
+        if total > u64::MAX as u128 {
+            None
+        } else {
+            Some(total as u64)
+        }
     }
 }
 
