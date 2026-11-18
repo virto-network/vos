@@ -182,6 +182,66 @@ fn a_byte_outside_every_call() {
     });
 }
 
+/// The whole trace with the second call's two byte rows forged by `edit`
+/// (rows 3 and 4: three bytes, then two): their chain still holds in the
+/// chip, and the call the CPU hands over, `(ts, destination, count)`, is not
+/// the chain's. Every chip's constraints hold; the whole trace's logup does
+/// not balance.
+fn forge_chain(test_name: &str, edit: impl Fn(&mut ComponentTrace)) {
+    use vos_pvm_proof::harness::base_components;
+    let components = base_components();
+    let mut side_note = side_note();
+    vos_pvm_proof::prepare_side_note_for_verification(&mut side_note);
+    side_note.ingest_memory_pages();
+    let mut traces: Vec<ComponentTrace> = components
+        .iter()
+        .map(|component| component.generate_component_trace(&mut side_note))
+        .collect();
+    assert!(accepts(components, &traces, &side_note), "the honest trace");
+    let witness = &mut traces[vos_pvm_proof::chip_idx::WITNESS_INPUT];
+    assert_eq!(
+        get(witness, Witness::IsFirst.offset(), 3),
+        1,
+        "row 3 starts a call"
+    );
+    assert_eq!(
+        get(witness, Witness::IsLast.offset(), 4),
+        1,
+        "row 4 ends it"
+    );
+    assert_chip(&WitnessInputChip, witness, &side_note);
+    edit(witness);
+    assert_chip(&WitnessInputChip, witness, &side_note);
+    if !in_child!(test_name) {
+        return;
+    }
+    assert!(accepts(components, &traces, &side_note));
+}
+
+/// The call's bytes one address on, `[d + 1, d + c + 1)`: a chain outside
+/// `[d, d + c)`.
+#[test]
+fn a_chain_writes_inside_its_call() {
+    forge_chain("a_chain_writes_inside_its_call", |trace| {
+        for row in [3, 4] {
+            let low = get(trace, Witness::Addr.offset(), row);
+            set(trace, Witness::Addr.offset(), row, low + 1);
+        }
+    });
+}
+
+/// The call's bytes at the next step's timestamp, where the CPU makes no
+/// witness-input call.
+#[test]
+fn a_chain_is_a_cpu_call_s() {
+    forge_chain("a_chain_is_a_cpu_call_s", |trace| {
+        for row in [3, 4] {
+            let low = get(trace, Witness::Ts.offset(), row);
+            set(trace, Witness::Ts.offset(), row, low + 1);
+        }
+    });
+}
+
 /// `Add64 φ2 = φ2 + φ1`, reading and writing φ2 at one timestamp, then a
 /// trap.
 fn add_in_place() -> SideNote {

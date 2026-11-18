@@ -166,11 +166,13 @@ verification (39) run Stwo's own quotient, which refuses the point.
   `debug-internals`), which `just ci-full` runs: not `check`, `gate` or
   `ci`.
 - **Not yet under a forgery gate of that kind:** PROGRAM_MEMORY's decode
-  binding, JUMP_TABLE (one padding fix), the lookup tables, MEMORY_PAGE and
-  MEMORY_MERKLE, the witness-input chip, the boundary-binding argument
+  binding, JUMP_TABLE (one padding fix), MEMORY_MERKLE, the boundary-binding argument
   (the boundary states recomputed into the boundary chips' claimed sums),
   the segment cut and closing-flag rule. These are in the
-  external audit's scope (below).
+  external audit's scope (below). The lookup tables are held to their
+  functions (`lookup_table_gate`), not by a forgery; MEMORY_PAGE (a page
+  listed twice, its closing timestamp) and the witness input (a chain off
+  its call) have theirs.
 - **Recorded, unfixed:** an invalid dynamic jump cannot be proved (no
   kernel needs it); a run longer than about 2^27 steps cannot be proved;
   a BLAKE2b pointer within 256 bytes of 2^32 cannot be proved. Each makes

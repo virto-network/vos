@@ -25,6 +25,7 @@ mod host_call_dispatch_gate;
 mod host_verify_boundary_gate;
 mod jump_table_gate;
 mod ledger_readconsistency_gate;
+mod lookup_table_gate;
 mod memory_ledger_gate;
 mod memory_ledger_padding_gate;
 mod memory_merkle_gate;

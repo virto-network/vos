@@ -146,3 +146,41 @@ fn a_page_is_real_on_all_its_rows() {
     }
     assert_chip(&chip, &trace, &side_note);
 }
+
+/// The first listed page listed a second time, every chip's trace generated
+/// from that page set: its bytes enter the ledger twice and its leaf is
+/// produced twice, while the trie consumes each listed index once. Every
+/// chip's constraints hold, the ledger's among them; the whole trace's logup
+/// does not balance.
+#[test]
+fn a_page_is_listed_once() {
+    use vos_pvm_proof::harness::base_components;
+    let components = base_components();
+    let traces_of = |side_note: &mut SideNote| -> Vec<ComponentTrace> {
+        components
+            .iter()
+            .map(|component| component.generate_component_trace(side_note))
+            .collect()
+    };
+    let honest = {
+        let mut side_note = side_note();
+        let traces = traces_of(&mut side_note);
+        accepts(components, &traces, &side_note)
+    };
+    assert!(honest, "the honest trace");
+    let listed_twice = || {
+        let mut side_note = side_note();
+        let pages = &mut side_note.memory_pages.as_mut().expect("listed pages").pages;
+        let first = pages[0].clone();
+        pages.push(first);
+        let traces = traces_of(&mut side_note);
+        (side_note, traces)
+    };
+    // The prover's fill takes the doubled set: a refusal below is the AIR's.
+    let _ = listed_twice();
+    if !in_child!("a_page_is_listed_once") {
+        return;
+    }
+    let (side_note, traces) = listed_twice();
+    assert!(accepts(components, &traces, &side_note));
+}

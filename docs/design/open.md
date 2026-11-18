@@ -78,9 +78,9 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   be about 2,800; `POSEIDON2_GAS` is 3,000, the round price above it with
   headroom [decided].
 - **Segment AIR parts not yet under a forgery gate:** the program memory's
-  decode binding, the jump table, the lookup tables, the memory page and
-  Merkle chips, the witness-input chip, the boundary-binding argument, and
-  the segment cut and closing-flag rule (`pvm/proof/SECURITY.md`).
+  decode binding, the jump table, the Merkle chip, the boundary-binding
+  argument, and the segment cut and closing-flag rule
+  (`pvm/proof/SECURITY.md`).
 - **Completeness limits:** an invalid dynamic jump cannot be proved; a
   run past 2^27 − 1 steps is refused before proving (`MAX_RUN_STEPS`):
   every segment's ledgers order from its `ts = 0` writes to its closing
