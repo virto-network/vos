@@ -82,17 +82,26 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   Merkle chips, the witness-input chip, the boundary-binding argument, and
   the segment cut and closing-flag rule (`pvm/proof/SECURITY.md`).
 - **Completeness limits:** an invalid dynamic jump cannot be proved; a
-  run longer than about 2^27 steps cannot be proved; a BLAKE2b pointer
-  within 256 bytes of 2^32 cannot be proved. The 2^27 limit bounds a
-  run's length, not only the gap between two accesses to one key: every
-  ledger chain of a segment starts at a `ts = 0` write and the ordering
-  delta has 28 bits, so no segment whose timestamps pass about 2^27
-  proves, and the prover refuses such a run by its step count before
-  proving. It is also a soundness bound: the ledgers compare timestamps
+  run past 2^27 − 1 steps is refused before proving (`MAX_RUN_STEPS`):
+  every segment's ledgers order from its `ts = 0` writes to its closing
+  reads, so the bound is on the run's length, not on a gap between two
+  accesses; a BLAKE2b pointer within 256 bytes of 2^32 cannot be proved.
+  The 2^27 bound is also a soundness bound: the ledgers compare timestamps
   mod p, and the per-segment `ts = 0` anchor bounds every access within
   2^27, so no provable segment reaches the alias 2^30 steps away
   (`pvm/proof/SECURITY.md`, "The leaf's binding"). Lifting it takes a
   wider ordering delta or a per-segment timestamp rebase, a new format.
+- **A window's page multiproof is computed from the whole memory image:**
+  planning a kernel's run hashes each window's pages and the tree above
+  them anew, so its host work is the windows times the image, quadratic
+  in a run that touches many pages. The windows are counted against the
+  segments the run's gas buys before any multiproof (`plan_kernel`), which
+  bounds it; a leaf-hash cache threaded through the segment cursor would
+  make it linear.
+- **A device proof's interaction nonce binds the transcript before it,
+  not the body after:** a replayed proof's head with another body passes
+  the verifier's precheck and costs one full verification to refuse.
+  Binding the nonce to the body needs a new device format.
 - **The witness stream's framing:** the AIR binds each witness-input call
   alone (a count at most its capacity, its writes), so a proved run may
   be given a short or empty read and more bytes later; a constraint
