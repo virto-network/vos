@@ -280,9 +280,9 @@ pub struct PoolProgram {
     code: CodeBlob,
     image: Image,
     price: Gas,
-    interpreter: OnceLock<Result<PreparedExecution, String>>,
+    interpreter: OnceLock<PreparedExecution>,
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    recompiler: OnceLock<Result<PreparedExecution, String>>,
+    recompiler: OnceLock<PreparedExecution>,
     /// Host memory a fresh interpreter machine of this program holds.
     fresh_bytes: OnceLock<usize>,
 }
@@ -402,7 +402,8 @@ impl PoolProgram {
         crate::spi::is_entry(&self.code, u64::from(pc))
     }
 
-    /// Prepared execution on `backend`, built on first use.
+    /// Prepared execution on `backend`, built on first use. A failure is
+    /// not kept: the host may have lacked a resource it has the next time.
     fn prepared(&self, backend: PvmBackend) -> Result<PreparedExecution, PoolError> {
         let slot = match crate::backend::resolve(backend).map_err(|_| PoolError::Backend)? {
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -412,16 +413,19 @@ impl PoolProgram {
                 &self.interpreter
             }
         };
-        slot.get_or_init(|| {
-            PreparedExecution::new_standard(
-                &self.code.code,
-                &self.code.bitmask,
-                &self.code.jump_table,
-                backend,
-            )
-        })
-        .clone()
-        .map_err(|_| PoolError::Backend)
+        if let Some(prepared) = slot.get() {
+            return Ok(prepared.clone());
+        }
+        let prepared = PreparedExecution::new_standard(
+            &self.code.code,
+            &self.code.bitmask,
+            &self.code.jump_table,
+            backend,
+        )
+        .map_err(|_| PoolError::Backend)?;
+        // Another thread may have prepared it meanwhile: every caller gets
+        // the one kept.
+        Ok(slot.get_or_init(|| prepared).clone())
     }
 }
 

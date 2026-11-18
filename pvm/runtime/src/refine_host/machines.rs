@@ -77,9 +77,11 @@ impl RefineContext {
         let program = self.inner.pool().filter(|_| owned).and_then(|pool| {
             pool.program(&hash).or_else(|| {
                 // Only bytes of the very program asked for, and only a valid
-                // one: anything else answers `WHO`, as a missing one does.
+                // service's code: anything else answers `WHO`, as a missing
+                // one does. Installing it is work for the base price alone,
+                // once a node, bounded by the service-code bound.
                 let bytes = self.programs.as_ref()?.program(&hash)?;
-                if crate::pool::CodeHash::of(&bytes) != hash {
+                if !crate::spi::service_fits(&bytes) || crate::pool::CodeHash::of(&bytes) != hash {
                     return None;
                 }
                 pool.install(&bytes).ok()?;

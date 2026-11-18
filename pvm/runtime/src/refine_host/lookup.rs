@@ -26,13 +26,11 @@ pub fn serve_lookup<P: AsRef<[u8]>>(
     find: impl FnOnce(&[u8; 32]) -> Option<P>,
 ) -> Result<(), ExitReason> {
     let registers = *machine.registers();
-    let mut hash = [0u8; 32];
-    if !machine
-        .memory()
-        .read_bytes_checked(registers[8] as u32, &mut hash)
-    {
-        return Err(ExitReason::Panic);
-    }
+    let hash: [u8; 32] = machine
+        .read_range(registers[8], 32)
+        .ok_or(ExitReason::Panic)?
+        .try_into()
+        .expect("32 bytes read");
     let own = registers[7] == u64::MAX || registers[7] == service;
     let Some(program) = own.then(|| find(&hash)).flatten() else {
         machine.registers_mut()[7] = result::NONE;
@@ -43,9 +41,15 @@ pub fn serve_lookup<P: AsRef<[u8]>>(
     if !machine.charge(LOOKUP_GAS + window.len() as u64) {
         return Err(ExitReason::OutOfGas);
     }
-    if !machine
-        .memory_mut()
-        .write_bytes_checked(registers[9] as u32, &program[window])
+    // An output past the 32-bit address space, or not all writable, is
+    // the guest's panic: no address is truncated.
+    let (address, len) = machine
+        .writable_range(registers[9], window.len() as u64)
+        .ok_or(ExitReason::Panic)?;
+    if len > 0
+        && !machine
+            .memory_mut()
+            .write_bytes_checked(address, &program[window])
     {
         return Err(ExitReason::Panic);
     }
@@ -104,5 +108,33 @@ mod tests {
         let (answer, gas, copied) = lookup(2, 64);
         assert_eq!((answer, gas), (result::NONE, 0), "another service's");
         assert_eq!(copied, vec![0; 64]);
+    }
+
+    /// A hash or an output pointer past the 32-bit address space panics,
+    /// where it was truncated to an address in it.
+    #[test]
+    fn a_pointer_past_the_address_space_panics() {
+        let blob = build_standard_program(&StandardProgram {
+            ro_data: vec![],
+            rw_data: vec![],
+            heap_pages: 0,
+            stack_size: 4096,
+            code: CodeBlob {
+                jump_table: vec![],
+                code: vec![0],
+                bitmask: vec![1],
+            },
+        })
+        .unwrap();
+        let mut machine = Machine::load(&blob, &[7; 32], 1_000_000).unwrap();
+        let registers = *machine.registers();
+        let (hash, out) = (registers[7], registers[1] - 4096);
+        for (hash, out) in [(hash + (1 << 32), out), (hash, out + (1 << 32))] {
+            let registers = machine.registers_mut();
+            (registers[7], registers[8], registers[9]) = (u64::MAX, hash, out);
+            (registers[10], registers[11]) = (0, 64);
+            let found = serve_lookup(&mut machine, 1, |_| Some(vec![9u8; 300]));
+            assert_eq!(found, Err(ExitReason::Panic), "{hash:#x} {out:#x}");
+        }
     }
 }
