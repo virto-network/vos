@@ -57,6 +57,8 @@ const WINDOW: &str =
     "the space admits none of this app's programs: the app or the space must update";
 /// A window a space's node could not compute whole yet.
 const UNAVAILABLE: &str = "the space's node cannot read its device window yet: try again";
+/// A space's handle, an agent and an instance there: whose device window.
+type WindowKey = ([u8; 32], u32, u32);
 /// How long a space's device window is taken as read.
 const WINDOW_TTL: Duration = Duration::from_secs(600);
 /// The furthest the node's time may be from the device's: past it, a relay
@@ -114,7 +116,7 @@ pub(crate) struct Inner {
     /// Each space's device window for an instance, as its node answered it
     /// last, and when: read before a proof, and kept for [`WINDOW_TTL`]
     /// while it admits this app's programs.
-    windows: Mutex<HashMap<([u8; 32], u32, u32), (Instant, DeviceWindow)>>,
+    windows: Mutex<HashMap<WindowKey, (Instant, DeviceWindow)>>,
 }
 
 /// What an enrollment asks of the device's personal space.
