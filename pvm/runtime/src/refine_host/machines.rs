@@ -25,6 +25,8 @@ pub trait ProgramSource: Send + Sync {
 }
 
 impl RefineContext {
+    /// `machine`, as the Gray Paper's; a VOS host also answers `FULL` for a
+    /// program past its budget ([`crate::inner::budget`]).
     pub(super) fn machine(&mut self) -> Result<(), Stop> {
         let registers = *self.outer.registers();
         let (address, len, initial_pc) = (registers[7], registers[8], registers[9]);
@@ -40,7 +42,7 @@ impl RefineContext {
         let result = match u32::try_from(initial_pc) {
             Ok(pc) => match self.inner.create(&program, pc) {
                 Ok(id) => id as u64,
-                Err(InnerError::Full) => result::FULL,
+                Err(InnerError::Full | InnerError::Budget) => result::FULL,
                 Err(InnerError::Backend) => return Err(Stop::Backend),
                 Err(_) => result::HUH,
             },
@@ -53,7 +55,8 @@ impl RefineContext {
     /// instruction counter the machine starts at. φ7 becomes the new
     /// machine's index, `WHO` for a program the pool does not hold, `HUH`
     /// for a counter that starts no instruction of it, or `FULL` at the
-    /// machine limit. The call costs `machine`'s base, as a failed `machine`
+    /// machine limit or past the pages the budget leaves
+    /// ([`crate::inner::budget`]). The call costs `machine`'s base, as a failed `machine`
     /// does; an installed program then costs the rest of its price, what
     /// laying it out costs a loader in host calls (never less than the
     /// base), whatever the counter.
@@ -92,7 +95,7 @@ impl RefineContext {
             .and_then(|pc| self.inner.instantiate(&program, pc))
         {
             Ok(id) => u64::from(id),
-            Err(InnerError::Full) => result::FULL,
+            Err(InnerError::Full | InnerError::Budget) => result::FULL,
             Err(InnerError::Backend) => return Err(Stop::Backend),
             Err(_) => result::HUH,
         };
@@ -159,6 +162,8 @@ impl RefineContext {
         self.answer(status)
     }
 
+    /// `pages`, as the Gray Paper's; a VOS host also answers `FULL` for a
+    /// mapping past its budget ([`crate::inner::budget`]).
     pub(super) fn pages(&mut self) -> Result<(), Stop> {
         let registers = *self.outer.registers();
         let (id, first, count, mode) = (registers[7], registers[8], registers[9], registers[10]);
@@ -182,6 +187,7 @@ impl RefineContext {
                     match self.inner.pages(id, first, count, mode) {
                         Ok(()) => result::OK,
                         Err(InnerError::Unknown) => result::WHO,
+                        Err(InnerError::Budget) => result::FULL,
                         Err(InnerError::Backend) => return Err(Stop::Backend),
                         Err(_) => result::HUH,
                     }

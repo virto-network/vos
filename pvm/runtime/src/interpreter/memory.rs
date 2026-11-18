@@ -460,6 +460,29 @@ impl PagePerms {
         self.pages_have_at_least(first, last + 1, permission)
     }
 
+    /// How many pages of `[first, end)` have at least `permission`.
+    fn count_at_least(&self, first: usize, end: usize, permission: u8) -> usize {
+        let mut count = 0;
+        let mut page = first;
+        while page < end {
+            let slot = page / SLOT_PAGES;
+            let slot_end = ((slot + 1) * SLOT_PAGES).min(end);
+            count += match &self.slots[slot] {
+                PermSlot::Uniform(existing) if *existing >= permission => slot_end - page,
+                PermSlot::Uniform(_) => 0,
+                PermSlot::Mixed(leaf) => {
+                    let base = slot * SLOT_PAGES;
+                    leaf[page - base..slot_end - base]
+                        .iter()
+                        .filter(|&&existing| existing >= permission)
+                        .count()
+                }
+            };
+            page = slot_end;
+        }
+        count
+    }
+
     /// Whether pages `[first, end)`, which must lie in the span, all have at
     /// least `permission`.
     fn pages_have_at_least(&self, first: usize, end: usize, permission: u8) -> bool {
@@ -1175,6 +1198,16 @@ impl Memory {
         dispatch!(self, m => (page < m.perms.pages()).then(|| m.perms.get(page)))
     }
 
+    /// How many pages of `[first, first + count)` are mapped (at least
+    /// read-only), the part of the range within the span.
+    pub fn mapped_pages(&self, first: usize, count: usize) -> usize {
+        let end = first.saturating_add(count).min(self.pages());
+        if first >= end {
+            return 0;
+        }
+        dispatch!(self, m => m.perms.count_at_least(first, end, super::PERM_RO))
+    }
+
     /// Whether every page of `[first, first + count)` is mapped (at least
     /// read-only). False when the range leaves the span.
     pub fn pages_mapped(&self, first: usize, count: usize) -> bool {
@@ -1666,6 +1699,17 @@ mod tests {
         flat.set_page_perms(perms.clone());
         sparse.set_page_perms(perms);
         (flat, sparse)
+    }
+
+    /// Mapped pages are counted page by page, alike in both models.
+    #[test]
+    fn mapped_pages_are_counted_alike() {
+        let (flat, sparse) = pair();
+        for memory in [&flat, &sparse] {
+            assert_eq!(memory.mapped_pages(0, 6), 5);
+            assert_eq!(memory.mapped_pages(2, 2), 1);
+            assert_eq!(memory.mapped_pages(5, 100), 1);
+        }
     }
 
     #[test]

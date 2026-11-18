@@ -61,7 +61,10 @@ fn preparation_cache_is_exact_process_wide_and_revalidates_each_entry() {
 #[test]
 fn preparation_cache_cap_and_default_bypass_do_not_change_admission() {
     let blob = host_then_trap();
+    // Past the cache's ceiling is past a VOS host's budget too: the
+    // Gray Paper's rules take any valid program.
     let mut machines = InnerMachines::new();
+    machines.set_profile(Profile::GrayPaper);
     let warm = machines.create(&blob, 0).unwrap();
     let warm = machines.machines[&warm].execution.clone();
     // A canonical program larger than the cache ceiling still creates
@@ -763,5 +766,122 @@ fn code_past_the_interpreters_bound_is_a_backend_refusal() {
     blob.extend_from_slice(&packed);
     assert!(crate::spi::deblob(&blob, 0).is_some());
     let mut machines = InnerMachines::new();
+    machines.set_profile(Profile::GrayPaper);
     assert_eq!(machines.create(&blob, 0), Err(InnerError::Backend));
+    // A VOS host refuses it before any backend sees it.
+    machines.set_profile(Profile::Vos);
+    assert_eq!(machines.create(&blob, 0), Err(InnerError::Budget));
+}
+
+/// A valid compact code blob of exactly `len` bytes: `trap`s, an
+/// instruction start every 25 bytes so preparing it stays cheap.
+fn blob_of_len(len: usize) -> Vec<u8> {
+    let blob = |code_len: usize| {
+        let code = vec![0; code_len];
+        let mut bitmask = vec![0; code_len];
+        for start in (0..code_len).step_by(25) {
+            bitmask[start] = 1;
+        }
+        vos_pvm_program::build_compact_code_blob(&vos_pvm_program::CodeBlob {
+            code,
+            bitmask,
+            jump_table: Vec::new(),
+        })
+        .unwrap()
+    };
+    // The header and the packed bitmask take about a ninth of the blob.
+    let mut code_len = len * 8 / 9;
+    while blob(code_len).len() < len {
+        code_len += 1;
+    }
+    while blob(code_len).len() > len {
+        code_len -= 1;
+    }
+    let made = blob(code_len);
+    assert_eq!(made.len(), len, "a blob of {len} bytes");
+    made
+}
+
+/// A VOS host bounds what one invocation's programs make it prepare and
+/// hold, counted in blob bytes before any backend sees them, so both
+/// backends refuse alike; the Gray Paper's rules take any valid program.
+/// (Unbounded, four 4 MiB programs held about 1 GiB of host memory for
+/// about 2 M gas, and distinct blobs were each prepared anew.)
+#[test]
+fn a_vos_host_bounds_the_programs_an_invocation_prepares_and_holds() {
+    let big = blob_of_len(budget::MACHINE_BLOB + 1);
+    let half = blob_of_len(budget::LIVE_BLOBS / 2);
+    for backend in backends() {
+        let mut machines = InnerMachines::with_backend(backend);
+        assert_eq!(machines.create(&big, 0), Err(InnerError::Budget));
+        let first = machines.create(&half, 0).unwrap();
+        machines.create(&half, 0).unwrap();
+        assert_eq!(
+            machines.create(&compact_blob(&[0], &[0]), 0),
+            Err(InnerError::Budget),
+            "{backend:?}: the live machines hold the whole budget"
+        );
+        machines.expunge(first).unwrap();
+        let mut prepared = 2 * half.len();
+        loop {
+            let created = machines.create(&half, 0);
+            prepared += half.len();
+            if prepared > budget::PREPARED_BLOBS {
+                assert_eq!(created, Err(InnerError::Budget), "{backend:?}");
+                break;
+            }
+            machines.expunge(created.unwrap()).unwrap();
+        }
+    }
+    let mut literal = InnerMachines::with_backend(PvmBackend::ForceInterpreter);
+    literal.set_profile(Profile::GrayPaper);
+    assert!(literal.create(&big, 0).is_ok());
+}
+
+/// A VOS host bounds the pages an invocation's machines hold mapped,
+/// counted from the mappings the guest asks for, alike on both backends.
+/// (Unbounded, a page became resident for about 130 gas: a refine's gas
+/// committed over 100 GiB.)
+#[test]
+fn a_vos_host_bounds_the_pages_an_invocation_maps() {
+    let first = INNER_FIRST_MAPPABLE_PAGE;
+    let half = (budget::MAPPED_PAGES / 2) as u32;
+    for backend in backends() {
+        let mut machines = InnerMachines::with_backend(backend);
+        let a = machines.create(&host_then_trap(), 0).unwrap();
+        let b = machines.create(&host_then_trap(), 0).unwrap();
+        machines
+            .pages(a, first, half, PageMode::AllocateReadWrite)
+            .unwrap();
+        // Mapping mapped pages again, or changing their access, maps none.
+        machines
+            .pages(a, first, half, PageMode::AllocateReadOnly)
+            .unwrap();
+        machines
+            .pages(a, first, half, PageMode::SetReadWrite)
+            .unwrap();
+        machines
+            .pages(b, first, half, PageMode::AllocateReadWrite)
+            .unwrap();
+        assert_eq!(
+            machines.pages(b, first + half, 1, PageMode::AllocateReadOnly),
+            Err(InnerError::Budget),
+            "{backend:?}"
+        );
+        machines.pages(a, first, 1, PageMode::Free).unwrap();
+        machines
+            .pages(b, first + half, 1, PageMode::AllocateReadOnly)
+            .unwrap();
+        machines.expunge(a).unwrap();
+        machines
+            .pages(b, first + half + 1, half - 1, PageMode::AllocateReadOnly)
+            .unwrap();
+
+        let mut literal = InnerMachines::with_backend(backend);
+        literal.set_profile(Profile::GrayPaper);
+        let c = literal.create(&host_then_trap(), 0).unwrap();
+        literal
+            .pages(c, first, 2 * half + 1, PageMode::AllocateReadOnly)
+            .unwrap();
+    }
 }

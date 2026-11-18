@@ -1112,3 +1112,28 @@ fn a_panicked_inner_machine_is_rerun_unpaid_only_on_the_jam_only_host() {
         assert_eq!(jam.registers[7], PANIC_STATUS, "{backend:?}");
     }
 }
+
+/// `pages` past a VOS host's budget answers `FULL` there; the JAM-only
+/// host maps them, as the Gray Paper does.
+#[test]
+fn pages_past_the_budget_answer_full_on_a_vos_host_alone() {
+    let pages = crate::inner::budget::MAPPED_PAGES as u32 + 1;
+    let [p0, p1, p2, _] = pages.to_le_bytes();
+    let code = [
+        10, 9, // machine(φ7, φ8): the arguments
+        51, 8, 16, // φ8 <- 16, the first mappable page
+        51, 9, p0, p1, p2, // φ9 <- the pages
+        51, 10, 2, // φ10 <- allocate read-write
+        10, 12, // pages(0, 16, pages, 2)
+        50, 0, // halt
+    ];
+    let outer = standard_program(&code, &[0, 2, 5, 10, 13, 15]);
+    let gas = 100_000_000;
+    let load = || RefineContext::load_with(&outer, &inner_program(), gas, MemoryModel::Sparse);
+    let vos = load().unwrap().run();
+    assert_eq!(vos.exit, ExitReason::Halt);
+    assert_eq!(vos.registers[7], result::FULL);
+    let jam = load().unwrap().try_run_jam(JamRefine::default()).unwrap();
+    assert_eq!(jam.invocation.exit, ExitReason::Halt);
+    assert_eq!(jam.invocation.registers[7], result::OK);
+}

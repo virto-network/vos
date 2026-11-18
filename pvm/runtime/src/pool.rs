@@ -311,6 +311,11 @@ impl PoolProgram {
         self.price
     }
 
+    /// The pages a machine of the program holds mapped as laid out.
+    pub(crate) fn mapped_pages(&self) -> usize {
+        self.image.regions.iter().map(|&(_, count, _)| count).sum()
+    }
+
     /// Whether a machine of the program may start at instruction counter
     /// `pc`, as `machine` checks its counter.
     pub(crate) fn enters_at(&self, pc: u32) -> bool {
