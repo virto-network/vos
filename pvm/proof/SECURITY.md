@@ -298,6 +298,16 @@ from its side note.
   children's positions adjacent and the wrap a root at position 0, but a
   leaf's positions are its witness, so neither binds anything; the entry
   flag, whose constants the leaf asserts, binds where the run starts.
+- **No statement counts steps.** A `trap`, or a host call the run does not
+  serve, stays at its pc (`chips/cpu/constraints/control.rs`, `host_call.rs`),
+  and the step chain is a lookup, not the rows' order (only the row below it
+  must be padding), so the same instruction may follow it again, in its
+  segment or the next, each a row that only advances the timestamp. Such a
+  run never leaves that pc, so never reaches the halt a statement requires,
+  and a segment's boundary timestamps are positions in its run, not the
+  steps it executed. No statement, the wrap's, a device
+  proof's or a venue's, carries a step count or a timestamp; a field that
+  ever did would need those rows refused.
 - **The program id is the trust anchor.** A Poseidon2-M31 hash over the
   transpiler version, the program hash, the shape, the segment channel,
   the classes' preprocessed roots, the image root and the leaf circuits'

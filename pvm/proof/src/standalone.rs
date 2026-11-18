@@ -161,6 +161,17 @@ fn shape<MC: PcsStack>(
         &shape_component_refs,
         &expected_log_sizes,
     )?;
+    // Stwo's lifted Merkle verifier takes the main and interaction trees'
+    // queries at the composition's height: a tree below it would panic on a
+    // hostile proof. Every chip has both kinds of column at a degree bound of
+    // one, so each tree reaches it; refuse a set that would not.
+    for tree in [&expected_log_sizes[1], &expected_log_sizes[2]] {
+        if tree.iter().copied().max() < Some(protocol_shape.max_log_degree_bound) {
+            return Err(VerificationError::InvalidStructure(
+                "a trace tree below the composition's height".to_string(),
+            ));
+        }
+    }
     Ok((expected_log_sizes, protocol_shape, security_shape))
 }
 
