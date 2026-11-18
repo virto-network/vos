@@ -81,6 +81,9 @@ pub(crate) struct TranslationContext {
     pub(crate) code_ranges: Vec<(u64, u64)>,
     /// Each `ecalli` emitted: the RISC-V address of its `ecall`, and its id.
     pub(crate) host_calls: Vec<(u64, u32)>,
+    /// The register a load into x0 at the next instruction may read into:
+    /// one the code after it writes before reading.
+    pub(crate) discard_into: Option<u8>,
     /// Point a branch whose target was never translated at a trap, rather
     /// than leave it unresolved: a kernel's code, its unreachable targets
     /// pruned.

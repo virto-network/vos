@@ -249,6 +249,9 @@ pub(super) fn translate_section_linked(
         // with the pending_load_imm the HI20 set.
         let lo12 = elf.lo12_sites.contains(&rv_addr);
         let (rd, rs1, funct3) = (riscv::rd(inst), riscv::rs1(inst), riscv::funct3(inst));
+        if riscv::opcode(inst) == op::LOAD && rd == 0 {
+            ctx.discard_into = dead_register(&data[offset + 4..]);
+        }
         match riscv::opcode(inst) {
             // ADDI rd, rs1, lo12 → address already loaded by HI20, reached
             // when the HI20 peek-ahead didn't consume this ADDI (e.g. a
@@ -276,4 +279,38 @@ pub(super) fn translate_section_linked(
     ctx.flush_pending()?;
 
     Ok(())
+}
+
+/// A register the straight-line code in `code` writes before it reads it,
+/// so one whose value at its start no execution reads: the first such the
+/// code writes, if any does before its first control-flow instruction.
+fn dead_register(code: &[u8]) -> Option<u8> {
+    // The registers read or written so far, each decided by the first.
+    let mut decided = 0u32;
+    for inst in riscv::words(code) {
+        let (rd, rs1, rs2) = (riscv::rd(inst), riscv::rs1(inst), riscv::rs2(inst));
+        let (reads, writes): (&[u8], Option<u8>) = match riscv::opcode(inst) {
+            op::LUI | op::AUIPC => (&[], Some(rd)),
+            op::LOAD | op::OP_IMM | op::OP_IMM_32 => (&[rs1], Some(rd)),
+            op::STORE => (&[rs1, rs2], None),
+            op::OP | op::OP_32 => (&[rs1, rs2], Some(rd)),
+            // A conditional move keeps its destination when it does not move.
+            op::CUSTOM_0 => (&[rs1, rs2, rd], Some(rd)),
+            op::MISC_MEM => (&[], None),
+            _ => return None,
+        };
+        for &r in reads {
+            decided |= 1 << r;
+        }
+        if let Some(r) = writes
+            && decided & (1 << r) == 0
+            && matches!(r, 1 | 2 | 5..=15)
+        {
+            return Some(r);
+        }
+        if let Some(r) = writes {
+            decided |= 1 << r;
+        }
+    }
+    None
 }

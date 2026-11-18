@@ -58,6 +58,10 @@ pub enum TranspileError {
     /// address, and a byte displacement from it has no PVM equivalent.
     #[error("jalr at {at:#x}: displacement {imm} from a register target is not representable")]
     IndirectDisplacement { at: u64, imm: i32 },
+    /// A load into x0 at `at` with no register free to receive it: the
+    /// straight-line code after it reads every register before writing it.
+    #[error("load into x0 at {at:#x}: no register is free to receive its value")]
+    DiscardedLoad { at: u64 },
 }
 
 /// A program's functions: each one's first PVM instruction in its code, and

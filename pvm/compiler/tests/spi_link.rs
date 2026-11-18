@@ -822,3 +822,44 @@ fn an_unrepresentable_indirect_displacement_is_refused() {
         );
     }
 }
+
+/// A load into x0 still reads memory: it halts where its address is
+/// readable, leaving every register as it was, and faults where it is
+/// not, x0 its base or not; with no register free to take its value the
+/// compiler refuses it.
+#[test]
+fn a_discarded_load_keeps_its_access() {
+    let ld0 = |rs1: u32, imm: i32| ld(0, rs1, imm);
+    // Readable: the stack below sp, and the ro data.
+    for load in [ld0(SP, -8), ld0(T1, 0), lbu(0, SP, -1)] {
+        let text = [
+            lui(T1, 0x10),   // t1 = the ro base
+            addi(A3, 0, 7),  // a3 = 7
+            load,            // discarded
+            addi(A4, 0, 1),  // a4 written before it is read: free
+            addi(A5, A3, 0), // a3 still 7
+            ret(),
+        ];
+        let blob = link_elf_spi(&text_elf(&text, Some(&RO_CONST.to_le_bytes()))).expect("links");
+        let (exit, registers) = run_both(&blob);
+        assert_eq!(exit, ExitReason::Halt);
+        assert_eq!(registers[T1_PVM], RO_VADDR, "the base keeps its value");
+        assert_eq!(registers[12], 7);
+    }
+    // Unreadable: below 64 KiB, through a register and through x0.
+    for load in [ld0(T1, 0x7f8), ld0(0, 0x7f8), lbu(0, 0, 8)] {
+        let text = [addi(T1, 0, 0), load, addi(A4, 0, 1), ret()];
+        let blob = link_elf_spi(&text_elf(&text, None)).expect("links");
+        let (exit, _) = run_both(&blob);
+        assert!(
+            matches!(exit, ExitReason::Panic | ExitReason::PageFault(_)),
+            "a discarded load of an unreadable address stops: {exit:?}"
+        );
+    }
+    // Every register read before it is written: nothing takes the value.
+    let text = [ld0(SP, -8), ret()];
+    assert!(matches!(
+        link_elf_spi(&text_elf(&text, None)),
+        Err(TranspileError::DiscardedLoad { .. })
+    ));
+}

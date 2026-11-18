@@ -11,6 +11,7 @@ use proptest::prelude::*;
 use vos_pvm::{ExitReason, refine};
 
 use super::{Link, LinkedElf, spi_blob, transpile_with};
+use crate::TranspileError;
 use crate::riscv::rv::{b_type, i_type, jal, r_type, s_type};
 
 const TEXT: u64 = 0x40_0000;
@@ -693,7 +694,13 @@ fn check(items: &[Item], registers: &[u64; 11]) -> Result<(), TestCaseError> {
         expected[at..at + 8].copy_from_slice(&reference.x[usize::from(r)].to_le_bytes());
     }
 
-    let program = link(&assemble(body));
+    // A load into x0 the code after it leaves no register free for is
+    // refused (`a_discarded_load_keeps_its_access`), not translated.
+    let elf = LinkedElf::text(TEXT, assemble(body));
+    let program = match transpile_with(&elf, Link::Whole) {
+        Err(TranspileError::DiscardedLoad { .. }) => return Ok(()),
+        translated => spi_blob(translated.expect("translates")).expect("links"),
+    };
     let invocation = refine::execute(&program, &args, 10_000_000).expect("executes");
     prop_assert_eq!(&invocation.exit, &ExitReason::Halt);
     let output = invocation.output_bounded(OUT_LEN).expect("output");
