@@ -3,7 +3,7 @@
 //! The kernel creates CODE caps that wrap compiled code in one of two backends.
 //! `PvmBackend` controls the selection; `CompiledProgram` holds the result.
 
-use alloc::{string::String, sync::Arc, vec};
+use alloc::{string::String, sync::Arc};
 
 /// Backend selection for PVM execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -213,6 +213,33 @@ impl PreparedExecution {
         &self.interpreter
     }
 
+    /// Host bytes the preparation holds: the interpreter's tables and,
+    /// on the recompiler, its native code and tables.
+    pub(crate) fn footprint(&self) -> usize {
+        use core::mem::size_of_val;
+        let p = &*self.interpreter;
+        let interpreter = size_of_val(&*p.decoded_insts)
+            + size_of_val(&*p.pc_to_idx)
+            + size_of_val(&*p.basic_block_starts)
+            + size_of_val(&*p.block_gas_costs)
+            + size_of_val(&*p.gas_block_start_by_pc)
+            + size_of_val(&*p.code)
+            + size_of_val(&*p.bitmask)
+            + size_of_val(&*p.jump_table);
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        if let Some(native) = &self.native {
+            return interpreter
+                + native.native_code.mmap_cap
+                + size_of_val(&*native.dispatch_table)
+                + size_of_val(&*native.fault_resume_offsets)
+                + size_of_val(&*native.gas_block_start_by_pc)
+                + size_of_val(&*native.block_gas_costs)
+                + size_of_val(&*native.trap_table)
+                + size_of_val(&*native.block_starts);
+        }
+        interpreter
+    }
+
     pub(crate) fn allocate_memory(
         &self,
         span: u64,
@@ -234,9 +261,9 @@ impl PreparedExecution {
             if span > isize::MAX as u64 {
                 return Err("flat memory span exceeds host address space".into());
             }
-            // Up to 4 GiB, zeroed by the allocator, which aborts the process
-            // when it cannot: the sparse model is the one a caller bounds.
-            crate::interpreter::Memory::flat(vec![0; span as usize])
+            // Up to 4 GiB, zeroed by the allocator; a host that cannot give
+            // it refuses the machine rather than aborting.
+            crate::interpreter::Memory::try_flat_zeroed(span as usize)?
         })
     }
 

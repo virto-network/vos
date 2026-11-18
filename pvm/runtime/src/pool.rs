@@ -725,10 +725,11 @@ pub(crate) fn prepared_code(
     code: &CodeBlob,
     backend: PvmBackend,
 ) -> Result<PreparedExecution, String> {
-    /// Code bytes kept across programs before the cache starts over:
-    /// counted by blob, while each entry keeps its native code and per-byte
-    /// tables too, several times its blob.
-    const CAPACITY_BYTES: usize = 64 << 20;
+    /// Host bytes the kept preparations hold before the cache starts
+    /// over, counted in what each holds (its tables and native code, tens
+    /// to hundreds of bytes a blob byte), not by blob. What the cache keeps
+    /// changes no result, only how often a program is prepared again.
+    const CAPACITY_BYTES: usize = 512 << 20;
 
     struct Cache {
         by_backend: HashMap<PvmBackend, HashMap<Arc<[u8]>, PreparedExecution>>,
@@ -758,8 +759,9 @@ pub(crate) fn prepared_code(
         return Ok(execution.clone());
     }
     let execution = prepare()?;
+    let footprint = execution.footprint();
     let mut cache = lock(cache);
-    if cache.bytes + code_blob.len() > CAPACITY_BYTES {
+    if cache.bytes + footprint > CAPACITY_BYTES {
         cache.by_backend.clear();
         cache.bytes = 0;
     }
@@ -770,7 +772,7 @@ pub(crate) fn prepared_code(
         return Ok(existing.clone());
     }
     programs.insert(code_blob.into(), execution.clone());
-    cache.bytes += code_blob.len();
+    cache.bytes += footprint;
     Ok(execution)
 }
 

@@ -1177,6 +1177,27 @@ impl Memory {
         Self::Flat(FlatMem::new(bytes))
     }
 
+    /// Flat memory of `len` zero bytes, all pages RW, or an error when the
+    /// host cannot allocate them (where `vec![0; len]` aborts the process).
+    /// The bytes come zeroed from the allocator, as `vec![0; len]`'s do,
+    /// so the pages stay untouched until written.
+    pub fn try_flat_zeroed(len: usize) -> Result<Self, alloc::string::String> {
+        if len == 0 {
+            return Ok(Self::flat(Vec::new()));
+        }
+        let refused = || alloc::format!("cannot allocate {len} bytes of flat memory");
+        let layout = core::alloc::Layout::array::<u8>(len).map_err(|_| refused())?;
+        // SAFETY: `layout` has a nonzero size.
+        let pointer = unsafe { alloc::alloc::alloc_zeroed(layout) };
+        if pointer.is_null() {
+            return Err(refused());
+        }
+        // SAFETY: the global allocator gave `pointer` for `len` bytes of
+        // alignment 1, all initialized to zero.
+        let bytes = unsafe { Vec::from_raw_parts(pointer, len, len) };
+        Ok(Self::flat(bytes))
+    }
+
     /// Sparse memory spanning `span` bytes (rounded up to whole pages),
     /// all pages RW, reading as zero until written.
     pub fn sparse(span: u64) -> Self {
@@ -1710,6 +1731,15 @@ mod tests {
             assert_eq!(memory.mapped_pages(2, 2), 1);
             assert_eq!(memory.mapped_pages(5, 100), 1);
         }
+    }
+
+    /// Flat memory the host cannot allocate is an error, not an abort.
+    #[test]
+    fn flat_memory_past_the_host_is_refused() {
+        assert!(Memory::try_flat_zeroed(isize::MAX as usize).is_err());
+        let zeroed = Memory::try_flat_zeroed(2 * PAGE).unwrap();
+        assert_eq!(zeroed.span(), 2 * PAGE as u64);
+        assert_eq!(zeroed.read_u64_le(PAGE as u32), Ok(0));
     }
 
     #[test]
