@@ -53,6 +53,11 @@ fn counting() -> Vec<u8> {
 /// A standard program of `code`, its instructions starting at
 /// `starts`, with [`program`]'s regions.
 fn standard(code: Vec<u8>, starts: &[usize]) -> Vec<u8> {
+    standard_with_heap(code, starts, 2)
+}
+
+/// [`standard`] with `heap_pages` pages of heap.
+fn standard_with_heap(code: Vec<u8>, starts: &[usize], heap_pages: u16) -> Vec<u8> {
     let mut bitmask = vec![0; code.len()];
     for &start in starts {
         bitmask[start] = 1;
@@ -65,7 +70,7 @@ fn standard(code: Vec<u8>, starts: &[usize]) -> Vec<u8> {
     .unwrap();
     let ro: Vec<u8> = (0..300).map(|i| (i * 7) as u8 | 1).collect();
     let rw: Vec<u8> = (0..5000).map(|i| (i * 13) as u8).collect();
-    let (heap_pages, stack) = (2u16, 8192u32);
+    let stack = 8192u32;
     let mut blob = Vec::new();
     blob.extend_from_slice(&(ro.len() as u32).to_le_bytes()[..3]);
     blob.extend_from_slice(&(rw.len() as u32).to_le_bytes()[..3]);
@@ -690,45 +695,73 @@ fn uninstalled_programs_and_full_programs_keep_no_machines() {
     );
 }
 
-/// A native machine whose resets zeroed many pages in place has all its
-/// pages discarded, and still equals a fresh one.
+/// A native machine returned to the pool holds the image's pages alone:
+/// the zero pages of its regions a tenant only read, which no write
+/// tracking sees, are discarded at reset with those it wrote, and the
+/// machine still equals a fresh one. (Reading 4,096 never-written heap
+/// pages of a native machine's shared mapping made them resident, 16 MiB
+/// that every idle machine kept.)
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn scattered_writes_trigger_a_deep_clean() {
-    let blob = program();
+fn a_returned_native_machine_keeps_no_page_a_tenant_touched() {
+    const READ: usize = 4096;
+    let code = vec![Opcode::Trap as u8];
+    let blob = standard_with_heap(code, &[0], READ as u16 + 1);
     let pool = Arc::new(MachinePool::new());
     let program = pool.program(&pool.install(&blob).unwrap()).unwrap();
     let mut machines = InnerMachines::with_backend(PvmBackend::ForceRecompiler);
     machines.set_pool(Arc::clone(&pool));
-    let base = 0x50_0000u32 / 4096;
-    let zeroed = |pool: &MachinePool| {
-        lock(&pool.idle)
-            .by_program
-            .values()
-            .flatten()
-            .map(|machine| machine.zeroed)
-            .sum::<usize>()
+    let resident = |pool: &MachinePool| {
+        let mut idle = lock(&pool.idle);
+        let machine = idle.by_program.values_mut().flatten().next().unwrap();
+        machine.vm.memory_mut().resident_pages().unwrap()
     };
-    let mut cleaned = false;
-    for _ in 0..4 {
-        let id = machines.instantiate(&program, 0).unwrap();
-        machines
-            .pages(id, base, 400, PageMode::AllocateReadWrite)
-            .unwrap();
-        for page in (0..400).step_by(2) {
-            machines.poke(id, (base + page) * 4096, &[1]).unwrap();
-        }
-        machines.expunge(id).unwrap();
-        cleaned |= zeroed(&pool) == 0;
-    }
-    assert!(cleaned, "a deep clean ran");
+    let id = machines.instantiate(&program, 0).unwrap();
+    machines.expunge(id).unwrap();
+    let fresh = resident(&pool);
+
+    let standard = crate::spi::parse_standard_program(&blob).unwrap();
+    let layout = standard.layout(&[]).unwrap();
+    let heap_end = (layout.rw.base + layout.rw.size) as u32;
+    let heap = heap_end - (READ * 4096) as u32;
+    let id = machines.instantiate(&program, 0).unwrap();
+    let read = machines.peek(id, heap, READ * 4096).unwrap();
+    assert!(read.iter().all(|&byte| byte == 0));
+    machines.poke(id, layout.stack.base as u32, &[1]).unwrap();
+    machines.expunge(id).unwrap();
+    assert_eq!(pool.idle(), 1);
+    assert_eq!(resident(&pool), fresh, "only the image stays resident");
+
     let id = machines.instantiate(&program, 0).unwrap();
     let (reference, reference_id) = loaded(&blob, PvmBackend::ForceRecompiler);
-    let touched: Vec<u32> = (base..base + 400).collect();
+    let touched: Vec<u32> = (heap / 4096..heap / 4096 + 16).collect();
     assert_eq!(
         dump(&machines, id, &touched),
         dump(&reference, reference_id, &touched)
     );
+}
+
+/// Idle native machines hold kernel mappings against a budget, and one
+/// past it is dropped rather than kept; a machine lent or dropped returns
+/// its mappings.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn idle_native_machines_are_kept_within_a_mapping_budget() {
+    let budget: &'static MappingBudget = Box::leak(Box::new(MappingBudget::new(20)));
+    let blob = program();
+    let pool = MachinePool::new();
+    let program = pool.program(&pool.install(&blob).unwrap()).unwrap();
+    let mut machine = pool.acquire(&program, PvmBackend::ForceRecompiler).unwrap();
+    let mut second = pool.acquire(&program, PvmBackend::ForceRecompiler).unwrap();
+    assert!(machine.reset() && machine.keep(budget));
+    let held = budget.held.load(Ordering::Relaxed);
+    assert!(held > NATIVE_FIXED_MAPPINGS && held <= 20, "{held}");
+    assert!(second.reset() && !second.keep(budget), "past the budget");
+    drop(machine);
+    assert_eq!(budget.held.load(Ordering::Relaxed), 0);
+    assert!(second.keep(budget));
+    let _ = second.into_parts();
+    assert_eq!(budget.held.load(Ordering::Relaxed), 0);
 }
 
 /// A standard program that stores u64 `args[8..16]` at address

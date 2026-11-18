@@ -25,6 +25,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use crate::backend::{PreparedExecution, PvmBackend};
@@ -38,17 +39,76 @@ const PAGE: usize = PVM_PAGE_SIZE as usize;
 
 /// Idle machines a pool keeps by default, across programs. Each JIT machine
 /// reserves more than 4 GiB of address space, so a process can hold about
-/// 30k of them at most.
+/// 30k of them at most; and each holds kernel mappings, which
+/// [`MappingBudget`] bounds across every pool.
 pub const DEFAULT_IDLE_LIMIT: usize = 4096;
 
 /// Idle machines a pool keeps by default for one program and backend, so
 /// one busy program cannot crowd out the others.
 pub const DEFAULT_IDLE_PER_PROGRAM: usize = 512;
 
-/// A native machine that has zeroed this many pages in place since its last
-/// deep clean has all its pages discarded and its image reinstalled, so
-/// idle machines do not keep a past tenant's footprint resident.
-const DEEP_CLEAN_PAGES: usize = 256;
+/// Kernel mappings a native machine holds besides one for each run of its
+/// guest window's permissions: its permission table, context, guards and
+/// host alias, with room to spare.
+const NATIVE_FIXED_MAPPINGS: usize = 8;
+
+/// The kernel mappings idle native machines may hold together, process-wide,
+/// so machines kept for reuse never crowd out running ones, whose page
+/// permissions also take mappings: a quarter of the process's mapping limit
+/// (`vm.max_map_count`, read once; Linux's default 65,530 where it cannot
+/// be read). A machine past it is dropped rather than kept idle, which
+/// changes no result, only how soon a machine is built again.
+pub(crate) struct MappingBudget {
+    held: AtomicUsize,
+    limit: usize,
+}
+
+impl MappingBudget {
+    const fn new(limit: usize) -> Self {
+        Self {
+            held: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    /// The process's budget.
+    fn process() -> &'static Self {
+        static BUDGET: OnceLock<MappingBudget> = OnceLock::new();
+        BUDGET.get_or_init(|| {
+            let limit = std::fs::read_to_string("/proc/sys/vm/max_map_count")
+                .ok()
+                .and_then(|limit| limit.trim().parse::<usize>().ok())
+                .unwrap_or(65_530);
+            Self::new(limit / 4)
+        })
+    }
+
+    /// Claim `mappings`, or `None` past the budget.
+    fn claim(&'static self, mappings: usize) -> Option<MappingClaim> {
+        self.held
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                (held + mappings <= self.limit).then_some(held + mappings)
+            })
+            .ok()
+            .map(|_| MappingClaim {
+                budget: self,
+                mappings,
+            })
+    }
+}
+
+/// Mappings an idle machine holds against a [`MappingBudget`], returned
+/// when the machine is lent or dropped.
+pub(crate) struct MappingClaim {
+    budget: &'static MappingBudget,
+    mappings: usize,
+}
+
+impl Drop for MappingClaim {
+    fn drop(&mut self) {
+        self.budget.held.fetch_sub(self.mappings, Ordering::Relaxed);
+    }
+}
 
 /// Lock pool state even after a panic elsewhere: it is only maps and
 /// counts, and releasing machines while unwinding must not abort.
@@ -108,12 +168,20 @@ impl Image {
 
     /// Return memory laid out by [`Self::install`] to the image: restore or
     /// clear every page written since, and restore the permissions that
-    /// changed. Returns the pages zeroed in place, which stay resident, or
-    /// `None` when the backend failed to clear pages.
-    fn restore(&self, memory: &mut Memory, permissions_changed: bool) -> Option<usize> {
+    /// changed. False when the backend failed to clear pages.
+    ///
+    /// Native memory is a shared mapping, where even a read of a page
+    /// never written makes it resident, and no write tracking sees it.
+    /// So every page of it the guest could have read and the image leaves
+    /// zero (its regions' and those it mapped since) is discarded, and no
+    /// page is zeroed in place: an idle native machine holds the image's
+    /// pages alone, whatever a past tenant touched. Sparse memory holds a
+    /// frame only for a page written, which the restore below zeroes in
+    /// place when its run is short.
+    fn restore(&self, memory: &mut Memory, permissions_changed: bool) -> bool {
         /// Runs this short are zeroed by writing; longer ones are discarded.
         const WRITE_ZEROS_PAGES: u32 = 16;
-        let mut zeroed = 0;
+        let native = !memory.is_sparse();
         for range in memory.take_pages_since_reset() {
             let mut page = range.start;
             while page < range.end {
@@ -128,44 +196,56 @@ impl Image {
                     .next()
                     .map_or(range.end, |(&next, _)| next);
                 let count = next - page;
-                if count <= WRITE_ZEROS_PAGES {
+                if native {
+                    // Discarded with the readable pages below.
+                } else if count <= WRITE_ZEROS_PAGES {
                     memory.zero_pages(page as usize, count as usize);
-                    zeroed += count as usize;
                 } else if !memory.clear_pages(page as usize, count as usize) {
-                    return None;
+                    return false;
                 }
                 page = next;
             }
         }
+        let changed = memory.take_changed_permissions();
+        if native {
+            let mapped = changed
+                .iter()
+                .filter(|&&(_, _, permission)| permission != PERM_NONE);
+            for &(first, count, _) in self.regions.iter().chain(mapped) {
+                if !self.clear_unimaged(memory, first, first + count) {
+                    return false;
+                }
+            }
+        }
         if permissions_changed {
-            self.restore_permissions(memory);
+            self.restore_permissions(memory, changed);
         }
         memory.take_changed_permissions();
         // The restores above are host writes, and no guest has run since
         // the capture: the next period starts clean.
         memory.forget_host_writes();
-        Some(zeroed)
-    }
-
-    /// Discard every page and reinstall the image's contents, leaving only
-    /// the image resident. Permissions are unchanged. False when the backend
-    /// failed to discard pages.
-    fn deep_clean(&self, memory: &mut Memory) -> bool {
-        let pages = memory.pages();
-        if !memory.clear_pages(0, pages) {
-            return false;
-        }
-        for (&page, bytes) in &self.pages {
-            memory.init_copy(page * PVM_PAGE_SIZE, &bytes[..]);
-        }
-        memory.forget_host_writes();
         true
     }
 
-    /// Set every page whose permission changed and now differs from the
-    /// image back to it, leaving the others untouched.
-    fn restore_permissions(&self, memory: &mut Memory) {
-        for (first, count, permission) in memory.take_changed_permissions() {
+    /// Discard the pages of `[first, end)` the image holds nothing for.
+    /// False when the backend failed to discard them.
+    fn clear_unimaged(&self, memory: &mut Memory, first: usize, end: usize) -> bool {
+        let mut page = first;
+        for (&imaged, _) in self.pages.range(first as u32..end as u32) {
+            let imaged = imaged as usize;
+            if !memory.clear_pages(page, imaged - page) {
+                return false;
+            }
+            page = imaged + 1;
+        }
+        memory.clear_pages(page, end - page)
+    }
+
+    /// Set every page of `changed`, the runs whose permission changed,
+    /// that now differs from the image back to it, leaving the others
+    /// untouched.
+    fn restore_permissions(&self, memory: &mut Memory, changed: Vec<(usize, usize, u8)>) {
+        for (first, count, permission) in changed {
             let end = first + count;
             let mut page = first;
             while page < end {
@@ -349,7 +429,6 @@ impl PoolProgram {
 pub(crate) struct PoolTicket {
     pub(crate) program: Arc<PoolProgram>,
     permissions_revision: u64,
-    zeroed: usize,
 }
 
 impl core::fmt::Debug for PoolTicket {
@@ -367,8 +446,8 @@ pub(crate) struct PooledMachine {
     pub(crate) vm: Interpreter,
     /// The permission revision right after the last build or reset.
     permissions_revision: u64,
-    /// Pages zeroed in place since the last deep clean.
-    zeroed: usize,
+    /// Held while the machine is idle.
+    idle: Option<MappingClaim>,
 }
 
 impl PooledMachine {
@@ -398,7 +477,7 @@ impl PooledMachine {
             execution,
             vm,
             permissions_revision,
-            zeroed: 0,
+            idle: None,
         })
     }
 
@@ -407,7 +486,6 @@ impl PooledMachine {
         let ticket = PoolTicket {
             program: self.program,
             permissions_revision: self.permissions_revision,
-            zeroed: self.zeroed,
         };
         (self.vm, self.execution, ticket)
     }
@@ -423,7 +501,7 @@ impl PooledMachine {
             execution,
             vm,
             permissions_revision: ticket.permissions_revision,
-            zeroed: ticket.zeroed,
+            idle: None,
         }
     }
 
@@ -435,34 +513,33 @@ impl PooledMachine {
         }
         let permissions_changed =
             self.vm.memory().permissions_revision() != self.permissions_revision;
-        let Some(zeroed) = self
+        // Interpreter frames are bounded by `keep`; native memory keeps
+        // the image's pages alone.
+        if !self
             .program
             .image
             .restore(self.vm.memory_mut(), permissions_changed)
-        else {
+        {
             return false;
-        };
-        self.zeroed += zeroed;
-        // Interpreter frames are bounded by `keep`; native pages zeroed in
-        // place stay resident until discarded.
-        if self.zeroed > DEEP_CLEAN_PAGES && !self.vm.memory().is_sparse() {
-            if !self.program.image.deep_clean(self.vm.memory_mut()) {
-                return false;
-            }
-            self.zeroed = 0;
         }
         self.vm.reset_state(0);
         self.permissions_revision = self.vm.memory().permissions_revision();
         !self.vm.memory().tracking_failed()
     }
 
-    /// Whether a reset machine is worth keeping idle.
-    fn keep(&self) -> bool {
+    /// Whether a reset machine is worth keeping idle, claiming its kernel
+    /// mappings from `budget` when it is native: an interpreter machine
+    /// that grew too large is not, nor is a native one past the budget.
+    fn keep(&mut self, budget: &'static MappingBudget) -> bool {
         let memory = self.vm.memory();
-        !memory.is_sparse()
-            || self.program.fresh_bytes.get().is_none_or(|&fresh| {
+        if memory.is_sparse() {
+            return self.program.fresh_bytes.get().is_none_or(|&fresh| {
                 memory.allocated_bytes() <= fresh.saturating_add(IDLE_GROWTH_LIMIT)
-            })
+            });
+        }
+        let mappings = NATIVE_FIXED_MAPPINGS + memory.permission_runs().len();
+        self.idle = budget.claim(mappings);
+        self.idle.is_some()
     }
 }
 
@@ -577,7 +654,7 @@ impl MachinePool {
         let installed = lock(&self.programs)
             .get(&machine.program.hash)
             .is_some_and(|program| Arc::ptr_eq(program, &machine.program));
-        if !installed || !machine.reset() || !machine.keep() {
+        if !installed || !machine.reset() || !machine.keep(MappingBudget::process()) {
             return;
         }
         let key = (machine.program.hash, machine.execution.backend());
@@ -699,7 +776,7 @@ impl OuterMachines {
             0,
         );
         let mut machine = PooledMachine::from_parts(vm, self.execution.clone(), ticket);
-        if !machine.reset() || !machine.keep() {
+        if !machine.reset() || !machine.keep(MappingBudget::process()) {
             return;
         }
         let mut idle = lock(&self.idle);

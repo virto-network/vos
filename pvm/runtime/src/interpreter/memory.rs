@@ -1177,6 +1177,31 @@ impl Memory {
         Self::Flat(FlatMem::new(bytes))
     }
 
+    /// The pages of native memory resident in the host (`mincore` on its
+    /// host alias); `None` for any other memory.
+    #[cfg(all(test, feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn resident_pages(&mut self) -> Option<usize> {
+        let pages = self.pages();
+        let Memory::Flat(FlatMem {
+            bytes: FlatBytes::Native(bytes),
+            ..
+        }) = self
+        else {
+            return None;
+        };
+        let mut resident = vec![0u8; pages];
+        // SAFETY: the host alias maps `pages` whole pages, page-aligned.
+        let status = unsafe {
+            libc::mincore(
+                bytes.host_ptr().cast(),
+                pages * PAGE,
+                resident.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, 0, "mincore on the host alias");
+        Some(resident.iter().filter(|&&page| page & 1 != 0).count())
+    }
+
     /// Flat memory of `len` zero bytes, all pages RW, or an error when the
     /// host cannot allocate them (where `vec![0; len]` aborts the process).
     /// The bytes come zeroed from the allocator, as `vec![0; len]`'s do,
