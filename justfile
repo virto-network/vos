@@ -98,9 +98,17 @@ bench: build-bench-guests
     cargo run --release -p vos-pvm-bench --bin snapshots
     cargo run --release -p vos-pvm-bench --bin nesting
 
+# The segment bench (`pvm/proof/benches/segments.rs`): a kernel's run with
+# precompiles cut into windows, then proved, each case in its own process
+# for its peak memory. A proving run: on a host with the memory for it.
+bench-segments:
+    cargo bench -p vos-pvm-proof --bench segments --no-run
+    cargo bench -p vos-pvm-proof --bench segments -- windows
+    cargo bench -p vos-pvm-proof --bench segments -- prove
+
 # Gray Paper 0.8.0 conformance vectors on the interpreter and the JIT.
 vectors:
-    cargo test -p vos-pvm --test pvm_vectors
+    cargo test -p vos-pvm --test pvm_vectors --test boundaries
 
 # Prover integration suites (`vos-pvm-proof`'s, and the agent's kernels
 # proved, `vos-kernel-tests`'), including the soundness gates behind

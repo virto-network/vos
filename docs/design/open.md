@@ -134,6 +134,13 @@ The scale results are in `core-model.md` §14, "The scale test".
   per-segment `ts = 0` anchor bounds every access within 2^27, so no
   provable segment reaches the alias 2^30 steps away
   (`pvm/proof/SECURITY.md`, "The leaf's binding").
+- **The witness stream's framing:** the AIR binds each witness-input call
+  alone (a count at most its capacity, its writes), so a proved run may
+  be given a short or empty read and more bytes later; a constraint
+  across calls (a zero read final) needs a new segment format. Until
+  then a kernel frames its input by content (`pvm/proof/SECURITY.md`,
+  "Three boundaries"), and the stock kernels' reads are to be audited
+  against that.
 - **The leaf's timestamp bytes:** the leaf range-checks the io-hash's 32
   boundary bytes alone, and rests on the fold chain for the rest; a leaf
   alone accepts a `ts_in` whose first limb is `p − 1`. Range-check
@@ -148,7 +155,8 @@ The scale results are in `core-model.md` §14, "The scale test".
   kernel.
 - **The Stwo fork's divergence citation** behind the affine DEEP batching
   of formats 39 and 47 needs a cryptographer's review; format 39's floor
-  holds without it (65.33 proven bits batched by powers).
+  holds without it (65.33 proven bits, the least term, batched by
+  powers).
 - **The Blake2b host hook** (`0x400`, Kreivo's `blake2_256`) for the final
   verifier, deferred until a venue's compute weight binds.
 - **The segment format's `component_mask`:** format 41's header mixes no
@@ -192,6 +200,10 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **Renames that move blobs:** `final-verifier/src/masked.rs` (format
   39's decode and parameters) beside `masking.rs` (the masked verifier),
   at the next change of the final verifier's circuit.
+- **An AUIPC fused with its JALR** (the `call` and `tail` idioms)
+  leaves the AUIPC's register unwritten where RISC-V writes it: the
+  idiom's scratch (`ra`, `t1`), which compiled code does not read after
+  the jump; writing it costs an instruction per tail call.
 - **Docs of guest-linked crates:** `vos-abi`'s credentials functions that
   panic on values their callers validate, and `vos-pvm-codec`'s bound of
   a decoded `Vec` by items, not bytes: one line each, at the next re-pin
@@ -202,6 +214,11 @@ The scale results are in `core-model.md` §14, "The scale test".
   where the root, the kit and the Wasm blob run it on `0.15.5`
   (`tools/gates/locks.py`'s `DRIFT` names the edge). Bounding the
   requirement in the fork closes it, at its next pin.
+- **The interpreter's two loops** share skip and the division, remainder
+  and upper-multiply results (`interpreter/alu.rs`); the other register
+  results (shifts, rotates, 32-bit arithmetic, the immediate forms,
+  comparisons and bit counts) are spelled out in `step` and in the
+  predecoded loop, each over its own operand decoding.
 - **The kit's lock:** shipping the lock VOS's `check-kit` builds on beside
   the kit, with a command listing every package of the verify graph a
   consumer resolves at another version; and signed release tags with a
@@ -325,6 +342,31 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **The registry and the root space** (`identity-and-authority.md` §12): the registry agent on JAM, the
   root space under a charter, the handover triggers' numbers, and the rules
   for exit and disputes.
+
+## Execution
+
+- **Host bounds past the Gray Paper's reader** (`vos_pvm_program`,
+  `vos_pvm::backend`): a zero-width jump table holds at most as many
+  entries as its blob has bytes, a refusal the reader gives as it gives
+  an invalid blob's (Ψ's panic, `machine`'s HUH), for any blob, a
+  service's under `W_C` among them; and the interpreter prepares at most
+  `MAX_INTERPRETED_CODE` (4 MiB) of code, a backend refusal past it, a
+  valid program only an inner machine's `machine` call can name. A table
+  of implicit zeros (a length, no entries) and a fallible predecode lift
+  both.
+- **Arithmetic on a code pointer in a register** (`vos_pvm_compiler`):
+  the compiler gives a code pointer its jump-table address, so `addi t0,
+  t0, 4` then `jalr t0` selects another entry than the source's
+  instruction four bytes on. It cannot see the arithmetic: only a
+  `jalr`'s own displacement past ±1 is refused, and a source that offsets
+  a code pointer otherwise runs differently.
+- **Service admission in the node** (`vos_pvm::spi::service_fits`, `W_C`):
+  `OuterMachines` refuses a service's code past 4,000,000 bytes; the node
+  side's install, and its refine and accumulate answering `BIG`, call it
+  when they land.
+- **The JAM-only host's package** (`JamRefine`): `fetch` kinds 7 and 10
+  serve the encoded package and context as the caller gives them; the
+  fixture encodes no work package, so nothing holds them to its items.
 
 ## Chains and extensions
 
