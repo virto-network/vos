@@ -149,7 +149,7 @@ impl TracingPvm {
             0
         };
         let opcode = Opcode::from_byte(opcode_byte).unwrap_or(Opcode::Trap);
-        let skip_len = compute_skip(&self.pvm.bitmask, pc_before as usize);
+        let skip_len = vos_pvm::skip(&self.pvm.bitmask, pc_before as usize) as u32;
         let category = opcode.category();
         let decoded_args = args::decode_args(
             &self.pvm.code,
@@ -500,18 +500,6 @@ impl TracingPvm {
     pub fn blake2b_calls(&self) -> &[Blake2bCall] {
         &self.blake2b_records
     }
-}
-
-/// Compute skip(i) — distance to next instruction minus 1.
-pub(crate) fn compute_skip(bitmask: &[u8], i: usize) -> u32 {
-    for j in 0..25u32 {
-        let idx = i + 1 + j as usize;
-        let bit = if idx < bitmask.len() { bitmask[idx] } else { 1 };
-        if bit == 1 {
-            return j;
-        }
-    }
-    24
 }
 
 /// Extract immediate value from decoded args (0 if none).

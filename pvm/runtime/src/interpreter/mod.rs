@@ -444,21 +444,9 @@ impl Interpreter {
         None
     }
 
-    /// Compute skip(i) — distance to next instruction minus one (eq A.3).
+    /// skip(i): the argument bytes of the instruction at `i` (eq. skip).
     fn skip(&self, i: usize) -> usize {
-        // skip(i) = min(24, first j where (k ++ [1,1,...])_{i+1+j} = 1)
-        for j in 0..25 {
-            let idx = i + 1 + j;
-            let bit = if idx < self.bitmask.len() {
-                self.bitmask[idx]
-            } else {
-                1 // infinite 1s appended
-            };
-            if bit == 1 {
-                return j;
-            }
-        }
-        24
+        crate::skip(&self.bitmask, i)
     }
 
     /// Read from ζ (code with implicit zero extension, eq A.4).
@@ -2637,55 +2625,6 @@ fn smod_i64(a: i64, b: i64) -> i64 {
     }
 }
 
-/// Compute the skip (number of argument bytes) for instruction at `pc` by
-/// scanning the bitmask for the next instruction start.
-///
-/// Uses u64 word-at-a-time scanning when possible. The bitmask has value 1
-/// at instruction starts and 0 for argument bytes. We find the first 1 after
-/// pc+1 by loading 8 bytes at a time and using trailing-zero count.
-#[inline(always)]
-pub fn skip_for_bitmask(bitmask: &[u8], pc: usize) -> usize {
-    let start = pc + 1;
-    let bm_len = bitmask.len();
-
-    // Fast path: if we have at least 8 bytes, use a u64 scan.
-    // Most instructions are 1-6 bytes, so the first word usually suffices.
-    if start + 8 <= bm_len {
-        // SAFETY: start + 8 <= bm_len ensures the 8-byte read is within the slice.
-        let word = unsafe { core::ptr::read_unaligned(bitmask.as_ptr().add(start) as *const u64) };
-        // Each byte is 0 or 1. A byte with value 1 means "instruction start".
-        // We want the position of the first non-zero byte.
-        if word != 0 {
-            // The first non-zero byte position (little-endian: trailing zeros / 8)
-            return (word.trailing_zeros() / 8) as usize;
-        }
-        // All 8 bytes are 0 — continue with scalar scan from start+8
-        let mut j = 8;
-        while j < 25 {
-            let idx = start + j;
-            if idx >= bm_len || bitmask[idx] == 1 {
-                return j;
-            }
-            j += 1;
-        }
-        // No instruction start within 25 bytes: skip caps at 24 (GP F_skip).
-        return 24;
-    }
-
-    // Scalar fallback for near end of bitmask.
-    // No instruction start within 25 bytes → 24 (GP F_skip cap).
-    let mut s = 24;
-    for j in 0..25 {
-        let idx = start + j;
-        let bit = if idx < bm_len { bitmask[idx] } else { 1 };
-        if bit == 1 {
-            s = j;
-            break;
-        }
-    }
-    s
-}
-
 /// Map each externally enterable instruction counter to the gas block that
 /// contains it. Argument-byte positions remain `u32::MAX`. The synthetic
 /// end-of-code opcode-zero position is included at `code.len()`.
@@ -2712,7 +2651,7 @@ pub(crate) fn compute_gas_block_start_by_pc(
         }
         let opcode = Opcode::from_byte(code[pc]);
         last_terminates = opcode.is_some_and(|opcode| opcode.is_terminator());
-        pc += 1 + skip_for_bitmask(bitmask, pc);
+        pc += 1 + crate::skip(bitmask, pc);
     }
 
     let sentinel_start = if current.is_none() || last_terminates {
@@ -2843,7 +2782,7 @@ pub fn bad_transfer(code: &[u8], bitmask: &[u8], jump_table: &[u32]) -> Option<B
             pc += 1;
             continue;
         }
-        let skip = skip_for_bitmask(bitmask, pc);
+        let skip = crate::skip(bitmask, pc);
         let transfer = Opcode::from_byte(code[pc]).and_then(|opcode| {
             match args::decode_args(code, pc, skip, opcode.category()) {
                 Args::Offset { offset } => Some((offset, false)),
@@ -2871,7 +2810,7 @@ pub fn bad_transfer(code: &[u8], bitmask: &[u8], jump_table: &[u32]) -> Option<B
 /// Uses the same GasSimulator as the recompiler — single code path.
 /// Gas is charged per basic block at block entry: max(max_done - 3, 1).
 fn compute_block_gas_costs(code: &[u8], bitmask: &[u8], basic_block_starts: &[bool]) -> Vec<u32> {
-    use crate::gas_cost::{fast_cost_from_raw, skip_distance};
+    use crate::gas_cost::fast_cost_from_raw;
     use crate::gas_sim::GasSimulator;
 
     let len = code.len();
@@ -2926,7 +2865,7 @@ fn compute_block_gas_costs(code: &[u8], bitmask: &[u8], basic_block_starts: &[bo
         last_was_terminator = fc.is_terminator;
 
         // Advance to next instruction
-        let skip = skip_distance(bitmask, pc);
+        let skip = crate::skip(bitmask, pc);
         pc += 1 + skip;
     }
 
