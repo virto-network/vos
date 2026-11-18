@@ -219,6 +219,17 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   tests' programs (an encoder of its `arbitrary` input), and a halting
   program in `program_blob`'s, so both backends are compared on a
   completed run, not only on refusals and panics.
+- **The masking's two missing gates:** a small chip's column committed off
+  its period, which the lifted protocol's size binding (the periodicity
+  value) must refuse, needs a seam in the masked prover's commit
+  (`pvm/proof/recair/src/masked/commit.rs`) that commits a column at another
+  size than its component's; and a known-witness leakage gate with a
+  positive control (a prover whose revealed rows exceed `h`, so a
+  witness-fixed linear combination of a column's revealed values cancels
+  its mask, which the gate must detect where the per-value tests cannot).
+- **The NEON Poseidon2 permutation** (`pvm/proof/poseidon2/src/packed/neon.rs`)
+  is held to the scalar reference only by an aarch64 build's tests, and no
+  aarch64 host runs the suites: a test leg on one.
 - **The external audit's scope:** the device shape, the stock kernels, the
   Poseidon2 chip and their masking, with the recursion AIR, the final
   verifier, `derive` and the security tool's counts. Engage before any

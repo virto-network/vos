@@ -84,6 +84,14 @@ impl Transcript {
     }
 
     /// Absorb `values` as one run.
+    ///
+    /// The run carries neither its length nor its kind: `[x]` and `[x, 0]`
+    /// absorb alike, as do a root and four field elements of the same words.
+    /// Every caller absorbs runs whose count and kind the verifier fixes (a
+    /// header, a format's roots, a shape's sampled values, the format's
+    /// public words), or one a later check pins (the recursion's outputs,
+    /// whose count its logup sum binds); a run whose length nothing else
+    /// pins needs that length absorbed before it.
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "M31's addition is modular: it neither overflows nor panics"

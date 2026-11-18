@@ -223,6 +223,11 @@ impl Poseidon2M31Channel {
     }
 }
 
+/// Every mix is one [`Transcript::absorb`] run, which records neither its
+/// length nor its kind: the verifiers mix only runs whose counts their
+/// format and shape fix before any is read from a proof (the header, the
+/// roots, the sampled values a checked shape lays out, the public words),
+/// or that a later check pins (the recursion's outputs, by its logup sum).
 impl Channel for Poseidon2M31Channel {
     const BYTES_PER_HASH: usize = 32;
 
