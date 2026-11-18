@@ -441,7 +441,7 @@ impl Scan {
 /// The proof in `bytes` under the device format `format`: at most
 /// [`MAX_PROOF_BYTES`], read whole and canonical (re-encoded, the same
 /// bytes, compared as they are written). Read past first, nothing kept, and
-/// refused when its decode would hold more than [`DECODE_MEMORY`] times its
+/// refused when its decode would hold more than three times its
 /// bytes.
 pub fn decode(format: &Format, bytes: &[u8]) -> Result<MaskedProof<Hasher>, Refusal> {
     if bytes.len() > MAX_PROOF_BYTES {

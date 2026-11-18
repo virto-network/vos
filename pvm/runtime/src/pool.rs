@@ -40,7 +40,7 @@ const PAGE: usize = PVM_PAGE_SIZE as usize;
 /// Idle machines a pool keeps by default, across programs. Each JIT machine
 /// reserves more than 4 GiB of address space, so a process can hold about
 /// 30k of them at most; and each holds kernel mappings, which
-/// [`MappingBudget`] bounds across every pool.
+/// a process-wide mapping budget bounds across every pool.
 pub const DEFAULT_IDLE_LIMIT: usize = 4096;
 
 /// Idle machines a pool keeps by default for one program and backend, so
