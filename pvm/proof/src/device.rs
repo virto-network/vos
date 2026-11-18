@@ -187,11 +187,13 @@ pub mod region {
 /// The bytes of a word of the word ledger.
 pub const WORD_BYTES: usize = crate::lookups::MEMORY_WORD_SIZE;
 
+mod layout;
 #[cfg(feature = "prover")]
 mod pin;
 #[cfg(feature = "prover")]
 mod run;
+pub use layout::DeviceLayout;
 #[cfg(feature = "prover")]
 pub use pin::device_chips_of_code;
 #[cfg(feature = "prover")]
-pub use run::{DeviceLayout, DeviceRun, TouchedWord};
+pub use run::{DeviceRun, TouchedWord};

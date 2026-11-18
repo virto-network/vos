@@ -36,11 +36,13 @@ use vos_pvm_final_verifier::masking::MaskedProof;
 use vos_pvm_proof::chips::CpuColumns;
 use vos_pvm_proof::device::{DeviceLayout, DeviceShape};
 
+#[cfg(feature = "prover")]
 mod prove;
 mod verify;
 
 #[cfg(feature = "seeded-masks")]
 pub use prove::prove_device_forced;
+#[cfg(feature = "prover")]
 pub use prove::{DeviceProver, device_shape, device_trace, install, prove_device};
 pub use verify::{device_floors, device_format, device_reveals, verify_device, verify_device_in};
 

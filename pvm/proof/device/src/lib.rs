@@ -3,7 +3,9 @@
 //! and verifies), its id, a run of it proved masked on the Blake2s-M31
 //! channel, a proof's bytes, and the auth statement's arguments and
 //! io-hash. A space's ingress and a member's device both take it; it links
-//! the masked prover without the recursion.
+//! the masked prover without the recursion, and without its `prover`
+//! feature it is the verifier alone ([`Verifier::of_release`]), ingress's
+//! build, which links neither the prover, nor the runtime, nor rayon.
 //!
 //! - **The program** ([`Program`]) is computed from the kernel alone: the
 //!   chips its code reaches (`device_chips_of_code`), and a log size each
@@ -49,13 +51,16 @@ use vos_pvm_proof::format::{DEVICE_PROOF, Format};
 
 mod error;
 pub mod masked;
+#[cfg(feature = "prover")]
 mod prove;
 mod verify;
 
 pub use error::{Error, Refusal};
+#[cfg(feature = "prover")]
 pub use prove::{GAS, Program, REFERENCE_GAS, REFERENCE_STEPS, STEPS};
 pub use verify::{Verifier, claim_io, decode, encode};
 pub use vos_pvm_final_verifier::masking::MaskedProof;
+#[cfg(feature = "prover")]
 pub use vos_pvm_recair::masked::{MaskRng, MaskStats};
 
 /// A device program's id, which a binding names ([`Program::id`]): a hash

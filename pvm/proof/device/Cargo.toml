@@ -7,20 +7,22 @@ description = "The device profile: a device kernel's program under the device fo
 
 [dependencies]
 # The masked prover and its randomness, without the recursion.
-vos-pvm-recair = { workspace = true }
+vos-pvm-recair = { workspace = true, optional = true }
 # The masked verifier, over any masked component set, and the masking's
 # component sets.
 vos-pvm-final-verifier = { workspace = true }
 vos-pvm-recair-air = { workspace = true }
 # The device chip set, its masked layout and trace, the format registry and
-# the kernel's tracer.
-vos-pvm-proof = { workspace = true }
+# the kernel's tracer (the last two the prover's). Not workspace-inherited:
+# the workspace's entry has the prover's features, which a verify-only build
+# leaves out.
+vos-pvm-proof = { path = "..", default-features = false }
 vos-pvm-precompiles = { workspace = true }
 # The credentials tree a device kernel's auth arguments are laid out over,
 # and a release artifact's encoding.
 vos-abi = { workspace = true }
 scale = { package = "vos-pvm-codec", path = "../../codec", default-features = false }
-stwo = { workspace = true, features = ["std", "prover", "parallel"] }
+stwo = { workspace = true, features = ["std"] }
 num-traits = "0.2"
 serde = { version = "1", features = ["derive"] }
 # A device proof's bytes, and a program's id (BLAKE2b-256).
@@ -28,11 +30,22 @@ postcard = { version = "1", features = ["alloc"] }
 blake2 = "0.10"
 
 [features]
+default = ["prover"]
+# The prover: a program from its kernel or a release, its runs traced and
+# proved masked. Without it the crate is the device verifier alone
+# (`Verifier::of_release`), linking neither the prover, nor the runtime and
+# its recompiler, nor rayon (`just check-device-verifier`): ingress's build.
+prover = [
+    "dep:vos-pvm-recair",
+    "vos-pvm-proof/prover",
+    "stwo/prover",
+    "stwo/parallel",
+]
 # The masked prover's test seams (`vos-pvm-recair`'s): the seeded masks and
 # the forced proof of the forgery gates (`masked::prove_device_forced`), for
 # the tests' dev edge. No production build enables it (`just
 # check-no-seeded-masks`).
-seeded-masks = ["vos-pvm-recair/seeded-masks"]
+seeded-masks = ["prover", "vos-pvm-recair/seeded-masks"]
 # The device format's leakage gate at a medium N, for `just test-proof`. No
 # code of the crate's.
 heavy-gates = []

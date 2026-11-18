@@ -665,7 +665,7 @@ fuzz secs="60":
 # each a binary past about 20 s): minutes, warm. It builds the guests its
 # tests run, the venues' refine programs, and nothing else outside the
 # workspace.
-check: fmt-check check-tiers check-layers build-final-verify build-statement-service
+check: fmt-check check-tiers check-layers check-device-verifier build-final-verify build-statement-service
     python3 -I pvm/proof/fuzz/test_corpus.py
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test {{core_crates}} ...(python3 -I tools/gates/tiers.py fast {{core_crates}} | split row ' ')
@@ -706,6 +706,18 @@ deny:
     for manifest in [pvm/proof/final-verifier/wasm/blob/Cargo.toml pvm/proof/fuzz/Cargo.toml] { \
         cargo deny --locked --manifest-path $manifest check --hide-inclusion-graph -A advisory-not-detected advisories \
         sources }
+
+# The device verifier built alone, ingress's build (`vos-pvm-device`
+# without its `prover` feature): it builds and lints clean, and its normal
+# dependencies hold neither the prover (`vos-pvm-recair`), nor the runtime
+# and its recompiler (`vos-pvm`), nor `rayon`.
+check-device-verifier:
+    cargo clippy -p vos-pvm-device --no-default-features --quiet -- -D warnings
+    let crates = (cargo tree -p vos-pvm-device --no-default-features -e normal --prefix none \
+        | lines | each {|line| $line | split row ' ' | first } | uniq); \
+    let linked = ($crates | where {|name| $name in ["vos-pvm", "vos-pvm-recair", "rayon"] }); \
+    if not ($linked | is-empty) { error make { msg: $"the device verifier links ($linked | str join ', ')" } }; \
+    print "the device verifier links neither the prover, nor the runtime, nor rayon"
 
 # The layers: a package under `pvm/` has no path dependency outside
 # `pvm/`, on a normal, a build or a dev edge, so the PVM, its compiler,

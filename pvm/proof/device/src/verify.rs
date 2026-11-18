@@ -42,6 +42,59 @@ pub struct Verifier {
 }
 
 impl Verifier {
+    /// The verifier of the program `release` names, from its CPU's column
+    /// words `cpu` and its preprocessed root `circuit` as a build with the
+    /// prover computed them ([`Verifier::cpu`], [`Verifier::circuit`]): no
+    /// prover, no transpiler and no tree committed, each part held to the
+    /// release's id, which hashes them all. What a build without the
+    /// `prover` feature, ingress's, verifies with. Refused when this build
+    /// verifies no such format, the kernel's layout is not a device's, the
+    /// chips are not a device mask or the CPU's words name no column, a log
+    /// size is under its floor or past the format's ceiling, or the id is
+    /// not the release's.
+    pub fn of_release(
+        release: &super::Release,
+        cpu: [u64; vos_pvm_proof::chips::CPU_COLUMN_WORDS],
+        circuit: [u8; 32],
+    ) -> Result<Self, super::Error> {
+        use super::Error;
+        let format = *crate::format(release.format).ok_or(Error::Format(release.format))?;
+        let layout = vos_pvm_proof::device::DeviceLayout::of_program(&release.kernel)
+            .filter(|layout| layout.is_disjoint())
+            .ok_or(Error::Layout)?;
+        if !vos_pvm_proof::device::is_device_mask(release.chips) {
+            return Err(Error::Chips);
+        }
+        let program = DeviceProgram {
+            active: release.chips,
+            cpu: vos_pvm_proof::chips::CpuColumns::from_words(cpu).ok_or(Error::Chips)?,
+            log_sizes: release.log_sizes.clone(),
+            layout,
+            circuit: Blake2sHash(circuit),
+        };
+        let masked = masked(&format, &program).ok_or(Error::Sizes)?;
+        let id = DeviceProgramId::of(&format, &program);
+        if id.0 != release.id {
+            return Err(Error::IdMismatch);
+        }
+        Ok(Self {
+            format,
+            program,
+            id,
+            masked,
+        })
+    }
+
+    /// Its CPU's column words, which [`Verifier::of_release`] takes.
+    pub fn cpu(&self) -> [u64; vos_pvm_proof::chips::CPU_COLUMN_WORDS] {
+        self.program.cpu.words()
+    }
+
+    /// Its preprocessed root, which [`Verifier::of_release`] takes.
+    pub fn circuit(&self) -> [u8; 32] {
+        self.program.circuit.0
+    }
+
     /// Its id, which a binding names.
     pub fn id(&self) -> &DeviceProgramId {
         &self.id
