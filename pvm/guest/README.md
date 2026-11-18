@@ -17,7 +17,15 @@ point at these files rather than copying them: their `.cargo/config.toml`
 links with `-T../../pvm/guest/pvm.ld`, and they build with `--target
 ../../pvm/guest/riscv64em-vos.json` under this toolchain. The venue guests
 (`final-verify`, `statement-service`) are of the main workspace and build
-for their own target, `pvm/proof/statement/riscv64em-vos.json`. A guest
+for their own target, `pvm/proof/statement/riscv64em-vos.json`, which
+differs from this one in one field: its `max-atomic-width` is 64, not 0.
+The final verifier's graph (Stwo's foldhash seed and tracing-core's
+callsites) needs `core::sync::atomic`, which a width of 0 removes; with
+64 and no `a` extension LLVM lowers each atomic to a libcall, and the
+venue guests' runtime (`pvm/proof/statement/src/bin/guest/runtime.rs`)
+defines each as its plain counterpart, a PVM invocation being
+single-threaded. An agent program needs no atomics, and this target keeps
+them out of it. A guest
 outside the repository copies the first three files and builds with `cargo
 build --release --target riscv64em-vos.json`. The ELF becomes a standard
 program through `vos_pvm_compiler::link_elf_spi`.
