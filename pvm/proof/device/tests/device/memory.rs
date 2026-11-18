@@ -116,6 +116,7 @@ fn mixed_run() -> SideNote {
     vos_pvm_proof::kernel::trace_kernel(&mixed(), &[], 10_000)
         .expect("halts")
         .side_note
+        .expand()
 }
 
 /// The program of [`mixed`] under `format`.
@@ -497,6 +498,7 @@ fn an_untouched_byte_of_a_touched_word_is_bound() {
         })
         .expect("halts")
         .side_note
+        .expand()
     };
     assert!(
         forged()

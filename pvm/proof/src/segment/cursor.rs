@@ -2,11 +2,12 @@
 
 use alloc::vec::Vec;
 
+use crate::core::step::{NUM_REGS, PvmStep, TraceStep};
 use crate::side_note::SideNote;
 
 use super::window::{
-    PendingWrite, SegmentMemory, apply_sparse_writes, apply_writes, build_segment,
-    build_sparse_segment, check_sorted, write_of_bytes, writes_of_step,
+    PendingWrite, SegmentMemory, apply_sparse_writes, apply_writes, build_segment, check_sorted,
+    write_of_bytes, writes_of_step,
 };
 
 /// Streaming segment driver: yields [`segment_side_note`](super::segment_side_note)-identical
@@ -33,13 +34,21 @@ use super::window::{
 /// without building the intervening `SideNote`s, so a sparse pass costs
 /// the same O(N) replay plus only the requested windows' assembly.
 ///
+/// The register file is threaded forward alike: a window of a run of
+/// compact steps (a kernel's, [`crate::kernel::trace_kernel`]) is expanded
+/// to full steps from the file entering it, so a pass holds the run's
+/// compact steps and one window's full ones, never the whole run's.
+///
 /// Panics if a window starts before one already yielded (the image
 /// cannot rewind); use a fresh cursor for a second pass.
-pub struct SegmentCursor<'a> {
-    full: &'a SideNote,
+pub struct SegmentCursor<'a, S: TraceStep = PvmStep> {
+    full: &'a SideNote<S>,
     /// The carried image: `full.initial_memory` with every write at
     /// `ts < applied_upto` applied.
     mem: SegmentMemory,
+    /// The carried register file: `full.initial_regs` with the write of
+    /// every step before `steps_at` applied.
+    regs: [u64; NUM_REGS],
     /// Exclusive timestamp bound of the writes already applied.
     applied_upto: u64,
     /// Index of the first step not yet applied to `mem`.
@@ -50,10 +59,10 @@ pub struct SegmentCursor<'a> {
     poseidon2_at: usize,
 }
 
-impl<'a> SegmentCursor<'a> {
+impl<'a, S: TraceStep> SegmentCursor<'a, S> {
     /// Start a pass over `full`'s windows from its initial memory. Panics
     /// if its precompile streams are not in timestamp order.
-    pub fn new(full: &'a SideNote) -> Self {
+    pub fn new(full: &'a SideNote<S>) -> Self {
         check_sorted(full);
         let mem = full.sparse_initial_memory.as_ref().map_or_else(
             || SegmentMemory::Dense(full.initial_memory.clone()),
@@ -62,6 +71,7 @@ impl<'a> SegmentCursor<'a> {
         Self {
             full,
             mem,
+            regs: full.initial_regs,
             applied_upto: 0,
             steps_at: 0,
             blake2b_at: 0,
@@ -78,7 +88,7 @@ impl<'a> SegmentCursor<'a> {
             "invalid segment range [{a}, {b}) over {} steps",
             self.full.steps.len()
         );
-        let ts_lo = self.full.steps[a].timestamp;
+        let ts_lo = self.full.steps[a].timestamp();
         assert!(
             ts_lo >= self.applied_upto,
             "windows must be visited in ascending order: window start ts {ts_lo} \
@@ -86,24 +96,28 @@ impl<'a> SegmentCursor<'a> {
             self.applied_upto
         );
         self.advance_to(ts_lo);
-        match &self.mem {
-            SegmentMemory::Dense(memory) => build_segment(self.full, a, b, memory.clone()),
-            SegmentMemory::Sparse(memory) => build_sparse_segment(self.full, a, b, memory.clone()),
-        }
+        let mem = match &self.mem {
+            SegmentMemory::Dense(memory) => SegmentMemory::Dense(memory.clone()),
+            SegmentMemory::Sparse(memory) => SegmentMemory::Sparse(memory.clone()),
+        };
+        build_segment(self.full, a, b, mem, self.regs)
     }
 
     /// Apply every not-yet-applied write with `ts < ts_lo` to the
-    /// carried image. Stream enumeration order mirrors
-    /// [`replay_writes`](super::replay_writes) (steps, then the precompile output
-    /// streams); [`apply_writes`](super::window::apply_writes) then applies the batch in ts order.
+    /// carried image, and those steps' register writes to the carried
+    /// file. Stream enumeration order mirrors
+    /// [`replay_writes`](super::replay_writes) (steps, then the precompile
+    /// output streams); [`apply_writes`](super::window::apply_writes) then
+    /// applies the batch in ts order.
     fn advance_to(&mut self, ts_lo: u64) {
         let full = self.full;
         let mut writes: Vec<PendingWrite> = Vec::new();
         while let Some(s) = full.steps.get(self.steps_at) {
-            if s.timestamp >= ts_lo {
+            if s.timestamp() >= ts_lo {
                 break;
             }
             writes_of_step(s, &mut writes);
+            self.regs = s.regs_after(self.regs);
             self.steps_at += 1;
         }
         while let Some(m) = full.blake2b_mem_ops.get(self.blake2b_at) {

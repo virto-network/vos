@@ -3,7 +3,7 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
-use crate::core::step::PvmStep;
+use crate::core::step::TraceStep;
 use crate::side_note::SideNote;
 
 use crate::core::tracing::{Blake2bMemOp, Poseidon2Op};
@@ -30,8 +30,8 @@ use crate::core::tracing::{Blake2bMemOp, Poseidon2Op};
 /// actual windows).
 ///
 /// Panics if either budget is zero.
-pub fn segment_bounds_budgeted(
-    full: &SideNote,
+pub fn segment_bounds_budgeted<S: TraceStep>(
+    full: &SideNote<S>,
     max_steps: usize,
     max_pages: usize,
 ) -> Vec<(usize, usize)> {
@@ -60,7 +60,7 @@ pub fn segment_bounds_budgeted(
     let mut cp = 0;
     let mut ranges: Vec<(u32, u32)> = Vec::new();
     for step in &full.steps {
-        let ts = step.timestamp;
+        let ts = step.timestamp();
         ranges.clear();
         step_ranges(step, &mut ranges);
         take_at(
@@ -87,14 +87,14 @@ pub fn segment_bounds_budgeted(
 }
 
 /// The step's own touched ranges: its optional memory read + write.
-fn step_ranges(s: &PvmStep, out: &mut Vec<(u32, u32)>) {
-    if let Some(r) = &s.mem_read {
+fn step_ranges(s: &impl TraceStep, out: &mut Vec<(u32, u32)>) {
+    if let Some(r) = s.mem_read() {
         out.push((r.address, r.size as u32));
     }
-    if let Some(w) = &s.mem_write {
+    if let Some(w) = s.mem_write() {
         out.push((w.address, w.size as u32));
     }
-    if let Some(w) = &s.witness {
+    if let Some(w) = s.witness() {
         out.push((w.address, w.bytes.len() as u32));
     }
 }

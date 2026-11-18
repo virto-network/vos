@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use crate::core::step::PvmStep;
+use crate::core::step::{NUM_REGS, TraceStep};
 use crate::side_note::SideNote;
 
 /// Slice a fully-traced `SideNote` into the segment covering steps
@@ -10,9 +10,12 @@ use crate::side_note::SideNote;
 /// bounded by `b - a`) and chains to the segments on either side.
 ///
 /// Reconstructed per segment:
-/// - `steps` = `full.steps[a..b]` (timestamps retained, so the per-row
-///   memory-ledger ordering is preserved within the segment);
-/// - `initial_regs` = `full.steps[a].regs_before`;
+/// - `steps` = `full.steps[a..b]` as full steps (timestamps retained, so
+///   the per-row memory-ledger ordering is preserved within the segment),
+///   compact ones expanded from the register file entering step `a`:
+///   `full.initial_regs` with every earlier step's write applied;
+/// - `initial_regs` = the register file entering step `a`: a full step's
+///   `regs_before`, else the threaded file;
 /// - `initial_memory` = `full.initial_memory` with every memory write in
 ///   `full.steps[..a]` applied — the memory state *entering* the
 ///   segment, so the boundary memory root chains and in-segment
@@ -37,7 +40,7 @@ use crate::side_note::SideNote;
 /// forward and yields identical `SideNote`s in O(N) total.
 ///
 /// Panics if `a >= b` or `b > full.steps.len()`.
-pub fn segment_side_note(full: &SideNote, a: usize, b: usize) -> SideNote {
+pub fn segment_side_note<S: TraceStep>(full: &SideNote<S>, a: usize, b: usize) -> SideNote {
     assert!(
         a < b && b <= full.steps.len(),
         "invalid segment range [{a}, {b}) over {} steps",
@@ -52,36 +55,33 @@ pub fn segment_side_note(full: &SideNote, a: usize, b: usize) -> SideNote {
     // at their output addresses, so a later segment's read of an
     // earlier-segment precompile result fails the memory-ledger
     // read-consistency check (`is_read · (value − prev) = 0`).
-    if full.sparse_initial_memory.is_some() {
-        let mem = replay_sparse_writes(full, Some(full.steps[a].timestamp));
-        build_sparse_segment(full, a, b, mem)
+    let regs = full.steps[..a]
+        .iter()
+        .fold(full.initial_regs, |regs, step| step.regs_after(regs));
+    let mem = if full.sparse_initial_memory.is_some() {
+        SegmentMemory::Sparse(replay_sparse_writes(full, Some(full.steps[a].timestamp())))
     } else {
-        let mem = replay_writes(full, Some(full.steps[a].timestamp));
-        build_segment(full, a, b, mem)
-    }
+        SegmentMemory::Dense(replay_writes(full, Some(full.steps[a].timestamp())))
+    };
+    build_segment(full, a, b, mem, regs)
 }
 
-/// Assemble the segment `SideNote` for `[a, b)` from `full` and the
-/// already-reconstructed entering memory image `mem`. Shared by
-/// [`segment_side_note`] (per-call prefix replay) and [`SegmentCursor`](super::SegmentCursor)
-/// (threaded image), so the two produce identical segments by
-/// construction — only the provenance of `mem` differs.
-pub(super) fn build_segment(full: &SideNote, a: usize, b: usize, mem: Vec<u8>) -> SideNote {
-    build_segment_with_memory(full, a, b, SegmentMemory::Dense(mem))
-}
-
-pub(super) fn build_sparse_segment(
-    full: &SideNote,
+/// Assemble the segment `SideNote` for `[a, b)` from `full`, the
+/// already-reconstructed entering memory image `mem` and `regs`, `full`'s
+/// register file with the writes of every step before `a` applied. Shared
+/// by [`segment_side_note`] (per-call prefix replay) and
+/// [`SegmentCursor`](super::SegmentCursor) (threaded image and registers),
+/// so the two produce identical segments by construction — only the
+/// provenance of `mem` and `regs` differs.
+pub(super) fn build_segment<S: TraceStep>(
+    full: &SideNote<S>,
     a: usize,
     b: usize,
-    mem: crate::SparseMemoryImage,
+    mem: SegmentMemory,
+    regs: [u64; NUM_REGS],
 ) -> SideNote {
-    build_segment_with_memory(full, a, b, SegmentMemory::Sparse(mem))
-}
-
-fn build_segment_with_memory(full: &SideNote, a: usize, b: usize, mem: SegmentMemory) -> SideNote {
-    let ts_lo = full.steps[a].timestamp;
-    let ts_hi = full.steps.get(b).map(|s| s.timestamp).unwrap_or(u64::MAX);
+    let ts_lo = full.steps[a].timestamp();
+    let ts_hi = full.steps.get(b).map_or(u64::MAX, TraceStep::timestamp);
     // The records of the window `[ts_lo, ts_hi)`: each stream is ts-sorted
     // (`check_sorted`), so they are the slice between two partition points.
     let blake2b = full.blake2b_mem_ops.partition_point(|op| op.ts < ts_lo)
@@ -89,13 +89,14 @@ fn build_segment_with_memory(full: &SideNote, a: usize, b: usize, mem: SegmentMe
     let poseidon2 = full.poseidon2_ops.partition_point(|op| op.ts < ts_lo)
         ..full.poseidon2_ops.partition_point(|op| op.ts < ts_hi);
 
+    let regs = S::entering(&full.steps, a, regs);
     let sn = SideNote::new_shared(
-        full.steps[a..b].to_vec(),
+        S::full(&full.steps[a..b], regs),
         full.code.clone(),
         full.bitmask.clone(),
     )
     .with_shared_jump_table(full.jump_table.clone())
-    .with_initial_regs(full.steps[a].regs_before);
+    .with_initial_regs(regs);
     let sn = match full.memory_layout() {
         Some(layout) => sn.with_memory_layout(layout),
         None => sn,
@@ -114,7 +115,7 @@ fn build_segment_with_memory(full: &SideNote, a: usize, b: usize, mem: SegmentMe
 /// tracer's (it appends a call's records at its step) and the cut's
 /// assumption: a window's records are a contiguous run of each stream, and
 /// the BLAKE2b calls parallel their memory operations.
-pub(super) fn check_sorted(full: &SideNote) {
+pub(super) fn check_sorted<S>(full: &SideNote<S>) {
     assert_eq!(
         full.blake2b_calls.len(),
         full.blake2b_mem_ops.len(),
@@ -142,7 +143,10 @@ pub(super) fn check_sorted(full: &SideNote) {
 /// Used both for a segment's threaded initial memory (`segment_side_note`)
 /// and its exit image (the boundary's memory root, `page_merkle`); the two
 /// MUST agree or the run's segments do not chain.
-pub(crate) fn replay_writes(side_note: &SideNote, ts_upper: Option<u64>) -> Vec<u8> {
+pub(crate) fn replay_writes<S: TraceStep>(
+    side_note: &SideNote<S>,
+    ts_upper: Option<u64>,
+) -> Vec<u8> {
     let writes = collect_writes(side_note, ts_upper);
     let mut mem = side_note.initial_memory.clone();
     apply_writes(&mut mem, writes);
@@ -152,8 +156,8 @@ pub(crate) fn replay_writes(side_note: &SideNote, ts_upper: Option<u64>) -> Vec<
 /// Replay writes over a canonical sparse entering image. This is the
 /// Refine proof path's equivalent of [`replay_writes`] and never grows a
 /// dense vector to a high guest address.
-pub(crate) fn replay_sparse_writes(
-    side_note: &SideNote,
+pub(crate) fn replay_sparse_writes<S: TraceStep>(
+    side_note: &SideNote<S>,
     ts_upper: Option<u64>,
 ) -> crate::SparseMemoryImage {
     let mut image = side_note
@@ -169,11 +173,14 @@ pub(super) enum SegmentMemory {
     Sparse(crate::SparseMemoryImage),
 }
 
-fn collect_writes(side_note: &SideNote, ts_upper: Option<u64>) -> Vec<PendingWrite> {
+fn collect_writes<S: TraceStep>(
+    side_note: &SideNote<S>,
+    ts_upper: Option<u64>,
+) -> Vec<PendingWrite> {
     let keep = |ts: u64| ts_upper.is_none_or(|t| ts < t);
     let mut writes = Vec::new();
     for step in &side_note.steps {
-        if keep(step.timestamp) {
+        if keep(step.timestamp()) {
             writes_of_step(step, &mut writes);
         }
     }
@@ -197,17 +204,17 @@ pub(super) type PendingWrite = (u64, u32, [u8; 64], u8);
 
 /// The step's regular store, and the bytes a witness-input call
 /// wrote, a buffer's worth a write, as pending writes.
-pub(super) fn writes_of_step(s: &PvmStep, out: &mut Vec<PendingWrite>) {
-    if let Some(w) = &s.mem_write {
+pub(super) fn writes_of_step(s: &impl TraceStep, out: &mut Vec<PendingWrite>) {
+    if let Some(w) = s.mem_write() {
         let sz = w.size as usize;
         let mut buf = [0u8; 64];
         buf[..sz].copy_from_slice(&w.value.to_le_bytes()[..sz]);
-        out.push((s.timestamp, w.address, buf, sz as u8));
+        out.push((s.timestamp(), w.address, buf, sz as u8));
     }
-    if let Some(w) = &s.witness {
+    if let Some(w) = s.witness() {
         for (index, chunk) in w.bytes.chunks(64).enumerate() {
             let address = w.address + 64 * index as u32;
-            out.push(write_of_bytes(s.timestamp, address, chunk));
+            out.push(write_of_bytes(s.timestamp(), address, chunk));
         }
     }
 }

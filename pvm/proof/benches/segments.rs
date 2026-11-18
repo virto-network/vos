@@ -30,6 +30,7 @@ mod imp {
     use vos_pvm_proof::core::ecall::{
         ECALL_BLAKE2B_COMPRESS, ECALL_POSEIDON2, ECALL_WITNESS_INPUT,
     };
+    use vos_pvm_proof::core::step::CompactStep;
     use vos_pvm_proof::format::SEGMENT;
     use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
     use vos_pvm_proof::segment::{SegmentCursor, segment_bounds_budgeted};
@@ -150,7 +151,7 @@ mod imp {
     }
 
     /// The bounds the cut class's budgets give `full`.
-    fn bounds(full: &SideNote, shape: &KernelShape) -> Vec<(usize, usize)> {
+    fn bounds(full: &SideNote<CompactStep>, shape: &KernelShape) -> Vec<(usize, usize)> {
         let class = &shape.classes[cut(shape)];
         segment_bounds_budgeted(full, 1 << class.log_steps, usize::from(class.pages))
     }

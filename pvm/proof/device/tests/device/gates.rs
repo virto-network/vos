@@ -118,6 +118,7 @@ fn forged_run(blob: &[u8], forge: impl FnOnce(&mut vos_pvm_proof::kernel::Memory
     trace_forged_kernel(blob, &witness(1), 10_000, forge)
         .expect("halts")
         .side_note
+        .expand()
 }
 
 /// A run of the device kernel, its Poseidon2 call among its steps, proves
@@ -285,7 +286,8 @@ fn an_unused_chip_proves_at_its_pinned_size() {
     assert_ne!(program.active & 1 << device_chip::MUL, 0);
     let mut side_note = vos_pvm_proof::kernel::trace_kernel(&kernel, &[], 10_000)
         .expect("halts")
-        .side_note;
+        .side_note
+        .expand();
     assert!(side_note.steps.iter().all(|step| step.opcode as u8 != 202));
     let (proof, _) = prove_device::<P2>(&format(), &program, &mut side_note, MaskRng::Seeded(9))
         .expect("proves");
@@ -310,6 +312,7 @@ fn a_run_past_the_programs_shape_is_refused() {
         vos_pvm_proof::kernel::trace_kernel(&kernel, &vec![7; len], 1_000_000)
             .expect("halts")
             .side_note
+            .expand()
     };
     let (active, log_sizes) = device_shape(&format, &kernel, &mut short(16)).expect("a shape");
     let program = install::<P2>(&format, &kernel, active, &log_sizes).expect("installs");
@@ -363,6 +366,7 @@ fn a_touch_outside_the_regions_is_refused() {
         })
         .expect("halts")
         .side_note
+        .expand()
     };
     refused_as_a_broken_constraint(&program, side_note);
 }
@@ -385,6 +389,7 @@ fn a_write_to_a_read_only_page_is_refused() {
         })
         .expect("halts")
         .side_note
+        .expand()
     };
     refused_as_a_broken_constraint(&program, side_note);
 }
@@ -402,7 +407,8 @@ fn program_of(kernel: &[u8]) -> DeviceProgram<<P2 as MerkleChannel>::H> {
             })
             .expect("halts")
         })
-        .side_note;
+        .side_note
+        .expand();
     let (active, log_sizes) = device_shape(&format, kernel, &mut reference).expect("a shape");
     install::<P2>(&format, kernel, active, &log_sizes).expect("installs")
 }
@@ -1010,6 +1016,7 @@ fn a_logical_right_shifts_forged_result_is_refused() {
         vos_pvm_proof::kernel::trace_kernel(&kernel, &[], 10_000)
             .expect("halts")
             .side_note
+            .expand()
     };
     prove_device::<P2>(&format(), &program, &mut honest(), MaskRng::Seeded(7))
         .expect("the honest run proves");

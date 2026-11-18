@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_final_verifier::{PUBLIC_WORDS, PublicWords, WrapProof};
+use vos_pvm_proof::core::step::TraceStep;
 use vos_pvm_proof::format::SEGMENT;
 #[cfg(feature = "watch")]
 use vos_pvm_proof::pcs::ProofHash;
@@ -162,7 +163,7 @@ pub fn cut_class(shape: &KernelShape) -> usize {
 pub fn prove_run(
     program: &KernelProgram,
     entry: &KernelEntry,
-    run: &SideNote,
+    run: &SideNote<impl TraceStep>,
 ) -> Result<(Node, Stats), TreeError> {
     run_watched(program, entry, run, &mut |_| {})
 }
@@ -173,7 +174,7 @@ pub fn prove_run(
 pub fn prove_run_watched(
     program: &KernelProgram,
     entry: &KernelEntry,
-    run: &SideNote,
+    run: &SideNote<impl TraceStep>,
     watch: &mut dyn FnMut(Built<'_>),
 ) -> Result<(Node, Stats), TreeError> {
     run_watched(program, entry, run, watch)
@@ -182,7 +183,7 @@ pub fn prove_run_watched(
 fn run_watched(
     program: &KernelProgram,
     entry: &KernelEntry,
-    run: &SideNote,
+    run: &SideNote<impl TraceStep>,
     watch: &mut dyn FnMut(Built<'_>),
 ) -> Result<(Node, Stats), TreeError> {
     let cut = cut_class(&program.shape);
@@ -242,7 +243,7 @@ fn run_watched(
 pub fn prove_final(
     program: &KernelProgram,
     entry: &KernelEntry,
-    run: &SideNote,
+    run: &SideNote<impl TraceStep>,
 ) -> Result<(Vec<u8>, Stats), TreeError> {
     final_watched(program, entry, run, &mut |_| {})
 }
@@ -253,7 +254,7 @@ pub fn prove_final(
 pub fn prove_final_watched(
     program: &KernelProgram,
     entry: &KernelEntry,
-    run: &SideNote,
+    run: &SideNote<impl TraceStep>,
     watch: &mut dyn FnMut(Built<'_>),
 ) -> Result<(Vec<u8>, Stats), TreeError> {
     final_watched(program, entry, run, watch)
@@ -262,7 +263,7 @@ pub fn prove_final_watched(
 fn final_watched(
     program: &KernelProgram,
     entry: &KernelEntry,
-    run: &SideNote,
+    run: &SideNote<impl TraceStep>,
     watch: &mut dyn FnMut(Built<'_>),
 ) -> Result<(Vec<u8>, Stats), TreeError> {
     let (root, mut stats) = run_watched(program, entry, run, watch)?;

@@ -103,6 +103,7 @@ pub fn run(blob: &[u8], input: &[u8]) -> SideNote {
     vos_pvm_proof::kernel::trace_kernel(blob, input, 10_000)
         .expect("halts")
         .side_note
+        .expand()
 }
 
 /// A masked device format of no registered number on `channel`: blowup 4,

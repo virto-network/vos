@@ -1,5 +1,5 @@
 use super::*;
-use crate::core::step::{MemAccess, NUM_REGS, PvmStep, WitnessWrite};
+use crate::core::step::{CompactStep, MemAccess, NUM_REGS, PvmStep, WitnessWrite};
 use crate::page_merkle;
 use crate::side_note::SideNote;
 use vos_pvm::instruction::Opcode;
@@ -277,32 +277,56 @@ fn copied_window(full: &SideNote, a: usize, b: usize) -> SideNote {
     sn
 }
 
+/// `full`'s run as the tracer records it: its steps compact, its register
+/// file entering them in `initial_regs`.
+fn compact(full: &SideNote) -> SideNote<CompactStep> {
+    let mut run = SideNote::new(
+        full.steps.iter().map(PvmStep::to_compact).collect(),
+        full.code.to_vec(),
+        full.bitmask.to_vec(),
+    )
+    .with_jump_table(full.jump_table.to_vec())
+    .with_initial_regs(full.steps[0].regs_before)
+    .with_memory(full.initial_memory.clone());
+    run.blake2b_calls = full.blake2b_calls.clone();
+    run.blake2b_mem_ops = full.blake2b_mem_ops.clone();
+    run.poseidon2_ops = full.poseidon2_ops.clone();
+    run
+}
+
 /// Every window of the threaded trace, cut on and just after each of its
 /// register writes, its witness-input call, its BLAKE2b and Poseidon2
-/// calls and its stores, built two ways — sliced, and by a cursor — is the
-/// copied window; its code, bitmask and jump table are its run's own
-/// allocations.
+/// calls and its stores, built four ways — sliced from the full steps,
+/// sliced from the compact ones, by a cursor over each — is the copied
+/// window; its code, bitmask and jump table are its run's own allocations.
 #[test]
 fn windows_at_every_cut_are_the_copied_construction() {
     let full = threaded_trace();
+    assert_eq!(compact(&full).expand().steps, full.steps);
+    let run = compact(&full);
     let n = full.steps.len();
     for a in 0..n {
         for b in a + 1..=n {
             let oracle = copied_window(&full, a, b);
             let from_full = segment_side_note(&full, a, b);
+            let from_run = segment_side_note(&run, a, b);
             assert_windows_equal(&from_full, &oracle);
+            assert_windows_equal(&from_run, &oracle);
             assert!(alloc::sync::Arc::ptr_eq(&from_full.code, &full.code));
             assert!(alloc::sync::Arc::ptr_eq(&from_full.bitmask, &full.bitmask));
             assert!(alloc::sync::Arc::ptr_eq(
                 &from_full.jump_table,
                 &full.jump_table
             ));
+            assert!(alloc::sync::Arc::ptr_eq(&from_run.code, &run.code));
             // A cursor's pass: `[0, a)`, then `[a, b)`, then `[b, n)`.
             let mut over_full = SegmentCursor::new(&full);
+            let mut over_run = SegmentCursor::new(&run);
             for (lo, hi) in [(0, a), (a, b), (b, n)] {
                 if lo < hi {
                     let oracle = copied_window(&full, lo, hi);
                     assert_windows_equal(&over_full.side_note(lo, hi), &oracle);
+                    assert_windows_equal(&over_run.side_note(lo, hi), &oracle);
                 }
             }
         }
@@ -311,7 +335,7 @@ fn windows_at_every_cut_are_the_copied_construction() {
     let witness = full.steps.iter().position(|s| s.witness.is_some());
     assert_eq!(witness, Some(5));
     assert!(full.steps.iter().filter(|s| s.reg_write.is_some()).count() > 6);
-    let entering = segment_side_note(&full, 6, 12);
+    let entering = segment_side_note(&run, 6, 12);
     assert_eq!(
         entering.initial_memory[0x400..0x446],
         full.steps[5].witness.as_ref().unwrap().bytes[..]

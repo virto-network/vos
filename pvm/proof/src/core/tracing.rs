@@ -476,6 +476,27 @@ impl TracingPvm {
         expand_steps(&self.steps, regs)
     }
 
+    /// Consume this trace into its run's side note as recorded: the compact
+    /// steps, the register file entering them in `initial_regs`, every
+    /// precompile record and the interpreter's program. What a run's windows
+    /// are cut from ([`crate::segment::SegmentCursor`]), each expanded to full
+    /// steps on its own, so the whole run is never held in both forms;
+    /// [`crate::SideNote::expand`] expands it whole. Attach the saved
+    /// entering image as [`Self::into_side_note`]'s caller does.
+    pub fn into_run(self) -> crate::SideNote<CompactStep> {
+        let regs = self.initial_regs();
+        let code = self.pvm.code.to_vec();
+        let bitmask = self.pvm.bitmask.to_vec();
+        let jump_table = self.pvm.jump_table.to_vec();
+        let mut run = crate::SideNote::new(self.steps, code, bitmask)
+            .with_jump_table(jump_table)
+            .with_initial_regs(regs);
+        run.blake2b_calls = self.blake2b_records;
+        run.blake2b_mem_ops = self.blake2b_mem_ops;
+        run.poseidon2_ops = self.poseidon2_ops;
+        run
+    }
+
     /// Consume this trace into a proof [`crate::SideNote`], preserving every
     /// recorded precompile boundary.
     ///

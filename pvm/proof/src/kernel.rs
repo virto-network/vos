@@ -22,15 +22,17 @@ pub use vos_pvm::interpreter::{Memory, PERM_RO, PERM_RW};
 use vos_pvm::precompile::WitnessRead;
 
 use crate::SideNote;
+use crate::core::step::CompactStep;
 use crate::core::tracing::TracingPvm;
 use crate::sparse_memory::SparseMemoryImage;
 
 /// A kernel's run, traced: what a proof of it starts from and proves, and
 /// what it ended with.
 pub struct KernelTrace {
-    /// The trace, its precompile calls and its initial memory: what the
-    /// segments are cut from.
-    pub side_note: SideNote,
+    /// The trace as the tracer records it ([`TracingPvm::into_run`]), its
+    /// precompile calls and its initial memory: what the segments are cut
+    /// from, each expanded on its own; [`SideNote::expand`] expands it whole.
+    pub side_note: SideNote<CompactStep>,
     /// The initial memory, whose page-tree root is the kernel's image root.
     pub image: SparseMemoryImage,
     /// Its output, by the halt convention: φ7's address, φ8's length.
@@ -289,7 +291,7 @@ fn trace(
     }
     let reads = core::mem::take(&mut tracer.witness_reads);
     let side_note = tracer
-        .into_side_note()
+        .into_run()
         .with_sparse_memory(image.clone())
         .with_memory_layout(permissions);
     Ok(KernelTrace {
