@@ -85,13 +85,13 @@ fn the_jam_host_charges_polkajams_prices() {
     );
     assert_eq!(
         (jam_gas::fetch(6, SEGMENT as u64), jam_gas::EXPORT),
-        (171, 3_521)
+        (Some(171), 3_521)
     );
     assert_eq!(SEGMENT, vos_wire::package::SEGMENT);
     assert_eq!(MAX_EXPORTS as usize, vos_wire::package::MAX_SEGMENTS);
     assert_eq!(
         [0, 300, 4096].map(jam_gas::historical_lookup),
-        [1_125, 1_203, 2_181]
+        [Some(1_125), Some(1_203), Some(2_181)]
     );
 }
 

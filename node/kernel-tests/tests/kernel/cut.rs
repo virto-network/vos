@@ -23,6 +23,7 @@ use vos_abi::vos_anchor::venue::{AnchorRefusal, Anchoring};
 use vos_abi::vos_anchor::{Anchor, RootKind, RootRead, SpaceGenesis, VenueId, space_root};
 use vos_abi::{Decode, Encode, SpaceId, WindowClock};
 use vos_pvm_final_verifier::masked;
+use vos_pvm_proof::core::step::CompactStep;
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
 use vos_pvm_proof::program_id::KernelProgram;
@@ -403,7 +404,7 @@ pub fn path_bytes(served: &Served) -> usize {
 /// Window `[a, b)` of the run proved at the first class of `program`'s
 /// shape that holds it, as `prove_kernel` proves it, and the class.
 pub fn prove_at_first_class(
-    cursor: &mut SegmentCursor<'_>,
+    cursor: &mut SegmentCursor<'_, CompactStep>,
     (a, b): (usize, usize),
     program: &KernelProgram,
 ) -> (usize, Proof) {

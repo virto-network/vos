@@ -16,8 +16,9 @@ use vos_abi::ids::{MethodId, ProgramHash};
 use vos_abi::records::Kernel;
 use vos_abi::result::{Attest, KernelReturn};
 use vos_pvm_proof::SideNote;
+use vos_pvm_proof::core::step::CompactStep;
 use vos_pvm_proof::format::SEGMENT;
-use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
+use vos_pvm_proof::kernel::{KernelTrace, KernelTraceError, trace_kernel};
 use vos_pvm_proof::program_id::{KernelEntry, KernelProgram};
 use vos_pvm_recair::tree::{Stats, TreeError};
 use vos_venue::vos_statement::ProgramId;
@@ -85,7 +86,7 @@ impl MaskedProver {
     /// output alone, so its record has none.
     pub fn rerun(&self, kernel: &[u8], attest: &Attest) -> Result<KernelTrace, StatementError> {
         let trace = trace_kernel(kernel, &attest.witness_input, RERUN_GAS)
-            .map_err(|_| StatementError::Rerun("the kernel does not re-run"))?;
+            .map_err(|error| not_rerun(&error))?;
         let parts = KernelReturn {
             public_args: attest.public_args.clone(),
             output: attest.output.clone(),
@@ -194,7 +195,7 @@ impl MaskedProver {
         prove: impl FnOnce(
             &KernelProgram,
             &KernelEntry,
-            &SideNote,
+            &SideNote<CompactStep>,
         ) -> Result<(Vec<u8>, Stats), TreeError>,
     ) -> Result<(Vec<u8>, Stats), StatementError> {
         let program = self.kernel(kernel)?;
@@ -212,6 +213,26 @@ impl MaskedProver {
                 error => StatementError::Failed(failed(&error)),
             }
         })
+    }
+}
+
+/// Why a kernel does not re-run on a record's witness, by the tracer's
+/// refusal alone: a kernel no proof of which can be made, a witness that is
+/// not the record's run, or the host's own failure, tried again.
+fn not_rerun(error: &KernelTraceError) -> StatementError {
+    use StatementError::{Failed, Kernel, Rerun};
+    match error {
+        KernelTraceError::Program => Kernel("the kernel is not a standard program"),
+        KernelTraceError::NotCanonical => {
+            Kernel("the kernel's blob is not its program's one encoding")
+        }
+        KernelTraceError::Code => Kernel("the kernel's code is past a proof's program memory"),
+        KernelTraceError::Transfer => Kernel("the kernel transfers to no basic block start"),
+        KernelTraceError::Input => Rerun("the witness is past a witness input's cap"),
+        KernelTraceError::Exit => Rerun("the kernel does not halt on the witness"),
+        KernelTraceError::Output => Rerun("the kernel's output is not readable"),
+        KernelTraceError::Unread => Rerun("the kernel reads less than the witness"),
+        KernelTraceError::Allocation => Failed("the kernel's output could not be allocated"),
     }
 }
 

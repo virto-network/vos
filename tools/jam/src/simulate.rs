@@ -75,7 +75,8 @@ impl Runner {
             items: vec![JamItem {
                 payload,
                 imports,
-                extrinsics: Vec::new(),
+                service: u32::try_from(self.service).unwrap_or(u32::MAX),
+                ..JamItem::default()
             }],
             preimages: Some(Arc::clone(&self.preimages)),
             ..JamRefine::default()

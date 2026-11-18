@@ -22,7 +22,7 @@ use vos_pvm::PVM_HALT_ADDR;
 use vos_pvm::precompile::WitnessRead;
 use vos_pvm_program::{StandardProgram, build_standard_program};
 use vos_pvm_proof::SideNote;
-use vos_pvm_proof::core::step::WitnessWrite;
+use vos_pvm_proof::core::step::{RegWrite, WitnessWrite};
 use vos_pvm_proof::kernel::{KernelTrace, KernelTraceError, trace_kernel};
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_proof::{prove, verify};
@@ -144,8 +144,9 @@ fn the_tracer_reads_as_the_agent_does_and_the_run_proves() {
         .iter()
         .filter(|step| step.opcode == vos_pvm::instruction::Opcode::Ecalli)
         .map(|step| {
-            assert_eq!(step.reg_write, Some(7));
-            step.regs_after[7]
+            let write = step.reg_write.expect("the call writes its count");
+            assert_eq!(write.index, 7);
+            write.value
         })
         .collect();
     assert_eq!(counts, [3, 0, 4, 3, 0]);
@@ -255,17 +256,20 @@ mod refused {
     fn a_count_past_the_capacity() {
         let mut trace = trace_kernel(&reader(&[(RW + 0x100, 2)]), &READER_INPUT[..2], GAS)
             .expect("the reader halts");
-        // load φ7, load φ8, the call, the store of its count, load φ8, halt.
+        // load φ7, load φ8, the call, the store of its count, load φ8, halt:
+        // the count written by the call, every later step's φ7 with it.
         let steps = &mut trace.side_note.steps;
-        assert_eq!(steps[2].regs_after[7], 2);
-        steps[2].regs_after[7] = 3;
+        assert_eq!(steps[2].reg_write, Some(RegWrite { index: 7, value: 2 }));
+        steps[2].reg_write = Some(RegWrite { index: 7, value: 3 });
         steps[2].witness.as_deref_mut().unwrap().bytes.push(0xa2);
-        for step in &mut steps[3..] {
-            step.regs_before[7] = 3;
-            step.regs_after[7] = 3;
-        }
         steps[3].mem_write.as_mut().unwrap().value = 3;
-        proved(whole(&trace));
+        let side_note = whole(&trace);
+        assert!(
+            side_note.steps[3..]
+                .iter()
+                .all(|step| step.regs_after[7] == 3)
+        );
+        proved(side_note);
     }
 
     /// The same run, honest, proves: the forgery above fails for its count.
@@ -273,8 +277,9 @@ mod refused {
     fn a_count_at_its_capacity_proves() {
         let trace = trace_kernel(&reader(&[(RW + 0x100, 2)]), &READER_INPUT[..2], GAS)
             .expect("the reader halts");
-        assert_eq!(trace.side_note.steps[2].regs_after[7], 2);
-        proved(whole(&trace));
+        let side_note = whole(&trace);
+        assert_eq!(side_note.steps[2].regs_after[7], 2);
+        proved(side_note);
     }
 }
 

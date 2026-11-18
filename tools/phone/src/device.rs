@@ -241,6 +241,7 @@ where
         vos_pvm_proof::kernel::trace_kernel(&kernel, &input, GAS)
             .expect("the kernel runs to its halt")
             .side_note
+            .expand()
     };
     let (_, active, log_sizes) = shape(&format, &kernel, released, trace);
     let program = install::<MC>(&format, &kernel, active, &log_sizes).expect("installed");
@@ -294,6 +295,7 @@ fn measure<MC: MerkleChannel>(
         vos_pvm_proof::kernel::trace_kernel(&kernel, &input, GAS)
             .expect("the kernel runs to its halt")
             .side_note
+            .expand()
     };
     let started = Instant::now();
     let (steps, active, log_sizes) = shape(&format, &kernel, released, trace);
