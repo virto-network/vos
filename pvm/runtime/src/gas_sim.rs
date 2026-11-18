@@ -77,6 +77,9 @@ impl ConformanceState {
         while !self.can_decode(cost.decode_slots) {
             if !self.dispatch_one() {
                 self.tick();
+                if !self.can_decode(cost.decode_slots) {
+                    self.skip_quiet_ticks();
+                }
             }
         }
 
@@ -131,13 +134,7 @@ impl ConformanceState {
         if self.start_slots == 0 {
             return false;
         }
-        let len = usize::from(self.rob_len);
-        let Some(index) = (0..len).find(|&index| {
-            let entry = self.rob[index];
-            entry.state == RobState::Wait
-                && self.dependencies_ready(entry.deps)
-                && units_fit(self.exec_units, entry.exec_unit)
-        }) else {
+        let Some(index) = self.ready() else {
             return false;
         };
 
@@ -146,6 +143,54 @@ impl ConformanceState {
         self.rob[index].state = RobState::Exe;
         self.start_slots -= 1;
         true
+    }
+
+    /// The lowest-index WAIT entry whose dependencies are done and whose
+    /// execution units are free.
+    fn ready(&self) -> Option<usize> {
+        (0..usize::from(self.rob_len)).find(|&index| {
+            let entry = self.rob[index];
+            entry.state == RobState::Wait
+                && self.dependencies_ready(entry.deps)
+                && units_fit(self.exec_units, entry.exec_unit)
+        })
+    }
+
+    /// Run at once the ticks after this one in which nothing but the
+    /// executing entries' countdown changes: called right after a tick that
+    /// left the machine unable to decode, when no entry can start, none is
+    /// decoded, retiring, or one cycle from releasing its units. Each such
+    /// tick only decrements every EXE entry's cycles and counts a cycle, so
+    /// running `least - 1` of them together, `least` the fewest cycles left
+    /// to an EXE entry, gives the state the ticks one by one give: a block
+    /// of long divisions costs a step per instruction, not a step per
+    /// cycle.
+    fn skip_quiet_ticks(&mut self) {
+        let len = usize::from(self.rob_len);
+        if self.rob[..len]
+            .first()
+            .is_some_and(|entry| entry.state == RobState::Fin)
+        {
+            return;
+        }
+        let mut least = u8::MAX;
+        for entry in &self.rob[..len] {
+            match entry.state {
+                RobState::Dec => return,
+                RobState::Exe => least = least.min(entry.cycles_left),
+                RobState::Wait | RobState::Fin => {}
+            }
+        }
+        if least == u8::MAX || least <= 1 || self.ready().is_some() {
+            return;
+        }
+        let quiet = least - 1;
+        for entry in &mut self.rob[..len] {
+            if entry.state == RobState::Exe {
+                entry.cycles_left -= quiet;
+            }
+        }
+        self.cycles += u32::from(quiet);
     }
 
     fn dependencies_ready(&self, mut deps: u32) -> bool {
@@ -208,6 +253,7 @@ impl ConformanceState {
         while self.rob_len != 0 {
             if !self.dispatch_one() {
                 self.tick();
+                self.skip_quiet_ticks();
             }
         }
         self.cycles.saturating_sub(3).max(1)
@@ -651,6 +697,40 @@ mod proptests {
                             is_move_reg: false,
                         }
                     }
+                })
+                .collect();
+            let mut simulator = GasSimulator::new();
+            for cost in &costs {
+                simulator.feed(cost);
+            }
+            prop_assert_eq!(
+                simulator.flush_and_get_cost(),
+                reference_conformance_cost(&costs),
+            );
+        }
+
+        /// Long latencies on few units fill the reorder buffer and leave
+        /// runs of quiet cycles, which the online state runs at once: still
+        /// the literal transcription's cost, cycle for cycle.
+        #[test]
+        fn conformance_with_full_reorder_buffers_matches_spec_reference(
+            raw in proptest::collection::vec(
+                (1u8..=80, 1u8..5, 0u8..7, any::<u16>(), any::<u16>(), 0u8..8),
+                // Past the 32 entries the buffer holds, within the 64 the
+                // reference's dependency words index.
+                0..=64,
+            ),
+        ) {
+            let costs: alloc::vec::Vec<FastCost> = raw
+                .into_iter()
+                .map(|(cycles, decode_slots, exec_unit, src, dst, kind)| FastCost {
+                    cycles: if kind == 0 { 0 } else { cycles },
+                    decode_slots: if kind == 0 { 1 } else { decode_slots },
+                    exec_unit: if kind == 0 { 0 } else { exec_unit },
+                    src_mask: src & 0x1fff,
+                    dst_mask: dst & 0x1fff,
+                    is_terminator: false,
+                    is_move_reg: kind == 0,
                 })
                 .collect();
             let mut simulator = GasSimulator::new();
