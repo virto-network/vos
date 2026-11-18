@@ -128,6 +128,7 @@ fn jam_only_gas(
         items: vec![JamItem {
             payload: payload.to_vec(),
             extrinsics: extrinsics.to_vec(),
+            service: u32::try_from(service).expect("a JAM service id is 32 bits"),
             ..JamItem::default()
         }],
         ..JamRefine::default()

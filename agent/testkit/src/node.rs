@@ -209,6 +209,7 @@ impl Node {
             service: u64::from(self.agent.0),
             items: vec![JamItem {
                 payload,
+                service: self.agent.0,
                 ..JamItem::default()
             }],
             preimages: Some(Arc::new(Scope {

@@ -39,6 +39,7 @@ impl Vos {
     /// output holds it.
     pub fn batch(&mut self, batch: &Batch) -> Result<WorkResult, Error> {
         let runner = &self.runner;
+        runner.admitted()?;
         let arguments = runner.arguments(&Work::encode_batch(batch), [0; 32]);
         let gas = batch.budget + defaults::batch_start(batch, arguments.len());
         let reader: Arc<dyn StateReader> = Arc::new(self.state.clone());

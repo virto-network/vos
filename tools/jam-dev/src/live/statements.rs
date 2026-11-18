@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use vos_abi::result::digest;
-use vos_pvm_compiler::{ServiceMetadata, service_blob};
+use vos_pvm_compiler::ServiceMetadata;
 use vos_statement::vos_anchor::{RootKind, SpaceId};
 use vos_statement_service::MAX_ITEMS;
 use vos_statement_service::accumulate::{BUCKET_MS, OUTCOME_KEEP_MS};
@@ -112,7 +112,7 @@ pub fn deploy(
     let mut program = vos_pvm_compiler::link_elf_spi(&bytes)
         .map_err(|error| format!("{}: {error:?}", elf.display()))?;
     configure(&mut program, config).map_err(|error| format!("{error:?}"))?;
-    let blob = service_blob(&program, &METADATA);
+    let blob = crate::service_code(&program, &METADATA)?;
     std::fs::write(file, &blob).map_err(|error| format!("{}: {error}", file.display()))?;
     let service = node
         .create_service(file, ENDOWMENT, Some(MIN_ITEM_GAS))

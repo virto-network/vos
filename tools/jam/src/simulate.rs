@@ -75,7 +75,7 @@ impl Runner {
     }
 
     /// [`Error::Big`] for a service past `W_C`, before any run.
-    pub(crate) fn admitted(&self) -> Result<(), Error> {
+    pub fn admitted(&self) -> Result<(), Error> {
         if self.fits { Ok(()) } else { Err(Error::Big) }
     }
 
@@ -87,7 +87,7 @@ impl Runner {
             items: vec![JamItem {
                 payload,
                 imports,
-                service: u32::try_from(self.service).unwrap_or(u32::MAX),
+                service: u32::try_from(self.service).expect("a JAM service id is 32 bits"),
                 ..JamItem::default()
             }],
             preimages: Some(Arc::clone(&self.preimages)),

@@ -14,3 +14,21 @@ pub mod live;
 pub mod venue;
 
 pub use venue::{Jam, JamVenue};
+
+use vos_pvm_compiler::{ServiceMetadata, service_blob};
+
+/// `code` as a JAM service's code blob, `metadata` first: refused past the
+/// Gray Paper's bound on it (`W_C`, `vos_pvm::spi::MAX_SERVICE_CODE`),
+/// which counts the looked-up blob whole, its metadata among it, and past
+/// which JAM refines and accumulates the service as `BIG`.
+pub fn service_code(code: &[u8], metadata: &ServiceMetadata) -> Result<Vec<u8>, String> {
+    let blob = service_blob(code, metadata);
+    if !vos_pvm::spi::service_fits(&blob) {
+        return Err(format!(
+            "the service's code is {} bytes, past W_C ({}): JAM refines and accumulates it as BIG",
+            blob.len(),
+            vos_pvm::spi::MAX_SERVICE_CODE
+        ));
+    }
+    Ok(blob)
+}

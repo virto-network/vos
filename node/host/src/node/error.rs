@@ -56,7 +56,9 @@ pub enum Error {
     Program(String),
     /// The agent program is past the Gray Paper's bound on a service's
     /// code (`W_C`, [`vos_pvm::spi::MAX_SERVICE_CODE`] bytes): a JAM node
-    /// refines and accumulates it as `BIG`, so no node runs it.
+    /// refines and accumulates it as `BIG`, so no node runs it. The node
+    /// counts the program alone; a JAM deployment's metadata prefix counts
+    /// on top (`vos_jam_dev::service_code`).
     ServiceTooBig,
     /// The refine gas cannot fit the largest handler, or a workflow's
     /// largest step, with the agent's reserves behind a full batch's other
