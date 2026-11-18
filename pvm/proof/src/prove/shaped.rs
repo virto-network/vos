@@ -114,35 +114,41 @@ pub struct KernelSegment {
 
 /// A kernel's run, traced whole in `full` (its steps compact, as
 /// [`crate::kernel::trace_kernel`] records them, or full), proved under
-/// `format` over `shape`: cut by class `cut`'s budgets, its steps and its
-/// pages ([`crate::segment::segment_bounds_budgeted`]), and each window
-/// proved at the first class whose sizes hold its rows. A class is tried by
+/// `format` over `shape`: planned first ([`super::plan_kernel`]: cut by
+/// class `cut`'s budgets, its steps and its pages, each window held by the
+/// classes whose page boundary takes it, cut in half while none does), and
+/// refused before any proof when its gas does not buy its segments
+/// ([`SegmentError::Segments`], [`super::max_segments`]). Each segment is
+/// then proved at the first class that holds it. A class is tried by
 /// proving at it: the window's side note is built anew for each class tried
 /// (its steps expanded, its records sliced, its program shared, not
-/// copied), its traces generated once, at the class's sizes, and a chip
-/// whose rows need more refuses it before any commitment; a class of fewer
-/// steps than the window's is skipped, as its CPU holds a row a step. A
-/// window none holds is cut in half, down to one step; a step no class
-/// holds is refused with [`SegmentError::Shape`]: one touching more pages
-/// than the largest class's (24, or 17 for a shape holding the Poseidon2
-/// chip), as a witness-input call writing more than about 64 KiB at once.
+/// copied), a class whose page boundary does not take the window passed
+/// over before any trace, the others' traces generated once, at the class's
+/// sizes, and a chip whose rows need more refuses it before any commitment;
+/// a class of fewer steps than the window's is skipped, as its CPU holds a
+/// row a step. A window none holds is cut in half, down to one step, and
+/// the segments so added are held to the same gas; a step no class holds
+/// is refused with [`SegmentError::Shape`]: one touching more pages than
+/// the largest class's (24, or 17 for a shape holding the Poseidon2 chip),
+/// as a witness-input call writing more than about 64 KiB at once.
+///
+/// Host work beside the proofs: each window's page multiproof, built twice
+/// (planned, proved), hashes the window's pages and every nonzero page of
+/// the memory image entering it, whose pages are the kernel's data or pages
+/// its gas wrote.
 pub fn prove_kernel<S: TraceStep>(
     full: &SideNote<S>,
     shape: &KernelShape,
     cut: usize,
     format: &'static Format,
 ) -> Result<Vec<KernelSegment>, SegmentError> {
-    shape.check().map_err(|_| SegmentError::MalformedShape)?;
-    let class = shape.classes.get(cut).ok_or(SegmentError::MalformedShape)?;
-    let bounds = crate::segment::segment_bounds_budgeted(
-        full,
-        1 << class.log_steps,
-        usize::from(class.pages),
-    );
+    let plan = super::plan_kernel(full, shape, cut)?;
+    let most = super::max_segments(plan.gas);
     let mut cursor = crate::segment::SegmentCursor::new(full);
-    let mut segments = Vec::with_capacity(bounds.len());
-    for (a, b) in bounds {
-        let mut pending = vec![(a, b)];
+    let mut segments = Vec::with_capacity(plan.segments.len());
+    let mut planned = plan.segments.len();
+    for segment in plan.segments {
+        let mut pending = vec![segment.steps];
         while let Some((a, b)) = pending.pop() {
             match prove_at_first_class(&mut cursor, (a, b), shape, format) {
                 Ok((class, proof)) => segments.push(KernelSegment {
@@ -151,6 +157,10 @@ pub fn prove_kernel<S: TraceStep>(
                     proof,
                 }),
                 Err(SegmentError::Shape { overflow: true, .. }) if b - a > 1 => {
+                    planned += 1;
+                    if planned > most {
+                        return Err(SegmentError::Segments);
+                    }
                     let middle = a + (b - a) / 2;
                     pending.push((middle, b));
                     pending.push((a, middle));
@@ -164,24 +174,28 @@ pub fn prove_kernel<S: TraceStep>(
 
 /// Window `[a, b)` proved at the first class of `shape` that holds its
 /// rows, and the class; or the overflow of the last class tried, a
-/// [`SegmentError::Shape`] whose size is past its pin.
+/// [`SegmentError::Shape`] whose size is past its pin. The classes whose
+/// page boundary does not take the window are passed over untraced
+/// ([`super::plan::holding`]).
 fn prove_at_first_class<S: TraceStep>(
     cursor: &mut crate::segment::SegmentCursor<'_, S>,
     (a, b): (usize, usize),
     shape: &KernelShape,
     format: &'static Format,
 ) -> Result<(usize, Proof), SegmentError> {
-    let steps = (b - a).next_power_of_two().trailing_zeros();
+    let mut window = Some(cursor.side_note(a, b));
+    let holding = super::plan::holding(window.as_mut().expect("a window"), b - a, shape)?;
     let mut overflow = SegmentError::Shape {
         chip: crate::chip_idx::CPU,
         overflow: true,
     };
-    for (index, class) in shape.classes.iter().enumerate() {
-        if steps > u32::from(class.log_steps) {
+    for (index, _) in shape.classes.iter().enumerate() {
+        if holding & 1 << index == 0 {
             continue;
         }
         let segment = shape.segment(index).ok_or(SegmentError::MalformedShape)?;
-        match prove_shaped(&mut cursor.side_note(a, b), &segment, format) {
+        let mut side_note = window.take().unwrap_or_else(|| cursor.side_note(a, b));
+        match prove_shaped(&mut side_note, &segment, format) {
             Ok(proof) => return Ok((index, proof)),
             Err(error @ SegmentError::Shape { overflow: true, .. }) => overflow = error,
             Err(error) => return Err(error),

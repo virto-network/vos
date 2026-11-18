@@ -31,12 +31,14 @@ pub(crate) mod active;
 mod debug;
 mod preprocessed;
 pub(crate) use preprocessed::preprocessed_root;
+pub(crate) mod plan;
 mod profile;
 mod request;
 mod shaped;
 
 #[cfg(feature = "debug-internals")]
 pub use debug::debug_assert_constraints_explicit;
+pub use plan::{KernelPlan, PlannedSegment, SEGMENT_GAS, max_segments, plan_kernel};
 pub use profile::ProveProfile;
 pub(crate) use request::{ProveRequest, Sizes};
 pub use shaped::{KernelSegment, program_commitment_for_shape, prove_kernel, prove_shaped};
@@ -63,6 +65,10 @@ pub enum SegmentError {
     /// The run is longer than [`MAX_RUN_STEPS`]: its ledgers' ordering
     /// deltas would pass their bits. Refused before any trace.
     RunLength,
+    /// The run takes more segments than its gas buys
+    /// ([`max_segments`]): refused before any proof, or once the cuts a
+    /// chip's rows force pass it.
+    Segments,
 }
 
 impl SegmentError {
@@ -96,6 +102,7 @@ impl core::fmt::Display for SegmentError {
             } => write!(formatter, "chip {chip} is another size than its shape"),
             Self::MalformedShape => formatter.write_str("the shape is not one of the segment AIR"),
             Self::RunLength => formatter.write_str("the run is longer than a proof's ledgers order"),
+            Self::Segments => formatter.write_str("the run takes more segments than its gas buys"),
         }
     }
 }
