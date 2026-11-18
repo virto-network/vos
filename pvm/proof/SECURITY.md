@@ -21,6 +21,18 @@ Two paths verify in production, and one is a reference:
   reference the leaf circuit is held to (the recursion's tests), linked by
   no production build; a node verifies segments inside its leaves.
 
+## What each verifier establishes
+
+| verifier | what an accepted proof binds | what its caller supplies or rests on |
+|---|---|---|
+| 41, a segment (`verify_standalone`) | a window of a run of the program its preprocessed root commits (code, layout, permissions, at the class's shape): the format's exact parameters, the shape, the boundary registers, pc, timestamps (both in `[1, 2^28)`) and memory roots, bound to the trace | the root, derived from the intended program and layout (§ Trust boundary: a segment proof); a window may start and stop inside a run, so whether its boundary states are the ones meant is the caller's |
+| 32, a leaf and a fold (in circuit) | a leaf: its segment's native checks, the entry constants under the entry flag and the halt pc under the halt flag; a fold: both children verified, both carrying the program id it recomputes and a circuit of that program's or the fold's, adjacent positions, the left exit's state digest equal to the right entry's | no caller outside the recursion; the two inductions (§ The leaf's binding): that boundary limbs are bytes and timestamps stay in the ledgers' range rests on the fold chain from the installed entry and on the state digest's collision resistance |
+| 39, the wrap (`vos-pvm-final-verifier`, judged by `vos-statement`) | a run from the program's entry to a halt (position 0, the entry and halt flags), the fold circuit pinned, the program id and the io-hash public | the program id the venue pinned, never the statement's; the venue's accepted formats, its anchored roots and its refusal of a repeated statement id (§ Trust boundary: a statement) |
+| 47, a device proof (`Verifier::verify`) | a run of the installed program's code from its entry to its halt, with io-hash `io` | the `Verifier` the node computed from the kernel at install (its program, masked format and id), and `io`, computed by ingress from the claim, never the proof's (§ Trust boundary: a device proof) |
+
+What none of them binds: a run's gas, the witness stream's framing, and
+an honest run's provability (§ Three boundaries).
+
 ## Formats and their bit counts
 
 Each number names one AIR, one channel and one set of parameters
@@ -149,11 +161,8 @@ the conjectured count.
   memory ledger at the call's timestamp, the addresses a carry chain that
   cannot wrap past 2^32. The register ledger orders reads before writes in
   a step, so a call cannot read its own result. What a kernel read is the
-  `witness_input` of its attest. The live host returns `min(capacity,
-  remaining)` bytes (`src/core/ecall.rs`); the AIR binds only the count's
-  bound, so a proved run may return a short read and then more bytes,
-  which no live stream does. A kernel must not take a short read for the
-  end of its input.
+  `witness_input` of its attest. What a proof binds of the stream, and the
+  contract a kernel may rely on, is § Three boundaries.
 - **The Poseidon2 call (`0x402`)** computes `C(l, r)`, the width-16
   permutation of `l ‖ r` truncated to 8 words, with no feed-forward: a
   pseudo-compression, a preimage of any digest one inverse permutation
@@ -173,7 +182,8 @@ the conjectured count.
   present as a halt. At the halt φ9..12 hold the io-hash.
 - **No gas is proved.** A statement says nothing of a run's cost: the live
   host meters, and live ≡ traced holds for the runs the host completed.
-  The prover role bears the cost of a run it chose to prove.
+  The prover role bears the cost of a run it chose to prove (§ Three
+  boundaries).
 - **Page permissions are part of a program's identity.** A kernel's
   regions (read-only data and the argument window readable; read-write data,
   heap and stack writable; nothing else mapped) are preprocessed constants
@@ -270,8 +280,9 @@ along the fold chain, not in a leaf alone (`recair/src/leaf/mod.rs`):
   (the io-hash's); a wire of 256 or more would enter the segment AIR as a
   register, a timestamp or a root limb no native state can express. The
   leftmost entry is byte constants (the entry flag, which the wrap
-  requires), every exit equals the next entry wire for wire (the fold's
-  continuity), and an exit is bytes the AIR produced (the next timestamp's
+  requires), every exit's state digest equals the next entry's (the fold's
+  continuity), so each entry is the previous exit up to a collision of
+  that digest (§ Three boundaries), and an exit is bytes the AIR produced (the next timestamp's
   and a register write's limbs Range256-checked, a memory root the
   BLAKE2b boundary compression's output, an XOR of byte pairs the bitwise
   table fixes, the chip under `blake2b_boundary_gate`) or
@@ -838,6 +849,92 @@ scope to files and functions. Its scope:
 
 Who performs it, and when, is open.
 
+## Three boundaries
+
+What a proof binds, and what it leaves to the live host, the installer or
+the prover role, where an audit most needs it said.
+
+### Gas and the witness stream
+
+- **Gas** is metered live and enters no proved statement: no column holds
+  it. A proof says nothing of a run's cost, nor that the live host would
+  have let the run finish: the AIR accepts a run to its halt whatever its
+  gas. Live ≡ traced holds for the runs the host completed.
+- **What a proof binds of a witness-input call** (`0x401`,
+  `src/chips/cpu/constraints/host_call.rs`, `src/chips/witness_input.rs`):
+  its destination φ7 and capacity φ8 as read; a count `c` written to φ7,
+  `c ≤ φ8` (CompareChip) and `c < 2^24`; for `c > 0`, the `c` bytes
+  `[φ7, φ7 + c)`, below 2^32, written at the call's timestamp through the
+  memory ledger, as every store is, and nothing else.
+- **What it does not bind:** the bytes' values, which are free witness;
+  and how the stream splits among calls. No constraint relates one call
+  to another, so a proved run may be given fewer bytes than the capacity,
+  or none, and more on a later call. The live host gives
+  `min(capacity, remaining)`, so 0 only at the input's end or at
+  capacity 0
+  (`vos_pvm::precompile::WitnessInput`, `src/core/ecall.rs`); a proved run
+  need not.
+- **The contract a kernel may rely on:** per call, the count's bound and
+  exactly those writes; nothing across calls. A kernel's public result is
+  therefore a function of the bytes it read whatever their split: it
+  frames its input by content (a length it reads and checks), reads on
+  through short reads until it has what it framed, and traps on a zero
+  read while bytes are still due (live, a truncated input; proved, a
+  trap is no halt, so a prover gains nothing by it). It never takes a
+  short or zero read for the end of an input it then acts on. Whatever of
+  the input decides the public result enters the io-hash or is checked
+  against a root the io-hash covers. No code under `pvm/` but tests reads
+  a witness; each kernel whose id is pinned, the node's stock kernels
+  among them, is to be audited against this contract (§ Deployment
+  checklist).
+
+### Program installation and continuity
+
+- **The installer's check:** `kernel::kernel_side_note`, which every
+  install's pin starts from, and `derive` refuse a program any of whose
+  control transfers lands on no basic-block start
+  (`vos_pvm::interpreter::bad_transfer`). The segment AIR checks only
+  that a next pc is an instruction start, so this refusal is what keeps a
+  proved run to the transfers the machine takes (§ The halt rule): a
+  program id pinned without it would admit runs the machine never makes.
+- **Continuity is a digest equality:** a fold requires the left child's
+  exit state digest to equal the right child's entry state digest, each
+  the Poseidon2-M31 leaf sponge (`recair/src/gadgets.rs`'s `leaf_hash`,
+  8 M31 words) over a boundary state's 148 byte wires
+  (`recair/src/fold/mod.rs`, "fold: continuity"); it never compares the
+  states themselves. The next segment's entry is the previous exit up to
+  a collision of that sponge on two boundary states, so continuity, and
+  the byte induction built on it (§ The leaf's binding), rest on its
+  collision resistance (at most about 2^124 work, the generic birthday
+  bound on 248 bits), a hash assumption the security tool does not
+  count.
+  `a_tree_root_wraps` (`recair/tests/recursion/wrap.rs`, in `just gate`)
+  holds continuity across a real run: four segments, four leaves, three
+  folds, the root wrapped and its io-hash the one-segment run's.
+  Range-checking the leaf's own timestamp bytes is recorded for the next
+  circuit change (`docs/design/open.md`).
+
+### Completeness and privacy
+
+- **Honest runs that cannot be proved** (`docs/design/open.md`,
+  "Completeness limits"): an invalid dynamic jump; a gap of 2^27 steps or
+  more between two accesses to one key; a BLAKE2b pointer within 256
+  bytes of 2^32. Each refuses an honest run's proof, never admits a false
+  one; a statement's absence is not a refusal (§ What a verified proof
+  does not guarantee, liveness).
+- **Masking:** formats 39 and 47 are masked (§ Masking). Segment, leaf
+  and fold proofs are not: their witness and trace are in the clear, and
+  they are private only while they stay in the prover role (§ What leaves
+  the prover role), a confinement no proof enforces.
+- **What the suites show:** the honest-path suites and the regression
+  gates (the forgery gates, the masking gates, the leakage gates) show
+  that honest proofs verify and that the forgeries and leaks they
+  construct are refused or found. None measures a soundness error or
+  establishes zero knowledge: those rest on the counts' model (§ Formats
+  and their bit counts) and on the masking's argument (§ Masking), both
+  in the external audit's scope, with the fork's FRI and affine batching,
+  the transcript's order and the masking's rank.
+
 ## What a verified proof does not guarantee
 
 - **Program intent:** a proof shows the bytecode ran as the PVM runs it,
@@ -859,9 +956,9 @@ Who performs it, and when, is open.
   kernel and its install record by someone other than its prover; pin the
   final verifier's build (its wrap root is a constant of it).
 - [ ] **Audit each kernel** whose id you pin: its roots, its nonces, its
-  salted fields, and that it never takes a short witness read for the end
-  of its input (a proved read returns at most the capacity, not the live
-  `min(capacity, remaining)`).
+  salted fields, and its witness reads against the stream contract (§
+  Three boundaries): its input framed by its content, and no short or
+  zero read taken for the end of its input.
 - [ ] **Cap the submission's length** before decoding it; key accepted
   statements on the statement id.
 - [ ] **Publish a segment's expected shape and boundary** where a segment

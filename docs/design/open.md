@@ -88,6 +88,13 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   per-segment `ts = 0` anchor bounds every access within 2^27, so no
   provable segment reaches the alias 2^30 steps away
   (`pvm/proof/SECURITY.md`, "The leaf's binding").
+- **The witness stream's framing:** the AIR binds each witness-input call
+  alone (a count at most its capacity, its writes), so a proved run may
+  be given a short or empty read and more bytes later; a constraint
+  across calls (a zero read final) needs a new segment format. Until
+  then a kernel frames its input by content (`pvm/proof/SECURITY.md`,
+  "Three boundaries"), and the stock kernels' reads are to be audited
+  against that.
 - **The leaf's timestamp bytes:** the leaf range-checks the io-hash's 32
   boundary bytes alone, and rests on the fold chain for the rest; a leaf
   alone accepts a `ts_in` whose first limb is `p − 1`. Range-check
