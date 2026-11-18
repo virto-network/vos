@@ -425,6 +425,44 @@ fn a_proof_of_another_shape_is_refused() {
     );
 }
 
+/// The witness builders lay out a valid proof's values and return an
+/// error, never a panic, for a proof of their shape that does not verify:
+/// a segment's (a run proved now) and a recursion proof's.
+#[test]
+fn an_unverified_proof_lays_out_no_values() {
+    let real = full_shape();
+    let mut proof = real.proof.clone();
+    proof.interaction_pow ^= 1;
+    assert_eq!(real.shape.check(&proof), Ok(()));
+    assert_eq!(
+        SegmentValues::from_proof(&real.shape, &proof).unwrap_err(),
+        WitnessError::Unverified
+    );
+
+    use vos_pvm_recair::fold::child::{ChildShape, ChildValues};
+    let mut context = Context::<SecureField>::with_outputs(2);
+    let a = context.guess(SecureField::from_u32_unchecked(3, 1, 4, 1));
+    let b = context.mul(a, a);
+    let c = context.add(b, a);
+    context.set_outputs(&[b, c]);
+    let finalized = context.finalize().expect("the wiring checks");
+    let (_, proof) = common::prove_and_verify(&finalized);
+    let shape = ChildShape::new(proof.log_sizes);
+    assert!(ChildValues::from_proof(&shape, &proof).is_ok());
+    for tamper in [
+        (|p: &mut vos_pvm_recair::RecairProof| p.interaction_pow ^= 1) as fn(&mut _),
+        |p| p.claimed_sums[0] += SecureField::one(),
+    ] {
+        let mut forged = proof.clone();
+        tamper(&mut forged);
+        assert_eq!(shape.check(&forged), Ok(()));
+        assert_eq!(
+            ChildValues::from_proof(&shape, &forged).unwrap_err(),
+            WitnessError::Unverified
+        );
+    }
+}
+
 /// A shape the native verifier refuses builds no circuit: a format not
 /// admitted, a log size past the native bound, counts below the format's
 /// floor at this shape, counted as the standalone verifier counts them.
