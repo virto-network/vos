@@ -36,7 +36,8 @@ pub fn device_shape(
     reference: &mut SideNote,
 ) -> Result<(u32, Vec<u32>), Error> {
     let layout = DeviceLayout::of_program(blob).ok_or(Error::Layout)?;
-    let active = device_chips_of_code(&reference.code, &reference.bitmask);
+    let active =
+        device_chips_of_code(&reference.code, &reference.bitmask).ok_or(Error::Precompile)?;
     let shape = DeviceShape {
         chips: active,
         cpu: CpuColumns::of_code(&reference.code, &reference.bitmask),
@@ -95,7 +96,9 @@ where
             return Err(Error::Layout);
         }
         let code = vos_pvm_proof::kernel::kernel_side_note(blob).map_err(|_| Error::Layout)?;
-        if active != device_chips_of_code(&code.code, &code.bitmask) {
+        if active
+            != device_chips_of_code(&code.code, &code.bitmask).ok_or(Error::Precompile)?
+        {
             return Err(Error::Chips);
         }
         let shape = DeviceShape {

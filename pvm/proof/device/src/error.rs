@@ -20,6 +20,9 @@ pub enum Error {
     /// The chips a release artifact names are not the ones the kernel's
     /// code reaches.
     Chips,
+    /// The kernel's code names the BLAKE2b precompile, which no device
+    /// kernel calls: its shape holds no BLAKE2b.
+    Precompile,
     /// A run does not reach its halt within its gas, or its output is not
     /// readable where its registers name it: the kernel's, or the reference
     /// program's.
@@ -64,6 +67,7 @@ impl Error {
             Self::IdMismatch
             | Self::Layout
             | Self::Chips
+            | Self::Precompile
             | Self::Halt
             | Self::Arguments
             | Self::Reference
@@ -86,6 +90,7 @@ impl core::fmt::Display for Error {
             Self::IdMismatch => f.write_str("the release's program id is not its program's"),
             Self::Layout => f.write_str("the kernel is not a standard program"),
             Self::Chips => f.write_str("the chips are not the kernel's code's"),
+            Self::Precompile => f.write_str("the kernel's code names the BLAKE2b precompile"),
             Self::Halt => f.write_str("the run does not halt within its gas"),
             Self::Arguments => f.write_str("the arguments are not the ones the run reads"),
             Self::Reference => f.write_str("the reference returns no arguments alone"),
