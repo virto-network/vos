@@ -135,7 +135,7 @@ pub(crate) trait Paired: Send + Sync {
 /// One enrollment's credential tree, its refresher while a session holds
 /// it, and its last payment.
 struct Tree {
-    /// The space's handle, which the client knows the space by.
+    /// The key its space's routes are kept under in the client.
     space: [u8; 32],
     keeper: tokio::sync::Mutex<TreeKeeper>,
     /// Where the keeper is kept, beside the enrollment.
@@ -282,7 +282,7 @@ impl Facility {
     /// Every enrollment's space told to the client, its routes as pinned.
     pub fn pin_all(&self) {
         for enrollment in self.inner.store.all().unwrap_or_default() {
-            self.inner.net.pin(enrollment.handle, pinned(&enrollment));
+            self.inner.net.pin(enrollment.routes(), pinned(&enrollment));
         }
     }
 
@@ -296,7 +296,7 @@ impl Facility {
             ..Synced::default()
         };
         for enrollment in all {
-            self.inner.net.pin(enrollment.handle, pinned(&enrollment));
+            self.inner.net.pin(enrollment.routes(), pinned(&enrollment));
             let Some(tree) = self.inner.tree_of(&enrollment) else {
                 synced.failed += 1;
                 continue;
@@ -311,7 +311,7 @@ impl Facility {
                 let _ = self
                     .inner
                     .net
-                    .refresh_onions_due(enrollment.handle, &registrar, now_ms())
+                    .refresh_onions_due(enrollment.routes(), &registrar, now_ms())
                     .await;
             }
         }
@@ -330,7 +330,7 @@ impl Facility {
                 space: enrollment.space,
                 handle: enrollment.handle,
                 member: enrollment.member,
-                opted_out: self.inner.net.opted_out(&enrollment.handle),
+                opted_out: self.inner.net.opted_out(&enrollment.routes()),
                 host: enrollment.host,
                 port: enrollment.port,
             })
@@ -345,15 +345,15 @@ impl Facility {
         };
         let net = &self.inner.net;
         for enrollment in self.inner.store.all().map_err(store_error)? {
-            if net.client().routes(&enrollment.handle).is_none() {
-                net.pin(enrollment.handle, pinned(&enrollment));
+            if net.client().routes(&enrollment.routes()).is_none() {
+                net.pin(enrollment.routes(), pinned(&enrollment));
             }
             let pins = net
                 .client()
-                .routes(&enrollment.handle)
+                .routes(&enrollment.routes())
                 .is_some_and(|routes| routes.onions.iter().any(|onion| onion.key == key));
             if pins {
-                return Ok(Some(enrollment.handle));
+                return Ok(Some(enrollment.routes()));
             }
         }
         Ok(None)
@@ -371,17 +371,17 @@ impl Facility {
             if enrollment.port != gateway.port || host(&enrollment.host) != host(&gateway.host) {
                 continue;
             }
-            if net.client().routes(&enrollment.handle).is_none() {
-                net.pin(enrollment.handle, pinned(&enrollment));
+            if net.client().routes(&enrollment.routes()).is_none() {
+                net.pin(enrollment.routes(), pinned(&enrollment));
             }
-            let routes = net.client().routes(&enrollment.handle);
+            let routes = net.client().routes(&enrollment.routes());
             match routes {
                 Some(routes) if routes.opted_out() => {
-                    opted_out.get_or_insert(enrollment.handle);
+                    opted_out.get_or_insert(enrollment.routes());
                 }
-                Some(routes) if !routes.onions.is_empty() => return Ok(enrollment.handle),
+                Some(routes) if !routes.onions.is_empty() => return Ok(enrollment.routes()),
                 _ => {
-                    unrouted.get_or_insert(enrollment.handle);
+                    unrouted.get_or_insert(enrollment.routes());
                 }
             }
         }
@@ -402,8 +402,8 @@ impl Facility {
     pub fn clearnet_refused(&self, host_key: &[u8; 32]) -> Result<(), Refusal> {
         let net = &self.inner.net;
         for enrollment in self.inner.store.all().map_err(store_error)? {
-            if net.client().routes(&enrollment.handle).is_none() {
-                net.pin(enrollment.handle, pinned(&enrollment));
+            if net.client().routes(&enrollment.routes()).is_none() {
+                net.pin(enrollment.routes(), pinned(&enrollment));
             }
         }
         match net.onion_pinned(host_key) {
@@ -415,7 +415,7 @@ impl Facility {
                     .all()
                     .map_err(store_error)?
                     .into_iter()
-                    .find(|enrollment| enrollment.handle == space)
+                    .find(|enrollment| enrollment.routes() == space)
                     .map(|enrollment| {
                         format!(
                             ", as the gateway it was enrolled through ({}:{})",
@@ -515,7 +515,7 @@ impl Inner {
                 let answer = self
                     .net
                     .request(
-                        enrollment.handle,
+                        enrollment.routes(),
                         Purpose::Fetch,
                         &wire::devices_request(actor.agent, actor.instance),
                     )
@@ -637,7 +637,7 @@ impl Inner {
                 .and_then(|bytes| TreeKeeper::restore(member, &bytes).ok())
                 .unwrap_or_else(|| TreeKeeper::new(member));
             Arc::new(Tree {
-                space: enrollment.handle,
+                space: enrollment.routes(),
                 keeper: tokio::sync::Mutex::new(keeper),
                 file,
                 unknown_at: Mutex::new(None),
@@ -842,7 +842,7 @@ impl Session {
     /// would join the device's network address to it. After an
     /// enrollment, s4 connects again, carried.
     fn carried(&self, enrollment: &Enrollment) -> Result<(), Refusal> {
-        if self.gateway.carried || self.inner.net.opted_out(&enrollment.handle) {
+        if self.gateway.carried || self.inner.net.opted_out(&enrollment.routes()) {
             return Ok(());
         }
         Err(refused(
@@ -854,15 +854,18 @@ impl Session {
 
     /// Refused, before any prompt, what would join a sign-in to the member
     /// in this session: a sign-in after the device was named in it (`to`
-    /// [`Learned::SignedIn`]), or naming it after a sign-in.
+    /// [`Learned::SignedIn`]), or naming it after a sign-in. Otherwise the
+    /// session is taken as `to` at once, in the same step, so two calls
+    /// racing on one session cannot both pass.
     fn apart(&self, to: Learned) -> Result<(), Refusal> {
-        let learned = *self.learned.lock().expect("learned poisoned");
+        let mut learned = self.learned.lock().expect("learned poisoned");
         let joined = match to {
-            Learned::SignedIn => learned == Learned::Named,
-            Learned::Named => learned == Learned::SignedIn,
+            Learned::SignedIn => *learned == Learned::Named,
+            Learned::Named => *learned == Learned::SignedIn,
             Learned::Nothing => false,
         };
         if !joined {
+            *learned = to;
             return Ok(());
         }
         Err(refused(
@@ -878,11 +881,6 @@ impl Session {
                 }
             },
         ))
-    }
-
-    /// What the session's server learned now.
-    fn learn(&self, learned: Learned) {
-        *self.learned.lock().expect("learned poisoned") = learned;
     }
 
     fn origin_line(&self) -> String {
@@ -925,7 +923,7 @@ impl Session {
         if let Some((handle, space, home_onions)) = self.inner.personal().and_then(|p| p.home()) {
             let named = crate::enrollment::onions(&request.onions);
             let same = |a: &[vos_wire::credentials::Onion], b: &[vos_wire::credentials::Onion]| {
-                a.len() == b.len() && a.iter().all(|onion| b.contains(onion))
+                a.iter().all(|onion| b.contains(onion)) && b.iter().all(|onion| a.contains(onion))
             };
             if (request.handle == handle || request.space == space) && !same(&named, &home_onions) {
                 return Err(refused(
@@ -1058,7 +1056,6 @@ impl Session {
                 choices: vec!["Done".into()],
             })
             .await;
-        self.learn(Learned::Named);
         Ok(Enrolled {
             member: member.to_bytes(),
             owner: owner.to_bytes(),
@@ -1100,7 +1097,6 @@ impl Session {
             |method| matches!(method.guard, Guard::Auth { .. }),
         )?;
         self.carried(&enrollment)?;
-        self.apart(Learned::SignedIn)?;
         let Guard::Auth { scope, once } = &method.guard else {
             unreachable!("an auth guard, filtered above")
         };
@@ -1122,6 +1118,7 @@ impl Session {
                 "the device is still reading its space's tree: try again in a few seconds",
             ));
         };
+        self.apart(Learned::SignedIn)?;
         let form = Form {
             title: if *once {
                 format!("Spend your one {}?", method.name)
@@ -1165,7 +1162,6 @@ impl Session {
         if !matches!(chrome.confirm(form).await, Answer::Confirmed { .. }) {
             return Err(declined());
         }
-        self.learn(Learned::SignedIn);
         // The secret is held until the node took a proof or refused it
         // for good: a root it no longer judges current is proved against
         // again, once, with no second prompt. The call is made before the
@@ -1259,7 +1255,7 @@ impl Session {
         let answer = self
             .inner
             .net
-            .request(enrollment.handle, Purpose::Proven, request)
+            .request(enrollment.routes(), Purpose::Proven, request)
             .await
             .map_err(|error| refused(Code::Api, error))?;
         if root_refused(&answer).is_some()
@@ -1283,10 +1279,10 @@ impl Session {
             |method| method.guard == Guard::Owner && method.name == TRANSFER,
         )?;
         self.carried(&enrollment)?;
-        self.apart(Learned::Named)?;
         self.inner
             .admits(&enrollment, &self.inner.stock.owner)
             .await?;
+        self.apart(Learned::Named)?;
         let (mut payee, mut amount) = (request.payee.clone(), request.amount.to_string());
         let mut notice = None;
         let (payee, amount) = loop {
@@ -1340,11 +1336,10 @@ impl Session {
             payee: values.0.clone(),
             amount: values.1,
         };
-        self.learn(Learned::Named);
         // The same payment asked again while its last proof may still run
         // (a relay that withheld it, then asked anew) is that proof again:
         // its binding runs once.
-        let now = node_time(&self.inner.net, enrollment.handle)
+        let now = node_time(&self.inner.net, enrollment.routes())
             .await
             .map_err(|error| refused(Code::Api, error))?;
         let tree = self.tree();
@@ -1392,7 +1387,7 @@ impl Session {
         method: &Method,
         arguments: Vec<u8>,
     ) -> Result<Call, Refusal> {
-        let now = node_time(&self.inner.net, enrollment.handle)
+        let now = node_time(&self.inner.net, enrollment.routes())
             .await
             .map_err(|error| refused(Code::Api, error))?;
         self.call_at(enrollment, method, arguments, now)
@@ -1425,7 +1420,7 @@ impl Session {
         let Some(tree) = self.inner.tree_of(&enrollment) else {
             return;
         };
-        self.inner.net.pin(enrollment.handle, pinned(&enrollment));
+        self.inner.net.pin(enrollment.routes(), pinned(&enrollment));
         {
             let mut held = self.held.lock().expect("held poisoned");
             if held.is_none() {
@@ -1433,7 +1428,7 @@ impl Session {
                 *held = Some(Arc::clone(&tree));
             }
         }
-        self.inner.net.keep_spare(enrollment.handle);
+        self.inner.net.keep_spare(enrollment.routes());
         let mut refresher = tree.refresher.lock().expect("refresher poisoned");
         if refresher.as_ref().is_some_and(|task| !task.is_finished()) {
             return;

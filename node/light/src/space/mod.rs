@@ -229,6 +229,13 @@ struct Refreshed {
 pub const ONIONS_EVERY_MS: u64 = 24 * 60 * 60 * 1000;
 /// How long the onions a read no longer names stay pinned.
 pub const ONIONS_KEPT_MS: u64 = 7 * ONIONS_EVERY_MS;
+/// How soon a read of the home's onion set that failed is tried again.
+pub const ONIONS_RETRY_MS: u64 = 60 * 60 * 1000;
+
+/// Whether two onion sets name the same onions, in any order.
+fn same_onions(a: &[Onion], b: &[Onion]) -> bool {
+    a.len() == b.len() && a.iter().all(|onion| b.contains(onion))
+}
 
 /// A kit's call on the device set at the agent `identity`, as signed.
 #[derive(Clone, Encode, Decode)]
@@ -513,6 +520,8 @@ pub struct Personal<H: Host> {
     owed: (Mutex<crate::Store>, Mutex<Option<Vec<u8>>>),
     /// The home kept, as an enrollment asks it while a flow holds the rest.
     home: Mutex<Option<Kept>>,
+    /// When the home's onion set was last asked for, read or not.
+    onions_tried: AtomicU64,
     /// The personal space's directory, and the artifacts a store made anew
     /// installs (`Personal::leave`).
     directory: PathBuf,
@@ -572,6 +581,7 @@ impl<H: Host> Personal<H> {
             wait: AtomicU64::new(WAIT_MS),
             owed,
             home,
+            onions_tried: AtomicU64::new(0),
             directory: directory.to_path_buf(),
             artifacts: artifacts.clone(),
         };
@@ -600,8 +610,15 @@ impl<H: Host> Personal<H> {
 
     /// A home's routes: its onions, onion-only (E17), under the home's
     /// own key ([`crate::route::home`]).
+    /// A card's or a code's set for the device's own home joins the set
+    /// it holds, refreshed, so a kit call or a pairing never narrows it.
     fn pin(&self, kept: &Kept) {
-        self.pin_with(kept, &[]);
+        let held = self
+            .home()
+            .filter(|mine| mine.home.handle == kept.home.handle)
+            .map(|mine| mine.onions)
+            .unwrap_or_default();
+        self.pin_with(kept, &held);
     }
 
     /// The same, the onions a read no longer names beside them.
@@ -632,9 +649,12 @@ impl<H: Host> Personal<H> {
             .as_ref()
             .filter(|refreshed| refreshed.handle == handle)
             .map_or(0, |refreshed| refreshed.at);
-        if now.saturating_sub(last) < ONIONS_EVERY_MS {
+        let tried = self.onions_tried.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < ONIONS_EVERY_MS || now.saturating_sub(tried) < ONIONS_RETRY_MS
+        {
             return Ok(());
         }
+        self.onions_tried.store(now, Ordering::Relaxed);
         let onions: Vec<Onion> = self.home_query(
             &kept.home,
             Purpose::Fetch,
@@ -667,7 +687,7 @@ impl<H: Host> Personal<H> {
         previous.truncate(vos_wire::credentials::MAX_ONIONS);
         let until = match previous.is_empty() {
             true => 0,
-            false if onions == kept.onions => held
+            false if same_onions(&onions, &kept.onions) => held
                 .state
                 .onions
                 .as_ref()
@@ -990,7 +1010,7 @@ impl To {
     fn routes(self) -> [u8; 32] {
         match self {
             To::Home(handle) => crate::route::home(&handle),
-            To::Space(handle) => handle,
+            To::Space(handle) => crate::route::space(&handle),
         }
     }
 }

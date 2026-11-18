@@ -75,7 +75,14 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
         ("arguments", Value::Bytes(Vec::new())),
     ]);
     let forms = chrome.shown.lock().unwrap().len();
-    let refused = session.ask("sign_in", &login, &chrome).await.unwrap_err();
+    let refused = loop {
+        match session.ask("sign_in", &login, &chrome).await.unwrap_err() {
+            refused if refused.code == Code::NoPath => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            refused => break refused,
+        }
+    };
     assert_eq!(refused.code, Code::Refused);
     assert!(refused.message.contains("new session"), "{refused:?}");
     assert_eq!(
@@ -368,7 +375,10 @@ async fn a_session_not_carried_over_tor_proves_nothing() {
     assert_eq!(chrome.shown.lock().unwrap().len(), forms, "no prompt");
     assert_eq!(*source.uses.lock().unwrap(), uses, "no use of the secret");
     // Opted out of Tor, the user accepted the clearnet's session.
-    facility.net().opt_out(HANDLE, true).unwrap();
+    facility
+        .net()
+        .opt_out(vos_light::route::space(&HANDLE), true)
+        .unwrap();
     signed_in(&session, &login, &chrome).await.unwrap();
 }
 

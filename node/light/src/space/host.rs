@@ -15,8 +15,8 @@ use crate::{AuthWitness, Call, DeviceSecret};
 /// The app's side of the personal space.
 pub trait Host: Send + Sync + 'static {
     /// `request` (a `vos-api` request) sent over the routes kept under
-    /// `space` (an enrolled space's handle, or a home's key,
-    /// [`crate::route::home`]), under `purpose`, its own connection's: the
+    /// `space` (an enrolled space's key, [`crate::route::space`], or a
+    /// home's, [`crate::route::home`]), under `purpose`, its own connection's: the
     /// answer's body, or why there is none.
     fn request(
         &self,

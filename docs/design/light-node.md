@@ -3425,9 +3425,10 @@ taken from a proven call's header before its body is read: its
 connection's and circuit's first (past either the channel is closed),
 then the onion's, for which one call a circuit waits (another is closed
 at once), so no circuit queues headers ahead of the others; the header
-takes its circuit's request token, and the body must then keep coming,
-each read within 5 s of the last and the whole within 30 s, so a header
-whose body never comes gives its places back after 5 s; an agent's calls
+takes its circuit's request token, and the body must then keep its pace:
+by 5 s plus its share of 30 s, as much of it as that share, the whole
+within 30 s, so a header whose body never comes, or comes a byte at a
+time, gives its places back after about 5 s; an agent's calls
 and proven calls from one circuit 4 a second, a burst of 16. *Known
 limit:* the members' wait still grows with the circuits an attacker
 holds: with one waiter each and 16 places freed every 5 s, a member waits

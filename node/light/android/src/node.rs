@@ -523,7 +523,7 @@ impl Node {
         let _entered = self.runtime.enter();
         self.facility
             .net()
-            .opt_out(handle, out)
+            .opt_out(vos_light::route::space(&handle), out)
             .map_err(|refusal| refused(Code::Refused, refusal.to_string()))
     }
 

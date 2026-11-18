@@ -25,11 +25,22 @@ use vos_api::Kind;
 use vos_wire::credentials::Onion;
 
 /// The key the routes of the home whose handle is `handle` are kept under,
-/// apart from every enrolled space's (each kept under its handle): a
+/// apart from every enrolled space's ([`space`]): a
 /// space whose enrollment names a home's handle reaches none of the home's
 /// routes, and the home's refresh none of its.
 pub fn home(handle: &[u8; 32]) -> [u8; 32] {
-    Blake2b::<U32>::new_with_prefix(b"vos.light.home-routes")
+    keyed(b"vos.light.home-routes", handle)
+}
+
+/// The key the routes of the space an enrollment names by `handle` are
+/// kept under: of another domain than every home's ([`home`]), so no
+/// handle a server names, a home's key included, reaches a home's routes.
+pub fn space(handle: &[u8; 32]) -> [u8; 32] {
+    keyed(b"vos.light.space-routes", handle)
+}
+
+fn keyed(domain: &[u8], handle: &[u8; 32]) -> [u8; 32] {
+    Blake2b::<U32>::new_with_prefix(domain)
         .chain_update(handle)
         .finalize()
         .into()
@@ -407,5 +418,9 @@ mod tests {
         let handle = [9; 32];
         assert_ne!(home(&handle), handle);
         assert_ne!(home(&handle), home(&[8; 32]));
+        // A server naming the home's key as its space's handle reaches
+        // another key still.
+        assert_ne!(space(&home(&handle)), home(&handle));
+        assert_ne!(space(&handle), home(&handle));
     }
 }

@@ -148,6 +148,12 @@ impl Enrollment {
         self.agents.iter().find(|pinned| pinned.agent == agent)
     }
 
+    /// The key its space's routes are kept under in the client
+    /// ([`vos_light::route::space`]), apart from every home's.
+    pub fn routes(&self) -> [u8; 32] {
+        vos_light::route::space(&self.handle)
+    }
+
     /// Whether `request` names exactly what this enrollment pinned.
     pub fn pins(&self, request: &crate::Enroll) -> bool {
         self.handle == request.handle

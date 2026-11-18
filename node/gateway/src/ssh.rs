@@ -16,10 +16,11 @@
 //! nothing while it waits for the port's and closed past the others; on
 //! an uncapped one a place among the port's own proven bodies
 //! ([`crate::caps::PROVEN_BODIES`]). Its header takes its address's rate
-//! token. The body must then arrive within [`LARGE_DEADLINE`], each read
-//! within [`PROGRESS`] of the last, so a header whose body never comes
-//! holds its places that long. Each call and proven call passes its port's
-//! caps, or is answered `Busy` with no node asked.
+//! token. The body must then arrive within [`LARGE_DEADLINE`], at a pace
+//! ([`Pace`]): after a first [`PROGRESS`], as much of it as that share of
+//! the deadline, so a header whose body never comes, or comes a byte at a
+//! time, holds its places about [`PROGRESS`]. Each call and proven call
+//! passes its port's caps, or is answered `Busy` with no node asked.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -48,9 +49,26 @@ pub const DEADLINE: Duration = Duration::from_secs(60);
 /// its places: a device proof over an onion circuit at its slowest
 /// measured rate (`light-node.md` §6.3), with room.
 pub const LARGE_DEADLINE: Duration = Duration::from_secs(30);
-/// How long a proven call's large body may pause once it holds its
-/// places: a Tor circuit delivers its cells seconds apart at worst.
+/// The slack a proven call's large body has over its pace once it holds
+/// its places: a Tor circuit delivers its cells seconds apart at worst.
 pub const PROGRESS: Duration = Duration::from_secs(5);
+
+/// A large body's pace from when it took its places: of its `length`
+/// bytes, `read` so far, each due by [`PROGRESS`] plus its share of
+/// [`LARGE_DEADLINE`], the whole by [`LARGE_DEADLINE`].
+struct Pace {
+    from: Instant,
+    length: u64,
+    read: u64,
+}
+
+impl Pace {
+    /// When its next byte is due.
+    fn due(&self) -> Instant {
+        let share = LARGE_DEADLINE.mul_f64(self.read as f64 / self.length.max(1) as f64);
+        (self.from + PROGRESS + share).min(self.from + LARGE_DEADLINE)
+    }
+}
 /// How long the onion's SSH connections may take to authenticate: the
 /// light node's own handshake deadline over Tor.
 pub const ONION_HANDSHAKE: Duration = Duration::from_secs(30);
@@ -162,7 +180,7 @@ pub fn server(
     let defaults = s4_server::ServerLimits::default();
     let mut limits = match mark {
         Mark::Onion => s4_server::ServerLimits {
-            handshake_timeout: ONION_HANDSHAKE,
+            auth_timeout: ONION_HANDSHAKE,
             host_services: s4_server::HostServiceLimits {
                 max_active_per_session: ONION_HOST_CALLS,
                 ..Default::default()
@@ -275,8 +293,8 @@ pub async fn relay(
     let mut chunk = vec![0u8; 64 << 10];
     // When the frame part read must have arrived by.
     let mut due: Option<Instant> = None;
-    // When a large body holding its places must have arrived by, whole.
-    let mut large_due: Option<Instant> = None;
+    // A large body's pace, once it holds its places.
+    let mut pace: Option<Pace> = None;
     // The places the frame part read holds, if it is a large body.
     let mut placed: Option<Placed> = None;
     let mut requests = tokio::task::JoinSet::new();
@@ -307,9 +325,10 @@ pub async fn relay(
             return;
         }
         reader.push(&chunk[..read]);
-        // A large body read on: its next bytes within `PROGRESS`.
-        if let Some(whole) = large_due {
-            due = Some(whole.min(Instant::now() + PROGRESS));
+        // A large body read on: its next bytes at its pace.
+        if let Some(pace) = pace.as_mut() {
+            pace.read += read as u64;
+            due = Some(pace.due());
         }
         while let Some(event) = reader.event() {
             match event {
@@ -317,7 +336,7 @@ pub async fn relay(
                     // A whole frame read: the next one's deadline runs from
                     // its own first byte.
                     due = None;
-                    large_due = None;
+                    pace = None;
                     let placed = placed.take();
                     // A large body's token was taken at its header.
                     let charged = placed.is_some();
@@ -384,7 +403,7 @@ pub async fn relay(
         while requests.try_join_next().is_some() {}
         if !reader.pending() {
             due = None;
-            large_due = None;
+            pace = None;
         } else if due.is_none() {
             due = Some(Instant::now() + DEADLINE);
         }
@@ -392,9 +411,8 @@ pub async fn relay(
         // runs from then, as the wait is the gateway's.
         if placed.is_none()
             && let Some(header) = reader.header()
-            && header
-                .body(Framing::Stream)
-                .is_some_and(|length| large(header.kind, length))
+            && let Some(length) = header.body(Framing::Stream)
+            && large(header.kind, length)
         {
             // Its header takes its address's token: a header whose body
             // never comes costs one, as a whole frame does.
@@ -434,9 +452,13 @@ pub async fn relay(
                 return;
             };
             placed = Some(taken);
-            let now = Instant::now();
-            large_due = Some(now + LARGE_DEADLINE);
-            due = Some(now + PROGRESS);
+            let started = Pace {
+                from: Instant::now(),
+                length: u64::from(length),
+                read: 0,
+            };
+            due = Some(started.due());
+            pace = Some(started);
         }
     }
 }

@@ -511,7 +511,8 @@ key = "{onion}"
             Limits::new(PerAddress::default()),
             vos_gateway::caps::Caps::none(),
             vos_gateway::caps::bodies(),
-        );
+        )
+        .with_connections(config.ssh_connections);
         let listener = tokio::net::TcpListener::bind(ssh)
             .await
             .map_err(|error| format!("{ssh}: {error}"))?;

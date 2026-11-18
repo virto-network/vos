@@ -751,7 +751,7 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
 /// included (`[onion] ssh_connections`, `ssh_connections`): past them a
 /// connection waits for one to close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_ports_ssh_connections_are_its_files() {
+async fn a_port_takes_the_ssh_connections_its_file_names() {
     let served = served();
     let gateway = Arc::new(Gateway::new(vec![Upstream::new(
         served.node.id().0,
@@ -785,11 +785,22 @@ async fn a_ports_ssh_connections_are_its_files() {
 /// Circuits holding the onion's proven-call places with headers alone,
 /// their bodies never sent, each channel opened again once closed, cannot
 /// starve a member: a circuit's waiters are its own (one at a time, its
-/// places taken before the port's), and a body that stops coming gives
-/// its places back within `PROGRESS`. The member's proven call, on a
-/// circuit of its own, reaches the node within one turn of the queue.
+/// places taken before the port's), and a body that falls behind its pace
+/// gives its places back about `PROGRESS` on. The member's proven call, on
+/// a circuit of its own, reaches the node within one turn of the queue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn headers_alone_hold_no_members_proven_call_back() {
+    starved(false).await;
+}
+
+/// The same with each body trickled a byte a second: kept coming, but
+/// behind its pace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trickled_bodies_hold_no_members_proven_call_back() {
+    starved(true).await;
+}
+
+async fn starved(trickle: bool) {
     use vos_gateway::caps::{Caps, PerPort};
     let served = served();
     let target = Target::socket(served.socket.clone());
@@ -893,6 +904,15 @@ async fn headers_alone_hold_no_members_proven_call_back() {
                     };
                     if channel.data(&bytes[..header]).await.is_err() {
                         continue;
+                    }
+                    if trickle {
+                        // Past the whole body's deadline either way.
+                        for byte in bytes[header..].iter().take(60) {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            if channel.data(&[*byte][..]).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                     let mut answers = Answers { buffer: Vec::new() };
                     while answers.next(&mut channel).await.is_some() {}

@@ -1224,19 +1224,21 @@ fn an_enrollment_naming_the_home_takes_none_of_its_routes() {
     let home = world.home(HOME, 2, 1);
     let phone = phone(&world, 0xe1);
     phone.claim(&world, home, KitKind::Phrase, "phone");
-    let enroll = |onion: u8| {
+    let enroll_at = |handle: [u8; 32], space: [u8; 32], onion: u8, application: &str| {
         let session = phone.node.open_session(vos_facility::Gateway {
             host_key: Some(ssh_host_key()),
+            application: application.into(),
             ..gateway()
         });
         let enrolled = phone.node.enroll(
             session,
-            Enroll::read(&enrollment_at(HOME, [0x53; 32], AGENT, IDENTITY, onion)).unwrap(),
+            Enroll::read(&enrollment_at(handle, space, AGENT, IDENTITY, onion)).unwrap(),
             Arc::clone(&phone.hand) as Arc<dyn vos_facility::node::Prompts>,
         );
         phone.node.close(session);
         enrolled
     };
+    let enroll = |onion: u8| enroll_at(HOME, [0x53; 32], onion, "vos.test");
     let refused = enroll(1).unwrap_err();
     assert_eq!(refused.code, Code::NotPinned);
     assert!(refused.message.contains("home"), "{refused:?}");
@@ -1263,4 +1265,23 @@ fn an_enrollment_naming_the_home_takes_none_of_its_routes() {
         personal.home_route(vos_light::route::Purpose::Member),
         Some(vos_light::route::Route::Onion)
     );
+    // A server naming the home's routes' own key as its handle reaches
+    // another key: its enrollment and its opt-out leave the home's routes.
+    let key = vos_light::route::home(&HOME);
+    enroll_at(key, [0x54; 32], 1, "vos.other").unwrap();
+    phone.node.sync().unwrap();
+    phone.node.opt_out(key, true).unwrap();
+    assert_eq!(
+        personal.home_route(vos_light::route::Purpose::Member),
+        Some(vos_light::route::Route::Onion)
+    );
+    let before = world.state.lock().unwrap().seen.len();
+    phone.node.sync_personal().unwrap();
+    for seen in &world.state.lock().unwrap().seen[before..] {
+        assert_eq!(
+            vos_light::testing::onion_of(&seen.target),
+            Some(vos_light::testing::address(&world, 2)),
+            "the home's onion alone: {seen:?}"
+        );
+    }
 }

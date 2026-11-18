@@ -378,8 +378,9 @@ them until an HTTP client exists (E23). What that changes for the node and its o
   and an agent's calls from one circuit (`node-api.md` §6). A client may
   open as many circuits as Tor lets it: the per-circuit caps bound one
   circuit (a proven call's header takes its circuit's places before it
-  waits for the onion's, one waiter a circuit, and a body that stops
-  coming gives them back after 5 s), the onion's global caps and the
+  waits for the onion's, one waiter a circuit, and a body that falls
+  behind its pace gives them back after about 5 s), the onion's global
+  caps and the
   node's verification budget bound them all; the members' wait grows
   with the attacker's circuits (about C × 5 / 16 s, `light-node.md`
   §6.6), whose bound past that is the introduction rate and arti's proof
