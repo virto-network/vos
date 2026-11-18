@@ -75,7 +75,7 @@ verifier, and the gates its build passed.
    (tallest 2^15 ≤ 2^17) [model]: 2.2–4.9 GiB at blowup 64 [projected], about
    85M JAM gas with Blake2b-256 in software, 64M through `0x400`, about
    122 KB unmasked [model]; masked as built (format 39, a fixed layout,
-   16 queries), a verify of 59.2M gas [measured].
+   16 queries), a verify of 60.5M gas [measured].
 8. **Every node carries the fold's circuit-hash word** (§6): a fold requires
    each child to carry its own word, and the wrap pins the root's, so every
    fold in the tree is the true fold circuit and every other node a leaf of
@@ -700,7 +700,7 @@ and fold layout of §1.1 is unchanged.
 | cells, extended cells | 7.5M, 481M | model |
 | memory, time | 2.2–4.9 GiB, 4.4–9.5 s unmasked [projected]; masked (format 39) as built: a 3.6 GiB heap [measured] | projected, measured |
 | JAM gas, unmasked | 81.1M with the model's Blake2s; **85.2M Blake2b-256 in software (×1.05); 64.1M through `0x400` (×0.79)** | model |
-| JAM gas, masked | **59.2M** the verify as built at 16 queries [measured, 2026-11-18]; 79.3M at 24 queries, the decode 1.50M of it [measured, 2026-10] | measured |
+| JAM gas, masked | **60.5M** the verify as built at 16 queries [measured, 2026-11-18]; 79.3M at 24 queries, the decode 1.50M of it [measured, 2026-10] | measured |
 | proof | about 122 KB unmasked [model]; masked as built, `wrap.proof` is 103,236 bytes (the committed fixture) | model, measured |
 
 - The gas uses a fit, within 5.8%, measured on a proxy verifier
@@ -760,8 +760,8 @@ by the format: the trees' widths (57 / 381 / 48 / 20) and the FRI round
 list (`[3, 3, 3, 2]`). `R` has 8 columns, so it needs no rank check. A
 venue links it (the JAM statements service's program, 391,784 bytes as a
 PVM program [measured, 2026-10-24]); the
-`valid` fixture's verify takes 59.2M gas on the JAM-only host and a
-statement judged 61.3M (`proving.md` §3.5).
+`valid` fixture's verify takes 60.5M gas on the JAM-only host and a
+statement judged 62.6M (`proving.md` §3.5).
 
 **The statement over it:** `vos-statement`
 (`pvm/proof/statement`) depends on it, not it on the statement: the

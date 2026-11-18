@@ -6,10 +6,10 @@
 # that measures it writes it (`just repin`). JAM gas on the JAM-only host
 # (`final-verify.elf`, `statement-service.elf`), Wasm instructions under the
 # PVF's semantics (`just judge-wasm`'s blob).
-masked-wrap-verify-gas 59202860
-masked-wrap-verify-gas-max 60499442
-masked-wrap-verify-gas-worst 62509123
+masked-wrap-verify-gas 60451863
+masked-wrap-verify-gas-max 61768160
+masked-wrap-verify-gas-worst 63807268
 masked-wrap-wasm-instructions-max 35020199
 masked-wrap-wasm-instructions-worst 36104431
-statement-judged-gas 61264627
-statement-service-refine-gas 61295265
+statement-judged-gas 62555733
+statement-service-refine-gas 62578151
