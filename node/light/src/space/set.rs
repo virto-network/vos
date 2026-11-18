@@ -297,9 +297,16 @@ impl<H: Host> Personal<H> {
         held.state.set_next_admin(next);
         self.keep(&held.light, &held.state)?;
         let kept = held.state.home.clone().ok_or(Error::NoSpace)?;
+        let agent = held.state.agent.ok_or(Error::NoSpace)?;
         drop(held);
         // The kit's call, kept as signed until its evidence is posted.
-        let posted = self.kit_call(&kit, kept, method::REPLACE, (me, admin).encode())?;
+        let posted = self.kit_call(
+            &kit,
+            kept,
+            Some(agent),
+            method::REPLACE,
+            (me, admin).encode(),
+        )?;
         self.posted(
             &mut self.held(),
             Recorded {

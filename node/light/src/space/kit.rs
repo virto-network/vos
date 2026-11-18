@@ -52,7 +52,7 @@ impl<H: Host> Personal<H> {
         kind: KitKind,
     ) -> Result<KitView, Error> {
         let kit = entered_kit(prompts, kind)?;
-        self.with_kit(&home, &kit, |link, _| {
+        self.with_kit(&home, &kit, None, |link, _| {
             let views: Vec<DeviceView> = link
                 .query(method::DEVICES, ())
                 .map_err(unreached)?
@@ -126,20 +126,22 @@ impl<H: Host> Personal<H> {
         arguments: Vec<u8>,
     ) -> Result<Posted, Error> {
         let kit = entered_kit(prompts, kind)?;
-        self.kit_call(&kit, home, method, arguments)
+        self.kit_call(&kit, home, None, method, arguments)
     }
 
-    /// [`Personal::by_kit`] with the kit entered already.
+    /// [`Personal::by_kit`] with the kit entered already, at `agent` when
+    /// the device knows it.
     pub(super) fn kit_call(
         &self,
         kit: &KitSecret,
         home: Kept,
+        agent: Option<(u32, [u8; 32])>,
         method: MethodId,
         arguments: Vec<u8>,
     ) -> Result<Posted, Error> {
         let signing = kit.signing();
         let origin = signing.verifying_key().to_bytes();
-        self.with_kit(&home, kit, |link, identity| {
+        self.with_kit(&home, kit, agent, |link, identity| {
             let entries = link.log_all(0).map_err(unreached)?.map_err(agent_refused)?;
             if let Some(posted) =
                 self.post_kept(link, identity, &entries, origin, method, &arguments)?
@@ -291,25 +293,32 @@ impl<H: Host> Personal<H> {
         self.keep(&held.light, &state)
     }
 
-    /// `f` over a link to the agent `home`'s `Homes` names for `kit`, under
+    /// `f` over a link to `agent`, or to the agent `home`'s `Homes` names
+    /// for `kit` when it is not given, under
     /// the kit's key, what fell due settled first; given the agent's
     /// identity.
     fn with_kit<T>(
         &self,
         home: &Kept,
         kit: &KitSecret,
+        agent: Option<(u32, [u8; 32])>,
         f: impl FnOnce(&mut AgentLink<'_, H>, [u8; 32]) -> Result<T, Error>,
     ) -> Result<T, Error> {
         self.pin(home);
-        let found: Option<u32> = self.home_query(
-            &home.home,
-            Purpose::Personal,
-            home.home.homes.0,
-            homes::method::FIND,
-            kit.index().encode(),
-        )?;
-        let agent = found.ok_or(Error::NoAgentForKit)?;
-        let identity = self.identity(&home.home, agent)?;
+        let (agent, identity) = match agent {
+            Some(agent) => agent,
+            None => {
+                let found: Option<u32> = self.home_query(
+                    &home.home,
+                    Purpose::Personal,
+                    home.home.homes.0,
+                    homes::method::FIND,
+                    kit.index().encode(),
+                )?;
+                let agent = found.ok_or(Error::NoAgentForKit)?;
+                (agent, self.identity(&home.home, agent)?)
+            }
+        };
         let signing = kit.signing();
         let mut session = Signer::new(signing.verifying_key().to_bytes());
         let mut link = link(
