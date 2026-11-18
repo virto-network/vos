@@ -150,8 +150,9 @@ pub mod budget {
     /// The blob bytes the invocation's live machines hold together.
     pub const LIVE_BLOBS: usize = 4 << 20;
     /// The blob bytes `machine` prepares in one invocation, expunged
-    /// machines' included: what bounds the host's preparation work.
-    pub const PREPARED_BLOBS: usize = 16 << 20;
+    /// machines' included: what bounds the host's preparation work, a few
+    /// seconds of one core at about half a microsecond a byte.
+    pub const PREPARED_BLOBS: usize = 8 << 20;
     /// The pages the invocation's live machines hold mapped together, 1 GiB.
     pub const MAPPED_PAGES: usize = 1 << 18;
 }
