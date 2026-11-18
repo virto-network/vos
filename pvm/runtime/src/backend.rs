@@ -146,7 +146,9 @@ pub const MAX_INTERPRETED_CODE: usize = 4 << 20;
 /// Compile PVM code into a `CompiledProgram` using the selected backend.
 /// Each backend bounds the code it prepares as its own resource, past any
 /// rule of the program: the interpreter at [`MAX_INTERPRETED_CODE`], the
-/// recompiler at its native bound (`recompiler::MAX_CODE`).
+/// recompiler at its native bound (`recompiler::MAX_CODE`). The code is
+/// unvalidated: on code `crate::spi::deblob` refuses the backends may
+/// charge different gas, so every loader validates first.
 pub fn compile(
     code: &[u8],
     bitmask: &[u8],
