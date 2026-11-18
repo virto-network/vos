@@ -7,8 +7,12 @@
 //! one input, 14 for the encoded sequence). An input is a work item's
 //! operand or a deferred transfer, encoded with its kind (see
 //! `vos_abi::jam::AccumulateInput`). `read` and `write` reach
-//! the agent's own storage. `gas` and `log` are served as in refine. Every
-//! other call answers `WHAT`: the node serves no service-management calls.
+//! the agent's own storage. `gas` and `log` are served as in refine.
+//! `checkpoint` is the Gray Paper's: a run that ends other than by halting
+//! (a panic, a page fault, out of gas) leaves the storage as it was at its
+//! last `checkpoint`, or as it was before the run when it made none; φ7
+//! becomes the gas left. Every other call answers `WHAT`: the node serves
+//! no service-management calls.
 //!
 //! One deliberate difference from a JAM node: `read` of another service's
 //! storage answers `NONE`. Agents keep their state to themselves and reach
@@ -19,6 +23,7 @@
 //! of what it copies out to the guest ([`BYTE_GAS`]).
 
 use alloc::borrow::Cow;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::inner::gp_call;
@@ -83,6 +88,9 @@ pub struct AccumulateContext<'a, S: ServiceStorage> {
     /// The inputs' encoding `fetch` kind 14 serves, built on first use.
     encoded_inputs: Option<Vec<u8>>,
     storage: &'a mut S,
+    /// Each key written since the last checkpoint, with the value it held
+    /// then: what an exceptional end writes back.
+    since_checkpoint: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
 impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
@@ -114,15 +122,29 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
             inputs,
             encoded_inputs: None,
             storage,
+            since_checkpoint: BTreeMap::new(),
         }
     }
 
-    /// Run to the end, serving accumulate's host calls.
+    /// Run to the end, serving accumulate's host calls. A run that does not
+    /// halt (a backend failure included) leaves the storage at its last
+    /// checkpoint.
     pub fn try_run(mut self) -> Result<Invocation, RefineError> {
+        let exit = self.serve();
+        if !matches!(exit, Ok(ExitReason::Halt)) {
+            for (key, value) in core::mem::take(&mut self.since_checkpoint) {
+                self.storage.write(&key, value.as_deref());
+            }
+        }
+        Ok(self.machine.finish(exit?))
+    }
+
+    /// Serve host calls to the run's last exit.
+    fn serve(&mut self) -> Result<ExitReason, RefineError> {
         loop {
             let exit = self.machine.try_resume()?;
             let ExitReason::HostCall(id) = exit else {
-                return Ok(self.machine.finish(exit));
+                return Ok(exit);
             };
             let served = self
                 .charge(BASE_CALL_GAS)
@@ -136,6 +158,12 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
                     Ok(gp_call::READ) => self.read(),
                     Ok(gp_call::WRITE) => self.write(),
                     Ok(gp_call::SOLICIT) => self.solicit(),
+                    Ok(gp_call::CHECKPOINT) => {
+                        self.since_checkpoint.clear();
+                        let left = self.machine.gas_remaining();
+                        self.machine.registers_mut()[7] = left;
+                        Ok(())
+                    }
                     Ok(gp_call::LOG) => {
                         self.log();
                         Ok(())
@@ -146,7 +174,7 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
                     }
                 });
             if let Err(exit) = served {
-                return Ok(self.machine.finish(exit));
+                return Ok(exit);
             }
         }
     }
@@ -322,6 +350,10 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
             self.machine.registers_mut()[7] = result::FULL;
             return Ok(());
         }
+        if !self.since_checkpoint.contains_key(&key) {
+            let held = self.storage.read(&key, 0, usize::MAX).map(|(_, held)| held);
+            self.since_checkpoint.insert(key.clone(), held);
+        }
         let previous = self.storage.write(&key, value.as_deref());
         self.machine.registers_mut()[7] = previous.map_or(result::NONE, |len| len as u64);
         Ok(())
@@ -457,6 +489,99 @@ mod tests {
         let invocation = run(22, &[], &mut storage);
         assert_eq!(invocation.exit, ExitReason::Halt);
         assert_eq!(invocation.registers[7], result::WHAT);
+    }
+
+    /// `checkpoint` answers the gas left, as `gas` does at the same point.
+    #[test]
+    fn a_checkpoint_answers_the_gas_left() {
+        let checkpoint = run(gp_call::CHECKPOINT as u8, &[], &mut BTreeMap::new());
+        let gas = run(gp_call::GAS as u8, &[], &mut BTreeMap::new());
+        assert_eq!(checkpoint.exit, ExitReason::Halt);
+        assert_eq!(checkpoint.registers[7], gas.registers[7]);
+    }
+
+    /// An accumulate that writes "abc" = "hello", makes call `call` (a
+    /// checkpoint, or one the host does not serve), writes "ab" = "hello",
+    /// then ends by `end`: halts, traps, or writes a value longer than its
+    /// gas pays for (out of gas).
+    fn checkpointed(call: u32, end: End, storage: &mut BTreeMap<Vec<u8>, Vec<u8>>) -> ExitReason {
+        #[rustfmt::skip]
+        let mut code: Vec<u8> = vec![
+            0, 0, 0, 0, 0,                // IC 0..5: refine traps
+            51, 7, 0x00, 0x00, 0x02,      // load_imm φ7, 0x2_0000 ("abc")
+            51, 8, 3,                     // load_imm φ8, 3
+            51, 9, 0x03, 0x00, 0x02,      // load_imm φ9, 0x2_0003 ("hello")
+            51, 10, 5,                    // load_imm φ10, 5
+            10, 5,                        // ecalli write
+            10, call as u8,               // ecalli call
+            51, 7, 0x00, 0x00, 0x02,      // load_imm φ7, 0x2_0000 ("ab")
+            51, 8, 2,                     // load_imm φ8, 2
+            51, 9, 0x03, 0x00, 0x02,      // load_imm φ9, 0x2_0003 ("hello")
+            51, 10, 5,                    // load_imm φ10, 5
+            10, 5,                        // ecalli write
+        ];
+        let mut starts = vec![0, 1, 2, 3, 4, 5, 10, 13, 18, 21, 23, 25, 30, 33, 38, 41];
+        #[rustfmt::skip]
+        let tail: &[u8] = match end {
+            End::Halt => &[50, 0],        // jump_ind φ0 (halt)
+            End::Trap => &[0],            // trap
+            End::OutOfGas => &[
+                51, 7, 0x00, 0x00, 0x02,  // load_imm φ7, 0x2_0000 ("ab")
+                51, 10, 0xff,             // load_imm φ10, 2^64 − 1 (value length)
+                10, 5,                    // ecalli write
+                0,                        // trap (unreached)
+            ],
+        };
+        starts.push(code.len());
+        if end == End::OutOfGas {
+            starts.extend([5, 8, 10].map(|at| code.len() + at));
+        }
+        code.extend_from_slice(tail);
+        let prepared = PreparedProgram::new(&standard(&code, &starts, 0)).unwrap();
+        AccumulateContext::load(&prepared, 7, 42, &[], 1_000_000, storage)
+            .unwrap()
+            .try_run()
+            .unwrap()
+            .exit
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum End {
+        Halt,
+        Trap,
+        OutOfGas,
+    }
+
+    /// A run that ends other than by halting leaves the storage as it was
+    /// at its last checkpoint, or before the run when it made none, a key
+    /// it held before included; one that halts keeps every write.
+    #[test]
+    fn an_exceptional_end_reverts_to_the_last_checkpoint() {
+        let before = BTreeMap::from([(b"ab".to_vec(), b"old".to_vec())]);
+        let hello = || b"hello".to_vec();
+        for (end, exit) in [
+            (End::Trap, ExitReason::Panic),
+            (End::OutOfGas, ExitReason::OutOfGas),
+        ] {
+            let mut storage = before.clone();
+            assert_eq!(checkpointed(gp_call::CHECKPOINT, end, &mut storage), exit);
+            let at_checkpoint = BTreeMap::from([
+                (b"ab".to_vec(), b"old".to_vec()),
+                (b"abc".to_vec(), hello()),
+            ]);
+            assert_eq!(storage, at_checkpoint, "reverted to the checkpoint");
+
+            let mut storage = before.clone();
+            assert_eq!(checkpointed(gp_call::LOG, end, &mut storage), exit);
+            assert_eq!(storage, before, "no checkpoint: reverted to the start");
+        }
+        let mut storage = before.clone();
+        assert_eq!(
+            checkpointed(gp_call::CHECKPOINT, End::Halt, &mut storage),
+            ExitReason::Halt
+        );
+        let halted = BTreeMap::from([(b"ab".to_vec(), hello()), (b"abc".to_vec(), hello())]);
+        assert_eq!(storage, halted, "a halt keeps every write");
     }
 
     #[test]
