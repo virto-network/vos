@@ -386,7 +386,7 @@ attribution). Its full design is `recursion-air.md`.
   verifies has it, so one circuit verifies a leaf or a fold, and only the
   preprocessed root, a witness, tells them apart.
   - **The kernel leaf fits.** At 40 queries over the window kernel's
-    shape, its leaf is 55,451 / 99,412 / 43,960 rows under format 41 (its
+    shape, its leaf is 55,455 / 99,485 / 44,040 rows under format 41 (its
     logical right shifts multiply, so its shape holds no DIVREM)
     [measured], 15% of `p2` spare; every test actor's kernel's classes fit
     within 57,825 / 129,629 / 46,040 [model, the derivation's bound]. A
