@@ -320,14 +320,22 @@ impl NativeMemory {
     /// Whether the runs installed, with those slot activations split off,
     /// are within this window's and the process's bounds.
     fn within_bounds(&self) -> bool {
+        let split = self.activation_splits();
+        let extra = counted(self.edges + split) - counted(self.edges);
+        self.edges + split <= PROTECTION_RUNS
+            && PROCESS_RUNS.load(Ordering::Relaxed) + extra <= PROCESS_PROTECTION_RUNS
+    }
+
+    /// The runs slot activations split off the installed ones: kernel
+    /// mappings past the permission table's runs.
+    pub(crate) fn activation_splits(&self) -> usize {
         // An active slot maps its writable pages writable and an inactive
         // one read-only: two writable neighbours on either side of a slot
         // boundary are two mappings.
         let activation = &*self.activation;
         // SAFETY: the window holds a permission byte per guest page.
         let table = unsafe { core::slice::from_raw_parts(self.window.perms(), self.span / 4096) };
-        let split = self
-            .writable
+        self.writable
             .keys()
             .filter(|&&slot| {
                 let first = slot * SLOT_PAGES;
@@ -336,10 +344,7 @@ impl NativeMemory {
                     && table[first - 1] == PERM_RW
                     && activation.is_active(slot) != activation.is_active(slot - 1)
             })
-            .count();
-        let extra = counted(self.edges + split) - counted(self.edges);
-        self.edges + split <= PROTECTION_RUNS
-            && PROCESS_RUNS.load(Ordering::Relaxed) + extra <= PROCESS_PROTECTION_RUNS
+            .count()
     }
 
     /// Retire the window: report what the guest wrote through it, then make
@@ -890,6 +895,22 @@ mod tests {
         memory.take_written(|first, count| runs.push((first, count)))?;
         runs.sort();
         Ok(runs)
+    }
+
+    /// A write that starts tracking a slot between two that do not splits
+    /// two mappings off the writable run, which the window counts: what an
+    /// idle machine claims from the process's mapping budget.
+    #[test]
+    fn an_activated_slot_counts_the_mappings_it_splits_off() {
+        let pages = 3 * SLOT_PAGES;
+        let mut memory = NativeMemory::new(pages * 4096).unwrap();
+        let mut perms = PagePerms::new_rw(pages);
+        memory.sync_permissions(&mut perms).unwrap();
+        assert_eq!(memory.activation_splits(), 0);
+        first_write(&memory, SLOT_PAGES + 3);
+        assert_eq!(memory.activation_splits(), 2, "both of its boundaries");
+        first_write(&memory, 3);
+        assert_eq!(memory.activation_splits(), 1, "its neighbour joins it");
     }
 
     #[test]

@@ -1412,6 +1412,20 @@ impl Memory {
         }
     }
 
+    /// The kernel mappings a native window's slot activations split off
+    /// its permission runs; 0 off a native window.
+    pub(crate) fn native_activation_splits(&self) -> usize {
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        if let Memory::Flat(FlatMem {
+            bytes: FlatBytes::Native(bytes),
+            ..
+        }) = self
+        {
+            return bytes.activation_splits();
+        }
+        0
+    }
+
     /// Whether this memory must not be reused: its native write tracking
     /// failed (it reports every page from then on), or its native window was
     /// retired and it runs on the interpreter for good.

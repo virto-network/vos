@@ -541,7 +541,9 @@ impl PooledMachine {
                 memory.allocated_bytes() <= fresh.saturating_add(IDLE_GROWTH_LIMIT)
             });
         }
-        let mappings = NATIVE_FIXED_MAPPINGS + memory.permission_runs().len();
+        let mappings = NATIVE_FIXED_MAPPINGS
+            + memory.permission_runs().len()
+            + memory.native_activation_splits();
         self.idle = budget.claim(mappings);
         self.idle.is_some()
     }

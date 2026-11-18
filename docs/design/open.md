@@ -278,6 +278,17 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
 - **`RecompiledPvm`,** the recompiler's test-only machine with its own
   memory path: retired once the instruction vectors run on
   `backend::StandardMachine`, the production path, on both backends.
+- **A slot's activation during a native run is not counted against the
+  mapping bounds:** a write that starts tracking a 4 MiB slot between two
+  untracked ones splits two kernel mappings off its writable run, from
+  the fault handler, and only the next permission sync counts them (and
+  an idle machine's claim). On a VOS host the pages an invocation maps
+  (`inner::budget`) bound the slots it can split; the JAM-only host's
+  inner machines are unbounded, and a failed activation there is a
+  backend error where the interpreter gives a result. Counting the splits
+  atomically at activation and, past the bounds or on a failed
+  `mprotect`, exiting before the store, retiring the window and finishing
+  on the interpreter would close it.
 - **The recompiler's preparation simulates block costs twice:**
   `compile_code` runs the gas simulator inline in its code generation,
   and the interpreter tables a native program keeps beside its code (for
