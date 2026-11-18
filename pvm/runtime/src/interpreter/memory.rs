@@ -742,7 +742,7 @@ pub struct FlatMem {
     perms: PagePerms,
     dirty: DirtyPages,
     /// Every capture since the last reset ([`Memory::take_pages_since_reset`]).
-    captured: Vec<core::ops::Range<u32>>,
+    captured: Captured,
     value_revision: u64,
 }
 
@@ -823,7 +823,7 @@ impl FlatMem {
             bytes: FlatBytes::Owned(bytes),
             perms: PagePerms::new_rw(pages),
             dirty: DirtyPages::new(pages),
-            captured: Vec::new(),
+            captured: Captured::default(),
             value_revision: 0,
         }
     }
@@ -948,7 +948,7 @@ pub struct SparseMem {
     /// Pages written since the last capture, in first-write order.
     dirty: Vec<u32>,
     /// Every capture since the last reset ([`Memory::take_pages_since_reset`]).
-    captured: Vec<core::ops::Range<u32>>,
+    captured: Captured,
     value_revision: u64,
 }
 
@@ -965,7 +965,7 @@ impl SparseMem {
             perms: PagePerms::new_rw(pages),
             frame_dirty: Vec::new(),
             dirty: Vec::new(),
-            captured: Vec::new(),
+            captured: Captured::default(),
             value_revision: 0,
         }
     }
@@ -1102,6 +1102,41 @@ impl SparseMem {
     }
 }
 
+/// The page ranges captured since a pooled machine's last reset. They are
+/// coalesced whenever they grow past twice what the last coalescing left
+/// (and past a floor), so each capture costs amortized time in its own
+/// ranges, however scattered the pages already held.
+#[derive(Clone, Debug, Default)]
+struct Captured {
+    ranges: Vec<core::ops::Range<u32>>,
+    /// The ranges the last coalescing left.
+    coalesced: usize,
+}
+
+impl Captured {
+    /// Ranges held before the first coalescing.
+    const FLOOR: usize = 4096;
+
+    fn extend(&mut self, pages: &[core::ops::Range<u32>]) {
+        self.ranges.extend_from_slice(pages);
+        if self.ranges.len() > Self::FLOOR.max(2 * self.coalesced) {
+            self.ranges = coalesce(core::mem::take(&mut self.ranges));
+            self.coalesced = self.ranges.len();
+        }
+    }
+
+    /// Every range held, sorted and coalesced, leaving none.
+    fn take(&mut self) -> Vec<core::ops::Range<u32>> {
+        self.coalesced = 0;
+        coalesce(core::mem::take(&mut self.ranges))
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.coalesced = 0;
+    }
+}
+
 /// Sort page ranges and merge those that overlap or touch.
 fn coalesce(mut ranges: Vec<core::ops::Range<u32>>) -> Vec<core::ops::Range<u32>> {
     ranges.sort_unstable_by_key(|range| range.start);
@@ -1141,7 +1176,7 @@ impl Memory {
             bytes: FlatBytes::Native(bytes),
             perms: PagePerms::new_rw(span as usize / PAGE),
             dirty: DirtyPages::new(span as usize / PAGE),
-            captured: Vec::new(),
+            captured: Captured::default(),
             value_revision: 0,
         }))
     }
@@ -1297,10 +1332,7 @@ impl Memory {
             Memory::Flat(m) => (m.dirty.take(), &mut m.captured),
             Memory::Sparse(m) => (m.take_dirty(), &mut m.captured),
         };
-        captured.extend(pages.iter().cloned());
-        if captured.len() > 4096 {
-            *captured = coalesce(core::mem::take(captured));
-        }
+        captured.extend(&pages);
         pages
     }
 
@@ -1313,7 +1345,7 @@ impl Memory {
             Memory::Flat(m) => &mut m.captured,
             Memory::Sparse(m) => &mut m.captured,
         };
-        coalesce(core::mem::take(captured))
+        captured.take()
     }
 
     /// The permission slots changed since the last call, with each slot's
@@ -1745,6 +1777,24 @@ mod tests {
         flat.set_page_perms(perms.clone());
         sparse.set_page_perms(perms);
         (flat, sparse)
+    }
+
+    /// Scattered pages captured one at a time are coalesced a logarithmic
+    /// number of times, not on every capture past the floor (20,000
+    /// captures sorted the whole list about 16,000 times).
+    #[test]
+    fn scattered_captures_coalesce_rarely() {
+        let mut captured = Captured::default();
+        let mut coalescings = 0;
+        for page in 0..20_000u32 {
+            let before = captured.coalesced;
+            captured.extend(core::slice::from_ref(&(2 * page..2 * page + 1)));
+            coalescings += usize::from(captured.coalesced != before);
+        }
+        assert_eq!(coalescings, 3);
+        let ranges = captured.take();
+        assert_eq!(ranges.len(), 20_000);
+        assert!(ranges.windows(2).all(|pair| pair[0].end < pair[1].start));
     }
 
     /// Mapped pages are counted page by page, alike in both models.
