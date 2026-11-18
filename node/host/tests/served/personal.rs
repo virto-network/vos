@@ -689,12 +689,14 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
     let mut slot = Signer::new(code.slot_key());
     let (mut joiner, put) = Joiner::scan(&code).unwrap();
     leave(&mut sockets, personal, &mut slot, &put);
-    let Opened::Put(put) = opener
+    let Opened::Check(check) = opener
         .read(&inbox(&mut sockets, personal, &first.sync.key))
         .unwrap()
     else {
-        panic!("the handshake's last message")
+        panic!("the joiner's handshake message")
     };
+    assert_eq!(check, joiner.check());
+    let put = opener.offer().unwrap();
     leave(&mut sockets, personal, &mut first.sync, &put);
     let Joined::Offer(offered) = joiner
         .read(&inbox(&mut sockets, personal, &slot.key))
