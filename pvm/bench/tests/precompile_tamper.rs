@@ -19,6 +19,7 @@ fn accepted(
         trace_program(program, arguments, GAS)
             .expect("trace")
             .side_note
+            .expand()
     };
     let honest = trace();
     let mut side_note = trace();

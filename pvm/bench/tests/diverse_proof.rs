@@ -33,10 +33,11 @@ fn diverse_guest_proves_end_to_end() {
         let expected = diverse(seed).to_le_bytes();
         assert_eq!(run_vos(&program, &args), expected, "seed {seed}");
 
-        let mut trace = trace_program(&program, &args, GAS).expect("trace");
+        let trace = trace_program(&program, &args, GAS).expect("trace");
         assert_eq!(trace.output, expected, "traced output");
-        let proof = prove(&mut trace.side_note).expect("prove");
+        let mut side_note = trace.side_note.expand();
+        let proof = prove(&mut side_note).expect("prove");
         assert_eq!(proof.format_version, format::SEGMENT.number);
-        verify(proof, &trace.side_note).expect("verify");
+        verify(proof, &side_note).expect("verify");
     }
 }
