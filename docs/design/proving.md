@@ -282,9 +282,10 @@ attribution). Its full design is `recursion-air.md`.
     their class and are halved into 48 segments of about 2,000 steps
     each, so it is a dense case, not a throughput figure. Proving is
     flat, 245.7–246.9 s → 245.3–247.1 s, peak 7,326–7,330 → 7,185–7,434
-    MiB: the STARK's columns dominate it. The harness's first run, before
-    the prover's workers took a 16 MiB stack, proved in 245.4 s at 7,256
-    MiB; a second aborted on a worker's stack overflow.
+    MiB: the STARK's columns dominate it. At rayon's default 2 MiB
+    worker stack, one run proved in 245.4 s at 7,256 MiB and another
+    aborted on a worker's stack overflow; at the prover's 16 MiB, none of
+    four did.
 - **Unmasked.** Segments never leave the prover role.
 
 ### 3.3 Leaf circuits

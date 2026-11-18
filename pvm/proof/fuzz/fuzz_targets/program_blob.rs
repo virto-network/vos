@@ -41,8 +41,12 @@ fuzz_target!(|data: &[u8]| {
             }
             (Err(reference), Err(native)) => assert_eq!(reference, native, "refusal"),
             // The recompiler's own resource bound (code past
-            // `vos_pvm::recompiler::MAX_CODE`), never a guest outcome.
-            (Ok(_), Err(vos_pvm::refine::RefineError::Backend)) => {}
+            // `vos_pvm::recompiler::MAX_CODE`), never a guest outcome; any
+            // other refusal of the recompiler's is a divergence.
+            (Ok(_), Err(vos_pvm::refine::RefineError::Backend))
+                if vos_pvm::spi::parse_standard_program(data).is_some_and(|program| {
+                    program.code.code.len() > vos_pvm::recompiler::MAX_CODE
+                }) => {}
             (reference, native) => panic!(
                 "the backends differ: {} / {}",
                 program_run::label(reference),

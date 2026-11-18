@@ -907,7 +907,9 @@ the prover role, where an audit most needs it said.
 - **The loader's bounds:** the proof tracer's loader
   (`kernel::trace_kernel`, `trace_program`, `kernel_side_note`) accepts
   every program the Gray Paper reader and validation accept, with no
-  executor code bound. It refuses code longer than a proof's program
+  executor code bound, but for the reader's one host bound: a zero-width
+  jump table of more entries than its blob has bytes
+  (`docs/design/open.md`, "Host bounds"). It refuses code longer than a proof's program
   memory holds (2^`MAX_PROOF_LOG_SIZE` = 2^24 bytes) as
   `KernelTraceError::Code`, the prover's own resource bound. An installed
   kernel must be its program's one encoding

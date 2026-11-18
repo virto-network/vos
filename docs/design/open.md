@@ -202,10 +202,19 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
 
 - **Host bounds past the Gray Paper's reader** (`vos_pvm_program`,
   `vos_pvm::backend`): a zero-width jump table holds at most as many
-  entries as its blob has bytes, and the interpreter prepares at most
-  `MAX_INTERPRETED_CODE` (4 MiB) of code, a backend refusal past it; both
-  are valid programs only an inner machine's `machine` call can name.
-  A fallible predecode with a table of implicit zeros lifts both.
+  entries as its blob has bytes, a refusal the reader gives as it gives
+  an invalid blob's (Ψ's panic, `machine`'s HUH), for any blob, a
+  service's under `W_C` among them; and the interpreter prepares at most
+  `MAX_INTERPRETED_CODE` (4 MiB) of code, a backend refusal past it, a
+  valid program only an inner machine's `machine` call can name. A table
+  of implicit zeros (a length, no entries) and a fallible predecode lift
+  both.
+- **Arithmetic on a code pointer in a register** (`vos_pvm_compiler`):
+  the compiler gives a code pointer its jump-table address, so `addi t0,
+  t0, 4` then `jalr t0` selects another entry than the source's
+  instruction four bytes on. It cannot see the arithmetic: only a
+  `jalr`'s own displacement past ±1 is refused, and a source that offsets
+  a code pointer otherwise runs differently.
 - **Service admission in the node** (`vos_pvm::spi::service_fits`, `W_C`):
   `OuterMachines` refuses a service's code past 4,000,000 bytes; the node
   side's install, and its refine and accumulate answering `BIG`, call it
