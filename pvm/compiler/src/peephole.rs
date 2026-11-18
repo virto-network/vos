@@ -24,17 +24,6 @@ fn parse_signed_imm(code: &[u8], start: usize, lx: usize) -> i64 {
     i64::from_le_bytes(buf)
 }
 
-/// Compute skip distance from bitmask: number of continuation bytes after position `pc`.
-fn skip_for(bitmask: &[u8], pc: usize) -> usize {
-    for j in 0..25 {
-        let idx = pc + 1 + j;
-        if idx >= bitmask.len() || bitmask[idx] == 1 {
-            return j;
-        }
-    }
-    0
-}
-
 /// Each instruction of PVM `code`, by its bitmask: where it starts, and how
 /// many continuation bytes follow it.
 fn instructions<'a>(code: &[u8], bitmask: &'a [u8]) -> impl Iterator<Item = (usize, usize)> + 'a {
@@ -47,7 +36,7 @@ fn instructions<'a>(code: &[u8], bitmask: &'a [u8]) -> impl Iterator<Item = (usi
         if pc >= bitmask.len() {
             return None;
         }
-        let (at, skip) = (pc, skip_for(bitmask, pc));
+        let (at, skip) = (pc, vos_pvm::skip(bitmask, pc));
         pc = at + 1 + skip;
         Some((at, skip))
     })
@@ -169,7 +158,7 @@ pub(crate) fn peephole_fuse_load_imm_alu(
             continue;
         }
         let op = code[i];
-        let s = skip_for(bitmask, i);
+        let s = vos_pvm::skip(bitmask, i);
         let next_i = i + 1 + s;
 
         // Look for load_imm followed by a ThreeReg ALU
@@ -179,7 +168,7 @@ pub(crate) fn peephole_fuse_load_imm_alu(
             && !targets.contains(&next_i)
         {
             let alu_op = Opcode::from_byte(code[next_i]);
-            let alu_s = skip_for(bitmask, next_i);
+            let alu_s = vos_pvm::skip(bitmask, next_i);
             let set_lt = matches!(alu_op, Some(Opcode::SetLtU | Opcode::SetLtS));
 
             // Check if the following instruction is a ThreeReg ALU we can fuse with.
@@ -411,7 +400,7 @@ pub(crate) fn peephole_fuse_load_imm_memory(
             continue;
         }
         let op = code[i];
-        let s = skip_for(bitmask, i);
+        let s = vos_pvm::skip(bitmask, i);
         let next_i = i + 1 + s;
 
         // Look for load_imm followed by load_ind or store_ind
@@ -420,7 +409,7 @@ pub(crate) fn peephole_fuse_load_imm_memory(
             && bitmask[next_i] == 1
             && !targets.contains(&next_i)
         {
-            let mem_s = skip_for(bitmask, next_i);
+            let mem_s = vos_pvm::skip(bitmask, next_i);
             if let Some(mem_op) = Opcode::from_byte(code[next_i])
                 && let Some(dir_op) = direct_opcode(mem_op)
             {
