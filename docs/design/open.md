@@ -297,11 +297,42 @@ The scale results are in `core-model.md` §14, "The scale test".
   `node/SECURITY.md`, "The onion"): a session of the onion's screens has at
   most four host-service calls in flight, which bounds one circuit's by its
   connections and sessions, but s4's host-service requests name no peer,
-  so no rate a circuit holds them to; and the onion's SSH server takes
-  s4-server's connection cap (128) with no idle timeout of its own
-  (russh's inactivity timeout is reset by the keepalives a live client
-  answers, so an idle close needs s4-server to count a connection's
-  channel traffic). Both need s4-server's work.
+  so no rate a circuit holds them to; and the onion's SSH server's
+  connections (`[onion] ssh_connections`, 128 by default, each given 30 s
+  to authenticate) have no idle close (russh's inactivity timeout is reset
+  by the keepalives a live client answers, so an idle close needs
+  s4-server to count a connection's channels and close one holding none
+  for a while). Both need s4-server's work.
+- **The onion's proven calls under many circuits** [known limit, dated
+  2026-11-18]: a proven call's header takes its circuit's places first and
+  one call a circuit waits for the onion's, so a member waits about
+  C × 5 / 16 s behind C circuits holding headers alone; inside the 60 s a
+  call waits up to about 190 circuits, not at the 1,024-circuit cap. Past
+  that the bound is the introduction points' rate and arti's service-side
+  proof of work (`pow`, behind `tor-pow`, which no arti release has
+  declared ready).
+- **The admin key's attestation** [known limit, dated 2026-11-18,
+  `light-node.md` §3.5]: a device's admin class and its hardware and
+  verified-boot flags are its own report (the keystore's `KeyInfo`), not
+  an attestation chain another device verified: a modified client can
+  claim a strong admin. Generating the key under an attestation challenge
+  bound to the agent and the device, and each device checking the chain
+  (its security level, the authentication it requires, the root of trust's
+  verified-boot state), is later work; so is the PIN-authenticated delayed
+  admin of a phone without a Class 3 biometric, which today cannot make
+  its admin key at all.
+- **A delayed admin's pairing** [not built]: its add is an operation that
+  waits the operation delay (72 h) past any pairing slot's life, and a
+  joiner that waits that long across restarts is not built: a delayed
+  admin opens no pairing (`Error::DelayedAdmin`), and a strong admin's
+  device pairs it. A phone whose devices are all delayed admins cannot
+  add another.
+- **A carried session's terminal geometry** [low, not fixed]: s4 sends a
+  carried session's exact columns, rows and pixel size, constant per phone
+  and rare in a small space, so a gateway may join a member's carried
+  sessions by them, and their sign-ins across scopes. Rounding them to a
+  few buckets on carried sessions, and reviewing what s4's hello volunteers
+  (fonts, theme, capabilities) for the same, is s4's work.
 - **The kit's calls on a phone** [built 2026-11-18, phone run pending]:
   `remove_by_kit`, `resolve_by_kit` and `kit_view` from any install, the
   restore screen's "A lost phone answers the restore"; driven on two

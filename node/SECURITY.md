@@ -343,10 +343,10 @@ facility (`identity-and-authority.md` §7):
 ## The onion
 
 A space's gateways host its onion service in process (arti, `vos-gateway`'s
-`tor` feature; `light-node.md` §6.1, §6.6, §6.7): its port 80 is the
-gateway's HTTP, its port 22 the gateway's SSH (s4's screens and the
-`vos-api` subsystem, whose relay set holds `Call` and `Credentialed`), any
-other port refused. What that changes for the node and its operators:
+`tor` feature; `light-node.md` §6.1, §6.6, §6.7): its port 22 is the
+gateway's SSH (s4's screens and the `vos-api` subsystem, whose relay set
+holds `Call` and `Credentialed`), any other port refused, port 80 among
+them until an HTTP client exists (E23). What that changes for the node and its operators:
 
 - **What Tor fixes:** no node or gateway learns a Tor client's network
   address, so a proof's nullifier, a feed read and a personal agent's
@@ -377,15 +377,22 @@ other port refused. What that changes for the node and its operators:
   flight through the onion, from one connection and from one circuit,
   and an agent's calls from one circuit (`node-api.md` §6). A client may
   open as many circuits as Tor lets it: the per-circuit caps bound one
-  circuit, the onion's global caps and the node's verification budget
-  bound them all, and a flood of well-formed junk proofs through a
+  circuit (a proven call's header takes its circuit's places before it
+  waits for the onion's, one waiter a circuit, and a body that stops
+  coming gives them back after 5 s), the onion's global caps and the
+  node's verification budget bound them all; the members' wait grows
+  with the attacker's circuits (about C × 5 / 16 s, `light-node.md`
+  §6.6), whose bound past that is the introduction rate and arti's proof
+  of work; and a flood of well-formed junk proofs through a
   private Tor network was held by Tor itself to about fifteen a second,
   members' sign-ins served throughout (`light-node.md` §6.6, measured on
   chutney, not on the live network).
 - **Not capped per circuit:** the demo's screens' own calls (s4's
   host-service calls carry no peer), which only the server's bound per
   session holds; and the onion's SSH server takes s4-server's connection
-  cap (128) with no idle timeout of its own (`docs/design/open.md`).
+  cap (128 unless `[onion] ssh_connections` sets it, each connection given
+  30 s to authenticate) with no idle close of its own
+  (`docs/design/open.md`).
 - **The onion's key is the gateway's identity,** self-authenticating:
   a gateway that holds it is the space's onion, and the registrar serves
   the space's onion set unsigned (`set_onions`, `onions`), as any answer a

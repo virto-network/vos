@@ -1174,6 +1174,15 @@ numbers wait for the phone session, `tools/phone/scripts/group.sh`]:
   included, waits 72 h and can be contested (its commits carry only
   operations already matured), which bounds what malware that captures
   such a key can do.
+- **The class as built** [built, 2026-11-18, decision 6]: the class is
+  the device's own report, as the UI's keystore answered it (`KeyInfo`'s
+  security level), not an attestation another device verified: a key that
+  is not hardware-backed registers `AdminClass::Delayed`, claimed, paired
+  or as a replacement; the verified-boot flag is recorded as reported.
+  Verifying the attestation chain, and the PIN-authenticated fallback of a
+  phone without a Class 3 biometric, are later work (`open.md`). A
+  delayed admin opens no pairing (`Error::DelayedAdmin`, below): a strong
+  admin's device pairs it.
 - **After first unlock:** a phone unlocked once since boot uses the sync
   key and the MLS state while locked; a thief who keeps it powered and
   runs code on it reads the personal space. Before the first unlock
@@ -2082,8 +2091,10 @@ one taken]:
   pre-shared key enters at the third message, so a joiner holding another
   code fails at the offer and the opener hears nothing until the slot
   expires; a delayed admin's pairing (its add an operation, its commit
-  after the delay, past the slot's life) is not built, `pair` making a
-  strong admin's inline add; the identity a claim's kit is sealed to is
+  after the delay, past the slot's life) is not built: `pair_offer`
+  refuses on a delayed admin (`Error::DelayedAdmin`) before a slot opens,
+  and a strong admin's device pairs it, `pair` making a strong admin's
+  inline add; the identity a claim's kit is sealed to is
   the answering node's word, so the device asks a second node.
 - **Memberships** (`memberships`): once the agent took the commit adding
   the joiner, never for a pairing cut short, the opener holds an
@@ -3002,7 +3013,16 @@ a client that pinned it needs no TLS certificate for it; the SSH host key
 stays pinned as today (§7.3). **A space has several gateways, so several
 onions** (arti offers no load-balanced onion): enrollment pins the set,
 the registrar serves the current set as a query, and a device refreshes
-its pinned set through any onion of it. The recovery kit carries the set
+its pinned set through any onion of it: an enrolled space's at each sync
+pass, its home's at the personal space's pass, each once a day; the onions
+a home's read no longer names stay pinned beside the new set for 7 days,
+so one forged answer cannot leave the device without a way home
+[built, 2026-11-18]. A home's routes are kept under a key of their own
+(`route::home`, a hash of its handle), apart from every enrolled space's
+(kept under the space's handle), so an enrollment naming the home's handle
+reaches none of them, nor its opt-out; such an enrollment is refused
+unless it names the home's own onion set (a home in a space the user
+belongs to). The recovery kit carries the set
 current at the claim; a space whose onions have all changed since is
 found only by its handle through the registry of spaces, which is not
 built (`open.md`, "The registry and the root space"; §8, D4). A gateway
@@ -3137,7 +3157,17 @@ nodes may ask the onion's mark of its proven calls, or of every request
   refused), and accepts that host key alone, under an
   SSH key drawn for the session, never resumed, forwarding no agent; the
   opt-out takes the space's clearnet port, its enrolled host key pinned;
-  a gateway no space was enrolled through s4 reaches itself.
+  a gateway no space was enrolled through s4 reaches itself, except an
+  onion service, which `:vos` carries over Tor at first contact (and a
+  client with no facility refuses to dial). A sign-in or a payment is
+  proved only for a session `:vos` carries, or one to a space the user
+  opted out of Tor (`Gateway.carried`): on the session s4 made itself to
+  enroll, both are refused before any prompt ("reconnect"), and s4
+  connects again once an enrollment is made on it, now carried. One
+  session never holds both what names the device (its digests, its
+  account's owner proof) and a sign-in: either is refused on a session
+  that holds the other, so a server cannot join the two (built
+  2026-11-18).
   The onion set's refresh (`refresh_onions`) is a `Time` and an `onions`
   query, each a fetch; a set of one to sixteen distinct onions replaces
   the pinned one, closing the space's connections.
@@ -3309,9 +3339,13 @@ phone; the Fairphone 6 (Snapdragon 7s Gen 3, Android 15) and the Pixel 1
 
 - **Tor is the default for every space** [decided, E22]: the light node
   reaches every space through its onion. Per space, the user may opt out
-  for **key-signed calls** (a member's own signed calls, P1 payments)
-  where the space allows the clearnet, after a plain warning that the
-  space's operators then see the device's address.
+  for **key-signed calls** (a member's own signed calls, P1 payments,
+  and s4's screens with the space's gateway) where the space allows the
+  clearnet, after a plain warning that the space's operators then see the
+  device's address, and so can join it to the sign-ins and payments its
+  screens ask for there (`OPT_OUT_WARNING`): the proof itself still goes
+  over Tor, but the session that asked for it and receives its answer
+  does not.
 - **Anonymous calls never use the clearnet,** in any space: a credentialed
   or proven call (sign-in, owner proofs, later spends) leaves the client
   only through Tor, whatever the user's or the space's setting; the client
@@ -3381,13 +3415,26 @@ place:
   keys may turn it on later.
 
 **The caps as built** [built, `node-api.md` §6]: each circuit counts as
-an address of its own (4 connections, 20 requests a second, a burst of
-40); 8 streams at once a circuit, 1,024 circuits at once, a circuit with
-no stream let go after 60 s; 16 proven calls in flight through the
-onion, 2 from one connection and 4 from one circuit, taken from a proven
-call's header before its body is read (a call waits for the onion's, and
-past its connection's or circuit's the channel is closed); an agent's
-calls and proven calls from one circuit 4 a second, a burst of 16. Past a
+an address of its own (4 connections, 16 requests in flight over them,
+20 requests a second, a burst of 40); 8 streams at once a circuit, 1,024
+circuits at once, a circuit with no stream let go after 60 s; the onion's
+SSH server takes 128 connections at once unless `[onion] ssh_connections`
+says otherwise, each given 30 s to authenticate; 16 proven calls in
+flight through the onion, 2 from one connection and 4 from one circuit,
+taken from a proven call's header before its body is read: its
+connection's and circuit's first (past either the channel is closed),
+then the onion's, for which one call a circuit waits (another is closed
+at once), so no circuit queues headers ahead of the others; the header
+takes its circuit's request token, and the body must then keep coming,
+each read within 5 s of the last and the whole within 30 s, so a header
+whose body never comes gives its places back after 5 s; an agent's calls
+and proven calls from one circuit 4 a second, a burst of 16. *Known
+limit:* the members' wait still grows with the circuits an attacker
+holds: with one waiter each and 16 places freed every 5 s, a member waits
+about C × 5 / 16 s behind C attacker circuits, inside the 60 s a call
+waits for up to about 190 circuits (the 1,024-circuit cap would mean
+about 320 s); past that the defence is the introduction points' rate and
+arti's proof of work (`open.md`). Past a
 cap on a request already read the gateway answers `Busy` and asks no
 node. A flood of junk proven calls the size of a device proof, from eight
 connections through a port capped this way, held at most the port's
@@ -4384,9 +4431,10 @@ key drawn for it alone; a proven call's spare connection is made ahead.
 (8.26)
 
 **H11. A user opts out of Tor for a space.** *Mitigation:* the opt-out
-covers that space's key-signed calls only, after a plain warning;
-anonymous calls and the personal agent stay on Tor whatever the user
-chooses [E22]. (8.26)
+covers that space's key-signed calls and its screens only, after a
+plain warning that its operators can then join the device's address to
+the sign-ins and payments asked on its screens; proofs and the personal
+agent stay on Tor whatever the user chooses [E22]. (8.26)
 
 ### 8.8 Linkability and membership
 

@@ -170,23 +170,34 @@ onion-only space; set it alike on every node of the space).
   authorities and fallbacks, say; a key arti does not know is refused, not
   ignored); the section's state, cache and full vanguards still apply over
   it.
-- **Caps:** each circuit counts as an address (4 connections, 20 requests
-  a second, a burst of 40, 8 streams at once); 1,024 circuits at once;
-  16 proven calls in flight through the onion, 2 a connection, 4 a
-  circuit; an agent's
-  calls from one circuit 4 a second, a burst of 16. Each is a key of
-  `[onion]` (`circuit_connections`, `circuit_rate`, `circuit_burst`,
-  `circuit_streams`, `circuits`, `proven`, `proven_per_connection`,
-  `proven_per_circuit`, `agent_rate`, `agent_burst`); `circuit_streams`
-  from 1 to 65,535 and `circuits` at least 1, or the gateway does not
-  start.
+- **Caps:** each circuit counts as an address (4 connections, 16
+  requests in flight over them, 20 requests a second, a burst of 40, 8
+  streams at once); 1,024 circuits at once; 16 proven calls in flight
+  through the onion, 2 a connection, 4 a circuit, one of a circuit's
+  waiting for a place among the onion's at a time; an agent's calls from
+  one circuit 4 a second, a burst of 16. Each is a key of `[onion]`
+  (`circuit_connections`, `circuit_in_flight`, `circuit_rate`,
+  `circuit_burst`, `circuit_streams`, `circuits`, `proven`,
+  `proven_per_connection`, `proven_per_circuit`,
+  `proven_waiting_per_circuit`, `agent_rate`, `agent_burst`);
+  `circuit_streams` from 1 to 65,535 and `circuits` at least 1, or the
+  gateway does not start. A clearnet address's requests in flight are
+  `per_address_in_flight` (64).
 - **The onion's SSH:** with an SSH port, the onion's port 22 serves the
   same screens (`vos-gateway`'s placeholder, or an application's built on
   its library) and `vos-api` subsystem, under the same `ssh_host_key`: the key the onion set lists
   for that onion. Its screens' own host-service calls pass no per-circuit
-  limit, only the server's bound per session; the onion's SSH server
-  holds at most 128 connections in all and has no idle timeout of its
-  own.
+  limit, only the server's bound per session. The onion's SSH server
+  holds at most `ssh_connections` connections in all (`[onion]`, 128 by
+  default; the clearnet SSH port's is the top-level `ssh_connections`),
+  each given 30 s to authenticate, and has no idle close of its own. That
+  number is the onion's capacity: a phone in the foreground keeps four to
+  six connections open (its feed, its spare, its screens, its member's
+  and personal agent's), so 128 serves about 25 phones at once; raise it
+  with the members a gateway serves.
+- **Key files:** the gateway's key, the onion's key and an application's
+  key (`seed` files in hex) are made `0600`; one its group or others may
+  read or write is refused at start (`chmod 600` it).
 - **The onion set:** the registrar sets the space's onions in the
   credential actor (`set_onions`, each onion's key and its SSH host key),
   which devices read (`onions`). Set it again when a gateway's onion

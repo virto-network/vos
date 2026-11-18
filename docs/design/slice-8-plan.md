@@ -50,9 +50,9 @@ ingress. Every gate has a limit it can miss.
 |---|---|---|---|
 | **PG1′ owner** | the stock `owner` kernel | ≤ 0.5 s, ≤ 512 MiB | M1 (format 46), M2 (47) |
 | **PG2′ sign-in** | the stock `auth` kernel | ≤ 1.0 s at format 46; at format 47 **the gate 0.65 s, the target 0.55 s** (a miss holds M2, the 4-way CPU split the next lever); ≤ 1 GiB; the proof ≤ 1.5 MiB | M1, M2, slice end |
-| **PG3′ flows** | enroll, sign-in and pay (P1); claim at a home-only test space with a phrase kit and with a security-key kit; pair a second device (enrolled in every other space at once); sync both ways; retire a phone; a removal let through, one contested and resolved by the kit, and the kit alone removing a phone that holds only a sync key; a restore cancelled by liveness, then one completed on a fresh install; a regroup keeping its regrouper alone, another device pairing again; move home (two homes: leave, claim, pair again); every secret behind its prompt; on test homes with delays in minutes, a lease that outlasts the session (no device re-proves, decision 16) and a low claim difficulty; recorded | each completes; over Tor at the median: a sign-in ≤ 4 s, a P1 payment ≤ 5 s, pairing ≤ 60 s from the scan to the second device's first read, arti and its SSH connections warm | M1 (P1, clearnet), M4 (the personal space, clearnet), M5 (over Tor), slice end |
+| **PG3′ flows** | enroll, sign-in and pay (P1); claim at a home-only test space with a phrase kit and with a security-key kit; pair a second device (enrolled in every other space at once); sync both ways; retire a phone; a removal let through, one contested and resolved by the kit, and the kit alone removing a phone that holds only a sync key; a restore cancelled by liveness, then one completed on a fresh install; a regroup keeping its regrouper alone, another device pairing again; move home (two homes: leave, claim, pair again); every secret behind its prompt; on test homes with delays in minutes, a lease that outlasts the session (no device re-proves, decision 16) and a low claim difficulty; recorded | each completes; over Tor at the median: a sign-in ≤ 4 s, a P1 payment ≤ 5 s, pairing ≤ 60 s from the scan to the second device's first read, arti and its SSH connections warm | M1 (P1) and M4 (the personal space), each an onion run: the client refuses the clearnet by construction for these, and the host suites cover the clearnet paths (owner, 2026-11-12); M5 (over Tor, its flood test), slice end |
 | **PG5 footprint** | the light node with arti, `vos-mls` and mls-rs | `.so` growth from `vos-mls` and mls-rs ≤ 2 MB (a miss: trim mls-rs's features, then the owner decides); from arti ≤ 10 MB, provisional until 8.1; idle ≤ 96 MiB; warm bootstrap ≤ 3 s p50; a day of background jobs ≤ 2% of the battery; ≤ 30 rendezvous an hour in the foreground after 8.27 | M0 (first numbers), slice end |
-| **PG6 sync** | the background job; a 1 MiB catch-up; a commit | on a locked phone after first unlock: the job ≤ 30 s and ≤ 1 MB down with nothing new, p50; the 1 MiB catch-up over Tor ≤ 20 s p50; a candidate processed on its copy ≤ 200 ms. **Recorded, as inputs to the windows:** the job in the "rare" bucket, after 3 days offline, after a force-stop, and the latency from a pending operation to its local notification | M4 (clearnet), M5 and slice end (Tor) |
+| **PG6 sync** | the background job; a 1 MiB catch-up; a commit | on a locked phone after first unlock: the job ≤ 30 s and ≤ 1 MB down with nothing new, p50; the 1 MiB catch-up over Tor ≤ 20 s p50; a candidate processed on its copy ≤ 200 ms. **Recorded, as inputs to the windows:** the job in the "rare" bucket, after 3 days offline, after a force-stop, and the latency from a pending operation to its local notification | M4, M5 and slice end, over the onion |
 
 PG4 (the spend) is slice 9's [E13].
 
@@ -181,7 +181,9 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
 
 ### M1 acceptance
 - `ci-full`, the checker loop, PG1′ and PG2′ on format 46, PG3′'s P1 flows
-  on the clearnet (S8-P2). Fable.
+  as an onion run (S8-P2; redefined 2026-11-12: the client refuses the
+  clearnet for proofs by construction, the host suites cover the clearnet
+  paths). Fable.
 - **Result so far** (2026-11-08): `ci-full` and the checker loop (seeds
   7901–7912, the cuts in full) pass at vos-core `113eb9499`. PG1′ and PG2′
   pass on the Fairphone 6: `owner` 351.8 ms and ≤ 337 MiB, `auth`
@@ -591,7 +593,8 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   `just android-build-vos <repository>` in s4.
 
 ### M4 acceptance
-- `ci-full`, PG3′'s personal-space flows and PG6 on the clearnet (S8-P5),
+- `ci-full`, PG3′'s personal-space flows and PG6 as onion runs (S8-P5;
+  redefined 2026-11-12, as M1's),
   8.21's model test, the carrier audit over the light node's and the
   agent's logs. Fable. Combined with M3's (E27); M5's phone runs may
   fold into S8-P7.
