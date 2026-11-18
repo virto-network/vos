@@ -278,6 +278,14 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
 - **`RecompiledPvm`,** the recompiler's test-only machine with its own
   memory path: retired once the instruction vectors run on
   `backend::StandardMachine`, the production path, on both backends.
+- **The recompiler's preparation simulates block costs twice:**
+  `compile_code` runs the gas simulator inline in its code generation,
+  and the interpreter tables a native program keeps beside its code (for
+  a retired window) run it again, so preparing for the recompiler costs
+  twice the simulation it needs; no result depends on it. Code generation
+  taking the interpreter's per-pc block costs would halve it, at the cost
+  of the recompiler's own walk, which the gas tests now hold to the
+  reference as a second computation.
 - **Decoding bytes a kernel was given** (`vos_pvm_codec`,
   `vos_tree::verify_encoded`): memory grows with the input by a factor
   the types set (an item's size for each byte of a short encoding; about
