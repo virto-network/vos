@@ -122,6 +122,10 @@ pub struct H8Wiring {
 
 /// A circuit's wiring, padded to its components' sizes, and where its
 /// reserved wires sit: its outputs and `u`, the public uses.
+///
+/// Its fields are open for tests to tamper; nothing proves or hashes a
+/// circuit that [`Circuit::check_wiring`] has not admitted (`prove`'s every
+/// entry and `Context::finalize` run it first).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Circuit {
     pub p2: Vec<P2Wiring>,
@@ -161,6 +165,12 @@ pub enum WiringError {
     /// An operand reads a lane of a wire that every `p2` row absorbing it
     /// leaves unread and no gate computes: a lane the prover chooses.
     UnreadLaneRead { address: u32, lane: usize },
+    /// A tagged `p2` row with an `act`, a `c_8` or `c_9`, or a bit other
+    /// than the zero wire: its input is then no longer `[c[0, 8), m]`.
+    TaggedRow { row: usize },
+    /// A node `p2` row whose bit is no wire a `b·b = b` row holds to 0 or 1:
+    /// a blend of the two children's orders.
+    NodeBit { row: usize },
 }
 
 impl fmt::Display for WiringError {
@@ -190,6 +200,15 @@ impl fmt::Display for WiringError {
             }
             Self::FreeMessageAbsorbed { row } => {
                 write!(f, "p2 row {row} absorbs a free message outside a node")
+            }
+            Self::NodeBit { row } => {
+                write!(f, "node p2 row {row}'s bit is no asserted bit")
+            }
+            Self::TaggedRow { row } => {
+                write!(
+                    f,
+                    "tagged p2 row {row} absorbs, sets c_8 or c_9, or reads a bit"
+                )
             }
             Self::UnreadLaneRead { address, lane } => {
                 write!(
@@ -274,11 +293,58 @@ impl Circuit {
     /// two of at least [`MIN_ROWS`] rows, no chained first row, every address
     /// below `p`, every used address yielded exactly once with the
     /// multiplicity of its uses, and the absolute multiplicities' sum below
-    /// `p`; and every read bound (`check_reads`).
+    /// `p`; every `p2` row's mode its invariants (`check_modes`); and every
+    /// read bound but a guess's (`check_reads`).
     pub fn check_wiring(&self) -> Result<WiringStats, WiringError> {
         let stats = self.check_relation(true)?;
+        self.check_modes()?;
         self.check_reads()?;
         Ok(stats)
+    }
+
+    /// The per-mode invariants the `p2` constraints rest on and the relation
+    /// cannot see (`vos_pvm_recair_air::p2`'s notes): a tagged row absorbs
+    /// nothing (`act` zero), sets no `c_8` or `c_9`, and its bit is the zero
+    /// wire, so its input is `[c[0, 8), m]` whatever the row before it holds;
+    /// a node row's bit is a wire some `qm31` row holds to `b·b = b`, so its
+    /// input is one of the two children's orders. A chained row's predecessor
+    /// is the row above it, and row 0 is never chained (`check_relation`); a
+    /// row's two output wires are consecutive by its layout.
+    fn check_modes(&self) -> Result<(), WiringError> {
+        let zero = BaseField::zero();
+        let one = BaseField::from(1);
+        let bits: HashSet<u32> = self
+            .qm31
+            .iter()
+            .filter(|wiring| {
+                let [a, b, c, out] = wiring.operands;
+                wiring.op
+                    == Qm31Op {
+                        k_m: one,
+                        ..Default::default()
+                    }
+                    && a.multiplicity != 0
+                    && a.address == b.address
+                    && b.multiplicity != 0
+                    && c.multiplicity == 0
+                    && out.address == a.address
+                    && out.multiplicity != 0
+            })
+            .map(|wiring| wiring.operands[0].address)
+            .collect();
+        for (row, wiring) in self.p2.iter().enumerate() {
+            if wiring.mode == Some(P2Mode::Node) && !bits.contains(&wiring.bit_address) {
+                return Err(WiringError::NodeBit { row });
+            }
+            if wiring.mode == Some(P2Mode::Tagged)
+                && (wiring.act != [zero; 8]
+                    || wiring.c[8..] != [zero; 2]
+                    || wiring.bit_address != self.layout.zero)
+            {
+                return Err(WiringError::TaggedRow { row });
+            }
+        }
+        Ok(())
     }
 
     /// Every value a gate reads is a wire's, or a lane some row absorbs:

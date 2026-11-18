@@ -545,6 +545,12 @@ pub fn verify(proof: RecairProof, circuit_hash: &Digest) -> Result<(), VerifyErr
         |channel| check_interaction_pow(channel, format, proof.interaction_pow),
     )?;
 
+    // The output count is the proof's, bound by the counting argument: the
+    // circuit the hash pins yields each of its outputs' wires once, with
+    // the multiplicity of one public use. A proof stating fewer outputs
+    // leaves a yield unmatched, one stating more adds a use no wire yields;
+    // either leaves the logup sum non-zero. The transcript need not tell
+    // the two counts apart (it mixes the values, not their count).
     let layout = Layout::node(proof.outputs.len() as u32);
     let total = proof.claimed_sums.iter().copied().sum::<SecureField>()
         + public_logup_sum(

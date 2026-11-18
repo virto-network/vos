@@ -5,6 +5,7 @@
 mod common;
 
 mod compiler;
+mod entries;
 mod gate_vm;
 mod gates;
 mod leakage;
