@@ -302,12 +302,31 @@ The scale results are in `core-model.md` §14, "The scale test".
   (russh's inactivity timeout is reset by the keepalives a live client
   answers, so an idle close needs s4-server to count a connection's
   channel traffic). Both need s4-server's work.
-- **The kit's own device-set calls on a phone:** the facility signs a
-  resolution and a removal with a device's admin key only; a contest
-  resolved by the kit, and the kit alone removing a phone that holds only
-  a sync key (PG3′), are driven in `node/light/tests/sealed/kit.rs` and
-  need the facility's kit-signed `resolve` and `remove` (and their
-  screens) before a phone runs them.
+- **The kit's calls on a phone** [built 2026-11-18, phone run pending]:
+  `remove_by_kit`, `resolve_by_kit` and `kit_view` from any install, the
+  restore screen's "A lost phone answers the restore"; driven on two
+  phones in the PG3′ session, not yet.
+- **The previous release's artifacts** [proposed]: the app ships its own
+  release's stock artifacts only, so an app one release ahead of a space
+  is refused at the window ("the app or the space must update") until the
+  space moves; shipping the previous release's beside them needs a
+  release process that keeps the previous one's ELF.
+- **A cosign or a resolution whose evidence never comes** [known limit,
+  dated 2026-11-18]: the operation it decides takes effect at the call,
+  while the devices take it only with the call's evidence; the device
+  that made it posts it until the log holds it (as every admin call's),
+  so only that device lost between the call and its evidence leaves the
+  devices without it, refusing the maturity (`Unsigned`) the agent
+  applied. Deciding at the evidence instead moves the agent's rules.
+- **An operation without its evidence is not shown** [known limit, dated
+  2026-11-18]: the chrome lists verified operations only, so one whose
+  evidence has not come (its device lost after the call) shows nothing
+  until the agent cancels it at its due time; showing it as unverified
+  needs its own notice kind and words.
+- **The joiner's check is shown, not compared by the app** [known limit,
+  dated 2026-11-18]: the opener's user confirms the two screens show the
+  same six digits; a user who confirms without looking pairs whoever
+  answered the QR first, as before the check.
 - **Every personal agent lapses at month 13** [risk, dated 2026-11-17,
   the owner's choice]: the yearly re-proof flow and the joiners' open
   claim (`light-node.md`'s E28) are deferred to the next stage of work, so

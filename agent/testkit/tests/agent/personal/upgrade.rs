@@ -9,7 +9,7 @@ use vos_testkit::programs::derived;
 use vos_wire::batch::{Admin, Input};
 use vos_wire::personal::{
     Acknowledged, Candidacy, DeviceView, Entry, Envelope, InboxItem, Operation, Overview,
-    Recipient, Recorded, RecoveryView, Verdict, Voted,
+    Recipient, RecoveryView, Verdict, Voted,
 };
 
 use vos_abi::{SpaceId, WindowClock};
