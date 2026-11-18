@@ -454,9 +454,9 @@ fn a_joiner_cut_short_pairs_again_on_the_same_phone() {
 }
 
 /// The pairing's check: both phones show the same, and an opener whose
-/// user does not confirm it puts nothing in the slot (not even the
-/// handshake's last message, which carries the offer) and closes it;
-/// confirmed, the pairing runs to its end.
+/// user does not confirm it puts nothing in the slot but the handshake's
+/// last message, which carries nothing, and closes it; confirmed, the
+/// pairing runs to its end.
 #[test]
 fn a_pairing_hands_nothing_over_until_its_check_is_confirmed() {
     let world = world();
@@ -481,7 +481,7 @@ fn a_pairing_hands_nothing_over_until_its_check_is_confirmed() {
         .into_iter()
         .filter(|step| *step == Step::call(method::PUT))
         .count();
-    assert_eq!(puts, 0, "nothing handed over, the offer included");
+    assert_eq!(puts, 1, "the handshake's last message alone, no offer");
     let checks = |phone: &Phone| phone.checks.lock().unwrap().clone();
     assert_eq!(checks(&first.phone), checks(&joiner.phone));
     assert_eq!(checks(&first.phone)[0].len(), 7, "six digits");

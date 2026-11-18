@@ -1239,7 +1239,9 @@ spike app, its log host-verified]:
   due without its evidence is cancelled** (`Unevidenced`), a cosigned one
   too, so the agent and the devices close it alike: a call whose device is
   lost between the call and its evidence wedges nothing, and is made
-  again.] The
+  again. A cosign or a resolution that would make an operation without its
+  evidence mature is refused `Unevidenced`: it is made again once the
+  operation's evidence is in, which its author's next pass posts.] The
   operators run ingress and could append anything to the log, so a device
   trusts an operation only by its signature (§8, B6).
 - Delays run on the agent's batch time alone; a device whose clock
@@ -1931,13 +1933,16 @@ skip expired items, each write deletes a few; no timer).
    `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2b` with A through the slot, the code
    its pre-shared key.
 3. **The check, before anything is handed over** [decided 2026-11-12,
-   built]: once A has read B's handshake message, both devices show a
-   six-digit check derived from the handshake's hash, and A's user confirms
-   that B shows the same before A writes anything more (the handshake's
-   last message carries A's offer); declined, A closes the slot. Someone who
-   photographed the QR and answered first holds a handshake of its own,
-   whose check the user's new phone does not show, so the slot grants
-   nothing until the user has seen whom it pairs.
+   built]: the handshake's last message (A's) carries nothing; once it is
+   written and read, both devices show a six-digit check derived from the
+   whole handshake's hash, and A's user confirms that B shows the same
+   before A sends anything more (its offer is the channel's first message);
+   declined, A closes the slot. Someone who photographed the QR and answered
+   first holds a handshake of its own, which A's last message ends: B
+   cannot read that message and shows no check. No side has a check before
+   that message, which A writes after the one it answers, so no answer is
+   ground until its check is B's; the slot grants nothing until the user
+   has seen whom it pairs.
 4. **Over the Noise channel,** B sends its public keys, the admin key's
    attestation and its KeyPackage; A sends the key archive, the naming
    secret, `R`, and its newest checkpoint's hash per scope (slice 9,

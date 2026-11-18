@@ -189,9 +189,10 @@ impl<H: Host> Personal<H> {
             })?;
             match opener.read(&items).map_err(failed)? {
                 Opened::Waiting => self.host.sleep(POLL),
-                Opened::Check(check) => {
-                    // Nothing, the offer included, leaves until the user
-                    // confirms the new device shows this check.
+                Opened::Check { check, put } => {
+                    self.put(held, &put.arguments())?;
+                    // Nothing more, the offer included, leaves until the
+                    // user confirms the new device shows this check.
                     if !prompts.confirm_pairing(&check) {
                         self.close_slot(held, opener)?;
                         return Err(Error::Declined);
@@ -369,11 +370,6 @@ impl<H: Host> Personal<H> {
                 .map(drop)
         };
         slot_put(&mut slot_signer, put.arguments())?;
-        // The check shown while the opener's user confirms it; until then
-        // the opener sends nothing.
-        if !prompts.show_pairing(joiner.check()) {
-            return Err(Error::Declined);
-        }
         let mut home = None;
         let until = code.expires;
         let (pairing, ack, offer, device) = loop {
@@ -400,6 +396,13 @@ impl<H: Host> Personal<H> {
             };
             match joiner.read(&items).map_err(failed)? {
                 Joined::Waiting => self.host.sleep(POLL),
+                // Shown while the opener's user confirms it; until then the
+                // opener sends nothing more.
+                Joined::Check(check) => {
+                    if !prompts.show_pairing(&check) {
+                        return Err(Error::Declined);
+                    }
+                }
                 Joined::Offer(offer) => {
                     // The code is the opener's: the space this device holds
                     // is left, and it pairs as a fresh install.

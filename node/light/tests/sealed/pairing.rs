@@ -174,11 +174,19 @@ fn pair_in(
     let (mut joining, second) = Joiner::scan(&code).unwrap();
     leave(home, &code.slot_key(), &second);
 
-    let Opened::Check(_) = opener_reads(home, opener, &mut side) else {
+    let Opened::Check { put: third, .. } = opener_reads(home, opener, &mut side) else {
         panic!("the handshake's last message")
     };
-    let third = side.offer().unwrap();
     leave(home, &opener.sync, &third);
+    let Joined::Check(check) = joiner_reads(home, &code, &mut joining) else {
+        panic!("the check")
+    };
+    assert_eq!(
+        Some(check.as_str()),
+        side.check(),
+        "both sides show one check"
+    );
+    leave(home, &opener.sync, &side.offer().unwrap());
     let Joined::Offer(offered) = joiner_reads(home, &code, &mut joining) else {
         panic!("the offer")
     };
@@ -350,8 +358,46 @@ fn a_phone_is_paired_through_the_slot_and_reads_at_once() {
     assert!(!home::holds_archive(&Phone::new(9).store).unwrap());
 }
 
+/// Someone who photographed the QR and answered first: the opener's third
+/// message ends the thief's handshake, which the user's new phone cannot
+/// read, so it shows no check to match the opener's; and no side shows a
+/// check before the third message, written after the second it answers,
+/// so a second message is not ground to a check the new phone shows.
+#[test]
+fn a_qr_thief_answering_first_leaves_the_new_phone_no_check() {
+    let (mut home, mut phones) = household(1);
+    let offer = Offer {
+        home: home_space(&home),
+        memberships: Vec::new(),
+    };
+    let (mut side, qr) = open(&mut home, &mut phones[0], offer);
+    let code = Code::from_bytes(&qr).unwrap();
+    let (mut thief, stolen) = Joiner::scan(&code).unwrap();
+    let (mut phone, _) = Joiner::scan(&code).unwrap();
+    assert_eq!(
+        (thief.check(), phone.check()),
+        (None, None),
+        "no check before the third"
+    );
+    leave(&mut home, &code.slot_key(), &stolen);
+    let Opened::Check { check, put } = side.read(&inbox(&home, phones[0].sync_key())).unwrap()
+    else {
+        panic!("the thief's second message")
+    };
+    leave(&mut home, &phones[0].sync, &put);
+    let slot = inbox(&home, code.slot_key().verifying_key().to_bytes());
+    assert_eq!(phone.read(&slot).err(), Some(PairError::Handshake));
+    assert_eq!(phone.check(), None, "the new phone shows no check");
+    let Joined::Check(theirs) = thief.read(&slot).unwrap() else {
+        panic!("the thief's check")
+    };
+    assert_eq!(theirs, check, "the opener's check is the thief's alone");
+    // Declined, nothing more leaves: the thief reads no offer.
+    assert!(matches!(thief.read(&slot).unwrap(), Joined::Waiting));
+}
+
 /// The handshake fails under a code that is not the QR's: the pre-shared
-/// key enters at its last message, so the joiner cannot read the offer,
+/// key enters at its last message, so the joiner cannot read it,
 /// and the opener never hears a hello. An item the operators replace fails
 /// at its reader, whichever side; and no step is taken out of turn.
 #[test]
@@ -366,17 +412,17 @@ fn another_code_or_a_replaced_item_fails_the_handshake() {
     code.code[0] ^= 1;
     let (mut joining, second) = Joiner::scan(&code).unwrap();
     leave(&mut home, &code.slot_key(), &second);
-    let Opened::Check(_) = side.read(&inbox(&home, phones[0].sync_key())).unwrap() else {
+    let Opened::Check { put: third, .. } = side.read(&inbox(&home, phones[0].sync_key())).unwrap()
+    else {
         panic!("the last message")
     };
-    let third = side.offer().unwrap();
     leave(&mut home, &phones[0].sync, &third);
     assert_eq!(
         joining
             .read(&inbox(&home, code.slot_key().verifying_key().to_bytes()))
             .err(),
         Some(PairError::Handshake),
-        "the offer does not open under another code"
+        "the handshake does not end under another code"
     );
     assert!(matches!(
         side.read(&inbox(&home, phones[0].sync_key())).unwrap(),
@@ -403,10 +449,10 @@ fn another_code_or_a_replaced_item_fails_the_handshake() {
     );
     let (mut joining, _) = Joiner::scan(&code).unwrap();
     leave(&mut home, &code.slot_key(), &second);
-    let Opened::Check(_) = side.read(&inbox(&home, phones[0].sync_key())).unwrap() else {
+    let Opened::Check { put: third, .. } = side.read(&inbox(&home, phones[0].sync_key())).unwrap()
+    else {
         panic!("the last message")
     };
-    let third = side.offer().unwrap();
     leave(&mut home, &phones[0].sync, &third);
     let mut served = inbox(&home, code.slot_key().verifying_key().to_bytes());
     for item in &mut served {
@@ -475,11 +521,14 @@ fn a_pairing_cut_short_is_abandoned_and_paired_again() {
     let code = Code::from_bytes(&qr).unwrap();
     let (mut joining, second) = Joiner::scan(&code).unwrap();
     leave(&mut home, &code.slot_key(), &second);
-    let Opened::Check(_) = opener_reads(&home, &phones[0], &mut side) else {
+    let Opened::Check { put: third, .. } = opener_reads(&home, &phones[0], &mut side) else {
         panic!("the last message")
     };
-    let third = side.offer().unwrap();
     leave(&mut home, &phones[0].sync, &third);
+    let Joined::Check(_) = joiner_reads(&home, &code, &mut joining) else {
+        panic!("the check")
+    };
+    leave(&mut home, &phones[0].sync, &side.offer().unwrap());
     let Joined::Offer(offered) = joiner_reads(&home, &code, &mut joining) else {
         panic!("the offer")
     };

@@ -327,6 +327,12 @@ The scale results are in `core-model.md` §14, "The scale test".
   dated 2026-11-18]: the opener's user confirms the two screens show the
   same six digits; a user who confirms without looking pairs whoever
   answered the QR first, as before the check.
+- **A cosign or resolution before the evidence is refused, not queued**
+  [known limit, dated 2026-11-18]: the agent refuses one that would make an
+  operation without its evidence mature (`Unevidenced`), and the device
+  shows the refusal; the user signs again once the operation's author has
+  posted it (its next pass). Holding the second signature until then needs
+  a held call of its own kind.
 - **Every personal agent lapses at month 13** [risk, dated 2026-11-17,
   the owner's choice]: the yearly re-proof flow and the joiners' open
   claim (`light-node.md`'s E28) are deferred to the next stage of work, so
