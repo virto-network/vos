@@ -5,6 +5,7 @@ use super::*;
 fn an_address_past_its_burst_is_answered_429() {
     let served = Served::start(PerAddress {
         connections: 64,
+        in_flight: 64,
         rate: 1,
         burst: 3,
     });

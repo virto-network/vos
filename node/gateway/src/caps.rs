@@ -11,10 +11,11 @@
 //!   log.
 //!
 //! A proven call holds its places from its header on, before its body is
-//! read: the SSH relay waits for a place among the port's (its channel
-//! reading nothing meanwhile) and closes a channel past its connection's
-//! or circuit's; a request whose body is already read is answered `Busy`
-//! past any cap, by the gateway, with no node asked. The clearnet's ports
+//! read: its connection's and circuit's first, at once (past either, the
+//! SSH relay closes its channel), then the port's, for which it waits, one
+//! waiter a circuit (past it, closed too), so no circuit queues ahead of
+//! the others by sending headers; a request whose body is already read is
+//! answered `Busy` past any cap, by the gateway, with no node asked. The clearnet's ports
 //! cap nothing ([`Caps::none`]): their clients' addresses are the bound
 //! ([`crate::limits`]).
 
@@ -50,6 +51,9 @@ pub struct PerPort {
     pub proven_per_connection: usize,
     /// Proven calls in flight from one address or circuit.
     pub proven_per_circuit: usize,
+    /// Proven calls from one address or circuit waiting for a place among
+    /// the port's.
+    pub waiting_per_circuit: usize,
     /// An agent's calls and proven calls a second from one address or
     /// circuit, on average.
     pub agent_rate: u32,
@@ -63,6 +67,7 @@ impl Default for PerPort {
             proven: 16,
             proven_per_connection: 2,
             proven_per_circuit: 4,
+            waiting_per_circuit: 1,
             agent_rate: 4,
             agent_burst: 16,
         }
@@ -76,6 +81,7 @@ pub struct Refused {
     pub connection: u64,
     pub circuit: u64,
     pub agent: u64,
+    pub waiting: u64,
 }
 
 /// Counts by key, each at most a limit.
@@ -112,24 +118,42 @@ pub struct Caps {
     proven: Arc<Semaphore>,
     connections: Counted<SocketAddr>,
     circuits: Counted<IpAddr>,
+    waiting: Counted<IpAddr>,
     agents: Rate<(IpAddr, u32)>,
-    refused: [AtomicU64; 4],
+    refused: [AtomicU64; 5],
 }
 
 /// A proven call's places among its port's, its connection's and its
 /// circuit's, given back when it is answered.
 pub struct Held {
-    caps: Arc<Caps>,
-    peer: Option<SocketAddr>,
+    _own: Own,
     _place: OwnedSemaphorePermit,
 }
 
-impl Drop for Held {
+/// A proven call's places among its connection's and its circuit's.
+struct Own {
+    caps: Arc<Caps>,
+    peer: Option<SocketAddr>,
+}
+
+impl Drop for Own {
     fn drop(&mut self) {
         if let Some(peer) = self.peer {
             self.caps.connections.give(peer);
             self.caps.circuits.give(counted(peer.ip()));
         }
+    }
+}
+
+/// A circuit's place among those waiting for the port's.
+struct Waiting<'a> {
+    caps: &'a Caps,
+    circuit: IpAddr,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.caps.waiting.give(self.circuit);
     }
 }
 
@@ -159,6 +183,7 @@ impl Caps {
             proven: Arc::new(Semaphore::new(rates.proven)),
             connections: Counted(Mutex::new(HashMap::new())),
             circuits: Counted(Mutex::new(HashMap::new())),
+            waiting: Counted(Mutex::new(HashMap::new())),
             agents: Rate::new(rates.agent_rate, rates.agent_burst),
             refused: Default::default(),
         })
@@ -174,13 +199,8 @@ impl Caps {
     }
 
     /// The connection's and circuit's places for a proven call from
-    /// `peer`, beside the port's `place`; `None` past either.
-    fn own(
-        self: &Arc<Self>,
-        per: PerPort,
-        peer: Option<SocketAddr>,
-        place: OwnedSemaphorePermit,
-    ) -> Option<Held> {
+    /// `peer`; `None` past either.
+    fn own(self: &Arc<Self>, per: PerPort, peer: Option<SocketAddr>) -> Option<Own> {
         if let Some(peer) = peer {
             if !self.connections.take(peer, per.proven_per_connection) {
                 self.refuse(1);
@@ -195,10 +215,9 @@ impl Caps {
                 return None;
             }
         }
-        Some(Held {
+        Some(Own {
             caps: Arc::clone(self),
             peer,
-            _place: place,
         })
     }
 
@@ -208,15 +227,21 @@ impl Caps {
         let Some(per) = self.per else {
             return Ok(None);
         };
+        let own = self.own(per, peer).ok_or(Capped)?;
         let Ok(place) = Arc::clone(&self.proven).try_acquire_owned() else {
             self.refuse(0);
             return Err(Capped);
         };
-        self.own(per, peer, place).map(Some).ok_or(Capped)
+        Ok(Some(Held {
+            _own: own,
+            _place: place,
+        }))
     }
 
-    /// A proven call's places from `peer`, once the port has one: `Err`
-    /// past its connection's or circuit's, at once.
+    /// A proven call's places from `peer`, once the port has one: `Err` at
+    /// once past its connection's or circuit's, or when its circuit has
+    /// as many waiting already. Its connection's and circuit's are taken
+    /// first, so what it waits for is the port's alone.
     pub async fn proven_wait(
         self: &Arc<Self>,
         peer: Option<SocketAddr>,
@@ -224,11 +249,34 @@ impl Caps {
         let Some(per) = self.per else {
             return Ok(None);
         };
-        let place = Arc::clone(&self.proven)
-            .acquire_owned()
-            .await
-            .expect("the port's places are never closed");
-        self.own(per, peer, place).map(Some).ok_or(Capped)
+        let own = self.own(per, peer).ok_or(Capped)?;
+        let place = match Arc::clone(&self.proven).try_acquire_owned() {
+            Ok(place) => place,
+            Err(_) => {
+                let _waiting = match peer {
+                    Some(peer) => {
+                        let circuit = counted(peer.ip());
+                        if !self.waiting.take(circuit, per.waiting_per_circuit) {
+                            self.refuse(4);
+                            return Err(Capped);
+                        }
+                        Some(Waiting {
+                            caps: self,
+                            circuit,
+                        })
+                    }
+                    None => None,
+                };
+                Arc::clone(&self.proven)
+                    .acquire_owned()
+                    .await
+                    .expect("the port's places are never closed")
+            }
+        };
+        Ok(Some(Held {
+            _own: own,
+            _place: place,
+        }))
     }
 
     /// Whether a call or proven call holding `body` from `peer` passes its
@@ -275,6 +323,7 @@ impl Caps {
             connection: count(1),
             circuit: count(2),
             agent: count(3),
+            waiting: count(4),
         }
     }
 
@@ -299,6 +348,7 @@ mod tests {
             proven: 4,
             proven_per_connection: 2,
             proven_per_circuit: 3,
+            waiting_per_circuit: 1,
             agent_rate: 1,
             agent_burst: 4,
         });
@@ -335,6 +385,18 @@ mod tests {
         };
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
+        // One waiter a circuit: another from it is refused at once, its
+        // own places given back.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                caps.proven_wait(at("10.0.0.3:2"))
+            )
+            .await
+            .expect("at once")
+            .is_err(),
+            "the circuit's waiter"
+        );
         drop(first);
         assert!(waiting.await.unwrap());
         drop((second, third, fourth));
@@ -352,7 +414,8 @@ mod tests {
                 proven: 1,
                 connection: 1,
                 circuit: 1,
-                agent: 1
+                agent: 1,
+                waiting: 1,
             }
         );
         assert_eq!(caps.proven(), 0);

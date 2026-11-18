@@ -13,6 +13,8 @@ use std::time::Instant;
 #[derive(Clone, Copy, Debug)]
 pub struct PerAddress {
     pub connections: usize,
+    /// Requests in flight at once, from every connection.
+    pub in_flight: usize,
     /// Requests a second, on average.
     pub rate: u32,
     /// Requests at once past the average.
@@ -23,6 +25,7 @@ impl Default for PerAddress {
     fn default() -> Self {
         Self {
             connections: 64,
+            in_flight: 64,
             rate: 200,
             burst: 400,
         }
@@ -112,22 +115,29 @@ impl<K: Hash + Eq> Rate<K> {
     }
 }
 
-/// Each address's connections and requests.
+/// Each address's connections, requests in flight and requests.
 pub struct Limits {
     per: PerAddress,
     open: Mutex<HashMap<IpAddr, usize>>,
+    flying: Mutex<HashMap<IpAddr, usize>>,
     requests: Rate<IpAddr>,
 }
 
-/// A connection's place among its address's, given back when it ends.
+/// A connection's or a request's place among its address's, given back
+/// when it ends.
 pub struct Place {
     limits: Arc<Limits>,
     address: IpAddr,
+    request: bool,
 }
 
 impl Drop for Place {
     fn drop(&mut self) {
-        let mut open = self.limits.open.lock().expect("the open connections");
+        let counts = match self.request {
+            true => &self.limits.flying,
+            false => &self.limits.open,
+        };
+        let mut open = counts.lock().expect("the counts");
         if let Some(count) = open.get_mut(&self.address) {
             *count -= 1;
             if *count == 0 {
@@ -142,6 +152,7 @@ impl Limits {
         Arc::new(Self {
             per,
             open: Mutex::new(HashMap::new()),
+            flying: Mutex::new(HashMap::new()),
             requests: Rate::new(per.rate, per.burst),
         })
     }
@@ -149,16 +160,31 @@ impl Limits {
     /// A place for a connection from `address`, if it holds fewer than its
     /// limit.
     pub fn connect(self: &Arc<Self>, address: IpAddr) -> Option<Place> {
+        self.place(address, false)
+    }
+
+    /// A place for a request in flight from `address`, if it has fewer in
+    /// flight than its limit.
+    pub fn in_flight(self: &Arc<Self>, address: IpAddr) -> Option<Place> {
+        self.place(address, true)
+    }
+
+    fn place(self: &Arc<Self>, address: IpAddr, request: bool) -> Option<Place> {
         let address = counted(address);
-        let mut open = self.open.lock().expect("the open connections");
+        let (counts, most) = match request {
+            true => (&self.flying, self.per.in_flight),
+            false => (&self.open, self.per.connections),
+        };
+        let mut open = counts.lock().expect("the counts");
         let count = open.entry(address).or_insert(0);
-        if *count >= self.per.connections {
+        if *count >= most {
             return None;
         }
         *count += 1;
         Some(Place {
             limits: Arc::clone(self),
             address,
+            request,
         })
     }
 
@@ -177,6 +203,7 @@ mod tests {
     fn an_address_gets_its_connections_and_its_burst() {
         let limits = Limits::new(PerAddress {
             connections: 2,
+            in_flight: 1,
             rate: 1,
             burst: 3,
         });
@@ -188,6 +215,11 @@ mod tests {
         assert!(limits.connect(other).is_some());
         drop(first);
         assert!(limits.connect(address).is_some());
+        // Requests in flight are counted apart from connections.
+        let flying = limits.in_flight(address).unwrap();
+        assert!(limits.in_flight(address).is_none());
+        drop(flying);
+        assert!(limits.in_flight(address).is_some());
         assert!((0..3).all(|_| limits.request(address)));
         assert!(!limits.request(address), "past the burst");
         assert!(limits.request(other), "another address's own");

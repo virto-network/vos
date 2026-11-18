@@ -64,7 +64,8 @@ fn run(cli: Cli) -> Result<(), String> {
                 Arc::clone(&limits),
                 vos_gateway::caps::Caps::none(),
                 vos_gateway::caps::bodies(),
-            ),
+            )
+            .with_connections(config.ssh_connections),
             &vos_gateway::ssh::Placeholder,
         )
         .await?;

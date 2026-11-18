@@ -94,6 +94,12 @@ fn ssh_server(
         Arc::clone(limits),
         Arc::clone(caps),
         crate::caps::bodies(),
+    )
+    .with_connections(
+        config
+            .onion
+            .as_ref()
+            .and_then(|onion| onion.ssh_connections),
     );
     crate::ssh::serve(config, Arc::clone(gateway), port, app, listener)
 }

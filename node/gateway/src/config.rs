@@ -50,6 +50,7 @@ pub struct Config {
     /// The most HTTP connections at once, from every address.
     pub connections: Option<usize>,
     pub per_address_connections: Option<usize>,
+    pub per_address_in_flight: Option<usize>,
     pub per_address_rate: Option<u32>,
     pub per_address_burst: Option<u32>,
     /// The nodes behind the gateway.
@@ -64,6 +65,9 @@ pub struct Config {
     pub ssh: Option<SocketAddr>,
     /// The SSH host key, made if missing.
     pub ssh_host_key: Option<PathBuf>,
+    /// The SSH port's connections at once, from every address, the
+    /// handshake included: s4-server's cap (its default, 128, unless set).
+    pub ssh_connections: Option<usize>,
     /// The onion service: the SSH port's screens and subsystem, and
     /// nothing else.
     pub onion: Option<Onion>,
@@ -103,6 +107,8 @@ pub struct Onion {
     /// SSH channels at once from one circuit, and its requests a second
     /// with a burst.
     pub circuit_connections: Option<usize>,
+    /// Requests in flight at once from one circuit, over all its channels.
+    pub circuit_in_flight: Option<usize>,
     pub circuit_rate: Option<u32>,
     pub circuit_burst: Option<u32>,
     /// Proven calls in flight through the onion, from one connection, and
@@ -110,6 +116,11 @@ pub struct Onion {
     pub proven: Option<usize>,
     pub proven_per_connection: Option<usize>,
     pub proven_per_circuit: Option<usize>,
+    /// Proven calls from one circuit waiting for a place among the onion's.
+    pub proven_waiting_per_circuit: Option<usize>,
+    /// The onion's SSH connections at once, from every circuit, the
+    /// handshake included: s4-server's cap.
+    pub ssh_connections: Option<usize>,
     /// An agent's calls a second from one circuit, and their burst.
     pub agent_rate: Option<u32>,
     pub agent_burst: Option<u32>,
@@ -120,6 +131,8 @@ pub struct Onion {
 /// circuits at will.
 pub const PER_CIRCUIT: PerAddress = PerAddress {
     connections: 4,
+    // A channel's whole [`crate::ssh::IN_FLIGHT`].
+    in_flight: 16,
     rate: 20,
     burst: 40,
 };
@@ -137,6 +150,7 @@ impl Onion {
     pub fn limits(&self) -> PerAddress {
         PerAddress {
             connections: self.circuit_connections.unwrap_or(PER_CIRCUIT.connections),
+            in_flight: self.circuit_in_flight.unwrap_or(PER_CIRCUIT.in_flight),
             rate: self.circuit_rate.unwrap_or(PER_CIRCUIT.rate),
             burst: self.circuit_burst.unwrap_or(PER_CIRCUIT.burst),
         }
@@ -152,6 +166,9 @@ impl Onion {
             proven_per_circuit: self
                 .proven_per_circuit
                 .unwrap_or(defaults.proven_per_circuit),
+            waiting_per_circuit: self
+                .proven_waiting_per_circuit
+                .unwrap_or(defaults.waiting_per_circuit),
             agent_rate: self.agent_rate.unwrap_or(defaults.agent_rate),
             agent_burst: self.agent_burst.unwrap_or(defaults.agent_burst),
         }
@@ -169,6 +186,7 @@ impl Config {
         let defaults = PerAddress::default();
         PerAddress {
             connections: self.per_address_connections.unwrap_or(defaults.connections),
+            in_flight: self.per_address_in_flight.unwrap_or(defaults.in_flight),
             rate: self.per_address_rate.unwrap_or(defaults.rate),
             burst: self.per_address_burst.unwrap_or(defaults.burst),
         }
@@ -290,10 +308,25 @@ pub fn hex32(text: &str) -> Result<[u8; 32], String> {
 }
 
 /// The seed in the file at `path`, in hex; made at random, readable by its
-/// owner only, if there is none.
+/// owner only, if there is none. A file its group or others may read or
+/// write is refused, as arti refuses its own.
 pub fn seed(path: &Path) -> Result<[u8; 32], String> {
+    use std::os::unix::fs::PermissionsExt;
     match std::fs::read_to_string(path) {
-        Ok(text) => hex32(&text),
+        Ok(text) => {
+            let mode = std::fs::metadata(path)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .permissions()
+                .mode();
+            if mode & 0o077 != 0 {
+                return Err(format!(
+                    "{}: a key file its group or others may read (mode {:o}): chmod 600 it",
+                    path.display(),
+                    mode & 0o777
+                ));
+            }
+            hex32(&text)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
@@ -423,5 +456,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(seed(&path).is_err(), "a key file others may read");
     }
 }

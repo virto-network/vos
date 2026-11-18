@@ -86,6 +86,7 @@ pub fn measure(inventory: &Inventory, run: &Run) -> Result<Cost, String> {
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let limits = Limits::new(PerAddress {
         connections: 4,
+        in_flight: 4,
         rate: u32::MAX,
         burst: u32::MAX,
     });

@@ -53,6 +53,7 @@ impl Front {
             gateway,
             vos_gateway::limits::Limits::new(vos_gateway::limits::PerAddress {
                 connections: 1024,
+                in_flight: 1024,
                 rate: u32::MAX,
                 burst: u32::MAX,
             }),

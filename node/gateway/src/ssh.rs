@@ -11,13 +11,15 @@
 //! channel, each frame within [`DEADLINE`] of its first byte.
 //!
 //! A proven call's body, up to a device proof's 1.5 MiB, is read only once
-//! it holds its places: on a capped port (the onion's) its port's,
-//! connection's and circuit's ([`crate::caps`]), the channel reading
+//! it holds its places: on a capped port (the onion's) its connection's
+//! and circuit's, then its port's ([`crate::caps`]), the channel reading
 //! nothing while it waits for the port's and closed past the others; on
 //! an uncapped one a place among the port's own proven bodies
-//! ([`crate::caps::PROVEN_BODIES`]). The body must then arrive within
-//! [`LARGE_DEADLINE`]. Each call and proven call passes its port's caps,
-//! or is answered `Busy` with no node asked.
+//! ([`crate::caps::PROVEN_BODIES`]). Its header takes its address's rate
+//! token. The body must then arrive within [`LARGE_DEADLINE`], each read
+//! within [`PROGRESS`] of the last, so a header whose body never comes
+//! holds its places that long. Each call and proven call passes its port's
+//! caps, or is answered `Busy` with no node asked.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -46,6 +48,12 @@ pub const DEADLINE: Duration = Duration::from_secs(60);
 /// its places: a device proof over an onion circuit at its slowest
 /// measured rate (`light-node.md` §6.3), with room.
 pub const LARGE_DEADLINE: Duration = Duration::from_secs(30);
+/// How long a proven call's large body may pause once it holds its
+/// places: a Tor circuit delivers its cells seconds apart at worst.
+pub const PROGRESS: Duration = Duration::from_secs(5);
+/// How long the onion's SSH connections may take to authenticate: the
+/// light node's own handshake deadline over Tor.
+pub const ONION_HANDSHAKE: Duration = Duration::from_secs(30);
 
 /// Host-service calls in flight from one of the onion's screen sessions:
 /// with a circuit's connections and an anonymous connection's sessions
@@ -63,6 +71,9 @@ pub struct Port {
     pub limits: Arc<Limits>,
     pub caps: Arc<Caps>,
     pub bodies: Arc<Semaphore>,
+    /// The SSH server's connections at once, the handshake included:
+    /// s4-server's default unless set.
+    pub connections: Option<usize>,
 }
 
 impl Port {
@@ -74,6 +85,15 @@ impl Port {
             limits,
             caps,
             bodies,
+            connections: None,
+        }
+    }
+
+    /// The same, its SSH server taking at most `connections` at once.
+    pub fn with_connections(self, connections: Option<usize>) -> Self {
+        Self {
+            connections,
+            ..self
         }
     }
 }
@@ -139,16 +159,21 @@ pub fn server(
     let mark = port.mark;
     let ed25519 = host_key.public_key().key_data().ed25519().map(|key| key.0);
     let server = app.server(&gateway, mark, ed25519);
-    let limits = match mark {
+    let defaults = s4_server::ServerLimits::default();
+    let mut limits = match mark {
         Mark::Onion => s4_server::ServerLimits {
+            handshake_timeout: ONION_HANDSHAKE,
             host_services: s4_server::HostServiceLimits {
                 max_active_per_session: ONION_HOST_CALLS,
                 ..Default::default()
             },
-            ..Default::default()
+            ..defaults
         },
-        _ => s4_server::ServerLimits::default(),
+        _ => defaults,
     };
+    if let Some(connections) = port.connections {
+        limits.max_connections = connections;
+    }
     server
         .host_key(host_key)
         .limits(limits)
@@ -250,6 +275,8 @@ pub async fn relay(
     let mut chunk = vec![0u8; 64 << 10];
     // When the frame part read must have arrived by.
     let mut due: Option<Instant> = None;
+    // When a large body holding its places must have arrived by, whole.
+    let mut large_due: Option<Instant> = None;
     // The places the frame part read holds, if it is a large body.
     let mut placed: Option<Placed> = None;
     let mut requests = tokio::task::JoinSet::new();
@@ -280,19 +307,27 @@ pub async fn relay(
             return;
         }
         reader.push(&chunk[..read]);
+        // A large body read on: its next bytes within `PROGRESS`.
+        if let Some(whole) = large_due {
+            due = Some(whole.min(Instant::now() + PROGRESS));
+        }
         while let Some(event) = reader.event() {
             match event {
                 Event::Frame(request) => {
                     // A whole frame read: the next one's deadline runs from
                     // its own first byte.
                     due = None;
-                    let placed = placed.take().unwrap_or_default();
+                    large_due = None;
+                    let placed = placed.take();
+                    // A large body's token was taken at its header.
+                    let charged = placed.is_some();
+                    let placed = placed.unwrap_or_default();
                     let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
                         return;
                     };
                     let mut place = None;
                     if let Some(connection) = connection {
-                        if !port.limits.request(connection.ip()) {
+                        if !charged && !port.limits.request(connection.ip()) {
                             tracing::debug!(
                                 ?connection,
                                 ?mark,
@@ -300,7 +335,7 @@ pub async fn relay(
                             );
                             return;
                         }
-                        place = port.limits.connect(connection.ip());
+                        place = port.limits.in_flight(connection.ip());
                         if place.is_none() {
                             let bytes =
                                 error_frame(Framing::Stream, request.id, FrameError::Unavailable);
@@ -349,6 +384,7 @@ pub async fn relay(
         while requests.try_join_next().is_some() {}
         if !reader.pending() {
             due = None;
+            large_due = None;
         } else if due.is_none() {
             due = Some(Instant::now() + DEADLINE);
         }
@@ -360,16 +396,28 @@ pub async fn relay(
                 .body(Framing::Stream)
                 .is_some_and(|length| large(header.kind, length))
         {
+            // Its header takes its address's token: a header whose body
+            // never comes costs one, as a whole frame does.
+            if let Some(connection) = connection
+                && !port.limits.request(connection.ip())
+            {
+                tracing::debug!(
+                    ?connection,
+                    ?mark,
+                    "a channel past its address's rate, closed"
+                );
+                return;
+            }
             let taken = if port.caps.caps() {
                 match tokio::time::timeout(DEADLINE, port.caps.proven_wait(connection)).await {
                     Ok(Ok(held)) => Some(Placed { held, body: None }),
                     _ => None,
                 }
             } else {
-                Arc::clone(&port.bodies)
-                    .acquire_owned()
+                tokio::time::timeout(DEADLINE, Arc::clone(&port.bodies).acquire_owned())
                     .await
                     .ok()
+                    .and_then(Result::ok)
                     .map(|body| Placed {
                         held: None,
                         body: Some(body),
@@ -386,7 +434,9 @@ pub async fn relay(
                 return;
             };
             placed = Some(taken);
-            due = Some(Instant::now() + LARGE_DEADLINE);
+            let now = Instant::now();
+            large_due = Some(now + LARGE_DEADLINE);
+            due = Some(now + PROGRESS);
         }
     }
 }

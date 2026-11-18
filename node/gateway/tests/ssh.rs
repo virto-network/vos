@@ -82,6 +82,17 @@ async fn port(key: [u8; 32], socket: PathBuf) -> std::net::SocketAddr {
 /// An SSH port relaying to the node at `socket`, marking each frame
 /// `mark`, and its address.
 async fn port_marked(key: [u8; 32], socket: PathBuf, mark: vos_api::Mark) -> std::net::SocketAddr {
+    port_limited(key, socket, mark, PerAddress::default()).await
+}
+
+/// An SSH port relaying to the node at `socket`, marking each frame
+/// `mark`, each address limited to `per`, and its address.
+async fn port_limited(
+    key: [u8; 32],
+    socket: PathBuf,
+    mark: vos_api::Mark,
+    per: PerAddress,
+) -> std::net::SocketAddr {
     let gateway = Arc::new(Gateway::new(vec![Upstream::new(
         key,
         Address::Socket(socket),
@@ -90,7 +101,7 @@ async fn port_marked(key: [u8; 32], socket: PathBuf, mark: vos_api::Mark) -> std
     let host_key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]));
     let port = vos_gateway::ssh::Port::new(
         mark,
-        Limits::new(PerAddress::default()),
+        Limits::new(per),
         vos_gateway::caps::Caps::none(),
         vos_gateway::caps::bodies(),
     );
@@ -105,12 +116,29 @@ async fn port_marked(key: [u8; 32], socket: PathBuf, mark: vos_api::Mark) -> std
 
 /// The subsystem's channel, under an ephemeral key.
 async fn channel(address: std::net::SocketAddr) -> russh::Channel<client::Msg> {
+    channel_from(address, std::net::Ipv4Addr::LOCALHOST)
+        .await
+        .unwrap()
+}
+
+/// The same from the loopback address `from`: each a circuit of its own
+/// to a port that counts addresses as circuits. `None` when the port
+/// takes no more connections now.
+async fn channel_from(
+    address: std::net::SocketAddr,
+    from: std::net::Ipv4Addr,
+) -> Option<russh::Channel<client::Msg>> {
+    static DRAWN: AtomicU64 = AtomicU64::new(1);
     let mut seed = [0u8; 32];
     seed[..8].copy_from_slice(&vos_node::wall_clock().to_le_bytes());
+    seed[8..16].copy_from_slice(&DRAWN.fetch_add(1, Ordering::Relaxed).to_le_bytes());
     let key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&seed));
-    let mut handle = client::connect(Arc::new(client::Config::default()), address, AcceptAll)
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind((from, 0).into()).unwrap();
+    let stream = socket.connect(address).await.ok()?;
+    let mut handle = client::connect_stream(Arc::new(client::Config::default()), stream, AcceptAll)
         .await
-        .unwrap();
+        .ok()?;
     let key = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), None);
     assert!(
         handle
@@ -119,19 +147,19 @@ async fn channel(address: std::net::SocketAddr) -> russh::Channel<client::Msg> {
             .unwrap()
             .success()
     );
-    let mut channel = handle.channel_open_session().await.unwrap();
+    let mut channel = handle.channel_open_session().await.ok()?;
     channel
         .request_subsystem(true, vos_gateway::ssh::SUBSYSTEM)
         .await
-        .unwrap();
+        .ok()?;
     // A bound on the wait, which a loaded host may stretch.
     let reply = tokio::time::timeout(Duration::from_secs(30), channel.wait())
         .await
-        .unwrap();
+        .ok()?;
     assert!(matches!(reply, Some(ChannelMsg::Success)), "{reply:?}");
     // The connection lives as long as its channel's test.
     std::mem::forget(handle);
-    channel
+    Some(channel)
 }
 
 /// Frames from the channel's bytes, as they come; `None` once it closed.
@@ -235,6 +263,18 @@ async fn a_node_gone_is_unavailable_and_the_channel_goes_on() {
 /// as one of them ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sixteen_requests_in_flight_a_channel() {
+    sixteen_in_flight(vos_api::Mark::Clearnet, PerAddress::default()).await;
+}
+
+/// The same on a port whose addresses are an onion's circuits: a channel's
+/// requests in flight are counted apart from its circuit's channels, so a
+/// circuit's one channel carries its sixteen too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sixteen_requests_in_flight_a_channel_of_a_circuit() {
+    sixteen_in_flight(vos_api::Mark::Onion, vos_gateway::config::PER_CIRCUIT).await;
+}
+
+async fn sixteen_in_flight(mark: vos_api::Mark, per: PerAddress) {
     let served = served();
     let target = Target::socket(served.socket.clone());
     let operator = Operator::signing(&target, SigningKey::from_bytes(&OPERATOR), served.node.id());
@@ -263,7 +303,7 @@ async fn sixteen_requests_in_flight_a_channel() {
     })
     .await
     .unwrap();
-    let address = port(served.node.id().0, served.socket.clone()).await;
+    let address = port_limited(served.node.id().0, served.socket.clone(), mark, per).await;
     let mut channel = channel(address).await;
     let mut answers = Answers { buffer: Vec::new() };
     // A query at a floor never reached: answered `Behind` after 5 s.
@@ -492,6 +532,7 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
         proven_per_connection: 2,
         // Every test connection is from one address.
         proven_per_circuit: 1_000,
+        waiting_per_circuit: 1_000,
         agent_rate: 1_000,
         agent_burst: 1_000,
     });
@@ -567,6 +608,7 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
         proven: 100,
         proven_per_connection: 2,
         proven_per_circuit: 1_000,
+        waiting_per_circuit: 1_000,
         agent_rate: 1_000,
         agent_burst: 1_000,
     });
@@ -703,6 +745,185 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
         CONNECTIONS * FLOOD + 1,
         "every proven call within its connection's reached the node"
     );
+}
+
+/// The SSH server takes the connections its port names, the handshake
+/// included (`[onion] ssh_connections`, `ssh_connections`): past them a
+/// connection waits for one to close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ports_ssh_connections_are_its_files() {
+    let served = served();
+    let gateway = Arc::new(Gateway::new(vec![Upstream::new(
+        served.node.id().0,
+        Address::Socket(served.socket.clone()),
+        [41; 32],
+    )]));
+    let host_key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[6; 32]));
+    let port = vos_gateway::ssh::Port::new(
+        vos_api::Mark::Onion,
+        Limits::new(PerAddress::default()),
+        vos_gateway::caps::Caps::none(),
+        vos_gateway::caps::bodies(),
+    )
+    .with_connections(Some(1));
+    let server = vos_gateway::ssh::server(host_key, gateway, port, &vos_gateway::ssh::Placeholder);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = server.serve_on(listener).await;
+    });
+    let first = channel(address).await;
+    let second = tokio::time::timeout(
+        Duration::from_secs(2),
+        channel_from(address, std::net::Ipv4Addr::LOCALHOST),
+    )
+    .await;
+    assert!(second.is_err(), "a second connection past the port's one");
+    drop(first);
+}
+
+/// Circuits holding the onion's proven-call places with headers alone,
+/// their bodies never sent, each channel opened again once closed, cannot
+/// starve a member: a circuit's waiters are its own (one at a time, its
+/// places taken before the port's), and a body that stops coming gives
+/// its places back within `PROGRESS`. The member's proven call, on a
+/// circuit of its own, reaches the node within one turn of the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn headers_alone_hold_no_members_proven_call_back() {
+    use vos_gateway::caps::{Caps, PerPort};
+    let served = served();
+    let target = Target::socket(served.socket.clone());
+    let operator = Operator::signing(&target, SigningKey::from_bytes(&OPERATOR), served.node.id());
+    let (agent, value) = tokio::task::spawn_blocking(move || {
+        let programs = Programs::load();
+        let Ok(Response::Created(agent)) = operator.create_agent(Vec::new()) else {
+            panic!("an agent")
+        };
+        vos_checker::calls::installed(
+            operator
+                .install(
+                    agent,
+                    &vos_checker::calls::install_of(COUNTER, &programs.counter_elf),
+                )
+                .unwrap(),
+        );
+        let client = Client::new(&target, SigningKey::from_bytes(&[9; 32]));
+        let value = client
+            .schema(agent, COUNTER)
+            .unwrap()
+            .unwrap()
+            .method_id("value")
+            .unwrap();
+        (agent, value)
+    })
+    .await
+    .unwrap();
+    let standing = verifying(
+        served.node.id().0,
+        served.socket.clone(),
+        Duration::from_millis(100),
+    )
+    .await;
+    let caps = Caps::new(PerPort {
+        proven: 4,
+        proven_per_connection: 2,
+        proven_per_circuit: 2,
+        waiting_per_circuit: 1,
+        agent_rate: 1_000,
+        agent_burst: 1_000,
+    });
+    let gateway = Arc::new(Gateway::new(vec![Upstream::new(
+        served.node.id().0,
+        Address::Socket(standing.socket.clone()),
+        [41; 32],
+    )]));
+    let host_key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[5; 32]));
+    let port = vos_gateway::ssh::Port::new(
+        vos_api::Mark::Onion,
+        Limits::new(PerAddress {
+            connections: 8,
+            in_flight: 16,
+            rate: 1_000,
+            burst: 1_000,
+        }),
+        Arc::clone(&caps),
+        vos_gateway::caps::bodies(),
+    );
+    let server = vos_gateway::ssh::server(host_key, gateway, port, &vos_gateway::ssh::Placeholder);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = server.serve_on(listener).await;
+    });
+    let junk = |at: u64| {
+        let call = vos_wire::ingress::Credentialed {
+            instance: COUNTER,
+            method: value,
+            arguments: Vec::new(),
+            nonce: [at as u8; 16],
+            expires_ms: served.clock.load(Ordering::SeqCst) + 60_000,
+            format: 0,
+            claim: vec![5; 64],
+            proof: vec![at as u8; 300_000],
+        };
+        frame(
+            Framing::Stream,
+            Kind::Credentialed as u16,
+            at,
+            &(agent, call).encode(),
+        )
+    };
+    let header = vos_api::Framing::Stream.header();
+    // Four circuits, two channels each, every one sending a header alone
+    // and holding it until the gateway closes it.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut holders = Vec::new();
+    for circuit in 0..4u8 {
+        for lane in 0..2u64 {
+            let (stop, bytes) = (
+                Arc::clone(&stop),
+                junk(1_000 + u64::from(circuit) * 10 + lane),
+            );
+            holders.push(tokio::spawn(async move {
+                let from = std::net::Ipv4Addr::new(127, 0, 1, 10 + circuit);
+                while !stop.load(Ordering::SeqCst) {
+                    let Some(mut channel) = channel_from(address, from).await else {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    };
+                    if channel.data(&bytes[..header]).await.is_err() {
+                        continue;
+                    }
+                    let mut answers = Answers { buffer: Vec::new() };
+                    while answers.next(&mut channel).await.is_some() {}
+                }
+            }));
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut member = channel_from(address, std::net::Ipv4Addr::new(127, 0, 2, 1))
+        .await
+        .unwrap();
+    let started = Instant::now();
+    member.data(&junk(7_000)[..]).await.unwrap();
+    let mut answers = Answers { buffer: Vec::new() };
+    let answered = tokio::time::timeout(Duration::from_secs(90), answers.next(&mut member))
+        .await
+        .expect("an answer")
+        .expect("the channel open");
+    let took = started.elapsed();
+    stop.store(true, Ordering::SeqCst);
+    assert_eq!(answered.0, Kind::Credentialed as u16);
+    assert_eq!(
+        Response::decode_exact(&answered.2),
+        Some(Response::Rejected(Rejection::Malformed)),
+        "the member's proven call reached the node"
+    );
+    assert!(took < Duration::from_secs(20), "the member waited {took:?}");
+    assert!(caps.refused().waiting > 0, "{:?}", caps.refused());
+    for holder in holders {
+        holder.abort();
+    }
 }
 
 /// The onion's servers, each circuit's channels limited to `connections`
