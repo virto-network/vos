@@ -175,7 +175,7 @@ pub fn prove_run_watched(
     program: &KernelProgram,
     entry: &KernelEntry,
     run: &SideNote<impl TraceStep>,
-    watch: &mut dyn FnMut(Built<'_>),
+    watch: &mut (dyn FnMut(Built<'_>) + Send),
 ) -> Result<(Node, Stats), TreeError> {
     run_watched(program, entry, run, watch)
 }
@@ -184,7 +184,17 @@ fn run_watched(
     program: &KernelProgram,
     entry: &KernelEntry,
     run: &SideNote<impl TraceStep>,
-    watch: &mut dyn FnMut(Built<'_>),
+    watch: &mut (dyn FnMut(Built<'_>) + Send),
+) -> Result<(Node, Stats), TreeError> {
+    vos_pvm_proof::on_prover_pool(|| run_on_pool(program, entry, run, watch))
+}
+
+/// [`run_watched`] on the prover's pool.
+fn run_on_pool(
+    program: &KernelProgram,
+    entry: &KernelEntry,
+    run: &SideNote<impl TraceStep>,
+    watch: &mut (dyn FnMut(Built<'_>) + Send),
 ) -> Result<(Node, Stats), TreeError> {
     let cut = cut_class(&program.shape);
     let started = Instant::now();
@@ -255,7 +265,7 @@ pub fn prove_final_watched(
     program: &KernelProgram,
     entry: &KernelEntry,
     run: &SideNote<impl TraceStep>,
-    watch: &mut dyn FnMut(Built<'_>),
+    watch: &mut (dyn FnMut(Built<'_>) + Send),
 ) -> Result<(Vec<u8>, Stats), TreeError> {
     final_watched(program, entry, run, watch)
 }
@@ -264,7 +274,7 @@ fn final_watched(
     program: &KernelProgram,
     entry: &KernelEntry,
     run: &SideNote<impl TraceStep>,
-    watch: &mut dyn FnMut(Built<'_>),
+    watch: &mut (dyn FnMut(Built<'_>) + Send),
 ) -> Result<(Vec<u8>, Stats), TreeError> {
     let (root, mut stats) = run_watched(program, entry, run, watch)?;
     let started = Instant::now();

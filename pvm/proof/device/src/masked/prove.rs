@@ -91,6 +91,15 @@ where
         active: u32,
         log_sizes: &[u32],
     ) -> Result<Self, Error> {
+        vos_pvm_proof::on_prover_pool(|| Self::installed(format, blob, active, log_sizes))
+    }
+
+    fn installed(
+        format: &Format,
+        blob: &[u8],
+        active: u32,
+        log_sizes: &[u32],
+    ) -> Result<Self, Error> {
         let layout = DeviceLayout::of_program(blob).ok_or(Error::Layout)?;
         if !layout.is_disjoint() {
             return Err(Error::Layout);
@@ -160,16 +169,18 @@ where
         side_note: &mut SideNote,
         rng: MaskRng,
     ) -> Result<(DeviceProof<MC::H>, MaskStats), Error> {
-        prove_device_with::<MC>(
-            &self.format,
-            &self.program,
-            Some(&self.committed),
-            side_note,
-            rng,
-            |_| {},
-            |_, _| {},
-            Checks::ALL,
-        )
+        vos_pvm_proof::on_prover_pool(|| {
+            prove_device_with::<MC>(
+                &self.format,
+                &self.program,
+                Some(&self.committed),
+                side_note,
+                rng,
+                |_| {},
+                |_, _| {},
+                Checks::ALL,
+            )
+        })
     }
 }
 
@@ -186,16 +197,18 @@ pub fn prove_device<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    prove_device_with::<MC>(
-        format,
-        program,
-        None,
-        side_note,
-        rng,
-        |_| {},
-        |_, _| {},
-        Checks::ALL,
-    )
+    vos_pvm_proof::on_prover_pool(|| {
+        prove_device_with::<MC>(
+            format,
+            program,
+            None,
+            side_note,
+            rng,
+            |_| {},
+            |_, _| {},
+            Checks::ALL,
+        )
+    })
 }
 
 /// [`prove_device`], the trace through `tamper` before it is committed,

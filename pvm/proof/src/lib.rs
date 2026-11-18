@@ -393,7 +393,8 @@ pub use prove::prove_with_explicit_components;
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use prove::{
-    ProveProfile, install_thread_pool, prepare_side_note_for_verification, prove_profiled,
+    ProveProfile, install_thread_pool, on_prover_pool, prepare_side_note_for_verification,
+    prove_profiled,
 };
 #[cfg(feature = "debug-internals")]
 pub use prove::{debug_assert_constraints_explicit, prove_chip_isolated_format};

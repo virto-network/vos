@@ -125,7 +125,7 @@ vectors:
 # among them. Last, the wrap files the suites wrote
 # checked to be final wraps alone.
 test-proof: build-final-verify judge-wasm
-    cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
+    cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa --test pool -- --test-threads=2
     for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse \
         | lines | where {|line| $line ends-with ': test' } | each {|line| $line \
         | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- \

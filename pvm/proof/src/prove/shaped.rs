@@ -96,12 +96,14 @@ pub fn program_commitment_for_shape(
     crate::proof::check_format_security(format, &config, &layout.security_shape).ok()?;
     install_thread_pool();
     let components = selected(shape.components);
-    crate::with_stack!(format.channel, Stack => {
-        Some(
-            super::preprocessed_root::<Stack>(side_note, &components, &shape.log_sizes, config)
-                .into_commitment(),
-        )
-    }, unbuilt => None)
+    super::on_prover_pool(|| {
+        crate::with_stack!(format.channel, Stack => {
+            Some(
+                super::preprocessed_root::<Stack>(side_note, &components, &shape.log_sizes, config)
+                    .into_commitment(),
+            )
+        }, unbuilt => None)
+    })
 }
 
 /// A segment of a kernel's run, proved: its steps `[a, b)`, its class and

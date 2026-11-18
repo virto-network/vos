@@ -238,7 +238,7 @@ impl PvmStep {
 /// ([`crate::segment::segment_bounds_budgeted`]) and its windows built from
 /// ([`crate::segment::SegmentCursor`]): its timestamp, its memory accesses
 /// and, from the register file entering it, the full step a window proves.
-pub trait TraceStep: Clone {
+pub trait TraceStep: Clone + Send + Sync {
     fn timestamp(&self) -> u64;
     fn mem_read(&self) -> Option<&MemAccess>;
     fn mem_write(&self) -> Option<&MemAccess>;

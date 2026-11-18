@@ -130,21 +130,28 @@ pub(crate) fn check_run_length(side_note: &SideNote) -> Result<(), SegmentError>
 }
 
 /// Cap rayon's global thread pool at a sensible default for our
-/// workload, unless the user has explicitly set `RAYON_NUM_THREADS`
-/// or initialised their own pool, and give its workers
-/// 16 MiB of stack.  Idempotent — safe to call many
-/// times; only the first effective call wins (we use a `OnceLock`
-/// guard around `ThreadPoolBuilder::build_global`).
+/// workload, unless the user has explicitly set `RAYON_NUM_THREADS`, and
+/// give its workers 16 MiB of stack. Idempotent: only the first call
+/// builds it. When another user built the global pool first, its stacks
+/// are theirs (rayon's default 2 MiB, at which a release prover's worker
+/// overflows): the prover then proves on a pool of its own
+/// ([`on_prover_pool`]), and this reports it.
 ///
 /// Past about 10 threads, memory-bandwidth contention overtakes the
 /// parallel gains, so the cap is `min(logical_cpus, 10)`: phones (4-8
 /// cores) run uncapped.
 ///
-/// Returns the number of threads the pool ended up with.
+/// Returns the number of threads the prover's pool has.
 pub fn install_thread_pool() -> usize {
+    prover_pool().map_or_else(rayon::current_num_threads, rayon::ThreadPool::current_num_threads)
+}
+
+/// The prover's own pool, when the global one is not the prover's: `None`
+/// when [`install_thread_pool`]'s build of the global pool took.
+fn prover_pool() -> Option<&'static rayon::ThreadPool> {
     use std::sync::OnceLock;
-    static INSTALLED: OnceLock<usize> = OnceLock::new();
-    *INSTALLED.get_or_init(|| {
+    static OWN: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    OWN.get_or_init(|| {
         // Honour explicit RAYON_NUM_THREADS — user knows best: zero
         // threads is the builder's own reading of it.
         let threads = if std::env::var_os("RAYON_NUM_THREADS").is_some() {
@@ -155,14 +162,37 @@ pub fn install_thread_pool() -> usize {
                 .unwrap_or(1);
             logical.min(10)
         };
-        // build_global fails if a pool already exists; ignore that
-        // case (e.g., test harness, downstream lib that set its own).
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .stack_size(WORKER_STACK)
-            .build_global();
-        rayon::current_num_threads()
+        let builder = || {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .stack_size(WORKER_STACK)
+        };
+        match builder().build_global() {
+            Ok(()) => None,
+            Err(_) => Some(
+                builder()
+                    .thread_name(|index| format!("vos-prover-{index}"))
+                    .build()
+                    .expect("the prover's pool"),
+            ),
+        }
     })
+    .as_ref()
+}
+
+/// `work` on a pool whose workers have the prover's 16 MiB stacks: on the
+/// caller's own pool when it is on one (a caller that pools its threads
+/// sizes their stacks, as the light node's prover does), else on the
+/// global pool when it is the prover's ([`install_thread_pool`]), else on
+/// the prover's own. Every proving entry point runs its work so.
+pub fn on_prover_pool<R: Send>(work: impl FnOnce() -> R + Send) -> R {
+    if rayon::current_thread_index().is_some() {
+        return work();
+    }
+    match prover_pool() {
+        Some(pool) => pool.install(work),
+        None => work(),
+    }
 }
 
 /// A prover worker's stack: 16 MiB, as a worker blocked in a `join` runs
@@ -530,8 +560,10 @@ pub(crate) fn prove_with(
     request: ProveRequest<'_>,
 ) -> Result<(Proof, ProveProfile), SegmentError> {
     let format = request.target.format;
-    crate::with_stack!(format.channel, Stack => prove_on::<Stack>(side_note, request),
-        unbuilt => Err(SegmentError::FormatNotAdmitted(format.number)))
+    on_prover_pool(|| {
+        crate::with_stack!(format.channel, Stack => prove_on::<Stack>(side_note, request),
+            unbuilt => Err(SegmentError::FormatNotAdmitted(format.number)))
+    })
 }
 
 fn prove_on<MC: PcsStack>(
