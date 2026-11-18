@@ -43,7 +43,19 @@ exceptions = [
 ]
 
 [bans]
-multiple-versions = "warn"
+# A crate held twice fails, but those below, each with what pulls each
+# version: no upgrade the crates that pull them accept removes them.
+# Reviewed 2026-11-18.
+multiple-versions = "deny"
+skip = [
+    { crate = "digest@0.10.7", reason = "blake2 0.10, sha2 0.10 and curve25519-dalek 4 take digest 0.10; sha3 0.11 takes 0.11." },
+    { crate = "block-buffer@0.10.4", reason = "digest 0.10's; digest 0.11 takes block-buffer 0.12." },
+    { crate = "crypto-common@0.1.7", reason = "digest 0.10's; digest 0.11 takes crypto-common 0.2." },
+    { crate = "cpufeatures@0.2.17", reason = "sha2 0.10's and curve25519-dalek 4's; blake3 and keccak 0.2 take 0.3." },
+    { crate = "hashbrown@0.14.5", reason = "dashmap 6's; indexmap 2 takes 0.17." },
+    { crate = "hashbrown@0.15.5", reason = "the Stwo fork's, pinned at its revision; indexmap 2 takes 0.17." },
+    { crate = "syn@1.0.109", reason = "vos-pvm-proof-derive is written against syn 1; every other macro crate takes syn 2." },
+]
 
 [sources]
 unknown-registry = "deny"

@@ -736,16 +736,26 @@ test-changed base="master" *flags="":
 # The workspace's dependencies (`deny.toml`, cargo-deny): every licence on
 # the AGPL-compatible allowlist, no advisory of the RustSec database but
 # those the file names with its reason, and no source but crates.io and
-# the forks it lists. Duplicate versions and yanked crates are warnings.
+# the forks it lists. A crate held in two versions fails but those the
+# file names with their reasons; yanked crates are warnings.
 # The advisory database is fetched; without a network it is the cached one.
-# Then the side workspaces' graphs (`just locks`), on their lock files: no
-# advisory and no other source there either (the root's ignores that match
-# nothing there allowed).
+# Then the side workspaces' graphs, on their lock files: no advisory and no
+# other source there either (the root's ignores that match nothing there
+# allowed): the Wasm blob's and the fuzz targets' (`just locks`) and the
+# bench guests'. The Wasm runner's is held to its sources alone: it pins
+# wasmtime at the version a Polkadot client runs the blob under, which its
+# measurements must match, whose advisories are that client's and reach no
+# shipped code. The verifier
+# kit's (`pvm/proof/kit/Cargo.lock`) is no workspace's here: it is the
+# root's pruned to what the kit links (`kit-lock`), which the root's check
+# holds.
 deny:
     cargo deny check --hide-inclusion-graph
-    for manifest in [pvm/proof/final-verifier/wasm/blob/Cargo.toml pvm/proof/fuzz/Cargo.toml] { \
+    for manifest in ([pvm/proof/final-verifier/wasm/blob/Cargo.toml pvm/proof/fuzz/Cargo.toml] \
+        ++ (glob pvm/bench/guests/*/Cargo.toml --exclude ['**/target/**'] | path relative-to $env.PWD)) { \
         cargo deny --locked --manifest-path $manifest check --hide-inclusion-graph -A advisory-not-detected advisories \
         sources }
+    cargo deny --locked --manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml check --hide-inclusion-graph sources
 
 # The device verifier built alone, ingress's build (`vos-pvm-device`
 # without its `prover` feature): it builds and lints clean, and its normal
