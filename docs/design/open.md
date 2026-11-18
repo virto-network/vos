@@ -223,9 +223,10 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   an invalid blob's (Ψ's panic, `machine`'s HUH), for any blob, a
   service's under `W_C` among them; and the interpreter prepares at most
   `MAX_INTERPRETED_CODE` (4 MiB) of code, a backend refusal past it, a
-  valid program only an inner machine's `machine` call can name. A table
-  of implicit zeros (a length, no entries) and a fallible predecode lift
-  both.
+  valid program only the JAM-only host's `machine` call can name (a VOS
+  host refuses an inner program past 2 MiB first, `inner::budget`). A
+  table of implicit zeros (a length, no entries) and a fallible predecode
+  lift both.
 - **Arithmetic on a code pointer in a register** (`vos_pvm_compiler`):
   the compiler gives a code pointer its jump-table address, so `addi t0,
   t0, 4` then `jalr t0` selects another entry than the source's
