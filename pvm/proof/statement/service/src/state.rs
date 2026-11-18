@@ -169,6 +169,18 @@ pub struct SpaceRecord {
     pub nonce: u64,
 }
 
+// `last` is indexed by a kind's byte: every kind's byte is its place, so
+// no kind misses its entry. Evaluated at compile time, so its indexing
+// cannot panic at run time.
+#[allow(clippy::indexing_slicing)]
+const _: () = {
+    let mut at = 0;
+    while at < RootKind::COUNT {
+        assert!(RootKind::ALL[at] as usize == at);
+        at += 1;
+    }
+};
+
 impl SpaceRecord {
     /// The last window anchored of `kind`.
     pub fn last(&self, kind: RootKind) -> Option<u64> {
