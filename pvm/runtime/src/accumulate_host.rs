@@ -64,10 +64,19 @@ pub trait ServiceStorage {
     }
     /// Ask for the preimage of `hash`, `len` bytes long: whether the store
     /// takes the request. A VOS node, which keeps its programs itself,
-    /// serves none: the call answers `WHAT`.
+    /// serves none: the call answers `WHAT`. A store that serves it keeps
+    /// what [`ServiceStorage::checkpoint`] and [`ServiceStorage::revert`]
+    /// say of its requests.
     fn solicit(&mut self, _hash: &[u8; 32], _len: u64) -> Option<bool> {
         None
     }
+    /// The run made a checkpoint: the requests made so far stand, whatever
+    /// its end. The host keeps the values itself.
+    fn checkpoint(&mut self) {}
+    /// The run ended other than by halting: drop the requests made since
+    /// the last checkpoint (or the run's start). The host has written the
+    /// values back already.
+    fn revert(&mut self) {}
 }
 
 /// Accumulate's arguments for `service` at `timeslot` over `inputs`
@@ -135,6 +144,7 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
             for (key, value) in core::mem::take(&mut self.since_checkpoint) {
                 self.storage.write(&key, value.as_deref());
             }
+            self.storage.revert();
         }
         Ok(self.machine.finish(exit?))
     }
@@ -160,6 +170,7 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
                     Ok(gp_call::SOLICIT) => self.solicit(),
                     Ok(gp_call::CHECKPOINT) => {
                         self.since_checkpoint.clear();
+                        self.storage.checkpoint();
                         let left = self.machine.gas_remaining();
                         self.machine.registers_mut()[7] = left;
                         Ok(())
@@ -582,6 +593,43 @@ mod tests {
         );
         let halted = BTreeMap::from([(b"ab".to_vec(), hello()), (b"abc".to_vec(), hello())]);
         assert_eq!(storage, halted, "a halt keeps every write");
+    }
+
+    /// A store serving `solicit` hears of each checkpoint and of an
+    /// exceptional end, to keep its requests as the run's end keeps the
+    /// values.
+    #[test]
+    fn a_store_hears_of_checkpoints_and_of_an_exceptional_end() {
+        #[derive(Default)]
+        struct Heard(BTreeMap<Vec<u8>, Vec<u8>>, Vec<&'static str>);
+        impl ServiceStorage for Heard {
+            fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+                self.0.read(key, offset, max)
+            }
+            fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize> {
+                self.0.write(key, value)
+            }
+            fn checkpoint(&mut self) {
+                self.1.push("checkpoint");
+            }
+            fn revert(&mut self) {
+                self.1.push("revert");
+            }
+        }
+        let heard = |end| {
+            let mut code = vec![0, 0, 0, 0, 0, 10, gp_call::CHECKPOINT as u8];
+            code.extend_from_slice(end);
+            let prepared =
+                PreparedProgram::new(&standard(&code, &[0, 1, 2, 3, 4, 5, 7], 0)).unwrap();
+            let mut storage = Heard::default();
+            AccumulateContext::load(&prepared, 7, 42, &[], 1_000_000, &mut storage)
+                .unwrap()
+                .try_run()
+                .unwrap();
+            storage.1
+        };
+        assert_eq!(heard(&[0]), ["checkpoint", "revert"]);
+        assert_eq!(heard(&[50, 0]), ["checkpoint"]);
     }
 
     #[test]
