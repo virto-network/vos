@@ -544,3 +544,141 @@ fn relocations_of_an_unloaded_section_change_nothing() {
         (&debug.actor, &debug.kernels)
     );
 }
+
+/// A package of `methods` attestable methods, each entry reading by a
+/// PC-relative pair one read-write object of `object` bytes at the
+/// read-write base, its code `extra` instructions longer: zeros past a
+/// first word when `far`, a `.data` word at each end of it, else `.bss`.
+fn reaching(methods: u64, object: u64, far: bool, extra: usize) -> Vec<u8> {
+    const NOBITS: u32 = 8;
+    const WRITE: u64 = 1;
+    const RW: u64 = 0x3_0000;
+    let start = TEXT;
+    let entry = TEXT + 4;
+    let code: Vec<u8> = [
+        i_type(0x67, 0, 0, RA, 0), // _start: ret
+        T0 << 7 | 0x17,            // entry: auipc t0, object
+        i_type(0x13, 0, T0, T0, 0),
+        i_type(0x03, 3, A0, T0, 0), // ld a0, 0(t0)
+        i_type(0x67, 0, 0, RA, 0),
+    ]
+    .into_iter()
+    .chain(std::iter::repeat_n(i_type(0x13, 0, A0, A0, 1), extra))
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    let schema = no_methods();
+    let attest = SCHEMA + schema.len() as u64;
+    let table: Vec<u8> = (1..=methods)
+        .flat_map(|method| [method.to_le_bytes(), entry.to_le_bytes()])
+        .flatten()
+        .collect();
+    let strtab = b"\0entry\0_start\0VOS_ATTEST\0object\0.Lpcrel\0".to_vec();
+    let symtab = [
+        symbol(0, 0, 0, 0),
+        symbol(1, 2, entry, 16),
+        symbol(7, 2, start, 4),
+        symbol(14, 1, attest, 16 * methods),
+        symbol(25, 1, RW, object),
+        symbol(32, 0, entry, 0),
+    ]
+    .concat();
+    let text_relocations = [
+        relocation(entry, 4, 23, 0),     // PCREL_HI20 to the object
+        relocation(entry + 4, 5, 24, 0), // PCREL_LO12_I by its label
+    ]
+    .concat();
+    let data_relocations: Vec<u8> = (0..methods)
+        .flat_map(|index| relocation(attest + 16 * index + 8, 1, 2, 0))
+        .collect();
+    let mut sections = vec![
+        Section::loaded(".vos_schema", 0, SCHEMA, schema),
+        Section::loaded(".rodata", 0, attest, table),
+        Section::loaded(".text", EXECUTE, TEXT, code),
+        Section::table(".symtab", SYMTAB, symtab, 5, 0),
+        Section::table(".strtab", STRTAB, strtab, 0, 0),
+        Section::table(".rela.text", RELA, text_relocations, 4, 3),
+        Section::table(".rela.rodata", RELA, data_relocations, 4, 2),
+    ];
+    if far {
+        sections.push(Section::loaded(".data", WRITE, RW, vec![0; 8]));
+        sections.push(Section::loaded(
+            ".data.end",
+            WRITE,
+            RW + object - 8,
+            vec![0; 8],
+        ));
+    } else {
+        sections.push(Section {
+            kind: NOBITS,
+            ..Section::loaded(".bss", WRITE, RW, Vec::new())
+        });
+    }
+    let mut file = elf(start, sections);
+    if !far {
+        // The `.bss` section's size, the last before the names' table.
+        let table = u64::from_le_bytes(file[40..48].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(file[60..62].try_into().unwrap()) as usize;
+        let header = table + 64 * (count - 2);
+        file[header + 32..header + 40].copy_from_slice(&object.to_le_bytes());
+    }
+    file
+}
+
+/// 1,024 kernels that each reach one 15 MiB object of zeros, which their
+/// blobs leave out, copied the object once each: 15 GiB of copies, 91 s in
+/// a release build. Their copies are counted as they are made, and refused
+/// past `MAX_KERNEL_DATA`.
+#[test]
+fn kernels_copying_one_large_object_each_are_refused() {
+    let elf = reaching(1024, 15 << 20, true, 0);
+    assert!(elf.len() < 64 << 10);
+    let started = Instant::now();
+    match derive(&elf) {
+        Err(vos_pvm_compiler::DeriveError::KernelData(copied)) => {
+            assert!(copied > vos_pvm_compiler::MAX_KERNEL_DATA)
+        }
+        other => panic!("{:?}", other.map(|derived| derived.kernels.len())),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// 1,024 kernels of one shape, each reaching a 16 MiB `.bss` object, which
+/// none copies: their leaves are sized once, not once each (22 s in a
+/// release build).
+#[test]
+fn kernels_of_one_shape_are_sized_once() {
+    let elf = reaching(1024, 16 << 20, false, 0);
+    let started = Instant::now();
+    let derived = derive(&elf).expect("derives");
+    assert_eq!(derived.kernels.len(), 1024);
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// Code past `MAX_CODE` is refused before it is translated, whose maps
+/// take about 25 bytes a byte of code: 16 MiB of it took 9 s and 370 MB in
+/// a release build.
+#[test]
+fn code_past_what_a_derivation_translates_is_refused() {
+    let extra = vos_pvm_compiler::MAX_CODE / 4;
+    let elf = reaching(1, 8, false, extra);
+    let started = Instant::now();
+    match derive(&elf) {
+        Err(vos_pvm_compiler::DeriveError::Code(bytes)) => {
+            assert!(bytes > vos_pvm_compiler::MAX_CODE)
+        }
+        other => panic!("{:?}", other.map(|derived| derived.kernels.len())),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}

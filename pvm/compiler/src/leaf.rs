@@ -574,21 +574,32 @@ fn clean_blocks(
             order
         })
         .collect();
+    // Each column's one sample at a point, by the point: none where it has
+    // two or more there.
+    let alone: Vec<Vec<BTreeMap<u64, Option<usize>>>> = samples
+        .iter()
+        .map(|columns| {
+            columns
+                .iter()
+                .map(|column| {
+                    let mut at: BTreeMap<u64, Option<usize>> = BTreeMap::new();
+                    for &(point, exponent) in column {
+                        at.entry(point)
+                            .and_modify(|one| *one = None)
+                            .or_insert(Some(exponent));
+                    }
+                    at
+                })
+                .collect()
+        })
+        .collect();
     let mut blocks = 0;
     for (tree, order) in orders.iter().enumerate() {
         for lanes in order.chunks_exact(8) {
             for (&point, exponents) in by_point {
                 let at: Option<Vec<usize>> = lanes
                     .iter()
-                    .map(|&column| {
-                        let mut at = samples[tree][column]
-                            .iter()
-                            .filter(|sample| sample.0 == point);
-                        match (at.next(), at.next()) {
-                            (Some(sample), None) => Some(sample.1),
-                            _ => None,
-                        }
-                    })
+                    .map(|&column| alone[tree][column].get(&point).copied().flatten())
                     .collect();
                 let Some(at) = at else { continue };
                 let (low, high) = (at[0], at[7]);
@@ -830,16 +841,28 @@ pub fn leaf_rows(chips: u32, log_sizes: &[u8; SEGMENT_CHIPS]) -> [usize; 3] {
     [p2, qm31 + FINALIZE, h8]
 }
 
-/// Each class of `shape` whose leaf would not fit the padded shape, with
-/// its rows.
-pub(crate) fn oversized_leaves(shape: &Shape) -> Vec<(usize, [usize; 3])> {
-    shape
-        .classes
-        .iter()
-        .enumerate()
-        .map(|(class, sizes)| (class, leaf_rows(shape.chips, &sizes.log_sizes)))
-        .filter(|(_, rows)| rows.iter().zip(PADDED).any(|(&rows, padded)| rows > padded))
-        .collect()
+/// [`leaf_rows`] of each class asked for, each computed once.
+#[derive(Default)]
+pub(crate) struct LeafRows(BTreeMap<(u32, [u8; SEGMENT_CHIPS]), [usize; 3]>);
+
+impl LeafRows {
+    /// Each class of `shape` whose leaf would not fit the padded shape,
+    /// with its rows.
+    pub(crate) fn oversized(&mut self, shape: &Shape) -> Vec<(usize, [usize; 3])> {
+        shape
+            .classes
+            .iter()
+            .enumerate()
+            .map(|(class, sizes)| {
+                let rows = *self
+                    .0
+                    .entry((shape.chips, sizes.log_sizes))
+                    .or_insert_with(|| leaf_rows(shape.chips, &sizes.log_sizes));
+                (class, rows)
+            })
+            .filter(|(_, rows)| rows.iter().zip(PADDED).any(|(&rows, padded)| rows > padded))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -884,7 +907,7 @@ mod tests {
             leaf_rows(shape.chips, &shape.classes[0].log_sizes),
             [55_496, 99_947 + FINALIZE, 43_960]
         );
-        assert!(oversized_leaves(&shape).is_empty());
+        assert!(LeafRows::default().oversized(&shape).is_empty());
     }
 
     /// A class whose every chip has one log size is refused, named with its
@@ -900,7 +923,7 @@ mod tests {
         shape.classes.push(flat);
         let rows = leaf_rows(shape.chips, &flat.log_sizes);
         assert!(rows[1] > PADDED[1], "{rows:?}");
-        assert_eq!(oversized_leaves(&shape), vec![(1, rows)]);
+        assert_eq!(LeafRows::default().oversized(&shape), vec![(1, rows)]);
         let terms = leaf_terms(shape.chips, &flat.log_sizes);
         assert!(terms.singles > 2 * 784, "{} single samples", terms.singles);
     }

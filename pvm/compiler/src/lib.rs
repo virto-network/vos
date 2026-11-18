@@ -29,7 +29,8 @@ mod spi;
 use thiserror::Error;
 
 pub use derive::{
-    DeriveError, Derived, INVOCATION_HEAP, MAX_DERIVED, MAX_ELF, TRANSPILER_VERSION, derive,
+    DeriveError, Derived, INVOCATION_HEAP, MAX_CODE, MAX_DERIVED, MAX_ELF, MAX_KERNEL_DATA,
+    TRANSPILER_VERSION, derive,
 };
 pub use linker::{link_elf_spi, link_elf_spi_with_symbols};
 pub use spi::{ServiceMetadata, service_blob};
