@@ -5,6 +5,11 @@ version.workspace = true
 license.workspace = true
 description = "The JAM statements service: a venue on JAM, as a service whose refine checks registrations', migrations' and anchors' signatures and judges statements against their final proofs, and whose accumulate keeps the spaces, their anchors and the statements accepted. no_std; its program for the PVM target."
 
+# The gates that refuse each test-only feature in a production build
+# (`just check-no-leaks`).
+[package.metadata.vos]
+test-features = { heap-peak = ["heap-peak"] }
+
 [features]
 # The service as a JAM program (`src/bin/statement-service.rs`), for the
 # PVM target only: no_main, the venue guests' runtime.

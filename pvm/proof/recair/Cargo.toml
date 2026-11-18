@@ -33,6 +33,11 @@ blake2 = "0.10"
 bytemuck = "1"
 rayon = { workspace = true }
 
+# The gates that refuse each test-only feature in a production build
+# (`just check-no-leaks`).
+[package.metadata.vos]
+test-features = { seeded-masks = ["seeded-masks"], watch = ["debug-internals"] }
+
 [features]
 default = ["recursion"]
 # The recursion prover: kernel leaves, folds, a run's tree and the final

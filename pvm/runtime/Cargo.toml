@@ -6,6 +6,11 @@ license.workspace = true
 authors.workspace = true
 description = "Gray Paper v0.8.0 PVM runtime used by VOS."
 
+# The gates that refuse each test-only feature in a production build
+# (`just check-no-leaks`).
+[package.metadata.vos]
+test-features = { debug-internals = ["debug-internals"] }
+
 [features]
 default = ["std"]
 std = ["dep:libc", "dep:memoffset"]

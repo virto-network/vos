@@ -29,6 +29,11 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 blake2 = "0.10"
 
+# The gates that refuse each test-only feature in a production build
+# (`just check-no-leaks`).
+[package.metadata.vos]
+test-features = { seeded-masks = ["seeded-masks"], test-device-format = ["test-device-format"] }
+
 [features]
 default = ["prover"]
 # The prover: a program from its kernel or a release, its runs traced and

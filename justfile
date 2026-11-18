@@ -355,38 +355,59 @@ check-blobs: build-blobs check-blob-roles
         print $"every pinned guest blob is blobs.lock's: ($built | length) blobs"
 
 # The gates' table: by gate, each build `cargo tree <args>` resolves (its
-# normal and build edges, for every target), the features no package in it
-# may enable and the packages it may not hold. Each package's enabled
-# features (`{f}`) are compared whole, so one a feature enables through
-# another is caught. `_forbidden <gate>...` resolves each build the gates
-# name once, prints every feature enabled and package held, and fails on
-# any, or when a build does not resolve.
+# normal and build edges, for every target). What a gate refuses in its
+# builds is read from the manifests, beside what it names: a package's
+# `[package.metadata.vos]` `test-features`, each of its test-only features
+# with the gates that refuse it, and `test-package`, the gates that refuse
+# the package itself. A feature named there that the package does not
+# define, or a gate no row builds, fails here, so a renamed feature is
+# never silently passed. Each package's enabled features (`{f}`) are
+# compared whole, so one a feature enables through another is caught.
+# `_forbidden <gate>...` resolves each build the gates name once, prints
+# every feature enabled and package held, and fails on any, or when a
+# build does not resolve.
 _forbidden +gates:
     let table = [ \
-        [gate args features packages]; \
-        [venue-model "--workspace" [model-judge] []] \
-        [venue-model "-p vos-statement-service --features pvm-guest" [model model-judge] []] \
-        [seeded-masks "--workspace" [seeded-masks other-pins chip-isolated] []] \
-        [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml --locked" [seeded-masks other-pins chip-isolated] []] \
-        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [seeded-masks other-pins chip-isolated] []] \
-        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml --locked" [seeded-masks other-pins chip-isolated] []] \
-        [debug-internals "--workspace" [debug-internals watch] []] \
-        [debug-internals "-p vos-statement-service --features pvm-guest" [debug-internals] []] \
-        [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [debug-internals] []] \
-        [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml --locked" [debug-internals] []] \
-        [test-device-format "--workspace" [test-device-format] []] \
-        [heap-peak "--workspace" [heap-peak] []] \
-        [heap-peak "-p vos-statement --features pvm-guest" [heap-peak] []] \
-        [heap-peak "-p vos-statement-service --features pvm-guest" [heap-peak] []] \
+        [gate args]; \
+        [venue-model "--workspace"] \
+        [venue-model "-p vos-statement-service --features pvm-guest"] \
+        [seeded-masks "--workspace"] \
+        [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml --locked"] \
+        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml"] \
+        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml --locked"] \
+        [debug-internals "--workspace"] \
+        [debug-internals "-p vos-statement-service --features pvm-guest"] \
+        [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml"] \
+        [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml --locked"] \
+        [test-device-format "--workspace"] \
+        [heap-peak "--workspace"] \
+        [heap-peak "-p vos-statement --features pvm-guest"] \
+        [heap-peak "-p vos-statement-service --features pvm-guest"] \
     ]; \
+    let manifests = (cargo metadata --no-deps --format-version 1 | from json | get packages); \
+    let features = ($manifests | each {|package| $package.metadata?.vos?."test-features"? | default {} \
+        | transpose feature gates | each {|row| { package: $package.name, feature: $row.feature, gates: $row.gates, \
+        defined: ($row.feature in ($package.features | columns)) } } } | flatten); \
+    let packages = ($manifests | each {|package| $package.metadata?.vos?."test-package"? | default [] \
+        | each {|gate| { package: $package.name, gate: $gate } } } | flatten); \
+    let known = ($table.gate | uniq); \
+    let stale = ($features | where not defined | each {|row| $"($row.package) declares no feature ($row.feature)" }) \
+        ++ ($features | each {|row| $row.gates | where {|gate| $gate not-in $known } | each {|gate| $"($row.package)'s ($row.feature) names no gate ($gate)" } } | flatten) \
+        ++ ($packages | where {|row| $row.gate not-in $known } | each {|row| $"($row.package) names no gate ($row.gate)" }) \
+        ++ ($known | where {|gate| ($features | where {|row| $gate in $row.gates } | is-empty) and ($packages | where gate == $gate | is-empty) } \
+        | each {|gate| $"no manifest names a feature or package the gate ($gate) refuses" }); \
+    for failure in $stale { print -e $failure }; \
+    if ($stale | is-not-empty) { error make { msg: "the manifests' test features and the gates' table disagree" } }; \
     let failures = ($table | where gate in [{{gates}}] | group-by args | items {|args, rows| \
+        let refused = ($features | where {|row| $row.gates | any {|gate| $gate in $rows.gate } } | get feature | uniq); \
+        let barred = ($packages | where gate in $rows.gate | get package | uniq); \
         let resolved = (cargo tree ...($args | split row ' ') -e no-dev --target all -f '{p}|{f}' --prefix none | complete); \
         if $resolved.exit_code != 0 { print -e $resolved.stderr; error make { msg: $"cargo tree ($args) failed" } }; \
         let tree = ($resolved.stdout | lines | each {|line| $line | str replace ' (*)' '' | split row '|' }); \
         let held = ($tree | each {|parts| $parts.0 | split row ' ' | first }); \
         let enabled = ($tree | each {|parts| $parts.1? | default '' | split row ',' } | flatten); \
-        ($rows.features | flatten | uniq | where {|feature| $feature in $enabled } | each {|feature| $"cargo tree ($args) enables ($feature)" }) \
-        ++ ($rows.packages | flatten | uniq | where {|package| $package in $held } | each {|package| $"cargo tree ($args) holds ($package)" }) \
+        ($refused | where {|feature| $feature in $enabled } | each {|feature| $"cargo tree ($args) enables ($feature)" }) \
+        ++ ($barred | where {|package| $package in $held } | each {|package| $"cargo tree ($args) holds ($package)" }) \
     } | flatten); \
     for failure in $failures { print -e $failure }; \
     if ($failures | is-not-empty) { error make { msg: "a production build enables a forbidden feature or holds a forbidden package" } }
