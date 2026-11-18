@@ -833,7 +833,7 @@ pub struct Restored {
 }
 
 /// The policy the control log `entries` set, read from its start in
-/// order, as a device following it takes it ([`configure`]): the claim's
+/// order, as a device following it takes it: the claim's
 /// configuration (one before its assignment, or the one beside it) whole,
 /// each later one over it ([`Policy::over`]), from [`Policy::DEFAULT`]. A
 /// restored device starts from it, never from a policy of its own.
