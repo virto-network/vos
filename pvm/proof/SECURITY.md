@@ -350,9 +350,12 @@ A leaf re-does the native verifier's checks in circuit, over the boundary
 states' 296 bytes as wires. Two properties every statement rests on hold
 along the fold chain, not in a leaf alone (`recair/src/leaf/mod.rs`):
 
-- **The boundary bytes are bytes.** The leaf range-checks 32 of the 296
-  (the io-hash's); a wire of 256 or more would enter the segment AIR as a
-  register, a timestamp or a root limb no native state can express. The
+- **The boundary bytes are bytes.** The leaf range-checks 44 of the 296:
+  the io-hash's 32, which it combines lossily, and the entry timestamp's 8
+  and the exit pc's 4, so that a leaf alone states no timestamp or pc
+  outside its integer type. Any other wire of 256 or more would enter the
+  segment AIR as a register, a timestamp or a root limb no native state
+  can express. The
   leftmost entry is byte constants (the entry flag, which the wrap
   requires), every exit's state digest equals the next entry's (the fold's
   continuity), so each entry is the previous exit up to a collision of
@@ -360,7 +363,11 @@ along the fold chain, not in a leaf alone (`recair/src/leaf/mod.rs`):
   and a register write's limbs Range256-checked, a memory root the
   BLAKE2b boundary compression's output, an XOR of byte pairs the bitwise
   table fixes, the chip under `blake2b_boundary_gate`) or
-  a copy of its entry.
+  a copy of its entry. The exit pc's limbs (the CPU's `next_pc`) are not
+  range-checked in the AIR; besides the leaf's check, a non-byte exit pc
+  cannot start the next segment, whose first step looks its pc up in the
+  program's canonical bytes, nor reach the halt, which the halt flag pins
+  to the halt pc's constant.
 - **Timestamps stay in the ledgers' range.** The register and memory
   ledgers compare `2·ts + is_write` reduced mod p, so two accesses about
   2^30 steps apart alias; no gas is proved and the CPU's timestamp is a
@@ -368,10 +375,10 @@ along the fold chain, not in a leaf alone (`recair/src/leaf/mod.rs`):
   a segment whose timestamps lie in `[2^27, p/2)` is unprovable, and a
   run, contiguous from ts 1, cannot cross that zone. The native verifier
   states the bound for a segment alone (both boundary timestamps under
-  2^28); the leaf does not range-check the timestamp's bytes, and a leaf
-  alone accepts a first limb of `p − 1`, which the fold chain then cannot
-  continue from an honest entry. Range-checking `ts_in`'s bytes in the leaf
-  is recorded for the next re-pin (`docs/design/open.md`).
+  2^28); the leaf range-checks the entry timestamp's bytes, so a leaf
+  alone states a `u64` entry timestamp (a first limb of `p − 1` is
+  refused, `recair/tests/gates/boundary_bytes.rs`), and the fold chain
+  carries the rest.
 
 ## Trust boundary: a device proof
 

@@ -109,14 +109,6 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   then a kernel frames its input by content (`pvm/proof/SECURITY.md`,
   "Three boundaries"), and the stock kernels' reads are to be audited
   against that.
-- **The leaf's timestamp bytes:** the leaf range-checks the io-hash's 32
-  boundary bytes alone, and rests on the fold chain for the rest; a leaf
-  alone accepts a `ts_in` whose first limb is `p − 1`. Range-check
-  `ts_in`'s 8 bytes in the leaf at the next re-pin (or all 264 unchecked
-  boundary bytes, about 3.4k `qm31` rows of the leaf's 28.8k spare
-  [estimate]), with a gate: a consistent segment trace whose `ts_in`
-  first limb is `p − 1`, accepted by a leaf alone and refused at the fold.
-  That gate is a recursion run, and no test builds such a leaf yet.
 - **Live fault text:** `ExitReason`'s `Debug` and executor panic messages
   can carry state into logs; the fix is the variant alone and a static
   panic message with its place, checked by one audited run of a faulting

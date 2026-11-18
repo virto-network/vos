@@ -413,8 +413,8 @@ pub const FINALIZE: usize = 512;
 
 /// The `p2` and `qm31` rows of the leaf's own work: the state digests and
 /// the output's hash; the flags, the io-hash's range checks and limbs, the
-/// outputs.
-const LEAF_WORK: [usize; 2] = [2 * 19 + 7, 85 + 448 + 2];
+/// initial timestamp's and the exit pc's range checks, the outputs.
+const LEAF_WORK: [usize; 2] = [2 * 19 + 7, 85 + 448 + 12 * 13 + 2];
 
 /// The boundary chips' public logup terms over the boundary states.
 const BOUNDARY_TERMS: usize = 644;
@@ -654,9 +654,9 @@ fn once_rows(by_point: &BTreeMap<u64, Vec<usize>>, items: &mut Items) -> usize {
                 powers.insert(step);
             }
         }
-        // The point, its coordinates' parts, its constants and the two
-        // chains over its samples.
-        point_rows += 13 + 2 * exponents.len() + 3 * usize::from(lowest > 0);
+        // The point, its coordinates' parts, its constants (`c` and its
+        // inverse among them) and the two chains over its samples.
+        point_rows += 14 + 2 * exponents.len() + 3 * usize::from(lowest > 0);
     }
     powers.remove(&0);
     conjugates.remove(&0);
@@ -901,11 +901,11 @@ mod tests {
         assert_eq!(terms.merkle[0], 40 * (954 + 78));
         assert_eq!(terms.fri, [40 * 243, 40 * 106, 0]);
         assert_eq!(terms.oods[1], 33_874);
-        assert_eq!(terms.deep_once[1], 19_659);
-        assert_eq!(terms.rows(), [55_500, 100_004, 44_040]);
+        assert_eq!(terms.deep_once[1], 19_675);
+        assert_eq!(terms.rows(), [55_500, 100_176, 44_040]);
         assert_eq!(
             leaf_rows(shape.chips, &shape.classes[0].log_sizes),
-            [55_500, 100_004 + FINALIZE, 44_040]
+            [55_500, 100_176 + FINALIZE, 44_040]
         );
         assert!(LeafRows::default().oversized(&shape).is_empty());
     }

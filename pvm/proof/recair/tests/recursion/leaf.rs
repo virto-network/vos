@@ -185,6 +185,8 @@ fn a_leaf_states_its_segment() {
     // 32 bytes of 13 rows (a limb, eight bits, four to recompose), and 16
     // limbs of two.
     assert_eq!(rows("leaf: io-hash"), [0, 32 * 13 + 16 * 2, 0]);
+    // ts in's 8 bytes and pc out's 4, 13 rows each.
+    assert_eq!(rows("leaf: ts in, pc out"), [0, 12 * 13, 0]);
     // 19 permutations a digest.
     assert_eq!(rows("leaf: digests"), [38, 0, 0]);
     // Seven, and the outputs' two rows.

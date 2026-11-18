@@ -332,7 +332,7 @@ const WINDOW_TERMS: [Term; 17] = [
         "qm31: DEEP sums of sampled values",
         1,
         false,
-        19_627,
+        19_643,
         20_458,
     ),
     term("qm31: proof-of-work checks", 1, false, 246, 64),
@@ -436,7 +436,7 @@ fn the_window_kernels_leaf_rows_per_term() {
         totals[1][term.component] += term.model * times;
     }
     assert_eq!(totals[0], context.rows(), "the terms cover every row");
-    assert_eq!(totals[0], [55_451, 99_412, 43_960]);
+    assert_eq!(totals[0], [55_451, 99_428, 43_960]);
     assert_eq!(
         totals[1],
         [59_242, 102_049, 46_080],

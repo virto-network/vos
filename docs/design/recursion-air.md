@@ -513,8 +513,9 @@ refuses it with. What the build found against the model:
 - **The kernel leaves** (`vos-pvm-recair`'s `leaf`): the window
   kernel's real segments verified in their classes' leaves, which prove and
   verify. The leaf's own work is 45 `p2` rows (the two state digests, 19
-  permutations each, and the output's 7) and 535 `qm31` (the flags 85, the
-  io-hash's 32 range-checked bytes and 16 limbs 448, the outputs 2), as
+  permutations each, and the output's 7) and 691 `qm31` (the flags 85, the
+  io-hash's 32 range-checked bytes and 16 limbs 448, the entry timestamp's
+  and the exit pc's 12 range-checked bytes 156, the outputs 2), as
   §4.1's model counts; finalizing adds 54 `qm31` rows of constants. The
   class-1 leaf: **57,700 / 102,227 / 46,000** finalized [measured], `p2`
   12.0% under 2^16, proved in 1.5 s at 942 MiB of heap, 0.22× its
