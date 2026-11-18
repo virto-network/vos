@@ -22,7 +22,7 @@ use vos_wire::credentials::{CredentialError, Open, RootEntry, meets, open_work};
 use vos_wire::homes::{AgentsPage, Counts, HomesError, Standing, Terms};
 use vos_wire::personal::{
     AdminClass, Attestation, Envelope, Kit, KitEntry, KitKind, NewDevice, Overview, PersonalError,
-    Policy, RECOVERY, Recorded, kit_index,
+    Policy, RECOVERY, kit_index,
 };
 
 use crate::common::ALICE;
