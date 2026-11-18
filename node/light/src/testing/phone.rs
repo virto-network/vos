@@ -57,6 +57,12 @@ pub struct Phone {
     pub confirms: Mutex<VecDeque<Option<Vec<String>>>>,
     /// Every one of those forms, as the app showed it.
     pub shown: Mutex<Vec<String>>,
+    /// Every pairing check shown or confirmed, the newest last.
+    pub checks: Mutex<Vec<String>>,
+    /// The next pairing check this phone is asked to confirm is declined.
+    pub decline_check: Mutex<bool>,
+    /// How long the user takes to compare a pairing's check.
+    pub comparing: Mutex<std::time::Duration>,
 }
 
 impl Phone {
@@ -79,6 +85,9 @@ impl Phone {
             evaluating: Mutex::new(None),
             confirms: Mutex::new(VecDeque::new()),
             shown: Mutex::new(Vec::new()),
+            checks: Mutex::new(Vec::new()),
+            decline_check: Mutex::new(false),
+            comparing: Mutex::new(std::time::Duration::ZERO),
         }
     }
 
@@ -214,6 +223,17 @@ impl Prompts for Phone {
     fn approve_admin(&self, approval: &Approval) -> bool {
         self.approvals.lock().unwrap().push(approval.clone());
         !self.declines()
+    }
+
+    fn confirm_pairing(&self, check: &str) -> bool {
+        self.checks.lock().unwrap().push(check.to_owned());
+        std::thread::sleep(*self.comparing.lock().unwrap());
+        !std::mem::take(&mut *self.decline_check.lock().unwrap())
+    }
+
+    fn show_pairing(&self, check: &str) -> bool {
+        self.checks.lock().unwrap().push(check.to_owned());
+        true
     }
 
     fn create_source(&self) -> Result<Vec<u8>, Error> {

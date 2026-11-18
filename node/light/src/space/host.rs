@@ -124,6 +124,13 @@ pub trait Prompts {
     fn enter_phrase(&self) -> Option<Zeroizing<String>>;
     /// Whether the user approves another device's new admin key.
     fn approve_admin(&self, approval: &Approval) -> bool;
+    /// On the device that showed a pairing code: whether the user confirms
+    /// the new device shows this `check` too. Nothing is handed over until
+    /// they do.
+    fn confirm_pairing(&self, check: &str) -> bool;
+    /// On the new device: the pairing's `check`, shown while the user
+    /// confirms it on the other device; whether they go on.
+    fn show_pairing(&self, check: &str) -> bool;
 
     /// A new secret source's key: its reference, which
     /// [`Prompts::evaluate_source`] takes.

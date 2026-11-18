@@ -912,7 +912,11 @@ devices that are awake have shown they hold the same keys.
 - **Between a removal's maturity and its confirmed epoch** the agent
   already refuses the removed device's keys; only operators serving it
   anyway could hand it data sealed under the prior epoch, for at most 72 h
-  after the 72 h removal delay (§8, B8).
+  after the 72 h removal delay (§8, B8). [As built, 2026-11-18: the 72 h
+  after the delay is the time to the user's next commit, which nothing
+  makes without them: every pass raises a commit owed (`Notice::Commit`,
+  the chrome's "Commit now") for as long as a matured removal waits for
+  one, and for as long as a verdict left the kit's `R` unheld (below).]
 - **Updates:** a device updates its leaf when an MLS leaf lifetime nears
   its end (a year), on the same yearly prompt as the home's re-proof
   [E15], and after its admin key is replaced; each is an admin-signed
@@ -1227,12 +1231,22 @@ spike app, its log host-verified]:
   arguments byte for byte with the operation it recorded, and verifies
   nothing. **Every device verifies the signature** against the admin key
   before acting, and acts on no operation without its evidence; the device
-  that made the call re-posts the evidence until it is stored. The
+  that made the call re-posts the evidence until it is stored. [As built,
+  2026-11-18: the device holds the call as signed before it leaves
+  (`DeviceGroup::sending`), and every pass posts its evidence until the log
+  holds it, finding the call in the log after a kill; the kit's flows keep
+  theirs in the store and post it when the kit calls again. **An operation
+  due without its evidence is cancelled** (`Unevidenced`), a cosigned one
+  too, so the agent and the devices close it alike: a call whose device is
+  lost between the call and its evidence wedges nothing, and is made
+  again.] The
   operators run ingress and could append anything to the log, so a device
   trusts an operation only by its signature (§8, B6).
 - Delays run on the agent's batch time alone; a device whose clock
   disagrees with the agent's by more than an hour raises an alarm and
-  otherwise acts as the log says.
+  otherwise acts as the log says. [As built: a restored device starts from
+  the agent's batch time and the log's policy (the claim's configuration,
+  each later one over it), never its own clock or a default.]
 
 **The device set** (a table in `Personal`): each device's sync key, admin
 key and its attestation, its admin class (strong or delayed), its
@@ -1284,7 +1298,13 @@ so it matures after 7 days; from then the phone's `alive` is ignored, and
 the kit's restore matures 7 days later, 14 days in all. With the kit alone
 against a thief who also passes the biometric, the owner cannot win: the
 thief vetoes, as an owner must be able to against a leaked kit (§8, A4,
-D3).
+D3). [As built, 2026-11-18: the kit's `remove` and `resolve` are the
+light node's `Personal::remove_by_kit` and `resolve_by_kit`, from any
+install, a fresh one too: the agent found by the kit's index, the set read
+under the kit (`kit_view`), what fell due settled before the call; the
+facility's restore screen offers them. A lost phone left powered, whose
+background job answers every restore with `alive`, is removed this way
+first.]
 
 **The removal frontier:** when a removal matures, the agent records, per
 scope, the position of the removed device's last accepted envelope; its
@@ -1910,11 +1930,18 @@ skip expired items, each write deletes a few; no timer).
    keystore, draws its sync key and a KeyPackage, and runs
    `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2b` with A through the slot, the code
    its pre-shared key.
-3. **Over the Noise channel,** B sends its public keys, the admin key's
+3. **The check, before anything is handed over** [decided 2026-11-12,
+   built]: once the handshake is done, both devices show a six-digit check
+   derived from its hash, and A's user confirms that B shows the same
+   before A hands anything over; declined, A closes the slot. Someone who
+   photographed the QR and answered first holds a handshake of its own,
+   whose check the user's new phone does not show, so the slot grants
+   nothing until the user has seen whom it pairs.
+4. **Over the Noise channel,** B sends its public keys, the admin key's
    attestation and its KeyPackage; A sends the key archive, the naming
    secret, `R`, and its newest checkpoint's hash per scope (slice 9,
    decision 16).
-4. **A adds B in one admin call, on one prompt:** for a strong admin an
+5. **A adds B in one admin call, on one prompt:** for a strong admin an
    add is immediate, so the add and its commit are one call,
    `commit(epoch, add(B's keys, B's "home" nullifier), handshake,
    welcome_hash)` (B computes its nullifier from its own member secret),
@@ -1922,7 +1949,7 @@ skip expired items, each write deletes a few; no timer).
    evidence call. B is in probation, and reads and writes at once through
    the archive. A delayed admin's add is an operation first and its
    commit, after the 72 h, a second call.
-5. **B joins:** fetches each scope's checkpoint (A's, by the hash it was
+6. **B joins:** fetches each scope's checkpoint (A's, by the hash it was
    given) and the envelopes after it. [As built, 2026-11-17, decision 16:
    it reads each scope from its start.]
 

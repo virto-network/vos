@@ -98,9 +98,10 @@ impl<H: Host> Personal<H> {
     }
 
     /// The pairing the code shown opened, driven to its end: the
-    /// handshake's messages, the joiner's hello, the handover (the archive
-    /// and `R`), then, once the joiner acknowledged it, the commit adding
-    /// it; the enrollments it is owed held, each deferrable.
+    /// handshake's messages, the user's confirmation that the new device
+    /// shows the handshake's check, the joiner's hello, the handover (the
+    /// archive and `R`), then, once the joiner acknowledged it, the commit
+    /// adding it; the enrollments it is owed held, each deferrable.
     pub fn pair_await(&self, prompts: &dyn Prompts) -> Result<Paired, Error> {
         let done = self.opened(prompts);
         self.waiting.end();
@@ -178,14 +179,7 @@ impl<H: Host> Personal<H> {
             // Cut short only before the handover: once the joiner holds it,
             // the pairing runs to its end or the slot's.
             if hello.is_none() && self.waiting.cancelled() {
-                // The slot closed, so the next offer starts anew.
-                let slot = opener.slot();
-                self.with_link(held, Purpose::Personal, |link, _| {
-                    link.call::<u64>(method::CLOSE_SLOT, slot.encode())
-                        .map_err(unreached)?
-                        .map_err(agent_refused)
-                        .map(drop)
-                })?;
+                self.close_slot(held, opener)?;
                 return Err(Error::Cancelled);
             }
             let items: Vec<InboxItem> = self.with_link(held, Purpose::Personal, |link, _| {
@@ -195,7 +189,16 @@ impl<H: Host> Personal<H> {
             })?;
             match opener.read(&items).map_err(failed)? {
                 Opened::Waiting => self.host.sleep(POLL),
-                Opened::Put(put) => self.put(held, &put.arguments())?,
+                Opened::Put(put) => {
+                    self.put(held, &put.arguments())?;
+                    // The handshake is done: nothing is handed over until
+                    // the user confirms the new device shows its check.
+                    let check = opener.check().ok_or_else(|| failed("no check"))?;
+                    if !prompts.confirm_pairing(check) {
+                        self.close_slot(held, opener)?;
+                        return Err(Error::Declined);
+                    }
+                }
                 Opened::Hello(heard) => {
                     // The commit is made on what the log decided, its admin
                     // key the one the set shows.
@@ -237,6 +240,17 @@ impl<H: Host> Personal<H> {
                 }
             }
         }
+    }
+
+    /// The slot `opener` opened, closed: the next offer starts anew.
+    fn close_slot(&self, held: &mut Held, opener: &Opener) -> Result<(), Error> {
+        let slot = opener.slot();
+        self.with_link(held, Purpose::Personal, |link, _| {
+            link.call::<u64>(method::CLOSE_SLOT, slot.encode())
+                .map_err(unreached)?
+                .map_err(agent_refused)
+                .map(drop)
+        })
     }
 
     /// The log followed until no candidate is pending, by `until` (ms),
@@ -382,6 +396,11 @@ impl<H: Host> Personal<H> {
             match joiner.read(&items).map_err(failed)? {
                 Joined::Waiting => self.host.sleep(POLL),
                 Joined::Offer(offer) => {
+                    // The check shown while the opener's user confirms it.
+                    let check = joiner.check().ok_or_else(|| failed("no check"))?;
+                    if !prompts.show_pairing(check) {
+                        return Err(Error::Declined);
+                    }
                     // The code is the opener's: the space this device holds
                     // is left, and it pairs as a fresh install.
                     if held.group.is_some()

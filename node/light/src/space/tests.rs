@@ -252,6 +252,12 @@ impl Prompts for Key {
     fn approve_admin(&self, _: &Approval) -> bool {
         false
     }
+    fn confirm_pairing(&self, _: &str) -> bool {
+        false
+    }
+    fn show_pairing(&self, _: &str) -> bool {
+        false
+    }
     fn create_source(&self) -> Result<Vec<u8>, Error> {
         Err(Error::Declined)
     }

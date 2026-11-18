@@ -143,6 +143,9 @@ enum Fate {
     Answer,
     Drop,
     TakeAndDrop,
+    /// Answered as taken, never applied: the operators answer a call and
+    /// never log it.
+    Forge,
 }
 
 /// The device's clock, in milliseconds: the world runs on it, offset.
@@ -305,9 +308,18 @@ pub struct State {
     /// The policy each personal agent is configured with at its claim,
     /// [`policy`] unless set.
     pub policy: Option<Policy>,
+    /// The device window every space answers, its stock kernels' programs
+    /// in their format unless set.
+    pub window: Option<vos_wire::ingress::DeviceWindow>,
     /// Each phone's requests, by its tag, as it asked them.
     pub traces: HashMap<u8, Vec<Step>>,
     kills: HashMap<u8, Kill>,
+    /// The next call each phone asks of a step, answered as taken and never
+    /// applied ([`World::forge`]).
+    forging: HashMap<u8, Step>,
+    /// The next request each phone asks of a step, the world's time moved
+    /// on before it is taken ([`World::pass_at`]).
+    passing: HashMap<u8, (Step, u64)>,
     next_agent: u32,
 }
 
@@ -317,6 +329,42 @@ pub struct State {
 pub struct Kernels {
     pub auth: Vec<u8>,
     pub owner: Vec<u8>,
+}
+
+impl Kernels {
+    /// The device window of a space whose guards admit these kernels'
+    /// programs alone, each in its format.
+    pub fn window(&self) -> vos_wire::ingress::DeviceWindow {
+        use vos_wire::ingress::{DeviceWindow, FormatWindow, KernelWindow, ProgramWindow};
+        let releases: Vec<Release> = [&self.auth, &self.owner]
+            .into_iter()
+            .map(|artifact| Release::decode_exact(artifact).expect("a release artifact"))
+            .collect();
+        let mut formats: Vec<FormatWindow> = Vec::new();
+        for release in &releases {
+            if !formats.iter().any(|format| format.format == release.format) {
+                formats.push(FormatWindow {
+                    format: release.format,
+                    retires_ms: None,
+                });
+            }
+        }
+        DeviceWindow {
+            formats,
+            kernels: releases
+                .iter()
+                .map(|release| KernelWindow {
+                    method: release.method,
+                    programs: vec![ProgramWindow {
+                        id: release.id,
+                        format: release.format,
+                        retires_ms: None,
+                    }],
+                    unavailable: false,
+                })
+                .collect(),
+        }
+    }
 }
 
 impl Kernels {
@@ -595,6 +643,20 @@ impl World {
         );
     }
 
+    /// The next call of `step` the phone tagged `tag` makes is answered as
+    /// taken at the agent's head and never applied: the operators answer a
+    /// call and never log it.
+    pub fn forge(&self, tag: u8, step: Step) {
+        self.state.lock().unwrap().forging.insert(tag, step);
+    }
+
+    /// The world's time moves on by `ms` as the phone tagged `tag` asks its
+    /// next request of `step`, before the world takes it: what fell due
+    /// meanwhile settles at that request.
+    pub fn pass_at(&self, tag: u8, step: Step, ms: u64) {
+        self.state.lock().unwrap().passing.insert(tag, (step, ms));
+    }
+
     /// Whether the phone tagged `tag` died.
     pub fn died(&self, tag: u8) -> bool {
         self.state
@@ -631,6 +693,16 @@ impl World {
         let mut state = self.state.lock().unwrap();
         if tag == 0 {
             return Fate::Answer;
+        }
+        if let Some((at, ms)) = state.passing.get(&tag).copied()
+            && at == step
+        {
+            state.passing.remove(&tag);
+            self.pass(ms);
+        }
+        if state.forging.get(&tag) == Some(&step) {
+            state.forging.remove(&tag);
+            return Fate::Forge;
         }
         if let Some(kill) = state.kills.get_mut(&tag) {
             if kill.fired {
@@ -681,6 +753,10 @@ impl World {
                     })
                     .encode()
             }
+            Some(Kind::Devices) => {
+                let window = state.window.clone().unwrap_or_else(|| self.stock.window());
+                Some(window).encode()
+            }
             Some(Kind::Query) => {
                 let (agent, query) = <(AgentId, QueryCall)>::decode_exact(body).expect("a query");
                 let outcome = state.query(agent.0, &query, now);
@@ -712,6 +788,33 @@ impl World {
             }
             other => panic!("the gateway relays no {other:?}"),
         }
+    }
+}
+
+impl World {
+    /// A call answered as the agent's next log entry, at the world's time,
+    /// and never applied.
+    fn forged(&self, body: &[u8]) -> Vec<u8> {
+        let now = self.now();
+        let state = self.state.lock().unwrap();
+        let (agent, call) = <(AgentId, ingress::Call)>::decode_exact(body).expect("a call");
+        let host = state.personal.get(&agent.0).expect("a personal agent");
+        let Outcome::Done(overview) = host.read(call.session.key, personal::OVERVIEW, ().encode())
+        else {
+            panic!("the agent's overview");
+        };
+        let next = vos_wire::personal::Overview::decode_exact(&overview)
+            .expect("an overview")
+            .next;
+        let recorded = vos_wire::personal::Recorded {
+            at: now,
+            index: next,
+        };
+        Response::Ran {
+            outcome: done(recorded),
+            at: 1,
+        }
+        .encode()
     }
 }
 
@@ -1039,9 +1142,13 @@ async fn serve(
                 .push((request.kind, agent_of(&request.body)));
             let answering = Arc::clone(&world);
             let (kind, body) = (request.kind, request.body.clone());
-            let answer = tokio::task::spawn_blocking(move || answering.answer(kind, &body))
-                .await
-                .expect("the world answered");
+            let forge = matches!(fate, Fate::Forge);
+            let answer = tokio::task::spawn_blocking(move || match forge {
+                true => answering.forged(&body),
+                false => answering.answer(kind, &body),
+            })
+            .await
+            .expect("the world answered");
             if matches!(fate, Fate::TakeAndDrop) {
                 return;
             }

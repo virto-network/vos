@@ -3,6 +3,7 @@
 //! own under the world's stock kernels, its enrollments as a test sets
 //! them.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vos_wire::credentials::Onion;
@@ -23,6 +24,9 @@ pub struct Reach {
     programs: OnceLock<(DeviceProgram, DeviceProgram)>,
     /// The phone's enrollments in other spaces.
     pub enrollments: Mutex<Vec<Enrolled>>,
+    /// How far the phone's clock runs ahead of the device's, in
+    /// milliseconds.
+    pub ahead: AtomicU64,
 }
 
 impl Reach {
@@ -44,6 +48,7 @@ impl Reach {
             prover: OnceLock::new(),
             programs: OnceLock::new(),
             enrollments: Mutex::new(Vec::new()),
+            ahead: AtomicU64::new(0),
         }
     }
 
@@ -119,6 +124,6 @@ impl Host for Reach {
     }
 
     fn now(&self) -> u64 {
-        super::wall()
+        super::wall() + self.ahead.load(Ordering::Relaxed)
     }
 }

@@ -15,6 +15,11 @@
 //!   answers with the third, carrying its [`Offer`]: the home, which the
 //!   joiner's "home" nullifier is of, and the user's other memberships,
 //!   which it is enrolled in.
+//! - **The check:** both sides derive a six-digit check from the
+//!   handshake's hash ([`check`]), the joiner showing it, the opener asking
+//!   its user to confirm the joiner shows the same before anything is handed
+//!   over: someone who photographed the QR and answered first holds a
+//!   handshake of its own, whose check the user's new phone does not show.
 //! - **Over the channel:** the joiner sends its [`Hello`] (its keys, its
 //!   nullifier, its key package, its handles in the offered spaces); the
 //!   opener pairs it ([`crate::group::DeviceGroup::pair`]) and hands over
@@ -65,6 +70,7 @@ const PSK: &[u8] = b"vos/personal/pairing/psk";
 const PROLOGUE: &[u8] = b"vos/personal/pairing/v1";
 const ITEM: &[u8] = b"vos/personal/pairing/item";
 const RECEIVED: &[u8] = b"vos/personal/pairing/received";
+const CHECK: &[u8] = b"vos/personal/pairing/check";
 /// A Noise message's bound, and an AEAD's tag.
 const NOISE_MAX: usize = 65_535;
 const TAG: usize = 16;
@@ -285,6 +291,18 @@ fn received(handover: &[u8]) -> [u8; 32] {
         .into()
 }
 
+/// The six-digit check of a handshake whose hash is `hash`, as both sides
+/// show it: `123 456`.
+pub fn check(hash: &[u8]) -> String {
+    let digest: [u8; 32] = Blake2b::<U32>::new()
+        .chain_update(CHECK)
+        .chain_update(hash)
+        .finalize()
+        .into();
+    let n = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    format!("{:03} {:03}", n / 1000, n % 1000)
+}
+
 fn random<const N: usize>() -> Result<[u8; N], PairError> {
     let mut bytes = [0; N];
     getrandom::getrandom(&mut bytes).map_err(|_| PairError::Random)?;
@@ -319,6 +337,8 @@ fn handshake(
 /// order, and reads in its peer's order.
 struct Channel {
     transport: snow::TransportState,
+    /// The handshake's check ([`check`]).
+    check: String,
     /// The next item this side writes and the next of its peer's it reads.
     written: u32,
     read: u32,
@@ -482,6 +502,17 @@ impl Opener {
         self.slot
     }
 
+    /// The handshake's check, once its last message is written: what the
+    /// user confirms the joiner shows before [`Opener::hand_over`].
+    pub fn check(&self) -> Option<&str> {
+        match &self.state {
+            Opening::Offered(channel) | Opening::Greeted(channel) | Opening::Handed(channel, _) => {
+                Some(&channel.check)
+            }
+            Opening::Shown(_) | Opening::Done => None,
+        }
+    }
+
     fn put(&self, n: u32, bytes: Vec<u8>) -> Put {
         Put {
             slot: self.slot,
@@ -515,6 +546,7 @@ impl Opener {
                 let len = handshake.write_message(&offer, &mut third)?;
                 third.truncate(len);
                 let channel = Channel {
+                    check: check(handshake.get_handshake_hash()),
                     transport: handshake.into_transport_mode()?,
                     written: 1,
                     read: 1,
@@ -635,6 +667,15 @@ impl Joiner {
         }
     }
 
+    /// The handshake's check, once the offer is read: what this device
+    /// shows while the opener's user confirms it.
+    pub fn check(&self) -> Option<&str> {
+        match &self.state {
+            Joining::Offered(channel) | Joining::Greeted(channel, ..) => Some(&channel.check),
+            Joining::Scanned(_) | Joining::Done => None,
+        }
+    }
+
     /// Read the slot's `items`: the next step.
     pub fn read(&mut self, items: &[InboxItem]) -> Result<Joined, PairError> {
         let state = core::mem::replace(&mut self.state, Joining::Done);
@@ -653,6 +694,7 @@ impl Joiner {
                 let len = handshake.read_message(&item.item.bytes, &mut payload)?;
                 let offer = Offer::decode_exact(&payload[..len]).ok_or(PairError::Decode)?;
                 let channel = Channel {
+                    check: check(handshake.get_handshake_hash()),
                     transport: handshake.into_transport_mode()?,
                     written: 1,
                     read: 1,
