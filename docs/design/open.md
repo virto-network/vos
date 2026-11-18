@@ -81,13 +81,18 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   decode binding, the jump table, the lookup tables, the memory page and
   Merkle chips, the witness-input chip, the boundary-binding argument, and
   the segment cut and closing-flag rule (`pvm/proof/SECURITY.md`).
-- **Completeness limits:** an invalid dynamic jump cannot be proved; the
-  ledgers cannot prove a gap of 2^27 steps between two accesses to one key;
-  a BLAKE2b pointer within 256 bytes of 2^32 cannot be proved. The 2^27 gap
-  is also a soundness bound: the ledgers compare timestamps mod p, and the
-  per-segment `ts = 0` anchor bounds every access within 2^27, so no
-  provable segment reaches the alias 2^30 steps away
-  (`pvm/proof/SECURITY.md`, "The leaf's binding").
+- **Completeness limits:** an invalid dynamic jump cannot be proved; a
+  run longer than about 2^27 steps cannot be proved; a BLAKE2b pointer
+  within 256 bytes of 2^32 cannot be proved. The 2^27 limit bounds a
+  run's length, not only the gap between two accesses to one key: every
+  ledger chain of a segment starts at a `ts = 0` write and the ordering
+  delta has 28 bits, so no segment whose timestamps pass about 2^27
+  proves, and the prover refuses such a run by its step count before
+  proving. It is also a soundness bound: the ledgers compare timestamps
+  mod p, and the per-segment `ts = 0` anchor bounds every access within
+  2^27, so no provable segment reaches the alias 2^30 steps away
+  (`pvm/proof/SECURITY.md`, "The leaf's binding"). Lifting it takes a
+  wider ordering delta or a per-segment timestamp rebase, a new format.
 - **The witness stream's framing:** the AIR binds each witness-input call
   alone (a count at most its capacity, its writes), so a proved run may
   be given a short or empty read and more bytes later; a constraint
@@ -162,6 +167,15 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   panic on values their callers validate, and `vos-pvm-codec`'s bound of
   a decoded `Vec` by items, not bytes: one line each, at the next re-pin
   of the node's programs.
+- **The fork's verify path, at its next pin** (`pvm/proof/SECURITY.md`,
+  "Stwo's verify path, audited"): the Blake2s-M31 channel's draws made
+  uniform (by rejection, as the Blake2b channel draws; 0 and 1 are 1.5
+  times as likely per coordinate today) and its doc corrected, a format
+  change for 47's transcript; the lifted Merkle verifier's height-0 `Ok`
+  moved after its shape check; and `verify_values` taking the DEEP
+  coefficient count and the batching mode from its caller's
+  configuration, mixed, rather than from the samples alone. VOS's own
+  checks make each unreachable or harmless today.
 - **Stwo's `hashbrown` requirement** is open (`>=0.15.2`), so a
   workspace whose graph holds a newer `hashbrown` re-resolves Stwo onto
   it: the fuzz targets run Stwo on `hashbrown 0.17.1` (`foldhash 0.2`)

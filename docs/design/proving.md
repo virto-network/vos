@@ -365,7 +365,9 @@ attribution). Its full design is `recursion-air.md`.
     the id is recomputed in-circuit; the leaf-circuit hashes above are
     that preimage's. Both children carry that id. A leaf's program id
     is a witness, so this is what binds it;
-  - **adjacency:** `left.last + 1 == right.first`;
+  - **adjacency:** `left.last + 1 == right.first`. A leaf's positions
+    are its witness (`first == last`, nothing more), so adjacency binds
+    nothing; continuity orders the run;
   - **continuity:** `left.exit_digest == right.entry_digest`;
   - **the ends:** the entry flag comes from the left, and the halt flag
     and io-hash from the right, each from its side alone. A fold states
@@ -376,7 +378,9 @@ attribution). Its full design is `recursion-air.md`.
   child is a leaf of the program or a true fold. The wrap refuses a
   root without `first = 0`, the entry flag and the halt flag, so a
   prefix of a run, or a run started mid-way, cannot fold into a
-  statement.
+  statement: the flags do it, since the entry flag holds the leftmost
+  leaf to the entry constants and the halt flag the rightmost to the halt
+  pc, while `first = 0` is a free position's.
 - **One padded shape for leaves and folds,** a format constant
   (`LEAF_FOLD_LOG_SIZES`): 2^16 / 2^17 / 2^16 rows. Every child a fold
   verifies has it, so one circuit verifies a leaf or a fold, and only the
