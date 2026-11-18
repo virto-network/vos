@@ -121,13 +121,16 @@ impl BatchProof {
         Ok(opened)
     }
 
-    /// The root after `writes` to the proven keys, from the proof alone.
+    /// The root after `writes` to the proven keys, from the proof alone,
+    /// the proof checked against `root`, the root before them: a proof of
+    /// another root is refused as [`Error::Root`], never updated.
     pub fn update<H: Hasher, K: AsRef<[u8]>>(
         &self,
         hasher: &H,
+        root: &Hash,
         writes: &[(K, Option<Hash>)],
     ) -> Result<Hash, Error> {
-        PartialTree::unchecked(&self.entries)?.update(hasher, writes)
+        PartialTree::open(hasher, &self.entries, root)?.update(hasher, writes)
     }
 }
 

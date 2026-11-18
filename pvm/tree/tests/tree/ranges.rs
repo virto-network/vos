@@ -128,10 +128,11 @@ proptest! {
         let mut witness = proof
             .verify(&H, &scratch(&model), &from, to.as_deref(), &rows(&model, &from, to.as_deref()))
             .unwrap();
+        let before = scratch(&model);
         let root = vos_tree::update(&H, &mut store, &writes).unwrap();
         apply(&mut model, &writes);
         prop_assert_eq!(root, scratch(&model));
-        prop_assert_eq!(proof.update(&H, &commitments(&writes)), Ok(root));
+        prop_assert_eq!(proof.update(&H, &before, &commitments(&writes)), Ok(root));
         prop_assert_eq!(witness.update(&H, &commitments(&writes)), Ok(root));
     }
 

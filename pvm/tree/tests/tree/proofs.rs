@@ -93,10 +93,11 @@ proptest! {
             .zip(&values)
             .map(|(key, value)| (key.clone(), value.map(|v| leaf(key, 1, &[v]))))
             .collect();
+        let before = scratch(&model);
         let root = vos_tree::update(&H, &mut store, &writes).unwrap();
         apply(&mut model, &writes);
         prop_assert_eq!(root, scratch(&model));
-        prop_assert_eq!(proof.update(&H, &commitments(&writes)), Ok(root));
+        prop_assert_eq!(proof.update(&H, &before, &commitments(&writes)), Ok(root));
         prop_assert_eq!(witness.update(&H, &commitments(&writes)), Ok(root));
         // The witness goes on from where it is, for the keys still present:
         // a delete may close what a later put of its key would need.
@@ -129,11 +130,17 @@ fn a_proof_covers_only_its_keys() {
         Some(Error::Uncovered)
     );
     let put = [(gamma.clone(), Some(leaf(&gamma, 1, b"new")))];
-    assert_eq!(proof.update(&H, &commitments(&put)), Err(Error::Uncovered));
-    let unsorted = [(gamma.clone(), None), (alpha.clone(), None)];
-    assert_eq!(proof.update(&H, &commitments(&unsorted)), Err(Error::Order));
     assert_eq!(
-        proof.update(&H, &[(Vec::new(), Some([0; 32]))]),
+        proof.update(&H, &root, &commitments(&put)),
+        Err(Error::Uncovered)
+    );
+    let unsorted = [(gamma.clone(), None), (alpha.clone(), None)];
+    assert_eq!(
+        proof.update(&H, &root, &commitments(&unsorted)),
+        Err(Error::Order)
+    );
+    assert_eq!(
+        proof.update(&H, &root, &[(Vec::new(), Some([0; 32]))]),
         Err(Error::Key)
     );
     for key in [Vec::new(), vec![1; MAX_KEY + 1]] {
@@ -198,7 +205,7 @@ fn a_key_prefixing_a_tree_key_is_refused() {
             Some(Error::Key)
         );
         let put = vec![(key.clone(), Some(leaf(&key, 1, b"v")))];
-        assert_eq!(proof.update(&H, &commitments(&put)), Err(Error::Key));
+        assert_eq!(proof.update(&H, &root, &commitments(&put)), Err(Error::Key));
         let before = store.clone();
         assert_eq!(vos_tree::update(&H, &mut store, &put), Err(Error::Key));
         assert_eq!(store, before, "a refused batch writes nothing");
