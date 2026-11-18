@@ -113,7 +113,7 @@ pub(crate) struct Inner {
     trees: Mutex<HashMap<(String, String), Arc<Tree>>>,
     /// The device's personal space, while it runs.
     paired: Mutex<Option<std::sync::Weak<dyn Paired>>>,
-    /// Each space's device window for an instance, as its node answered it
+    /// Each space's device window for its credential actor, as its node answered it
     /// last, and when: read before a proof, and kept for [`WINDOW_TTL`]
     /// while it admits this app's programs.
     windows: Mutex<HashMap<WindowKey, (Instant, DeviceWindow)>>,
@@ -484,19 +484,20 @@ impl Inner {
         })
     }
 
-    /// Whether the space admits `kernel`'s program for `method` of
-    /// `enrollment`, as its device window says (`light-node.md` §4.4): read
-    /// before anything is asked or proved, so a space behind the app, or
-    /// ahead of it, is refused with the window's words and not a proof's.
+    /// Whether the space admits the stock `kernel`'s program, as the device
+    /// window of `enrollment`'s credential actor, whose method a stock
+    /// kernel is, says (`light-node.md` §4.4): read before anything is
+    /// asked or proved, so a space behind the app, or ahead of it, is
+    /// refused with the window's words and not a proof's.
     pub(crate) async fn admits(
         &self,
         enrollment: &Enrollment,
-        method: &Method,
         kernel: &[u8],
     ) -> Result<(), Refusal> {
         let shipped = <Release as vos_abi::Decode>::decode_exact(kernel)
             .ok_or_else(|| refused(Code::Prove, "a stock kernel's artifact does not decode"))?;
-        let key = (enrollment.handle, method.agent, method.instance);
+        let actor = enrollment.credentials;
+        let key = (enrollment.handle, actor.agent, actor.instance);
         let held = self
             .windows
             .lock()
@@ -512,7 +513,7 @@ impl Inner {
                     .request(
                         enrollment.handle,
                         Purpose::Fetch,
-                        &wire::devices_request(method.agent, method.instance),
+                        &wire::devices_request(actor.agent, actor.instance),
                     )
                     .await
                     .map_err(|error| {
@@ -1025,7 +1026,7 @@ impl Session {
             ));
         }
         self.inner
-            .admits(&enrollment, method, &self.inner.stock.auth)
+            .admits(&enrollment, &self.inner.stock.auth)
             .await?;
         let Some(witness) = self.witness().await else {
             return Err(refused(
@@ -1193,7 +1194,7 @@ impl Session {
             |method| method.guard == Guard::Owner && method.name == TRANSFER,
         )?;
         self.inner
-            .admits(&enrollment, method, &self.inner.stock.owner)
+            .admits(&enrollment, &self.inner.stock.owner)
             .await?;
         let (mut payee, mut amount) = (request.payee.clone(), request.amount.to_string());
         let mut notice = None;

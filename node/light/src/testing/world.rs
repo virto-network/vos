@@ -25,7 +25,7 @@ use russh::{Channel, ChannelId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use vos_abi::credentials as tree;
 use vos_abi::credentials::{DEPTH, EMPTY, Words};
-use vos_abi::ids::{AgentId, MethodId, ProgramHash};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, ProgramHash};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode, SpaceId};
 use vos_api::{Event, Framing, Kind, Reader, Requests, frame};
@@ -311,6 +311,8 @@ pub struct State {
     /// The device window every space answers, its stock kernels' programs
     /// in their format unless set.
     pub window: Option<vos_wire::ingress::DeviceWindow>,
+    /// The agent and instance of each device window asked, in order.
+    pub windows_asked: Vec<(u32, u32)>,
     /// Each phone's requests, by its tag, as it asked them.
     pub traces: HashMap<u8, Vec<Step>>,
     kills: HashMap<u8, Kill>,
@@ -754,6 +756,9 @@ impl World {
                     .encode()
             }
             Some(Kind::Devices) => {
+                let (agent, instance) =
+                    <(AgentId, InstanceId)>::decode_exact(body).expect("a devices request");
+                state.windows_asked.push((agent.0, instance.0));
                 let window = state.window.clone().unwrap_or_else(|| self.stock.window());
                 Some(window).encode()
             }

@@ -2535,7 +2535,8 @@ format, the chips, the sizes and the root.
     proves with the newest program it ships that the window holds, in a
     format it holds (`vos_light::choose`, `wire::devices_request` [built];
     the facility's sign-in and payment read it before their prompt, over
-    `Fetch`, kept ten minutes while it admits the app's programs [built,
+    `Fetch`, the window of the space's credential actor, whose methods the
+    stock kernels are, kept ten minutes while it admits the app's programs [built,
     2026-11-18]). When the space admits none it refuses before any prompt,
     use of the secret or proof (`DeviceError::Window`: "the space admits
     none of this app's programs: the app or the space must update"); a window

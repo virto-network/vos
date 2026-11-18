@@ -766,4 +766,12 @@ async fn a_window_without_this_apps_programs_is_refused_before_proving() {
             Err(error) => panic!("{error:?}"),
         }
     }
+    // A stock kernel is the credential actor's method: its window is the
+    // one read, whichever instance the call goes to.
+    let asked = world.state.lock().unwrap().windows_asked.clone();
+    assert!(!asked.is_empty());
+    assert!(
+        asked.iter().all(|&asked| asked == (AGENT, CREDENTIALS)),
+        "{asked:?}"
+    );
 }
