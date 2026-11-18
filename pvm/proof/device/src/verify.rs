@@ -55,16 +55,32 @@ impl Verifier {
     /// Verifies the proof in `bytes` ([`decode`]) of this program's kernel
     /// stating the io-hash `io`.
     ///
-    /// The crate runs with std and is not linted panic-free: a caller
-    /// verifying bytes it was given treats a panic here as a refusal
-    /// (`catch_unwind`), as it treats `Err`. The fuzz targets
-    /// `device_verify_bytes` and `device_verify_mutate` hold it to no panic.
+    /// The crate runs with std and is not linted panic-free: a panic in the
+    /// verification is caught and refused as [`Refusal::Panic`], in a build
+    /// that unwinds (the workspace's profiles do; one built with
+    /// `panic = "abort"` aborts). The fuzz targets `device_verify_bytes` and
+    /// `device_verify_mutate` hold it to no panic.
     pub fn verify(&self, io: &[u8; 32], bytes: &[u8]) -> Result<(), Refusal> {
         verify(&self.format, &self.program, &self.masked, io, bytes)
     }
 }
 
 pub(super) fn verify(
+    format: &Format,
+    program: &DeviceProgram<Hasher>,
+    masked: &Masked,
+    io: &[u8; 32],
+    bytes: &[u8],
+) -> Result<(), Refusal> {
+    // Nothing the verification holds outlives it: a panic leaves no state
+    // half-changed behind.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        verify_unguarded(format, program, masked, io, bytes)
+    }))
+    .unwrap_or(Err(Refusal::Panic))
+}
+
+fn verify_unguarded(
     format: &Format,
     program: &DeviceProgram<Hasher>,
     masked: &Masked,
@@ -229,12 +245,137 @@ pub fn encode(format: &Format, proof: &MaskedProof<Hasher>) -> Option<Vec<u8>> {
     postcard::to_allocvec(&WireRef::of(format, proof)).ok()
 }
 
+/// The most a proof's decode holds in memory, a multiple of its bytes:
+/// [`Scan`] counts it before the decode. An honest device proof's values
+/// take about as much memory as their encoding (a field element's 16 bytes
+/// from its limbs' varints), its vectors' headers a few percent more; junk
+/// of nested empty vectors would take 24 bytes a byte.
+const DECODE_MEMORY: usize = 3;
+
+/// A sequence of `T` read past, its elements decoded one at a time and
+/// dropped: the memory its decode would hold, the elements' and each
+/// one's own, counted with nothing kept.
+struct Seq<T>(usize, core::marker::PhantomData<T>);
+
+/// The memory a value's decode holds beyond itself: its sequences'.
+trait Held {
+    fn held(&self) -> usize;
+}
+
+macro_rules! held_by_value {
+    ($($type:ty),*) => {$(
+        impl Held for $type {
+            fn held(&self) -> usize {
+                0
+            }
+        }
+    )*};
+}
+held_by_value!(
+    u32,
+    u64,
+    stwo::core::fields::qm31::SecureField,
+    stwo::core::fields::m31::BaseField,
+    Blake2sHash,
+    stwo::core::pcs::PcsConfig
+);
+
+impl<T> Held for Seq<T> {
+    fn held(&self) -> usize {
+        self.0
+    }
+}
+
+impl<'de, T: serde::Deserialize<'de> + Held> serde::Deserialize<'de> for Seq<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit<T>(core::marker::PhantomData<T>);
+        impl<'de, T: serde::Deserialize<'de> + Held> serde::de::Visitor<'de> for Visit<T> {
+            type Value = Seq<T>;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a sequence")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Seq<T>, A::Error> {
+                let mut held = core::mem::size_of::<Vec<T>>();
+                while let Some(element) = seq.next_element::<T>()? {
+                    held = held
+                        .saturating_add(core::mem::size_of::<T>())
+                        .saturating_add(element.held());
+                }
+                Ok(Seq(held, core::marker::PhantomData))
+            }
+        }
+        deserializer.deserialize_seq(Visit(core::marker::PhantomData))
+    }
+}
+
+/// A FRI layer's proof, as [`Wire`]'s read past.
+#[derive(serde::Deserialize)]
+struct LayerScan {
+    fri_witness: Seq<stwo::core::fields::qm31::SecureField>,
+    decommitment: Seq<Blake2sHash>,
+    #[allow(dead_code, reason = "read past")]
+    commitment: Blake2sHash,
+}
+
+impl Held for LayerScan {
+    fn held(&self) -> usize {
+        self.fri_witness.0.saturating_add(self.decommitment.0)
+    }
+}
+
+/// [`Wire`], read past: its fields in its order, every sequence a [`Seq`].
+#[derive(serde::Deserialize)]
+struct Scan {
+    #[allow(dead_code, reason = "read past")]
+    format_version: u32,
+    #[allow(dead_code, reason = "read past")]
+    interaction_pow: u64,
+    claimed_sums: Seq<stwo::core::fields::qm31::SecureField>,
+    #[allow(dead_code, reason = "read past")]
+    config: stwo::core::pcs::PcsConfig,
+    commitments: Seq<Blake2sHash>,
+    sampled_values: Seq<Seq<Seq<stwo::core::fields::qm31::SecureField>>>,
+    decommitments: Seq<Seq<Blake2sHash>>,
+    queried_values: Seq<Seq<Seq<stwo::core::fields::m31::BaseField>>>,
+    #[allow(dead_code, reason = "read past")]
+    proof_of_work: u64,
+    first_layer: LayerScan,
+    inner_layers: Seq<LayerScan>,
+    last_layer: Seq<stwo::core::fields::qm31::SecureField>,
+    #[allow(dead_code, reason = "read past")]
+    log_size: u32,
+}
+
+impl Scan {
+    /// The memory the decode of the proof it read would hold.
+    fn held(&self) -> usize {
+        [
+            self.claimed_sums.0,
+            self.commitments.0,
+            self.sampled_values.0,
+            self.decommitments.0,
+            self.queried_values.0,
+            self.first_layer.held(),
+            self.inner_layers.0,
+            self.last_layer.0,
+        ]
+        .into_iter()
+        .fold(0, usize::saturating_add)
+    }
+}
+
 /// The proof in `bytes` under the device format `format`: at most
 /// [`MAX_PROOF_BYTES`], read whole and canonical (re-encoded, the same
-/// bytes, compared as they are written).
+/// bytes, compared as they are written). Read past first, nothing kept, and
+/// refused when its decode would hold more than [`DECODE_MEMORY`] times its
+/// bytes.
 pub fn decode(format: &Format, bytes: &[u8]) -> Result<MaskedProof<Hasher>, Refusal> {
     if bytes.len() > MAX_PROOF_BYTES {
         return Err(Refusal::Length);
+    }
+    let (scan, _): (Scan, &[u8]) = postcard::take_from_bytes(bytes).map_err(|_| Refusal::Decode)?;
+    if scan.held() > DECODE_MEMORY.saturating_mul(bytes.len()) {
+        return Err(Refusal::Decode);
     }
     let (wire, rest): (Wire, &[u8]) =
         postcard::take_from_bytes(bytes).map_err(|_| Refusal::Decode)?;
@@ -272,6 +413,35 @@ pub fn claim_io(claim: &[u8]) -> Option<[u8; 32]> {
 mod tests {
     use super::super::FORMAT;
     use super::*;
+
+    /// A well-formed proof of `n` empty sampled columns and nothing else: a
+    /// byte each, 24 bytes each once decoded.
+    fn hollow(n: usize) -> Vec<u8> {
+        let mut bytes = postcard::to_allocvec(&(FORMAT.number, 0u64, 0u8)).unwrap();
+        bytes.extend(postcard::to_allocvec(&FORMAT.pcs_config()).unwrap());
+        bytes.push(0);
+        bytes.extend(postcard::to_allocvec(&n).unwrap());
+        bytes.extend(core::iter::repeat_n(0, n));
+        bytes.extend([0, 0, 0, 0, 0]);
+        bytes.extend([0; 32]);
+        bytes.extend([0, 0, 0]);
+        bytes
+    }
+
+    /// Junk whose decode would hold far more than its bytes, nested empty
+    /// vectors, is refused before it is decoded: it decodes whole as a
+    /// proof's wire, at 24 bytes a byte, where the read past it holds none.
+    #[test]
+    fn a_decode_holds_at_most_a_few_times_its_bytes() {
+        let bytes = hollow(1 << 20);
+        let (wire, rest): (Wire, &[u8]) = postcard::take_from_bytes(&bytes).expect("a wire");
+        assert!(rest.is_empty());
+        assert_eq!(wire.stark_proof.0.sampled_values.len(), 1 << 20);
+        drop(wire);
+        assert!(matches!(decode(&FORMAT, &bytes), Err(Refusal::Decode)));
+        let (scan, _): (Scan, &[u8]) = postcard::take_from_bytes(&bytes).expect("a scan");
+        assert!(scan.held() > 24 * bytes.len());
+    }
 
     /// A decode refuses bytes past the cap, of another format, cut or with
     /// a byte more.

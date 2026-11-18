@@ -190,7 +190,8 @@ impl Program {
     }
 
     /// Verifies the proof in `bytes` ([`decode`](super::decode)) of this
-    /// program's kernel stating the io-hash `io`.
+    /// program's kernel stating the io-hash `io`, a panic refused as
+    /// [`Refusal::Panic`] ([`Verifier::verify`]).
     pub fn verify(&self, io: &[u8; 32], bytes: &[u8]) -> Result<(), Refusal> {
         verify(&self.format, self.program(), &self.masked, io, bytes)
     }

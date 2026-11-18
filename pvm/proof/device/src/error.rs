@@ -142,6 +142,9 @@ pub enum Refusal {
     Logup,
     /// The STARK does not verify.
     Stark,
+    /// The verifier panicked on the bytes, a refusal as any other
+    /// ([`crate::Verifier::verify`]).
+    Panic,
 }
 
 impl Refusal {
@@ -174,6 +177,7 @@ impl core::fmt::Display for Refusal {
             Self::Program => "the proof is of another program",
             Self::Logup => "the claimed sums do not cancel against the claim",
             Self::Stark => "the STARK does not verify",
+            Self::Panic => "the verifier panicked on the bytes",
         })
     }
 }
