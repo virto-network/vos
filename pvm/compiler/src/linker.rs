@@ -76,7 +76,8 @@ pub(crate) struct LinkedElf {
     /// Relocations in loaded sections naming an address by a symbol, a
     /// PC-relative pair's or data's: where, and the symbol's own value.
     pub(crate) symbol_refs: Vec<(u64, u64)>,
-    /// How many relocation entries the ELF holds, of any type.
+    /// How many relocation entries the ELF holds for its loaded sections,
+    /// of any type.
     pub(crate) relocations: usize,
     /// The first relocation type the linker does not follow, in a section
     /// the program loads, branches and jumps aside.

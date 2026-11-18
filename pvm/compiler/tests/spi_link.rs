@@ -24,7 +24,8 @@ type Section<'a> = (&'a str, u32, u64, u64, &'a [u8]);
 
 /// Build a minimal ELF64 (little-endian, RISC-V) image from `sections`,
 /// with `entry` as `e_entry`. A NULL section and the `.shstrtab` are added
-/// automatically.
+/// automatically, and a `.rela<name>` section applies to the section
+/// `<name>`.
 fn build_elf(entry: u64, sections: &[Section<'_>]) -> Vec<u8> {
     // Section-name string table: NUL, then each name NUL-terminated.
     let mut shstrtab = vec![0u8];
@@ -50,18 +51,28 @@ fn build_elf(entry: u64, sections: &[Section<'_>]) -> Vec<u8> {
 
     // Section headers: NULL, the given sections, .shstrtab.
     let shnum = sections.len() as u16 + 2;
-    let mut shdr = |name_off: u32, sh_type: u32, flags: u64, addr: u64, off: u64, size: u64| {
-        let mut h = [0u8; 64];
-        h[0..4].copy_from_slice(&name_off.to_le_bytes());
-        h[4..8].copy_from_slice(&sh_type.to_le_bytes());
-        h[8..16].copy_from_slice(&flags.to_le_bytes());
-        h[16..24].copy_from_slice(&addr.to_le_bytes());
-        h[24..32].copy_from_slice(&off.to_le_bytes());
-        h[32..40].copy_from_slice(&size.to_le_bytes());
-        file.extend_from_slice(&h);
+    let applies_to = |name: &str| {
+        name.strip_prefix(".rela").map_or(0, |target| {
+            sections
+                .iter()
+                .position(|(section, ..)| *section == target)
+                .map_or(0, |index| index as u32 + 1)
+        })
     };
-    shdr(0, 0, 0, 0, 0, 0); // NULL
-    for (i, (_, sh_type, flags, addr, data)) in sections.iter().enumerate() {
+    let mut shdr =
+        |name_off: u32, sh_type: u32, flags: u64, addr: u64, off: u64, size: u64, info: u32| {
+            let mut h = [0u8; 64];
+            h[44..48].copy_from_slice(&info.to_le_bytes());
+            h[0..4].copy_from_slice(&name_off.to_le_bytes());
+            h[4..8].copy_from_slice(&sh_type.to_le_bytes());
+            h[8..16].copy_from_slice(&flags.to_le_bytes());
+            h[16..24].copy_from_slice(&addr.to_le_bytes());
+            h[24..32].copy_from_slice(&off.to_le_bytes());
+            h[32..40].copy_from_slice(&size.to_le_bytes());
+            file.extend_from_slice(&h);
+        };
+    shdr(0, 0, 0, 0, 0, 0, 0); // NULL
+    for (i, (name, sh_type, flags, addr, data)) in sections.iter().enumerate() {
         shdr(
             name_offsets[i],
             *sh_type,
@@ -69,6 +80,7 @@ fn build_elf(entry: u64, sections: &[Section<'_>]) -> Vec<u8> {
             *addr,
             offsets[i],
             data.len() as u64,
+            applies_to(name),
         );
     }
     shdr(
@@ -78,6 +90,7 @@ fn build_elf(entry: u64, sections: &[Section<'_>]) -> Vec<u8> {
         0,
         shstrtab_off,
         shstrtab.len() as u64,
+        0,
     );
 
     // ELF header (only the fields parse_linked_elf reads).

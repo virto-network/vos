@@ -477,3 +477,70 @@ fn overlapping_functions_are_walked_once() {
         "{FUNCTIONS} overlapping functions: {took:?}"
     );
 }
+
+/// A package whose read-only data holds, past its attestables' table, a
+/// plain word equal to its entry's address, and `debug`, sections the
+/// program does not load.
+fn package_with(debug: Vec<Section>) -> Vec<u8> {
+    let start = TEXT;
+    let entry = TEXT + 4;
+    let code: Vec<u8> = [i_type(0x67, 0, 0, RA, 0), i_type(0x67, 0, 0, RA, 0)]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let schema = no_methods();
+    let attest = SCHEMA + schema.len() as u64;
+    let rodata = [1u64, entry, entry].map(u64::to_le_bytes).concat();
+    let strtab = b"\0entry\0_start\0VOS_ATTEST\0".to_vec();
+    let symtab = [
+        symbol(0, 0, 0, 0),
+        symbol(1, 2, entry, 4),
+        symbol(7, 2, start, 4),
+        symbol(14, 1, attest, 16),
+    ]
+    .concat();
+    let mut sections = vec![
+        Section::loaded(".vos_schema", 0, SCHEMA, schema),
+        Section::loaded(".rodata", 0, attest, rodata),
+        Section::loaded(".text", EXECUTE, TEXT, code),
+        Section::table(".symtab", SYMTAB, symtab, 5, 0),
+        Section::table(".strtab", STRTAB, strtab, 0, 0),
+        // R_RISCV_64 of the entry, in the attestables' table.
+        Section::table(".rela.rodata", RELA, relocation(attest + 8, 1, 2, 0), 4, 2),
+    ];
+    sections.extend(debug);
+    elf(start, sections)
+}
+
+/// Relocations in a section the program does not load, as debug
+/// information, change nothing derived: their offsets are no program
+/// addresses, though one here equals the plain word's and one a code
+/// address, and both name the entry.
+#[test]
+fn relocations_of_an_unloaded_section_change_nothing() {
+    let attest = SCHEMA + no_methods().len() as u64;
+    let plain = package_with(Vec::new());
+    let debug = package_with(vec![
+        Section::table(".debug_info", PROGBITS, vec![0; 64], 0, 0),
+        Section::table(
+            ".rela.debug_info",
+            RELA,
+            [
+                relocation(attest + 16, 1, 2, 0), // R_RISCV_64 at the plain word
+                relocation(TEXT + 4, 1, 23, 0),   // PCREL_HI20 at the entry
+                relocation(TEXT, 1, 19, 0),       // CALL_PLT at `_start`
+            ]
+            .concat(),
+            4,
+            7,
+        ),
+    ]);
+    let (plain, debug) = (
+        derive(&plain).expect("derives"),
+        derive(&debug).expect("derives"),
+    );
+    assert_eq!(
+        (&plain.actor, &plain.kernels),
+        (&debug.actor, &debug.kernels)
+    );
+}
