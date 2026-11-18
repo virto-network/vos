@@ -137,8 +137,10 @@ impl TranslationContext {
             self.emit_load_imm(auipc_rd, auipc_val as i64)?;
         }
 
-        // Flush pending LUI if this isn't an OP-IMM (ADDI) that consumes it.
+        // Flush pending LUI if this isn't an OP-IMM (ADDI) or JALR that
+        // consumes it.
         if opcode != op::OP_IMM
+            && opcode != op::JALR
             && let Some((lui_rd, lui_val)) = self.pending_lui.take()
         {
             self.emit_load_imm(lui_rd, lui_val)?;

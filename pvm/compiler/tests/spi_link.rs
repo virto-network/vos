@@ -624,6 +624,15 @@ const A3: u32 = 13; // → φ10
 const A4: u32 = 14; // → φ11
 const A5: u32 = 15; // → φ12
 
+fn i_op(f3: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
+    ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | 0x13
+}
+fn ori(rd: u32, rs1: u32, imm: i32) -> u32 {
+    i_op(6, rd, rs1, imm)
+}
+fn andi(rd: u32, rs1: u32, imm: i32) -> u32 {
+    i_op(7, rd, rs1, imm)
+}
 fn xor(rd: u32, rs1: u32, rs2: u32) -> u32 {
     (rs2 << 20) | (rs1 << 15) | (4 << 12) | (rd << 7) | 0x33
 }
@@ -723,4 +732,93 @@ fn a_code_address_has_one_value_in_every_form() {
         program.code.jump_table.len(),
         "one entry per code address"
     );
+}
+
+/// `jalr` jumps to `(rs1 + imm) & !1`: a displacement of one, a pointer
+/// with bit 0 set (a tagged pointer) and the two together reach the
+/// function, from a call and from a jump, through a call whose link
+/// register is its base, and the registers keep their values, the tagged
+/// base included.
+#[test]
+fn an_indirect_jump_clears_bit_zero_of_its_target() {
+    let text = [
+        addi(T2, RA, 0),  //  0: preserve the host return address
+        auipc(T0, 0),     //  4
+        addi(T0, T0, 76), //  8: t0 = &F (80)
+        jalr(RA, T0, 1),  // 12: displacement one
+        ori(T1, T0, 1),   // 16: t1 = &F | 1
+        jalr(RA, T1, 0),  // 20: a tagged pointer
+        jalr(RA, T1, -1), // 24: a tagged pointer, displacement -1
+        auipc(RA, 0),     // 28
+        addi(RA, RA, 12), // 32: ra = &40
+        jalr(0, T1, 0),   // 36: a jump through a tagged pointer; F returns to 40
+        addi(RA, T0, 0),  // 40: ra = &F
+        jalr(RA, RA, 0),  // 44: its target read before its link is written
+        auipc(T0, 0),     // 48
+        addi(T0, T0, 44), // 52: t0 = &H (92)
+        jalr(T0, T0, 0),  // 56: H returns through t0
+        addi(RA, T2, 0),  // 60
+        ret(),            // 64
+        nop(),            // 68
+        nop(),            // 72
+        nop(),            // 76
+        addi(A4, A4, 1),  // 80: F counts its calls
+        andi(A5, T1, 1),  // 84: and reads t1's tag
+        ret(),            // 88
+        addi(A4, A4, 1),  // 92: H counts its calls
+        jalr(0, T0, 0),   // 96
+    ];
+    let blob = link_elf_spi(&text_elf(&text, None)).expect("links");
+    let (exit, registers) = run_both(&blob);
+    assert_eq!(exit, ExitReason::Halt, "{registers:?}");
+    assert_eq!(registers[11], 6, "every jump reaches its function");
+    assert_eq!(registers[12], 1, "the tagged base keeps bit 0");
+    assert_eq!(registers[T1_PVM] & 1, 1);
+}
+
+/// A target known at translation is cleared alike: an AUIPC or a LUI with
+/// the `jalr` after it, the LUI's register keeping its value.
+#[test]
+fn a_static_indirect_target_clears_bit_zero() {
+    let target = TEXT_VADDR + 40;
+    let text = [
+        addi(T2, RA, 0),                           //  0
+        auipc(T0, 0),                              //  4
+        jalr(RA, T0, 37),                          //  8: 4 + 37 = 41, so 40
+        lui(T1, (target >> 12) as u32),            // 12
+        jalr(RA, T1, (target & 0xfff) as i32 + 1), // 16: 40 again, t1 kept
+        addi(RA, T2, 0),                           // 20
+        ret(),                                     // 24
+        nop(),                                     // 28
+        nop(),                                     // 32
+        nop(),                                     // 36
+        addi(A4, A4, 1),                           // 40
+        ret(),                                     // 44
+    ];
+    let blob = link_elf_spi(&text_elf(&text, None)).expect("links");
+    let (exit, registers) = run_both(&blob);
+    assert_eq!(exit, ExitReason::Halt);
+    assert_eq!(registers[11], 2);
+    assert_eq!(
+        registers[T1_PVM],
+        target & !0xfff,
+        "the LUI's register keeps its value"
+    );
+}
+
+/// A displacement of two or more from a register names another
+/// instruction of the source and another entry of the jump table: the
+/// compiler refuses it.
+#[test]
+fn an_unrepresentable_indirect_displacement_is_refused() {
+    for imm in [2, -2, 4, 2047] {
+        let text = [jalr(RA, T0, imm), ret()];
+        assert!(
+            matches!(
+                link_elf_spi(&text_elf(&text, None)),
+                Err(TranspileError::IndirectDisplacement { imm: refused, .. }) if refused == imm
+            ),
+            "displacement {imm}"
+        );
+    }
 }

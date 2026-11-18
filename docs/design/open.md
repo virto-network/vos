@@ -154,6 +154,10 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
 - **Renames that move blobs:** `final-verifier/src/masked.rs` (format
   39's decode and parameters) beside `masking.rs` (the masked verifier),
   at the next change of the final verifier's circuit.
+- **An AUIPC fused with its JALR** (the `call` and `tail` idioms)
+  leaves the AUIPC's register unwritten where RISC-V writes it: the
+  idiom's scratch (`ra`, `t1`), which compiled code does not read after
+  the jump; writing it costs an instruction per tail call.
 - **Docs of guest-linked crates:** `vos-abi`'s credentials functions that
   panic on values their callers validate, and `vos-pvm-codec`'s bound of
   a decoded `Vec` by items, not bytes: one line each, at the next re-pin

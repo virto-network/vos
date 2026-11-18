@@ -250,6 +250,48 @@ fn load_imm_jump_ind_positive_smoke() {
     verify(proof, &side_note).expect("verification failed");
 }
 
+/// `load_imm_jump_ind` with its load register its base: the jump reads the
+/// base before the load writes it, as a compiled indirect call through its
+/// own link register needs (`jalr ra, 0(ra)`).
+#[test]
+fn load_imm_jump_ind_through_its_own_link_register() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 4; // the base: jump_table[1] = 5
+
+    let code = vec![
+        Opcode::LoadImmJumpInd as u8,
+        0x00, // ra = rb = 0
+        1,    // lx = 1
+        2,    // imm_x = 2: the value ra takes
+        Opcode::Trap as u8,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 1, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![4u32, 5u32],
+        regs,
+        vec![0u8; 4 * 1024 * 1024],
+        10000,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let _ = tracing.run();
+    let steps = tracing.into_trace();
+    assert_eq!(steps[0].opcode, Opcode::LoadImmJumpInd);
+    assert_eq!(
+        steps[0].next_pc, 5,
+        "the jump reads the base before the load"
+    );
+    assert_eq!(steps[0].regs_after[0], 2, "then the load writes it");
+
+    let mut side_note =
+        vos_pvm_proof::SideNote::new(steps, code, bitmask).with_jump_table(vec![4u32, 5u32]);
+    let proof = prove(&mut side_note).expect("proving failed");
+    verify(proof, &side_note).expect("verification failed");
+}
+
 #[test]
 #[should_panic(expected = "failed")]
 fn load_imm_jump_ind_forged_target_rejected() {

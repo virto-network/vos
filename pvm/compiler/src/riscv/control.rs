@@ -7,6 +7,17 @@ use crate::TranspileError;
 use super::{TranslationContext, encode_var_imm};
 
 impl TranslationContext {
+    /// `jalr rd, imm(rs1)`: jump to `(rs1 + imm) & !1`, the sum's bit 0
+    /// cleared as RISC-V clears it, and write the return address to `rd`.
+    ///
+    /// A target known at translation (an AUIPC or LUI pair, or base x0) is
+    /// a code address, cleared in that domain. A register holds a code
+    /// pointer as its jump-table address, `2·(index + 1)`: even, with one
+    /// entry per code address. A displacement of 0 or ±1 from it lands, bit
+    /// 0 cleared, on the entry itself or (with the pointer's bit 0 set) on
+    /// the same entry as in the source; a larger one names a different
+    /// instruction of the source but a different entry of the table, and
+    /// is refused.
     pub(super) fn translate_jalr(
         &mut self,
         rd: u8,
@@ -14,32 +25,41 @@ impl TranslationContext {
         imm: i32,
         addr: u64,
     ) -> Result<(), TranspileError> {
-        // Check for auipc+jalr pair (PC-relative call/jump)
-        if let Some((auipc_rd, auipc_val)) = self.pending_auipc.take() {
-            if auipc_rd == rs1 {
-                // Combined auipc+jalr: target = auipc_val + imm
-                let target = (auipc_val as i64 + imm as i64) as u64;
-                if rd == 0 {
-                    // Tail call: just jump, no return address
-                    self.emit_jump(target);
-                } else {
-                    // Function call: fused load_imm_jump
-                    let rv_return_addr = addr + 4;
-                    self.emit_call(rd, rv_return_addr, target)?;
+        let pending = match (self.pending_auipc.take(), self.pending_lui.take()) {
+            (Some((auipc_rd, value)), _) if auipc_rd == rs1 => Some(value as i64),
+            (auipc, lui) => {
+                if let Some((auipc_rd, value)) = auipc {
+                    self.emit_load_imm(auipc_rd, value as i64)?;
                 }
-                return Ok(());
-            } else {
-                // auipc targeted a different register — emit it as load_imm
-                self.emit_load_imm(auipc_rd, auipc_val as i64)?;
+                match lui {
+                    Some((lui_rd, value)) if lui_rd == rs1 => {
+                        // The LUI's register keeps its value unless the
+                        // jump's return address overwrites it.
+                        if lui_rd != rd {
+                            self.emit_load_imm(lui_rd, value)?;
+                        }
+                        Some(value)
+                    }
+                    Some((lui_rd, value)) => {
+                        self.emit_load_imm(lui_rd, value)?;
+                        None
+                    }
+                    None => None,
+                }
             }
-        }
+        };
 
-        // Base x0: the absolute address `imm`. A 12-bit address is code only
-        // if a section was linked there; otherwise the jump traps.
-        if rs1 == 0 {
-            let target = i64::from(imm) as u64;
-            let is_code = self.is_code_addr(target);
-            if !is_code {
+        // A static target: an AUIPC/LUI pair, or base x0 (the absolute
+        // address `imm`, code only if a section was linked there; otherwise
+        // the jump traps).
+        let base = match pending {
+            Some(value) => Some(value),
+            None if rs1 == 0 => Some(0),
+            None => None,
+        };
+        if let Some(base) = base {
+            let target = (base.wrapping_add(i64::from(imm)) as u64) & !1;
+            if rs1 == 0 && !self.is_code_addr(target) {
                 self.emit_op(Opcode::Trap);
             } else if rd == 0 {
                 self.emit_jump(target);
@@ -49,30 +69,75 @@ impl TranslationContext {
             return Ok(());
         }
 
-        // Plain JALR (no preceding auipc, or auipc was for different reg)
+        if !(-1..=1).contains(&imm) {
+            return Err(TranspileError::IndirectDisplacement { at: addr, imm });
+        }
+        let pvm_rs1 = self.require_reg(rs1)?;
         if rd == 0 {
-            // Tail call or return: jump_ind without saving return address.
-            // Handles ret (rs1=ra, imm=0) and tail calls through any register.
-            let pvm_rs1 = self.require_reg(rs1)?;
-            self.emit_op(Opcode::JumpInd);
-            self.emit_data(pvm_rs1);
-            self.emit_var_imm(imm);
+            self.emit_masked_jump_ind(pvm_rs1, imm);
         } else {
-            // Indirect call (e.g. vtable dispatch): save return address then jump.
-            // load_imm_jump_ind: rd = return_addr, jump via rs1+imm.
-            let jt_addr = self.jump_table_slot(addr + 4) as i32;
-
+            // An indirect call: the target, bit 0 cleared, in `rd`, which the
+            // return address overwrites; `load_imm_jump_ind` jumps through
+            // the register's value before it writes it.
             let pvm_rd = self.require_reg(rd)?;
-            let pvm_rs1 = self.require_reg(rs1)?;
-            let lx = Self::var_imm_byte_count(jt_addr);
+            let mut source = pvm_rs1;
+            if imm != 0 {
+                self.emit_op(Opcode::AddImm64);
+                self.emit_data(pvm_rd | (source << 4));
+                self.emit_var_imm(imm);
+                source = pvm_rd;
+            }
+            self.emit_op(Opcode::AndImm);
+            self.emit_data(pvm_rd | (source << 4));
+            self.emit_var_imm(-2);
 
+            let jt_addr = self.jump_table_slot(addr + 4) as i32;
+            let lx = Self::var_imm_byte_count(jt_addr);
             self.emit_op(Opcode::LoadImmJumpInd);
-            self.emit_data(pvm_rd | (pvm_rs1 << 4)); // reg_byte: ra=rd, rb=rs1
+            self.emit_data(pvm_rd | (pvm_rd << 4)); // ra = rd, rb = rd
             self.emit_data(lx as u8); // lx: byte count for imm_x (return addr)
             self.emit_var_imm(jt_addr); // imm_x: jump table return address
-            self.emit_var_imm(imm); // imm_y: offset added to rs1
+            self.emit_var_imm(0); // imm_y: offset added to rb
         }
         Ok(())
+    }
+
+    /// `jump_ind` to `(r + imm) & !1` with no register to clear bit 0 in:
+    /// `r` rotated right by one puts its bit 0 in the sign, a branch on it
+    /// picks the displacement that clears the sum's bit 0, and a rotation
+    /// by 63 restores `r` on both paths, so the jump leaves every register
+    /// as RISC-V leaves it.
+    fn emit_masked_jump_ind(&mut self, r: u8, imm: i32) {
+        // The displacement for an even `r`, and for an odd one: the sum's
+        // bit 0 is `r`'s xor `imm`'s.
+        let (even, odd) = if imm & 1 == 0 {
+            (imm, imm - 1)
+        } else {
+            (imm - 1, imm)
+        };
+        let rotate = |ctx: &mut Self, by: i32| {
+            ctx.emit_op(Opcode::RotR64Imm);
+            ctx.emit_data(r | (r << 4));
+            ctx.emit_var_imm(by);
+        };
+        let jump = |ctx: &mut Self, displacement: i32| {
+            ctx.emit_op(Opcode::JumpInd);
+            ctx.emit_data(r);
+            ctx.emit_var_imm(displacement);
+        };
+        rotate(self, 1);
+        let branch_pc = self.code.len();
+        self.emit_op(Opcode::BranchLtSImm);
+        self.emit_data(r); // lx = 0: the immediate 0
+        let offset_at = self.code.len();
+        self.emit_imm32(0);
+        rotate(self, 63);
+        jump(self, even);
+        let odd_pc = self.code.len();
+        let relative = (odd_pc - branch_pc) as i32;
+        self.code[offset_at..offset_at + 4].copy_from_slice(&relative.to_le_bytes());
+        rotate(self, 63);
+        jump(self, odd);
     }
 
     pub(super) fn translate_branch(

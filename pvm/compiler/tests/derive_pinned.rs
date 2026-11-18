@@ -20,20 +20,20 @@ use vos_pvm_compiler::{TRANSPILER_VERSION, derive};
 /// `named`.
 const PINNED: (u32, &str, u32, [(u32, &str); 3]) = (
     1,
-    "7bde719724614b3fb3ff023eb615184d12047cdac7cceb8ac602d94f8950268c",
+    "d628b4e49559442b41568d4c9f5b37dad4a8ac0f00ecc18a377a6a99275a5807",
     896,
     [
         (
             0x94bb_3e83,
-            "1965796dd7f4a906f08fe61ead896acee9cfffe4820c26fa2693651f429ead88",
+            "c100db3a89deb89f0c77be47cd7ead19ffaab68d839947689f6e1752d08392cf",
         ),
         (
             0xcf46_1499,
-            "5b38a5b674631ff8941e6e2c2817612ee69913384bf2f74c65d50292f0114e40",
+            "226baf7e3e496823303d7ed1231723fcbe03a48f5597dc93786e638bead85f68",
         ),
         (
             0xe389_a21d,
-            "d413a5ab4eed05679fbbbdc77106cfab6b33c59570792edf74380641686f996a",
+            "8d6cb37bcf7d9fcc580c65fc6ab30b1c3953452895a6c6a74745a547c3b4f110",
         ),
     ],
 );

@@ -53,6 +53,11 @@ pub enum TranspileError {
     /// holds: linked, it would run whatever its offset bytes name.
     #[error("unresolved branch target {target:#x}")]
     UnresolvedTarget { target: u64 },
+    /// A `jalr` at `at` whose displacement from its base register is
+    /// neither 0 nor ±1: a code pointer in a register is its jump-table
+    /// address, and a byte displacement from it has no PVM equivalent.
+    #[error("jalr at {at:#x}: displacement {imm} from a register target is not representable")]
+    IndirectDisplacement { at: u64, imm: i32 },
 }
 
 /// A program's functions: each one's first PVM instruction in its code, and
