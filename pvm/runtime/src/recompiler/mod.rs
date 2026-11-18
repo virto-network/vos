@@ -763,21 +763,13 @@ impl RecompiledPvm {
                 // SAFETY: mmap_ptr and mmap_len come from a valid mmap allocation in the assembler.
                 let code_slice =
                     unsafe { std::slice::from_raw_parts(mmap_ptr, compile_result.mmap_len) };
-                let _ = std::fs::write("/tmp/pvm_native.bin", code_slice);
-                tracing::debug!(
-                    native_bytes = compile_result.mmap_len,
-                    "wrote native code to /tmp/pvm_native.bin (mmap path)"
-                );
+                dump_native(code_slice);
             }
             nc
         } else {
             let native = compile_result.native_code;
             if debug {
-                let _ = std::fs::write("/tmp/pvm_native.bin", &native);
-                tracing::debug!(
-                    native_bytes = native.len(),
-                    "wrote native code to /tmp/pvm_native.bin (copy path)"
-                );
+                dump_native(&native);
             }
             NativeCode::new(&native)?
         };
@@ -1190,6 +1182,33 @@ impl RecompiledPvm {
 /// Whether `VOS_PVM_DEBUG` is set, read once: the recompiler's debug
 /// outputs, which show a run's registers, exist only under
 /// `debug-internals`.
+/// Write `native` to a new file of this process's own in the temporary
+/// directory, never through a symbolic link, for a debugging session.
+fn dump_native(native: &[u8]) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static DUMPS: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "pvm-native-{}-{}.bin",
+        std::process::id(),
+        DUMPS.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .and_then(|mut file| file.write_all(native));
+    match written {
+        Ok(()) => {
+            tracing::debug!(native_bytes = native.len(), path = %path.display(), "wrote native code")
+        }
+        Err(error) => tracing::debug!(%error, path = %path.display(), "native code not written"),
+    }
+}
+
 #[cfg(feature = "debug-internals")]
 fn debug_from_environment() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
