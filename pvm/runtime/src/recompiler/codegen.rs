@@ -643,41 +643,28 @@ impl Compiler {
         let exit_label_offset = self.asm.label_offset(self.exit_label).unwrap_or(0) as u32;
         let trap_table = self.trap_entries;
 
-        // If the assembler uses mmap, finalize directly to executable memory
-        // (no copy). Otherwise fall back to Vec-based finalize.
-        match self.asm.finalize_executable() {
-            Ok((ptr, code_len, mmap_cap)) => {
-                // Wrap in a Vec that will munmap on drop (via NativeCode).
-                // We return a CompileResult with a dummy native_code — the caller
-                // should use native_mmap_ptr/len/cap instead.
-                Ok(CompileResult {
-                    native_code: Vec::new(), // not used when mmap_ptr is set
-                    dispatch_table,
-                    fault_resume_offsets,
-                    gas_block_start_by_pc: self.gas_block_start_by_pc,
-                    block_gas_costs: self.block_gas_costs,
-                    trap_table,
-                    exit_label_offset,
-                    panic_offset,
-                    mmap_ptr: Some(ptr),
-                    mmap_len: code_len,
-                    mmap_cap,
-                })
-            }
-            Err(_) => Ok(CompileResult {
-                native_code: self.asm.finalize(),
-                dispatch_table,
-                fault_resume_offsets,
-                gas_block_start_by_pc: self.gas_block_start_by_pc,
-                block_gas_costs: self.block_gas_costs,
-                trap_table,
-                exit_label_offset,
-                panic_offset,
-                mmap_ptr: None,
-                mmap_len: 0,
-                mmap_cap: 0,
-            }),
-        }
+        // A mapped buffer becomes executable in place; its failure is the
+        // compile's (the mapping is gone with it). Only a heap buffer is
+        // copied out.
+        let (native_code, mmap_ptr, mmap_len, mmap_cap) = if self.asm.is_mapped() {
+            let (ptr, len, cap) = self.asm.finalize_executable()?;
+            (Vec::new(), Some(ptr), len, cap)
+        } else {
+            (self.asm.finalize(), None, 0, 0)
+        };
+        Ok(CompileResult {
+            native_code,
+            dispatch_table,
+            fault_resume_offsets,
+            gas_block_start_by_pc: self.gas_block_start_by_pc,
+            block_gas_costs: self.block_gas_costs,
+            trap_table,
+            exit_label_offset,
+            panic_offset,
+            mmap_ptr,
+            mmap_len,
+            mmap_cap,
+        })
     }
 
     /// Emit memory read. Address in SCRATCH (RDX). Result in dst.

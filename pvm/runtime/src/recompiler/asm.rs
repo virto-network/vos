@@ -1589,7 +1589,11 @@ impl Assembler {
     }
 
     /// Resolve fixups and return the code as a `Vec<u8>` (for Vec-backed buffers).
+    /// Empty once [`Self::finalize_executable`] released the buffer.
     pub fn finalize(&mut self) -> Vec<u8> {
+        if self.buf.is_null() {
+            return Vec::new();
+        }
         self.resolve_fixups();
         match &mut self.code_buf {
             CodeBuf::Vec(code) => {
@@ -1616,82 +1620,82 @@ impl Assembler {
         }
     }
 
+    /// Whether the code is written straight into a mapping that
+    /// [`Self::finalize_executable`] makes executable.
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.code_buf, CodeBuf::Mmap { .. })
+    }
+
     /// Resolve fixups, mprotect the buffer to PROT_READ|PROT_EXEC with a
     /// trailing PROT_NONE guard page, and return the executable buffer pointer
     /// and length. Only works for mmap-backed buffers.
     /// Returns (ptr, code_len, mmap_capacity) for NativeCode construction.
+    ///
+    /// Ownership of the mapping leaves the assembler on success and on
+    /// failure alike (a failure unmaps it): the assembler holds no buffer
+    /// afterwards, and nothing may emit into or finalize it again.
     pub fn finalize_executable(&mut self) -> Result<(*mut u8, usize, usize), String> {
+        let CodeBuf::Mmap { ptr, capacity } = self.code_buf else {
+            return Err("finalize_executable requires mmap-backed buffer".into());
+        };
         self.resolve_fixups();
-        match &mut self.code_buf {
-            CodeBuf::Mmap { ptr, capacity } => {
-                let code_len = self.write_pos;
-                let p = *ptr;
-                let mut cap = *capacity;
-                let page_size = 4096usize;
-                let code_pages = (code_len + page_size - 1) & !(page_size - 1);
-                let needed = code_pages + page_size; // + trailing guard page
+        // From here the mapping is the caller's or gone.
+        self.code_buf = CodeBuf::Mmap {
+            ptr: std::ptr::null_mut(),
+            capacity: 0,
+        };
+        self.buf = std::ptr::null_mut();
+        self.capacity = 0;
+        let code_len = self.write_pos;
+        let page_size = 4096usize;
+        let code_pages = (code_len + page_size - 1) & !(page_size - 1);
+        let needed = code_pages + page_size; // + trailing guard page
+        let mut p = ptr;
+        let mut cap = capacity;
 
-                // Extend the mapping if necessary to fit a trailing guard page.
-                if cap < needed {
-                    // SAFETY: p/cap are from a valid mmap. mremap may move the
-                    // mapping; the returned pointer replaces the old one.
-                    let new_ptr = unsafe {
-                        libc::mremap(p as *mut libc::c_void, cap, needed, libc::MREMAP_MAYMOVE)
-                    };
-                    if new_ptr == libc::MAP_FAILED {
-                        // SAFETY: p/cap are from the original valid mmap (mremap failed,
-                        // so the original mapping is still intact and must be freed).
-                        unsafe {
-                            libc::munmap(p as *mut libc::c_void, cap);
-                        }
-                        *ptr = std::ptr::null_mut();
-                        *capacity = 0;
-                        return Err("mremap for guard page failed".into());
-                    }
-                    let new_p = new_ptr as *mut u8;
-                    *ptr = new_p;
-                    cap = needed;
-                    *capacity = cap;
-                }
-
-                let p = *ptr;
-
-                // SAFETY: mprotect transitions code pages from RW to RX (W^X).
-                // On failure, munmap cleans up. Ownership transfers to the caller
-                // by nulling ptr/capacity (prevents double-free in Drop).
-                unsafe {
-                    if libc::mprotect(
-                        p as *mut libc::c_void,
-                        code_pages,
-                        libc::PROT_READ | libc::PROT_EXEC,
-                    ) != 0
-                    {
-                        libc::munmap(p as *mut libc::c_void, cap);
-                        *ptr = std::ptr::null_mut();
-                        *capacity = 0;
-                        return Err("mprotect RX failed".into());
-                    }
-                    // Trailing guard: PROT_NONE catches wild forward jumps past JIT code.
-                    // SAFETY: p + code_pages is within the mmap region (cap >= needed).
-                    if libc::mprotect(
-                        p.add(code_pages) as *mut libc::c_void,
-                        cap - code_pages,
-                        libc::PROT_NONE,
-                    ) != 0
-                    {
-                        libc::munmap(p as *mut libc::c_void, cap);
-                        *ptr = std::ptr::null_mut();
-                        *capacity = 0;
-                        return Err("mprotect guard failed".into());
-                    }
-                }
-                // Prevent Drop from double-freeing — ownership transfers to caller
-                *ptr = std::ptr::null_mut();
-                *capacity = 0;
-                Ok((p, code_len, cap))
+        // Extend the mapping if necessary to fit a trailing guard page.
+        if cap < needed {
+            // SAFETY: p/cap are from a valid mmap. mremap may move the
+            // mapping; the returned pointer replaces the old one.
+            let new_ptr =
+                unsafe { libc::mremap(p as *mut libc::c_void, cap, needed, libc::MREMAP_MAYMOVE) };
+            if new_ptr == libc::MAP_FAILED {
+                // SAFETY: mremap failed, so the original mapping is intact.
+                unsafe { libc::munmap(p as *mut libc::c_void, cap) };
+                return Err("mremap for guard page failed".into());
             }
-            CodeBuf::Vec(_) => Err("finalize_executable requires mmap-backed buffer".into()),
+            p = new_ptr as *mut u8;
+            cap = needed;
         }
+
+        // SAFETY: mprotect transitions code pages from RW to RX (W^X); the
+        // guard lies within the mapping (cap >= needed). On failure the
+        // mapping is unmapped, and no pointer to it remains.
+        unsafe {
+            if libc::mprotect(
+                p as *mut libc::c_void,
+                code_pages,
+                libc::PROT_READ | libc::PROT_EXEC,
+            ) != 0
+            {
+                libc::munmap(p as *mut libc::c_void, cap);
+                return Err(format!(
+                    "making native code executable: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            // Trailing guard: PROT_NONE catches wild forward jumps past JIT code.
+            if libc::mprotect(
+                p.add(code_pages) as *mut libc::c_void,
+                cap - code_pages,
+                libc::PROT_NONE,
+            ) != 0
+            {
+                libc::munmap(p as *mut libc::c_void, cap);
+                return Err("mprotect guard failed".into());
+            }
+        }
+        Ok((p, code_len, cap))
     }
 
     /// Get a slice of the written code bytes (for tests). Syncs Vec len first.

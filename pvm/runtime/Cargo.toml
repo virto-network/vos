@@ -27,5 +27,6 @@ vos-pvm-poseidon2 = { path = "../proof/poseidon2" }
 tracing = { version = "0.1", default-features = false }
 
 [dev-dependencies]
+libc = "0.2"
 proptest = "1"
 serde_json = "1"
