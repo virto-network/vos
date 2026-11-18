@@ -261,6 +261,28 @@ attribution). Its full design is `recursion-air.md`.
     on format 41 (3 segments 17.0 s, 3 leaves 5.7 s, 2 folds 3.5 s, the
     masked wrap 7.1 s) [measured, x86 dev machine, 2026-10-31; node side:
     `vos-kernel-tests`' window kernel, `Totals::report`].
+- **A run's windows** [built]: a kernel's run is held as the tracer
+  records it, its steps without their register files, and each window
+  is expanded from the file entering it; a window shares the run's code,
+  bitmask and jump table and takes its precompile records as a slice of
+  each stream, so a class retried costs no copy of the program and no
+  scan of the run's calls. The segment bench
+  (`pvm/proof/benches/segments.rs`, the release bench profile) traces a
+  loop of a witness read, a load, a store, a Poseidon2 call and a BLAKE2b
+  compression; two runs each side, the window and proof digests equal on
+  both [measured, sigma (i5-1340P, 16 threads, 31 GB), 2026-11-18;
+  `RAYON_NUM_THREADS=16 just bench-segments`, so the pool has 16
+  workers]:
+  - 1,920,015 steps, 120,000 calls of each, cut into 59 windows, none
+    proved: the peak resident set 1,035–1,039 → 353–365 MiB, tracing
+    331–341 → 224–236 ms, building the windows 197–228 → 108–114 ms;
+  - 96,015 steps, 6,000 calls of each: the cut's three windows overflow
+    their class and are halved into 48 segments of about 2,000 steps
+    each, so it is a dense case, not a throughput figure. Proving is
+    flat, 245.7–246.9 s → 245.3–247.1 s, peak 7,326–7,330 → 7,185–7,434
+    MiB: the STARK's columns dominate it. The harness's first run, before
+    the prover's workers took a 16 MiB stack, proved in 245.4 s at 7,256
+    MiB; a second aborted on a worker's stack overflow.
 - **Unmasked.** Segments never leave the prover role.
 
 ### 3.3 Leaf circuits
