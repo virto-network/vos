@@ -1,12 +1,21 @@
 use alloc::sync::Arc;
 use std::collections::HashMap;
 
-use crate::core::step::{NUM_REGS, PvmStep};
+use crate::core::step::{CompactStep, NUM_REGS, PvmStep};
 
 /// Prover's side note used for tracking additional data for trace generation.
-pub struct SideNote {
+///
+/// A segment's, the one a proof fills its traces from, holds full
+/// [`PvmStep`]s. A kernel's whole run ([`crate::kernel::trace_kernel`],
+/// [`crate::core::tracing::TracingPvm::into_run`]) holds the tracer's
+/// [`CompactStep`]s, its register file entering its first step in
+/// `initial_regs`: its windows are cut from it
+/// ([`crate::segment::SegmentCursor`], [`crate::prove_kernel`]), each
+/// expanded to full steps on its own, and [`SideNote::expand`] expands it
+/// whole.
+pub struct SideNote<S = PvmStep> {
     /// The execution trace steps.
-    pub steps: Vec<PvmStep>,
+    pub steps: Vec<S>,
     /// Program bytecode.
     pub code: Arc<[u8]>,
     /// Bitmask for instruction validation.
@@ -290,15 +299,24 @@ pub struct MulEntry {
     pub is_32bit: bool,
 }
 
-impl SideNote {
-    pub fn new(steps: Vec<PvmStep>, code: Vec<u8>, bitmask: Vec<u8>) -> Self {
+impl SideNote<CompactStep> {
+    /// The whole run as full steps, threaded from `initial_regs` (see
+    /// [`CompactStep`]): what proving it as one segment, or forging one of
+    /// its steps, takes.
+    pub fn expand(self) -> SideNote {
+        self.map_steps(crate::core::step::expand_steps)
+    }
+}
+
+impl<S> SideNote<S> {
+    pub fn new(steps: Vec<S>, code: Vec<u8>, bitmask: Vec<u8>) -> Self {
         Self::new_shared(steps, code.into(), bitmask.into())
     }
 
     /// Construct a side note while sharing immutable program artifacts.
     /// Refine uses this across machine slices so repeated boundaries retain
     /// one program allocation rather than one copy per child proof.
-    pub(crate) fn new_shared(steps: Vec<PvmStep>, code: Arc<[u8]>, bitmask: Arc<[u8]>) -> Self {
+    pub(crate) fn new_shared(steps: Vec<S>, code: Arc<[u8]>, bitmask: Arc<[u8]>) -> Self {
         Self {
             steps,
             code,
@@ -334,7 +352,9 @@ impl SideNote {
             device: None,
         }
     }
+}
 
+impl SideNote {
     /// Build the memory-page Merkle boundary payload for this segment
     /// (design §0–§3).  Enumerates the touched pages (always adding page 0, so
     /// the listed set is never empty and the new chips stay unconditionally
@@ -402,7 +422,9 @@ impl SideNote {
             multiproof: mp,
         });
     }
+}
 
+impl<S> SideNote<S> {
     /// Builder-style setter: attach a program's jump_table to this side note.
     /// Used by tests and prove paths to seed JumpTableChip's preprocessed
     /// table.  No-op for programs that don't use JumpInd / LoadImmJumpInd
@@ -470,6 +492,47 @@ impl SideNote {
         self.steps.len()
     }
 
+    /// The same side note over steps `f` makes of `self`'s and its
+    /// entering register file.
+    fn map_steps<T>(self, f: impl FnOnce(&[S], [u64; NUM_REGS]) -> Vec<T>) -> SideNote<T> {
+        SideNote {
+            steps: f(&self.steps, self.initial_regs),
+            code: self.code,
+            bitmask: self.bitmask,
+            range256_counts: self.range256_counts,
+            bitwise_and_counts: self.bitwise_and_counts,
+            bitwise_and_byte_counts: self.bitwise_and_byte_counts,
+            initial_memory: self.initial_memory,
+            sparse_initial_memory: self.sparse_initial_memory,
+            num_initial_mem_entries: self.num_initial_mem_entries,
+            power_of_two_counts: self.power_of_two_counts,
+            popcount_counts: self.popcount_counts,
+            bitcount_counts: self.bitcount_counts,
+            byte_to_bits_counts: self.byte_to_bits_counts,
+            blake2b_calls: self.blake2b_calls,
+            blake2b_mem_ops: self.blake2b_mem_ops,
+            poseidon2_ops: self.poseidon2_ops,
+            merkle_blake2b_calls: self.merkle_blake2b_calls,
+            merkle_blake2b_mults: self.merkle_blake2b_mults,
+            initial_regs: self.initial_regs,
+            final_regs: self.final_regs,
+            closing_chip_active: self.closing_chip_active,
+            cpu_rows_local: self.cpu_rows_local,
+            program_memory_counts: self.program_memory_counts,
+            jump_table: self.jump_table,
+            jump_table_counts: self.jump_table_counts,
+            mul_entries: self.mul_entries,
+            bitwise_entries: self.bitwise_entries,
+            compare_entries: self.compare_entries,
+            divrem_entries: self.divrem_entries,
+            memory_pages: self.memory_pages,
+            memory_layout: self.memory_layout,
+            device: self.device,
+        }
+    }
+}
+
+impl SideNote {
     pub fn add_range256(&mut self, value: u8) {
         self.range256_counts[value as usize] += 1;
     }

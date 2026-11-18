@@ -26,6 +26,7 @@ pub mod pool;
 pub mod precompile;
 pub mod refine;
 pub mod refine_host;
+mod skip;
 pub mod spi;
 #[cfg(test)]
 mod test_support;
@@ -35,6 +36,7 @@ pub mod recompiler;
 
 pub use backend::PvmBackend;
 pub use interpreter::Interpreter;
+pub use skip::{SKIP_MAX, skip};
 
 /// Standard PVM specification version implemented by the portable path.
 pub const STANDARD_PVM_SPEC_VERSION: &str = "0.8.0";

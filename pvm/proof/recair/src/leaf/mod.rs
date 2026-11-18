@@ -42,9 +42,9 @@
 //! the fold chain:
 //! - the leftmost entry is byte constants: the entry flag ties it to the
 //!   kernel's entry state, and the wrap refuses a root without the flag;
-//! - every exit equals the next segment's entry wire for wire: the fold
-//!   checks the exit's digest equal to the entry's, each the leaf sponge
-//!   over the wires as they are;
+//! - every exit equals the next segment's entry up to a collision of the
+//!   leaf sponge: the fold checks the exit's digest equal to the entry's,
+//!   each the leaf sponge over the wires as they are;
 //! - an exit is bytes the segment AIR produced, or a copy of its entry: its
 //!   timestamp is `next_timestamp`, whose limbs are Range256-checked
 //!   (`pvm/proof/src/chips/cpu/constraints/row.rs`); a register is the

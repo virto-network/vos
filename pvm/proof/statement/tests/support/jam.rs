@@ -161,8 +161,9 @@ pub fn refine(program: &[u8], args: &[u8], jam: JamRefine, gas: u64) -> Refined 
 
 /// `program`'s accumulate as service `service` at `slot` over `inputs`
 /// (each `fetch` kind 15's), on `storage`, with `gas`: its exit and the gas
-/// it took. The host charges each call the accumulate host's base, not
-/// PolkaJam's per-call prices.
+/// it took, on the VOS accumulate host: each call at its flat 10, the VOS
+/// profile's, not the Gray Paper's tariff (`gas` 48, `write` 2,442 and its
+/// length terms), so the figure is the VOS host's.
 pub fn accumulate(
     program: &PreparedProgram,
     slot: u64,

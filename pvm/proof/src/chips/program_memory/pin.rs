@@ -113,8 +113,8 @@ fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> Decoded {
     let opcode_byte = code[pc];
     let opcode = Opcode::from_byte(opcode_byte).unwrap_or(Opcode::Trap);
     let category = opcode.category();
-    let skip_len = crate::core::tracing::compute_skip(bitmask, pc);
-    let decoded_args = args::decode_args(code, pc, skip_len as usize, category);
+    let skip_len = vos_pvm::skip(bitmask, pc);
+    let decoded_args = args::decode_args(code, pc, skip_len, category);
     let (ra, rb, rd) = crate::core::tracing::decode_reg_indices(opcode, &decoded_args);
     let imm = crate::core::tracing::decode_immediate(&decoded_args);
     let imm_y = crate::core::tracing::decode_imm_y(&decoded_args);

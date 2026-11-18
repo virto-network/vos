@@ -14,23 +14,21 @@ pub use vos_pvm_program::{
     read_nat,
 };
 
-/// The most code bytes a program may hold, on either backend: what every
-/// validation of a code blob ([`validate_code_blob`]) and every compile
-/// (`backend::compile`, `recompiler::compile_code`, `RecompiledPvm::new`)
-/// refuses past, so a program's prepared tables and native code stay
-/// bounded by its length and the recompiler's offsets fit an `i32` (at
-/// most `recompiler::asm::INSTRUCTION` native bytes for each code byte).
-pub const MAX_CODE: usize = 2 << 20;
+/// Gray Paper v0.8.0's `W_C` (`definitions.tex`): the most bytes a
+/// service's code may hold. Refine and accumulate of a longer one fail as
+/// `BIG` before any run (`pvm_invocations.tex`). The text counts the
+/// looked-up preimage, its metadata prefix included; a VOS service's code
+/// is its standard program alone, so its whole blob is what counts.
+pub const MAX_SERVICE_CODE: usize = 4_000_000;
 
-/// `code` refused past [`MAX_CODE`] bytes: a compile's guard.
-pub(crate) fn code_fits(code: &[u8]) -> Result<(), alloc::string::String> {
-    if code.len() > MAX_CODE {
-        return Err(alloc::format!(
-            "{} bytes of code, past {MAX_CODE}",
-            code.len()
-        ));
-    }
-    Ok(())
+const _: () = assert!(MAX_SERVICE_CODE <= crate::backend::MAX_INTERPRETED_CODE);
+
+/// Whether `blob`, a service's whole code, is within [`MAX_SERVICE_CODE`]:
+/// the admission of a service, apart from what any one backend prepares
+/// (a program's decoded code, which a validation never bounds; see
+/// `backend::compile`).
+pub fn service_fits(blob: &[u8]) -> bool {
+    blob.len() <= MAX_SERVICE_CODE
 }
 
 /// Whether a machine of `program` may start at `pc`: an instruction's first
@@ -53,11 +51,7 @@ pub(crate) fn is_entry(program: &CodeBlob, pc: u64) -> bool {
 pub fn validate_code_blob(program: &CodeBlob, initial_pc: u64) -> bool {
     let code = &program.code;
     let bitmask = &program.bitmask;
-    if code.is_empty()
-        || code.len() > MAX_CODE
-        || bitmask.len() != code.len()
-        || !is_entry(program, initial_pc)
-    {
+    if code.is_empty() || bitmask.len() != code.len() || !is_entry(program, initial_pc) {
         return false;
     }
 
@@ -85,7 +79,7 @@ pub fn validate_code_blob(program: &CodeBlob, initial_pc: u64) -> bool {
 
 /// Full Gray Paper `deblob(program, initial_pc)` boundary.
 ///
-/// This combines canonical compact decoding, whole-program validation and
+/// This combines the compact decoding, whole-program validation and
 /// initial-instruction validation. Callers implementing full Ψ must turn a
 /// `None` result into a no-charge panic over the unchanged input state;
 /// callers implementing Ω_M retain its specified `HUH` mapping.

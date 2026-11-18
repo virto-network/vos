@@ -16,6 +16,7 @@ use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_proof::SideNote;
 use vos_pvm_proof::chip_idx;
 use vos_pvm_proof::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_POSEIDON2, ECALL_WITNESS_INPUT};
+use vos_pvm_proof::core::step::CompactStep;
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::trace_kernel;
 use vos_pvm_proof::program_id::KernelEntry;
@@ -93,14 +94,14 @@ fn witness() -> Vec<u8> {
 }
 
 /// The kernel's run, its witness input `input`.
-fn run_on(blob: &[u8], input: &[u8]) -> SideNote {
+fn run_on(blob: &[u8], input: &[u8]) -> SideNote<CompactStep> {
     trace_kernel(blob, input, 100_000_000)
         .expect("halts")
         .side_note
 }
 
 /// The kernel's run.
-fn run(blob: &[u8]) -> SideNote {
+fn run(blob: &[u8]) -> SideNote<CompactStep> {
     run_on(blob, &witness())
 }
 

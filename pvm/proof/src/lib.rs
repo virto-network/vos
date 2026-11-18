@@ -71,8 +71,10 @@
 //! The prover-side happy path lives at the crate root:
 //!
 //! - **Trace** — [`kernel::trace_kernel`] (a kernel's run, from the
-//!   loader's layout), [`TracingPvm::into_side_note`][into_side_note] (a
-//!   run's whole trace) or [`SideNote::new`] from a hand-built step trace.
+//!   loader's layout, its steps compact: each window is expanded on its
+//!   own), [`TracingPvm::into_run`][into_run] (a run's compact trace),
+//!   [`TracingPvm::into_side_note`][into_side_note] (a run's whole trace,
+//!   expanded) or [`SideNote::new`] from a hand-built step trace.
 //! - **Prove** — [`prove_kernel`] (a kernel's run over its shape, cut into
 //!   segments), [`prove_shaped`] (a segment over one class), and
 //!   [`program_commitment_for_shape`] (the class's preprocessed root a
@@ -93,6 +95,7 @@
 //! without notice**; they are public only for the verifier crate, the
 //! recursion, and the AIR-column derives.
 //!
+//! [into_run]: crate::core::tracing::TracingPvm::into_run
 //! [into_side_note]: crate::core::tracing::TracingPvm::into_side_note
 
 #![cfg_attr(not(feature = "prover"), no_std)]

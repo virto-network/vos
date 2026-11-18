@@ -305,7 +305,7 @@ impl Compiler {
             // through the normal path where feed_gas_direct reads the table.
             // Lumping it here charged 2, diverging from the interpreter.
             if raw_byte == 1 {
-                let skip = crate::interpreter::skip_for_bitmask(bitmask, pc);
+                let skip = crate::skip(bitmask, pc);
                 if is_gas_start {
                     self.emit_gas_block_start(pc, &mut pending_gas, &mut gas_sim);
                 } else if is_resume_start {
@@ -361,7 +361,7 @@ impl Compiler {
                     continue;
                 }
             };
-            let skip = crate::interpreter::skip_for_bitmask(bitmask, pc);
+            let skip = crate::skip(bitmask, pc);
             let next_pc = (pc + 1 + skip) as u32;
 
             // Read register bytes once — used by both arg decoding and gas cost.

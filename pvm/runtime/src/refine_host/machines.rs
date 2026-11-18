@@ -28,7 +28,7 @@ impl RefineContext {
     pub(super) fn machine(&mut self) -> Result<(), Stop> {
         let registers = *self.outer.registers();
         let (address, len, initial_pc) = (registers[7], registers[8], registers[9]);
-        self.charge(gas::MACHINE_BASE.saturating_add(gas::memory(gas::MACHINE_PER_KIB, len)))?;
+        self.charge_whole(gas::memory(gas::MACHINE_BASE, gas::MACHINE_PER_KIB, len))?;
         // Gray Paper v0.8.0 checks the invocation-wide machine limit before
         // inspecting the caller-supplied program range. At capacity even an
         // unreadable outer pointer therefore returns FULL, rather than
@@ -103,7 +103,7 @@ impl RefineContext {
         let registers = *self.outer.registers();
         let (id, outer_address, inner_address, len) =
             (registers[7], registers[8], registers[9], registers[10]);
-        self.charge(gas::PEEK_BASE.saturating_add(gas::memory(gas::PEEK_PER_KIB, len)))?;
+        self.charge_whole(gas::memory(gas::PEEK_BASE, gas::PEEK_PER_KIB, len))?;
         let (outer_address, len) = self.outer_range(outer_address, len)?;
         let status = match u32::try_from(id) {
             Ok(id) if self.inner.contains(id) => match (len == 0)
@@ -137,7 +137,7 @@ impl RefineContext {
         let registers = *self.outer.registers();
         let (id, outer_address, inner_address, len) =
             (registers[7], registers[8], registers[9], registers[10]);
-        self.charge(gas::POKE_BASE.saturating_add(gas::memory(gas::POKE_PER_KIB, len)))?;
+        self.charge_whole(gas::memory(gas::POKE_BASE, gas::POKE_PER_KIB, len))?;
         let bytes = self.read_outer(outer_address, len)?;
         let status = match u32::try_from(id) {
             Ok(id) if self.inner.contains(id) => match bytes
@@ -162,15 +162,15 @@ impl RefineContext {
     pub(super) fn pages(&mut self) -> Result<(), Stop> {
         let registers = *self.outer.registers();
         let (id, first, count, mode) = (registers[7], registers[8], registers[9], registers[10]);
-        self.charge(match mode {
-            0 => {
-                gas::PAGES_FREE_BASE.saturating_add(count.saturating_mul(gas::PAGES_FREE_PER_PAGE))
-            }
-            1 | 2 => gas::PAGES_ALLOC_BASE
-                .saturating_add(count.saturating_mul(gas::PAGES_ALLOC_PER_PAGE)),
-            3 | 4 => gas::PAGES_SET_MODE_BASE
-                .saturating_add(count.saturating_mul(gas::PAGES_SET_MODE_PER_PAGE)),
-            _ => gas::PAGES_INVALID,
+        self.charge_whole(match mode {
+            0 => gas::linear(gas::PAGES_FREE_BASE, gas::PAGES_FREE_PER_PAGE, count),
+            1 | 2 => gas::linear(gas::PAGES_ALLOC_BASE, gas::PAGES_ALLOC_PER_PAGE, count),
+            3 | 4 => gas::linear(
+                gas::PAGES_SET_MODE_BASE,
+                gas::PAGES_SET_MODE_PER_PAGE,
+                count,
+            ),
+            _ => Some(gas::PAGES_INVALID),
         })?;
         let status = match u32::try_from(id) {
             Ok(id) if self.inner.contains(id) => match (
@@ -209,7 +209,7 @@ impl RefineContext {
             return Err(PANIC);
         }
         let requested_gas = u64::from_le_bytes(frame[..8].try_into().expect("eight bytes"));
-        self.charge(gas::INVOKE_BASE.saturating_add(requested_gas))?;
+        self.charge_whole(gas::INVOKE_BASE.checked_add(requested_gas))?;
         let mut inner_registers = [0u64; PVM_REGISTER_COUNT];
         for (i, register) in inner_registers.iter_mut().enumerate() {
             let start = 8 + i * 8;

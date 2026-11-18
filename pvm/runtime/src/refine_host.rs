@@ -40,7 +40,9 @@ enum Stop {
 /// A host call stopping the machine on a panic.
 const PANIC: Stop = Stop::Exit(ExitReason::Panic);
 
-/// Gas for a host call the Gray Paper prices at its base cost.
+/// The VOS node profile's flat price of `gas` and `log`, smaller than the
+/// Gray Paper's (`gas` is 48 on the JAM-only host, [`jam_gas::GAS`]); every
+/// figure measured on a VOS node's refine says so.
 const BASE_CALL_GAS: Gas = 10;
 
 /// Which host serves a refine.
@@ -49,8 +51,9 @@ enum Host {
     /// A VOS node, computing the outer machine's precompiles in place when
     /// `precompiles` is set.
     Node { precompiles: bool },
-    /// The JAM-only host ([`RefineContext::try_run_jam`]), at PolkaJam's
-    /// prices: it computes no precompile.
+    /// The JAM-only host ([`RefineContext::try_run_jam`]), Gray Paper
+    /// refine at its tariff: no precompile computed, no VOS extension
+    /// served.
     Jam,
 }
 
@@ -212,6 +215,11 @@ impl RefineContext {
         &self.inner
     }
 
+    /// Whether a VOS node serves this refine, with its extensions.
+    fn serves_vos(&self) -> bool {
+        matches!(self.host, Host::Node { .. })
+    }
+
     /// Whether the outer machine's precompiles are computed in place.
     fn computes_precompiles(&self) -> bool {
         self.host == (Host::Node { precompiles: true })
@@ -229,22 +237,39 @@ impl RefineContext {
             Ok(host_call::PAGES) => self.pages(),
             Ok(host_call::INVOKE) => self.invoke(),
             Ok(host_call::EXPUNGE) => self.expunge(),
+            // VOS extensions, never on the JAM-only host whatever the
+            // context holds.
             #[cfg(feature = "std")]
-            Ok(host_call::INSTANTIATE) if self.inner.pool().is_some() => self.instantiate(),
-            Ok(host_call::STATE_READ) if self.state.is_some() => self.state_read(),
-            Ok(host_call::STATE_SCAN) if self.state.is_some() => self.state_scan(),
+            Ok(host_call::INSTANTIATE) if self.serves_vos() && self.inner.pool().is_some() => {
+                self.instantiate()
+            }
+            Ok(host_call::STATE_READ) if self.serves_vos() && self.state.is_some() => {
+                self.state_read()
+            }
+            Ok(host_call::STATE_SCAN) if self.serves_vos() && self.state.is_some() => {
+                self.state_scan()
+            }
             Ok(gp_call::GAS) => self.gas(),
-            // PolkaJam does not serve `log`.
-            Ok(gp_call::LOG) if self.host != Host::Jam => self.log(),
+            // `log` is no call of the Gray Paper's.
+            Ok(gp_call::LOG) if self.serves_vos() => self.log(),
             _ => Err(Stop::Exit(ExitReason::HostCall(id))),
         }
     }
 
     fn charge(&mut self, amount: Gas) -> Result<(), Stop> {
-        if self.outer.charge(amount) {
-            Ok(())
-        } else {
-            Err(Stop::Exit(ExitReason::OutOfGas))
+        self.charge_whole(Some(amount))
+    }
+
+    /// Charge a host call's whole gas, `None` past u64: more than the
+    /// machine holds, so out of gas.
+    fn charge_whole(&mut self, amount: Option<Gas>) -> Result<(), Stop> {
+        match amount {
+            Some(amount) if self.outer.charge(amount) => Ok(()),
+            _ => {
+                // Out of gas spends what is left, whatever the amount.
+                self.outer.charge(Gas::MAX);
+                Err(Stop::Exit(ExitReason::OutOfGas))
+            }
         }
     }
 

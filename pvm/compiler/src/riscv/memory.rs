@@ -15,9 +15,17 @@ impl TranslationContext {
         imm: i32,
         addr: u64,
     ) -> Result<(), TranspileError> {
-        if rd == 0 {
-            return Ok(());
-        } // Write to x0 is a no-op
+        // A load into x0 discards its value, not its access: it still reads
+        // memory and faults where the read faults. Every PVM register holds
+        // a RISC-V one, so the read goes into a register the code after it
+        // overwrites before reading.
+        let rd = if rd == 0 {
+            self.discard_into
+                .take()
+                .ok_or(TranspileError::DiscardedLoad { at: addr })?
+        } else {
+            rd
+        };
 
         // Fuse `load_imm rs1, K; load rd, off(rs1)` into a direct
         // absolute-address load — but ONLY when the load overwrites its own base

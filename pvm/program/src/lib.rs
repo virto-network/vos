@@ -225,7 +225,9 @@ pub fn encode_nat(value: u64, output: &mut Vec<u8>) {
     }
 }
 
+/// The `width` little-endian bytes at `offset`, `width` at most 8.
 fn read_le(data: &[u8], offset: usize, width: usize) -> Option<u64> {
+    debug_assert!(width <= 8, "a natural of at most eight bytes");
     let bytes = data.get(offset..offset.checked_add(width)?)?;
     let mut value = 0u64;
     for (index, byte) in bytes.iter().copied().enumerate() {
@@ -260,14 +262,45 @@ fn copy_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(output)
 }
 
+/// A jump-table entry: `width` little-endian bytes at `offset`, a natural
+/// of the Gray Paper's register domain (`N_R`, below 2^64), so bytes past
+/// the eighth must be zero; `None` when it is not one or the bytes are
+/// missing. Every width is admitted, 0 included (then the entry is 0).
+fn read_entry(data: &[u8], offset: usize, width: usize) -> Option<u64> {
+    let bytes = data.get(offset..offset.checked_add(width)?)?;
+    let (low, high) = bytes.split_at(width.min(8));
+    if high.iter().any(|&byte| byte != 0) {
+        return None;
+    }
+    Some(
+        low.iter()
+            .rev()
+            .fold(0, |value, &byte| value << 8 | u64::from(byte)),
+    )
+}
+
+/// Decode a compact code blob as Gray Paper v0.8.0's `deblob` reads it
+/// (`pvm.tex`): `E(|j|) ⌢ E_1(z) ⌢ E(|c|) ⌢ E_z(j) ⌢ E(c) ⌢ E(k)`.
+///
+/// The entry width `z` is any octet, and an entry is any natural of the
+/// register domain in exactly `z` bytes, leading zeroes allowed
+/// (`serialization.tex`, fixed-length integer encoding). The naturals and
+/// the bitmask have one encoding each, so their wider or padded forms are
+/// refused. An entry at or past 2^32 decodes to `u32::MAX`: neither is a
+/// basic block start of a code the host indexes with a u32, so a dynamic
+/// jump through either panics alike.
+///
+/// One host bound departs from the text: a zero-width table, whose entries
+/// take no bytes, holds at most as many entries as the blob has bytes, so
+/// a few bytes cannot ask for an unbounded table.
+///
+/// Distinct blobs may thus decode to one [`CodeBlob`]; where one program
+/// must have one blob, [`parse_canonical_standard_program`] says so.
 pub fn parse_compact_code_blob(data: &[u8]) -> Option<CodeBlob> {
     let (jump_len, jump_nat_len) = read_nat(data, 0)?;
     let mut offset = jump_nat_len;
     let width = usize::from(*data.get(offset)?);
     offset += 1;
-    if !(1..=4).contains(&width) {
-        return None;
-    }
     let (code_len, code_nat_len) = read_nat(data, offset)?;
     offset = offset.checked_add(code_nat_len)?;
     let jump_len = usize::try_from(jump_len).ok()?;
@@ -275,7 +308,11 @@ pub fn parse_compact_code_blob(data: &[u8]) -> Option<CodeBlob> {
 
     // Prove that every declared item is present before reserving from an
     // attacker-controlled count. In particular, a tiny blob declaring
-    // u64::MAX jump entries must fail here rather than panic in the allocator.
+    // u64::MAX jump entries must fail here rather than panic in the
+    // allocator.
+    if width == 0 && jump_len > data.len() {
+        return None;
+    }
     let jump_bytes = jump_len.checked_mul(width)?;
     let jump_end = offset.checked_add(jump_bytes)?;
     let code_end = jump_end.checked_add(code_len)?;
@@ -288,11 +325,9 @@ pub fn parse_compact_code_blob(data: &[u8]) -> Option<CodeBlob> {
     let mut jump_table = Vec::new();
     jump_table.try_reserve_exact(jump_len).ok()?;
     for _ in 0..jump_len {
-        jump_table.push(u32::try_from(read_le(data, offset, width)?).ok()?);
+        let entry = read_entry(data, offset, width)?;
+        jump_table.push(u32::try_from(entry).unwrap_or(u32::MAX));
         offset = offset.checked_add(width)?;
-    }
-    if usize::from(entry_size(&jump_table)) != width {
-        return None;
     }
     let code = copy_bytes(data.get(offset..code_end)?)?;
     offset = code_end;
@@ -362,6 +397,16 @@ pub fn parse_standard_program(blob: &[u8]) -> Option<StandardProgram> {
         stack_size,
         code,
     })
+}
+
+/// [`parse_standard_program`], refused unless `blob` is the program's one
+/// encoding, [`build_standard_program`]'s: for a boundary where one program
+/// has one blob, as a program whose identity is its blob's hash. A Gray
+/// Paper program whose jump table is wider than its entries need parses
+/// with [`parse_standard_program`] and is refused here.
+pub fn parse_canonical_standard_program(blob: &[u8]) -> Option<StandardProgram> {
+    let program = parse_standard_program(blob)?;
+    (build_standard_program(&program)? == blob).then_some(program)
 }
 
 pub fn build_standard_program(program: &StandardProgram) -> Option<Vec<u8>> {
@@ -483,12 +528,110 @@ mod tests {
         assert!(parse_compact_code_blob(&bytes).is_none());
     }
 
+    /// One trap, its jump table `entries`, each `width` bytes as given:
+    /// the compact blob's raw bytes, written without the writer.
+    fn raw_code(entries: &[&[u8]], width: u8) -> Vec<u8> {
+        let mut bytes = vec![entries.len() as u8, width, 1];
+        for entry in entries {
+            assert_eq!(entry.len(), usize::from(width));
+            bytes.extend_from_slice(entry);
+        }
+        bytes.extend_from_slice(&[0, 1]);
+        bytes
+    }
+
+    fn table(bytes: &[u8]) -> Option<Vec<u32>> {
+        parse_compact_code_blob(bytes).map(|code| {
+            assert_eq!((code.code, code.bitmask), (vec![0], vec![1]));
+            code.jump_table
+        })
+    }
+
+    /// An entry in more bytes than it needs reads as its value: a width is
+    /// the blob's, not the table's least.
     #[test]
-    fn nonminimal_jump_entry_width_is_rejected() {
-        // One jump-table entry with value 1 fits in one byte. Encoding it in
-        // two bytes would otherwise decode to the same CodeBlob.
-        let bytes = [1, 2, 1, 1, 0, 0, 1];
-        assert!(parse_compact_code_blob(&bytes).is_none());
+    fn padded_jump_entries_read_as_their_values() {
+        assert_eq!(table(&[1, 1, 1, 0, 0, 1]), Some(vec![0]));
+        assert_eq!(table(&[1, 2, 1, 0, 0, 0, 1]), Some(vec![0]));
+        assert_eq!(
+            table(&[2, 2, 1, 1, 0, 0x34, 0x12, 0, 1]),
+            Some(vec![1, 0x1234])
+        );
+        assert_eq!(table(&raw_code(&[&[7, 0, 0, 0]], 4)), Some(vec![7]));
+    }
+
+    /// Width 0: every entry is 0, in no bytes; with no entries any width
+    /// reads.
+    #[test]
+    fn a_zero_width_table_holds_zeros() {
+        assert_eq!(table(&[3, 0, 1, 0, 1]), Some(vec![0, 0, 0]));
+        assert_eq!(table(&[0, 0, 1, 0, 1]), Some(vec![]));
+        assert_eq!(table(&[0, 200, 1, 0, 1]), Some(vec![]));
+        // More zero-width entries than the blob has bytes: the host's bound.
+        assert_eq!(table(&[6, 0, 1, 0, 1]), None);
+    }
+
+    /// Widths 5 to 8 read a whole register; an entry past 2^32 is no block
+    /// start, as `u32::MAX` is none.
+    #[test]
+    fn wide_entries_read_up_to_a_register() {
+        for width in 5..=8u8 {
+            let mut entry = vec![0u8; usize::from(width)];
+            entry[0] = 9;
+            assert_eq!(table(&raw_code(&[&entry], width)), Some(vec![9]), "{width}");
+            entry[usize::from(width) - 1] = 1;
+            assert_eq!(
+                table(&raw_code(&[&entry], width)),
+                Some(vec![u32::MAX]),
+                "{width}: past 2^32"
+            );
+        }
+        assert_eq!(
+            table(&raw_code(&[&[0xff; 4]], 4)),
+            Some(vec![u32::MAX]),
+            "2^32 - 1 itself"
+        );
+    }
+
+    /// Past 8 bytes an entry is a register's natural only if its bytes past
+    /// the eighth are zero.
+    #[test]
+    fn entries_past_a_register_are_refused() {
+        for width in [9u8, 16, 255] {
+            let mut entry = vec![0u8; usize::from(width)];
+            entry[0] = 3;
+            assert_eq!(table(&raw_code(&[&entry], width)), Some(vec![3]), "{width}");
+            entry[8] = 1;
+            assert_eq!(table(&raw_code(&[&entry], width)), None, "{width}");
+            entry[8] = 0;
+            entry[usize::from(width) - 1] = 0x80;
+            assert_eq!(table(&raw_code(&[&entry], width)), None, "{width}");
+        }
+    }
+
+    /// The canonical reader takes the writer's bytes alone: a padded
+    /// table, a zero width or a saturated entry is the same program in
+    /// other bytes.
+    #[test]
+    fn the_canonical_reader_takes_the_writers_bytes_alone() {
+        let program = |code: Vec<u8>| {
+            let mut blob = vec![0; 11];
+            blob.extend_from_slice(&(code.len() as u32).to_le_bytes());
+            blob.extend_from_slice(&code);
+            blob
+        };
+        let canonical = program(vec![1, 1, 1, 0, 0, 1]);
+        assert!(parse_canonical_standard_program(&canonical).is_some());
+        for other in [
+            vec![1, 2, 1, 0, 0, 0, 1],
+            vec![1, 0, 1, 0, 1],
+            raw_code(&[&[0, 0, 0, 0, 1]], 5),
+            vec![0, 7, 1, 0, 1],
+        ] {
+            let blob = program(other);
+            assert!(parse_standard_program(&blob).is_some());
+            assert!(parse_canonical_standard_program(&blob).is_none());
+        }
     }
 
     /// Every length class of a natural (GP eq C.1) round-trips at its

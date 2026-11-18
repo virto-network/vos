@@ -5,9 +5,11 @@
 //! they live under `benches/` (out of `cargo test`) and run serially, one prove
 //! at a time, so a single large trace never competes for RAM with another.
 //!
-//! Run the default (safe) set:
+//! Run the default set (log sizes up to 14):
 //!     cargo bench --bench prove
-//! Run specific benchmarks by name substring (e.g. the heavy ones):
+//! Run specific benchmarks by name substring, e.g. the heavy ones, which
+//! are not in the default set: `log16` (~16 GB) and `scale_sweep` (log
+//! sizes 10 to 19):
 //!     cargo bench --bench prove -- log16
 //!     cargo bench --bench prove -- profile_log14 scale_sweep
 //!
@@ -79,8 +81,9 @@ mod imp {
         ]
     }
 
-    /// The set run when no filter is given: the standard ladder and the scale
-    /// sweep, but not the >=16 GB variant (run it by name).
+    /// The set run when no filter is given: the ladder up to log size 14 and
+    /// its profile. The ~16 GB log-16 run and the scale sweep, which goes on
+    /// to log size 19, run only by name.
     const DEFAULT: &[&str] = &[
         "bench_prove_log05",
         "bench_prove_log08",
@@ -88,7 +91,6 @@ mod imp {
         "bench_prove_log12",
         "bench_prove_log14",
         "profile_log14",
-        "scale_sweep",
     ];
 
     pub fn run(args: Vec<String>) {

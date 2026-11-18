@@ -307,7 +307,7 @@ impl CpuColumns {
             ));
             uses.push(Use::Op(super::super::classify::classify_opcode(op)));
             if op == Opcode::Ecalli {
-                let skip = vos_pvm::gas_cost::skip_distance(bitmask, pc);
+                let skip = vos_pvm::skip(bitmask, pc);
                 if let vos_pvm::args::Args::Imm { imm } =
                     vos_pvm::args::decode_args(code, pc, skip, category)
                     && let Ok(id) = u32::try_from(imm)

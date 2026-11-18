@@ -116,7 +116,7 @@ pub fn code_chips(code: &[u8], bitmask: &[u8]) -> u32 {
         };
         chips |= opcode_chips(op);
         if op == Opcode::Ecalli {
-            let skip = vos_pvm::gas_cost::skip_distance(bitmask, pc);
+            let skip = vos_pvm::skip(bitmask, pc);
             if let vos_pvm::args::Args::Imm { imm } =
                 vos_pvm::args::decode_args(code, pc, skip, category)
             {

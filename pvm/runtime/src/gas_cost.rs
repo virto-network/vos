@@ -37,25 +37,13 @@ fn gas_register_roles(opcode: u8, raw_a: u8, raw_b: u8, raw_d: u8) -> (u8, u8, u
 /// not validated instruction fetches, so neither position must be in bounds or
 /// marked as an instruction start.
 fn branch_cost(code: &[u8], bitmask: &[u8], pc: usize, target: usize) -> u32 {
-    let fallthrough = pc.saturating_add(1 + skip_distance(bitmask, pc));
+    let fallthrough = pc.saturating_add(1 + crate::skip(bitmask, pc));
     let zero_extended = |index: usize| code.get(index).copied().unwrap_or(0);
     if matches!(zero_extended(target), 0 | 2) || matches!(zero_extended(fallthrough), 0 | 2) {
         1
     } else {
         20
     }
-}
-
-/// Compute skip distance (bytes to next instruction start).
-pub fn skip_distance(bitmask: &[u8], pc: usize) -> usize {
-    for j in 0..25 {
-        let idx = pc + 1 + j;
-        let bit = if idx < bitmask.len() { bitmask[idx] } else { 1 };
-        if bit == 1 {
-            return j;
-        }
-    }
-    24
 }
 
 // ============================================================================
@@ -93,18 +81,7 @@ fn reg_bit(r: u8) -> u16 {
 /// Extract branch target from raw code bytes (for gas cost computation).
 /// Works for both OneRegImmOffset and TwoRegOneOffset categories.
 fn extract_branch_target_raw(code: &[u8], bitmask: &[u8], pc: usize) -> usize {
-    let skip = {
-        // No instruction start within 25 bytes → 24 (GP F_skip cap).
-        let mut s = 24;
-        for j in 0..25 {
-            let idx = pc + 1 + j;
-            if idx >= bitmask.len() || bitmask[idx] == 1 {
-                s = j;
-                break;
-            }
-        }
-        s
-    };
+    let skip = crate::skip(bitmask, pc);
     let opcode = code[pc];
     // For branches, use the existing decode_args to get the offset
     let cat = crate::instruction::Opcode::from_byte(opcode)
@@ -1759,7 +1736,7 @@ mod tests {
                 buf[0] = opcode;
                 buf[1] = reg_byte1;
                 buf[2] = reg_byte2;
-                let skip = crate::interpreter::skip_for_bitmask(&bitmask, 0);
+                let skip = crate::skip(&bitmask, 0);
                 let (ra, rb, rd) = (buf[1] & 0x0F, (buf[1] >> 4) & 0x0F, buf[2]);
 
                 // Compare the ACTUAL simulator cost of a single-instruction
@@ -1836,7 +1813,7 @@ mod tests {
                 let args = crate::args::decode_args(
                     &code,
                     pc,
-                    skip_distance(&bitmask, pc),
+                    crate::skip(&bitmask, pc),
                     opcode.category(),
                 );
                 sim.feed(&fast_cost_lut_regs(
@@ -1931,7 +1908,7 @@ mod tests {
         let args = crate::args::decode_args(
             &code,
             0,
-            skip_distance(&bitmask, 0),
+            crate::skip(&bitmask, 0),
             crate::instruction::Opcode::BranchEq.category(),
         );
         let raw = fast_cost_from_raw(170, 0, 0, 0, 0, &code, &bitmask);
@@ -2012,7 +1989,7 @@ mod tests {
             if fc.is_terminator {
                 break;
             }
-            let skip = skip_distance(bitmask, pc);
+            let skip = crate::skip(bitmask, pc);
             pc += 1 + skip;
         }
         sim.flush_and_get_cost()
@@ -2051,16 +2028,6 @@ mod proptests {
     use proptest::prelude::*;
 
     proptest! {
-        /// skip_distance never exceeds 24.
-        #[test]
-        fn skip_distance_bounded(
-            bitmask in proptest::collection::vec(0u8..=1, 1..64),
-            pc in 0usize..63,
-        ) {
-            let dist = skip_distance(&bitmask, pc);
-            prop_assert!(dist <= 24);
-        }
-
         /// reg_bit always returns a power of two (single bit set).
         #[test]
         fn reg_bit_is_power_of_two(r in 0u8..16) {

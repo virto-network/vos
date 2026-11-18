@@ -27,6 +27,9 @@ pub const ACCUMULATE_ENTRY: u32 = 5;
 /// `read` and `write` name the calling service with this id.
 pub const SELF_SERVICE: u64 = u64::MAX;
 
+/// The VOS accumulate profile's flat price of every call, smaller than the
+/// Gray Paper's tariff (`gas` 48, `write` 2,442 and its length terms): a
+/// gas figure of this host is the VOS profile's, not a JAM node's.
 const BASE_CALL_GAS: Gas = 10;
 
 /// The agent's storage, as accumulate's `read` and `write` see it.

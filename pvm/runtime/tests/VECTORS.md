@@ -1,6 +1,6 @@
 # PVM conformance vectors
 
-The runtime keeps two checked-in contracts, both for Gray Paper v0.8.0:
+The runtime keeps three checked-in contracts, all for Gray Paper v0.8.0:
 
 - `vectors-v080/*.gp080.json` is the instruction corpus. Its 170
   independently expected cases place every one of the 139 valid opcodes as a
@@ -22,6 +22,18 @@ The runtime keeps two checked-in contracts, both for Gray Paper v0.8.0:
   validation of both branch successors before selection, implicit trailing
   traps, and the fact that `unlikely` and `ecalli` are not in the
   termination set.
+
+- `boundaries.rs` holds the program and invocation boundaries at the
+  public API, each program written out byte by byte (never through the
+  crate's writer) and each outcome read from the text: `deblob`'s jump
+  table at every width (zero, padded, five to eight bytes, past a
+  register), the `machine` call's reader, Ψ's uncharged panic on an entry
+  that is no instruction start (past the code, an operand byte) against an
+  interior instruction start, the recompiler's own code bound against the
+  interpreter and the service-code bound `W_C` at service admission, and
+  Ψ_M's halt output (an empty length whatever its pointer, an unreadable
+  range empty, an embedder's bound its own refusal). They run on the
+  interpreter and, where the host has it, the recompiler.
 
 The v0.8 opcode, instruction-category, and termination-set manifests are
 frozen in `pvm_vectors.rs`. They are transcribed from Appendix A.5 and

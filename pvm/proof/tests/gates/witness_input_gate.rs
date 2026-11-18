@@ -50,6 +50,7 @@ fn side_note() -> SideNote {
     trace_kernel(&blob, &[1, 2, 3, 4, 5], 1_000_000)
         .expect("halts")
         .side_note
+        .expand()
 }
 
 /// The first witness-input row of the CPU's trace that wrote bytes.

@@ -232,6 +232,79 @@ impl PvmStep {
     }
 }
 
+/// A step as a run's side note holds it: a full [`PvmStep`] (a hand-built
+/// trace, a forged one, the tracer's expanded) or a [`CompactStep`] (the
+/// tracer's own record). What a run is cut by
+/// ([`crate::segment::segment_bounds_budgeted`]) and its windows built from
+/// ([`crate::segment::SegmentCursor`]): its timestamp, its memory accesses
+/// and, from the register file entering it, the full step a window proves.
+pub trait TraceStep: Clone {
+    fn timestamp(&self) -> u64;
+    fn mem_read(&self) -> Option<&MemAccess>;
+    fn mem_write(&self) -> Option<&MemAccess>;
+    fn witness(&self) -> Option<&WitnessWrite>;
+    /// The register file leaving the step, `regs` the file entering it.
+    fn regs_after(&self, regs: [u64; NUM_REGS]) -> [u64; NUM_REGS];
+    /// The register file entering step `at` of `steps`, `threaded` the
+    /// entering file with every earlier step's write applied: a full step's
+    /// own snapshot, which a forged trace may set apart from its
+    /// predecessor's, else `threaded`.
+    fn entering(steps: &[Self], at: usize, threaded: [u64; NUM_REGS]) -> [u64; NUM_REGS];
+    /// The full steps `steps`, `regs` the register file entering the first.
+    fn full(steps: &[Self], regs: [u64; NUM_REGS]) -> alloc::vec::Vec<PvmStep>;
+}
+
+impl TraceStep for PvmStep {
+    fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+    fn mem_read(&self) -> Option<&MemAccess> {
+        self.mem_read.as_ref()
+    }
+    fn mem_write(&self) -> Option<&MemAccess> {
+        self.mem_write.as_ref()
+    }
+    fn witness(&self) -> Option<&WitnessWrite> {
+        self.witness.as_deref()
+    }
+    fn regs_after(&self, _: [u64; NUM_REGS]) -> [u64; NUM_REGS] {
+        self.regs_after
+    }
+    fn entering(steps: &[Self], at: usize, _: [u64; NUM_REGS]) -> [u64; NUM_REGS] {
+        steps[at].regs_before
+    }
+    fn full(steps: &[Self], _: [u64; NUM_REGS]) -> alloc::vec::Vec<PvmStep> {
+        steps.to_vec()
+    }
+}
+
+impl TraceStep for CompactStep {
+    fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+    fn mem_read(&self) -> Option<&MemAccess> {
+        self.mem_read.as_ref()
+    }
+    fn mem_write(&self) -> Option<&MemAccess> {
+        self.mem_write.as_ref()
+    }
+    fn witness(&self) -> Option<&WitnessWrite> {
+        self.witness.as_deref()
+    }
+    fn regs_after(&self, mut regs: [u64; NUM_REGS]) -> [u64; NUM_REGS] {
+        if let Some(write) = self.reg_write {
+            regs[write.index as usize] = write.value;
+        }
+        regs
+    }
+    fn entering(_: &[Self], _: usize, threaded: [u64; NUM_REGS]) -> [u64; NUM_REGS] {
+        threaded
+    }
+    fn full(steps: &[Self], regs: [u64; NUM_REGS]) -> alloc::vec::Vec<PvmStep> {
+        expand_steps(steps, regs)
+    }
+}
+
 /// Expand a run of compact steps into full steps, threading the register
 /// file forward from `entering_regs`: `regs_before` of each step is
 /// `regs_after` of the previous (the tracer's continuity invariant).

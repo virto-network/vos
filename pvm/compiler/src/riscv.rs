@@ -56,6 +56,11 @@ pub(crate) struct TranslationContext {
     /// names), a return address or a code address loaded as a value.
     /// Resolved during `apply_fixups` to patch jump table entries.
     return_fixups: Vec<(usize, u64)>,
+    /// The jump-table entry of each RISC-V code address given one, in the
+    /// order they were first needed: a code address has one PVM value
+    /// whether an immediate, a return address or a pointer in data names
+    /// it, so two pointers to one function compare equal.
+    code_slots: HashMap<u64, usize>,
     /// Pending AUIPC: (rd, computed_address). Used to pair with the next JALR.
     pending_auipc: Option<(u8, u64)>,
     /// Pending LUI: (rd, upper_imm). Used to fuse LUI+ADDI into single load_imm.
@@ -76,6 +81,9 @@ pub(crate) struct TranslationContext {
     pub(crate) code_ranges: Vec<(u64, u64)>,
     /// Each `ecalli` emitted: the RISC-V address of its `ecall`, and its id.
     pub(crate) host_calls: Vec<(u64, u32)>,
+    /// The register a load into x0 at the next instruction may read into:
+    /// one the code after it writes before reading.
+    pub(crate) discard_into: Option<u8>,
     /// Point a branch whose target was never translated at a trap, rather
     /// than leave it unresolved: a kernel's code, its unreachable targets
     /// pruned.
@@ -132,8 +140,10 @@ impl TranslationContext {
             self.emit_load_imm(auipc_rd, auipc_val as i64)?;
         }
 
-        // Flush pending LUI if this isn't an OP-IMM (ADDI) that consumes it.
+        // Flush pending LUI if this isn't an OP-IMM (ADDI) or JALR that
+        // consumes it.
         if opcode != op::OP_IMM
+            && opcode != op::JALR
             && let Some((lui_rd, lui_val)) = self.pending_lui.take()
         {
             self.emit_load_imm(lui_rd, lui_val)?;
@@ -375,13 +385,20 @@ impl TranslationContext {
         Ok(())
     }
 
-    /// Reserve a jump-table entry that [`Self::apply_fixups`] points at the
-    /// translation of RISC-V address `target`, and return the address a
+    /// The jump-table entry [`Self::apply_fixups`] points at the translation
+    /// of RISC-V address `target`, reserved on first use, as the address a
     /// djump to it takes.
     fn jump_table_slot(&mut self, target: u64) -> u32 {
-        let index = self.jump_table.len();
-        self.jump_table.push(0);
-        self.return_fixups.push((index, target));
+        let index = match self.code_slots.get(&target) {
+            Some(&index) => index,
+            None => {
+                let index = self.jump_table.len();
+                self.jump_table.push(0);
+                self.return_fixups.push((index, target));
+                self.code_slots.insert(target, index);
+                index
+            }
+        };
         jump_table_address(index)
     }
 
@@ -405,27 +422,32 @@ impl TranslationContext {
         crate::linker::in_ranges(&self.code_ranges, addr)
     }
 
-    /// Build a mapping from RISC-V code addresses to PVM jump table addresses.
-    ///
-    /// Only creates jump table entries for the given `targets` — the set of
-    /// RISC-V addresses actually referenced as function pointers (e.g. from
-    /// absolute relocations in data sections like vtables). Returns a map of
-    /// RISC-V address → jump table address (= (index+1)*2).
-    ///
-    /// This is needed to fix indirect calls through function pointers stored in
-    /// data sections (vtables, callbacks, etc.). The PVM's `jump_ind` instruction
-    /// expects jump table addresses, not raw code offsets.
+    /// Map each of `targets`, the RISC-V code addresses data holds as code
+    /// pointers (vtables, callbacks, switch tables), to its jump-table
+    /// address (= (index+1)*2): the PVM's `jump_ind` takes jump-table
+    /// addresses, not code offsets. A target the code already gave an entry
+    /// keeps it, translated or not (a pruned kernel function's entry is the
+    /// shared trap), so data and code hold one value for it; a new one gets
+    /// an entry in `targets`' order. Run after [`Self::apply_fixups`]; a
+    /// target neither translated nor given an entry by the code has none.
     pub(crate) fn build_function_pointer_map(
         &mut self,
         targets: &BTreeSet<u64>,
     ) -> HashMap<u64, u32> {
         let mut rv_to_jt = HashMap::new();
         for rv_addr in targets {
-            if let Some(&pvm_offset) = self.address_map.get(rv_addr) {
-                let jt_idx = self.jump_table.len();
-                self.jump_table.push(pvm_offset);
-                rv_to_jt.insert(*rv_addr, jump_table_address(jt_idx));
-            }
+            let index = match self.code_slots.get(rv_addr) {
+                Some(&index) => index,
+                None => {
+                    let Some(&pvm_offset) = self.address_map.get(rv_addr) else {
+                        continue;
+                    };
+                    self.jump_table.push(pvm_offset);
+                    self.code_slots.insert(*rv_addr, self.jump_table.len() - 1);
+                    self.jump_table.len() - 1
+                }
+            };
+            rv_to_jt.insert(*rv_addr, jump_table_address(index));
         }
         rv_to_jt
     }

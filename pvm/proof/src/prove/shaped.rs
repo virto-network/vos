@@ -5,6 +5,7 @@ use super::{
     ProveRequest, SegmentError, Sizes, Target, install_thread_pool,
     prepare_side_note_for_verification, prove_with,
 };
+use crate::core::step::TraceStep;
 use crate::format::Format;
 use crate::framework::MachineProverComponent;
 use crate::pcs::Commitment;
@@ -87,19 +88,22 @@ pub struct KernelSegment {
     pub proof: Proof,
 }
 
-/// A kernel's run, traced whole in `full`, proved under `format` over
-/// `shape`: cut by class `cut`'s budgets, its steps and its pages
-/// ([`crate::segment::segment_bounds_budgeted`]), and each window proved at
-/// the first class whose sizes hold its rows. A class is tried by proving
-/// at it: its traces are generated once, at its sizes, and a chip whose
-/// rows need more refuses it before any commitment; a class of fewer steps
-/// than the window's is skipped, as its CPU holds a row a step. A window
-/// none holds is cut in half, down to one step; a step no class holds is
-/// refused with [`SegmentError::Shape`]: one touching more pages than the
-/// largest class's (24, or 17 for a shape holding the Poseidon2 chip), as
-/// a witness-input call writing more than about 64 KiB at once.
-pub fn prove_kernel(
-    full: &SideNote,
+/// A kernel's run, traced whole in `full` (its steps compact, as
+/// [`crate::kernel::trace_kernel`] records them, or full), proved under
+/// `format` over `shape`: cut by class `cut`'s budgets, its steps and its
+/// pages ([`crate::segment::segment_bounds_budgeted`]), and each window
+/// proved at the first class whose sizes hold its rows. A class is tried by
+/// proving at it: the window's side note is built anew for each class tried
+/// (its steps expanded, its records sliced, its program shared, not
+/// copied), its traces generated once, at the class's sizes, and a chip
+/// whose rows need more refuses it before any commitment; a class of fewer
+/// steps than the window's is skipped, as its CPU holds a row a step. A
+/// window none holds is cut in half, down to one step; a step no class
+/// holds is refused with [`SegmentError::Shape`]: one touching more pages
+/// than the largest class's (24, or 17 for a shape holding the Poseidon2
+/// chip), as a witness-input call writing more than about 64 KiB at once.
+pub fn prove_kernel<S: TraceStep>(
+    full: &SideNote<S>,
     shape: &KernelShape,
     cut: usize,
     format: &'static Format,
@@ -137,8 +141,8 @@ pub fn prove_kernel(
 /// Window `[a, b)` proved at the first class of `shape` that holds its
 /// rows, and the class; or the overflow of the last class tried, a
 /// [`SegmentError::Shape`] whose size is past its pin.
-fn prove_at_first_class(
-    cursor: &mut crate::segment::SegmentCursor<'_>,
+fn prove_at_first_class<S: TraceStep>(
+    cursor: &mut crate::segment::SegmentCursor<'_, S>,
     (a, b): (usize, usize),
     shape: &KernelShape,
     format: &'static Format,

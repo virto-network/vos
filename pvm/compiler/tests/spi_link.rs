@@ -612,3 +612,290 @@ fn refine_convention_guest_round_trips_args() {
         Some(&RO_CONST.to_le_bytes()[..])
     );
 }
+
+// ---------------------------------------------------------------------------
+// Code pointers, indirect jumps and discarded loads keep RISC-V's meaning.
+// ---------------------------------------------------------------------------
+
+const T0_PVM: usize = 2;
+const T1_PVM: usize = 3;
+const A2_PVM: usize = 9;
+const A3: u32 = 13; // → φ10
+const A4: u32 = 14; // → φ11
+const A5: u32 = 15; // → φ12
+
+fn i_op(f3: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
+    ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | 0x13
+}
+fn ori(rd: u32, rs1: u32, imm: i32) -> u32 {
+    i_op(6, rd, rs1, imm)
+}
+fn andi(rd: u32, rs1: u32, imm: i32) -> u32 {
+    i_op(7, rd, rs1, imm)
+}
+fn xor(rd: u32, rs1: u32, rs2: u32) -> u32 {
+    (rs2 << 20) | (rs1 << 15) | (4 << 12) | (rd << 7) | 0x33
+}
+fn auipc(rd: u32, imm20: u32) -> u32 {
+    (imm20 << 12) | (rd << 7) | 0x17
+}
+fn nop() -> u32 {
+    addi(0, 0, 0)
+}
+
+/// `text` at [`TEXT_VADDR`], with `rodata` at [`RO_VADDR`] when given.
+fn text_elf(text: &[u32], rodata: Option<&[u8]>) -> Vec<u8> {
+    let text = assemble(text);
+    let mut sections: Vec<Section<'_>> = vec![(".text", 1, 0x6, TEXT_VADDR, &text)];
+    if let Some(rodata) = rodata {
+        sections.push((".rodata", 1, 0x2, RO_VADDR, rodata));
+    }
+    build_elf(TEXT_VADDR, &sections)
+}
+
+/// `blob` run on both backends, each run's exit and registers, the two
+/// the same.
+fn run_both(blob: &[u8]) -> (ExitReason, [u64; 13]) {
+    use vos_pvm::PvmBackend;
+    let mut runs = Vec::new();
+    for backend in [PvmBackend::ForceInterpreter, PvmBackend::Default] {
+        let mut machine =
+            refine::Machine::load_with_backend(blob, &[], GAS, MemoryModel::Auto, backend)
+                .expect("loads");
+        let exit = machine.resume();
+        let invocation = machine.finish(exit);
+        runs.push((invocation.exit, invocation.registers));
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "the interpreter and the default backend differ"
+    );
+    runs.remove(0)
+}
+
+/// One function's address taken at two instruction sites, held in data,
+/// and passed as a return address: each form is one value, so pointers to
+/// one function compare equal, and every one of them dispatches to it.
+#[test]
+fn a_code_address_has_one_value_in_every_form() {
+    const F: u64 = 64;
+    let text = [
+        addi(T2, RA, 0),   //  0: preserve the host return address
+        auipc(T0, 0),      //  4
+        addi(T0, T0, 60),  //  8: t0 = &F, materialized
+        auipc(T1, 0),      // 12
+        addi(T1, T1, 52),  // 16: t1 = &F, materialized at another site
+        lui(A2, 0x10),     // 20
+        ld(A2, A2, 0),     // 24: a2 = &F, from data
+        jal(RA, 52),       // 28: call G (80), returning to 32
+        jalr(RA, T0, 0),   // 32: F through each pointer
+        jalr(RA, T1, 0),   // 36
+        jalr(RA, A2, 0),   // 40
+        addi(RA, T2, 0),   // 44
+        ret(),             // 48
+        nop(),             // 52
+        nop(),             // 56
+        nop(),             // 60
+        addi(A4, A4, 1),   // 64: F counts its calls
+        ret(),             // 68
+        nop(),             // 72
+        nop(),             // 76
+        auipc(A3, 0),      // 80: G: a3 = the address 32, materialized
+        addi(A3, A3, -48), // 84
+        xor(A5, RA, A3),   // 88: zero iff the return address is that value
+        ret(),             // 92
+    ];
+    let elf = text_elf(&text, Some(&(TEXT_VADDR + F).to_le_bytes()));
+    let blob = link_elf_spi(&elf).expect("links");
+    let (exit, registers) = run_both(&blob);
+    assert_eq!(exit, ExitReason::Halt);
+    assert_eq!(
+        registers[T0_PVM], registers[T1_PVM],
+        "two immediates of one address"
+    );
+    assert_eq!(
+        registers[T0_PVM], registers[A2_PVM],
+        "an immediate and a data pointer"
+    );
+    assert_eq!(
+        registers[12], 0,
+        "a return address and the same address as an immediate"
+    );
+    assert_eq!(registers[11], 3, "every pointer reaches the function");
+
+    let program = parse_standard_program(&blob).expect("parses");
+    let mut entries = program.code.jump_table.clone();
+    entries.sort_unstable();
+    entries.dedup();
+    assert_eq!(
+        entries.len(),
+        program.code.jump_table.len(),
+        "one entry per code address"
+    );
+}
+
+/// `jalr` jumps to `(rs1 + imm) & !1`: a displacement of one, a pointer
+/// with bit 0 set (a tagged pointer) and the two together reach the
+/// function, from a call and from a jump, through a call whose link
+/// register is its base, and the registers keep their values, the tagged
+/// base included.
+#[test]
+fn an_indirect_jump_clears_bit_zero_of_its_target() {
+    let text = [
+        addi(T2, RA, 0),  //  0: preserve the host return address
+        auipc(T0, 0),     //  4
+        addi(T0, T0, 76), //  8: t0 = &F (80)
+        jalr(RA, T0, 1),  // 12: displacement one
+        ori(T1, T0, 1),   // 16: t1 = &F | 1
+        jalr(RA, T1, 0),  // 20: a tagged pointer
+        jalr(RA, T1, -1), // 24: a tagged pointer, displacement -1
+        auipc(RA, 0),     // 28
+        addi(RA, RA, 12), // 32: ra = &40
+        jalr(0, T1, 0),   // 36: a jump through a tagged pointer; F returns to 40
+        addi(RA, T0, 0),  // 40: ra = &F
+        jalr(RA, RA, 0),  // 44: its target read before its link is written
+        auipc(T0, 0),     // 48
+        addi(T0, T0, 44), // 52: t0 = &H (92)
+        jalr(T0, T0, 0),  // 56: H returns through t0
+        addi(RA, T2, 0),  // 60
+        ret(),            // 64
+        nop(),            // 68
+        nop(),            // 72
+        nop(),            // 76
+        addi(A4, A4, 1),  // 80: F counts its calls
+        andi(A5, T1, 1),  // 84: and reads t1's tag
+        ret(),            // 88
+        addi(A4, A4, 1),  // 92: H counts its calls
+        jalr(0, T0, 0),   // 96
+    ];
+    let blob = link_elf_spi(&text_elf(&text, None)).expect("links");
+    let (exit, registers) = run_both(&blob);
+    assert_eq!(exit, ExitReason::Halt, "{registers:?}");
+    assert_eq!(registers[11], 6, "every jump reaches its function");
+    assert_eq!(registers[12], 1, "the tagged base keeps bit 0");
+    assert_eq!(registers[T1_PVM] & 1, 1);
+}
+
+/// A displacement of ±1 of the other parity names the source's address
+/// two bytes past the pointer's, where the source faults: -1 from an even
+/// pointer and +1 from a tagged one stop, from a call and from a jump,
+/// and never reach a neighbouring function.
+#[test]
+fn a_displacement_of_the_other_parity_stops() {
+    for (tag, imm) in [(0, -1), (1, 1)] {
+        for rd in [RA, 0] {
+            let text = [
+                auipc(T0, 0),      //  0
+                addi(T0, T0, 20),  //  4: t0 = &F (20)
+                ori(T0, T0, tag),  //  8
+                jalr(rd, T0, imm), // 12
+                ret(),             // 16
+                addi(A4, A4, 1),   // 20: F, and its neighbours either side
+                addi(A4, A4, 1),   // 24
+                ret(),             // 28
+            ];
+            let blob = link_elf_spi(&text_elf(&text, None)).expect("links");
+            let (exit, registers) = run_both(&blob);
+            assert!(
+                matches!(exit, ExitReason::Panic),
+                "tag {tag}, displacement {imm}, rd {rd}: {exit:?}"
+            );
+            assert_eq!(registers[11], 0, "no function ran");
+        }
+    }
+}
+
+/// A target known at translation is cleared alike: an AUIPC or a LUI with
+/// the `jalr` after it, the LUI's register keeping its value.
+#[test]
+fn a_static_indirect_target_clears_bit_zero() {
+    let target = TEXT_VADDR + 40;
+    let text = [
+        addi(T2, RA, 0),                           //  0
+        auipc(T0, 0),                              //  4
+        jalr(RA, T0, 37),                          //  8: 4 + 37 = 41, so 40
+        lui(T1, (target >> 12) as u32),            // 12
+        jalr(RA, T1, (target & 0xfff) as i32 + 1), // 16: 40 again, t1 kept
+        addi(RA, T2, 0),                           // 20
+        ret(),                                     // 24
+        nop(),                                     // 28
+        nop(),                                     // 32
+        nop(),                                     // 36
+        addi(A4, A4, 1),                           // 40
+        ret(),                                     // 44
+    ];
+    let blob = link_elf_spi(&text_elf(&text, None)).expect("links");
+    let (exit, registers) = run_both(&blob);
+    assert_eq!(exit, ExitReason::Halt);
+    assert_eq!(registers[11], 2);
+    assert_eq!(
+        registers[T1_PVM],
+        target & !0xfff,
+        "the LUI's register keeps its value"
+    );
+}
+
+/// A displacement of two or more from a register names another
+/// instruction of the source and another entry of the jump table: the
+/// compiler refuses it.
+#[test]
+fn an_unrepresentable_indirect_displacement_is_refused() {
+    for imm in [2, -2, 4, 2047] {
+        let text = [jalr(RA, T0, imm), ret()];
+        assert!(
+            matches!(
+                link_elf_spi(&text_elf(&text, None)),
+                Err(TranspileError::IndirectDisplacement { imm: refused, .. }) if refused == imm
+            ),
+            "displacement {imm}"
+        );
+    }
+}
+
+/// A load into x0 still reads memory: it halts where its address is
+/// readable, leaving every register as it was, and faults where it is
+/// not, x0 its base or not; with no register free to take its value the
+/// compiler refuses it.
+#[test]
+fn a_discarded_load_keeps_its_access() {
+    let ld0 = |rs1: u32, imm: i32| ld(0, rs1, imm);
+    // Readable: the stack below sp, and the ro data.
+    for load in [ld0(SP, -8), ld0(T1, 0), lbu(0, SP, -1)] {
+        let text = [
+            lui(T1, 0x10),   // t1 = the ro base
+            addi(A3, 0, 7),  // a3 = 7
+            load,            // discarded
+            addi(A4, 0, 1),  // a4 written before it is read: free
+            addi(A5, A3, 0), // a3 still 7
+            ret(),
+        ];
+        let blob = link_elf_spi(&text_elf(&text, Some(&RO_CONST.to_le_bytes()))).expect("links");
+        let (exit, registers) = run_both(&blob);
+        assert_eq!(exit, ExitReason::Halt);
+        assert_eq!(registers[T1_PVM], RO_VADDR, "the base keeps its value");
+        assert_eq!(registers[12], 7);
+    }
+    // Unreadable: below 64 KiB, through a register and through x0.
+    for load in [ld0(T1, 0x7f8), ld0(0, 0x7f8), lbu(0, 0, 8)] {
+        let text = [addi(T1, 0, 0), load, addi(A4, 0, 1), ret()];
+        let blob = link_elf_spi(&text_elf(&text, None)).expect("links");
+        let (exit, _) = run_both(&blob);
+        assert!(
+            matches!(exit, ExitReason::Panic | ExitReason::PageFault(_)),
+            "a discarded load of an unreadable address stops: {exit:?}"
+        );
+    }
+    // No register written before control flow, or every one read before
+    // it is written: nothing takes the value.
+    let every_read: Vec<u32> = [ld0(SP, -8)]
+        .into_iter()
+        .chain([RA, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].map(|r| sd(r, SP, -16)))
+        .chain([addi(A5, A5, 1), ret()])
+        .collect();
+    for text in [vec![ld0(SP, -8), ret()], every_read] {
+        assert!(matches!(
+            link_elf_spi(&text_elf(&text, None)),
+            Err(TranspileError::DiscardedLoad { .. })
+        ));
+    }
+}

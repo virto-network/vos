@@ -114,6 +114,13 @@ name = "prove"
 harness = false
 required-features = ["prover"]
 
+# A kernel's run with precompiles cut into windows and proved: time and peak
+# memory (see benches/segments.rs; `just bench-segments`).
+[[bench]]
+name = "segments"
+harness = false
+required-features = ["prover"]
+
 # Poseidon2-M31 hashing throughput (see benches/poseidon2.rs).
 [[bench]]
 name = "poseidon2"

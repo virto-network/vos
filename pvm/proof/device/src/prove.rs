@@ -212,7 +212,7 @@ impl ReferenceProgram<'_> {
 
 /// `kernel`'s run on `arguments`, traced to its halt within `gas`.
 fn trace(kernel: &[u8], arguments: &[u8], gas: u64) -> Result<SideNote, Error> {
-    trace_run(kernel, arguments, gas).map(|trace| trace.side_note)
+    trace_run(kernel, arguments, gas).map(|trace| trace.side_note.expand())
 }
 
 /// [`trace`], the whole run: [`Error::Layout`] for a blob that is not a
@@ -224,8 +224,13 @@ fn trace_run(
     gas: u64,
 ) -> Result<vos_pvm_proof::kernel::KernelTrace, Error> {
     vos_pvm_proof::kernel::trace_kernel(blob, arguments, gas).map_err(|error| match error {
-        KernelTraceError::Program | KernelTraceError::Transfer => Error::Layout,
+        KernelTraceError::Program
+        | KernelTraceError::NotCanonical
+        | KernelTraceError::Code
+        | KernelTraceError::Transfer => Error::Layout,
         KernelTraceError::Input | KernelTraceError::Unread => Error::Arguments,
-        KernelTraceError::Exit | KernelTraceError::Output => Error::Halt,
+        KernelTraceError::Exit | KernelTraceError::Output | KernelTraceError::Allocation => {
+            Error::Halt
+        }
     })
 }

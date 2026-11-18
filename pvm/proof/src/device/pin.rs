@@ -20,7 +20,7 @@ pub fn device_chips_of_code(code: &[u8], bitmask: &[u8]) -> u32 {
         };
         chips |= crate::opcode_component_mask(op) & chip_idx::OPTIONAL;
         if op == Opcode::Ecalli {
-            let skip = vos_pvm::gas_cost::skip_distance(bitmask, pc);
+            let skip = vos_pvm::skip(bitmask, pc);
             if let vos_pvm::args::Args::Imm { imm } =
                 vos_pvm::args::decode_args(code, pc, skip, category)
             {

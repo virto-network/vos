@@ -14,4 +14,4 @@ pub const WORD_SIZE: usize = 8;
 #[cfg(feature = "prover")]
 mod trace;
 #[cfg(feature = "prover")]
-pub use trace::{CompactStep, MemAccess, PvmStep, RegWrite, WitnessWrite, expand_steps};
+pub use trace::{CompactStep, MemAccess, PvmStep, RegWrite, TraceStep, WitnessWrite, expand_steps};

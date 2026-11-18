@@ -972,3 +972,29 @@ fn state_scan_charges_by_the_byte_and_reads_no_row_it_cannot_pay_for() {
     assert_eq!(short.exit, ExitReason::OutOfGas);
     assert_eq!(read, 3);
 }
+
+/// The JAM-only host serves no VOS extension whatever the context holds:
+/// a state reader and a pool set, `state_read` and `instantiate` are
+/// unknown calls, `WHAT` at `C_unknown`, as with neither.
+#[cfg(feature = "std")]
+#[test]
+fn the_jam_only_host_serves_no_vos_extension_whatever_the_context_holds() {
+    let pool = alloc::sync::Arc::new(crate::pool::MachinePool::new());
+    for program in [state_reading_program(), instantiating_program([7; 32])] {
+        let bare = RefineContext::load(&program, &[], 1_000_000)
+            .unwrap()
+            .try_run_jam(JamRefine::default())
+            .unwrap()
+            .invocation;
+        let equipped = RefineContext::load(&program, &[], 1_000_000)
+            .unwrap()
+            .with_state(alloc::sync::Arc::new(Fixed))
+            .with_pool(alloc::sync::Arc::clone(&pool))
+            .try_run_jam(JamRefine::default())
+            .unwrap()
+            .invocation;
+        assert_eq!(equipped.exit, ExitReason::Halt);
+        assert_eq!(equipped.registers[7], result::WHAT);
+        assert_eq!(equipped.gas_used, bare.gas_used, "the unknown call's price");
+    }
+}

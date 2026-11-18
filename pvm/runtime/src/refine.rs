@@ -152,6 +152,10 @@ pub struct Machine {
     interp: Interpreter,
     terminal_exit: Option<ExitReason>,
     execution: Option<PreparedExecution>,
+    /// The pages a standard program's read-write data may grow over
+    /// (`grow_heap`): from its first read-write page up to a zone below its
+    /// stack. None for a machine of a bare code blob.
+    heap: Option<core::ops::Range<u32>>,
     /// What returns the memory to the outer machines that lent it.
     #[cfg(feature = "std")]
     lent: Option<crate::pool::PoolTicket>,
@@ -164,7 +168,7 @@ pub enum MachineObservation<'a> {
 }
 
 impl Machine {
-    /// Construct the full Gray Paper Ψ boundary from a canonical compact PVM
+    /// Construct the full Gray Paper Ψ boundary from a compact PVM
     /// blob and an explicit architectural state.
     ///
     /// A failed `deblob(blob, initial_pc)` is represented as an immediate
@@ -214,6 +218,7 @@ impl Machine {
             interp,
             terminal_exit,
             execution: None,
+            heap: None,
             #[cfg(feature = "std")]
             lent: None,
         }
@@ -259,6 +264,9 @@ impl Machine {
 
     /// Instantiate fresh execution state starting at instruction counter
     /// `entry`: 0 is refine, 5 accumulate (the Gray Paper entry points).
+    /// An `entry` that is no instruction start (past the code, on an
+    /// operand byte) is Gray Paper Ψ's panic before any step: no gas
+    /// charged, the registers and memory as loaded, the counter 0.
     pub fn load_prepared_at(
         prepared: &PreparedProgram,
         entry: u32,
@@ -267,8 +275,22 @@ impl Machine {
         model: MemoryModel,
     ) -> Result<Self, RefineError> {
         let mut machine = Self::load_prepared(prepared, args, gas, model)?;
-        machine.interp.set_pc(entry);
+        machine.enter_at(&prepared.program.code, entry);
         Ok(machine)
+    }
+
+    /// Start a loaded machine of `code` at `entry`. Gray Paper Ψ's `deblob`
+    /// takes an instruction start with a known opcode alone; any other
+    /// entry (past the code, on an operand byte) is its panic before any
+    /// step: no gas charged, the registers and memory as loaded, the
+    /// counter 0, on every backend alike.
+    pub(crate) fn enter_at(&mut self, code: &vos_pvm_program::CodeBlob, entry: u32) {
+        if crate::spi::is_entry(code, u64::from(entry)) {
+            self.interp.set_pc(entry);
+        } else {
+            self.interp.set_pc(0);
+            self.terminal_exit = Some(ExitReason::Panic);
+        }
     }
 
     /// Instantiate fresh execution state from validated immutable preparation.
@@ -343,6 +365,7 @@ impl Machine {
             // retaining cold preparation here would duplicate those tables.
             execution: (prepared.backend() != PvmBackend::ForceInterpreter)
                 .then(|| prepared.clone()),
+            heap: Some(heap_pages(&layout)),
             #[cfg(feature = "std")]
             lent: None,
         })
@@ -354,6 +377,7 @@ impl Machine {
         interp: Interpreter,
         execution: PreparedExecution,
         gas: Gas,
+        layout: &crate::spi::StandardLayout<'_>,
         ticket: crate::pool::PoolTicket,
     ) -> Self {
         Self {
@@ -361,6 +385,7 @@ impl Machine {
             interp,
             terminal_exit: None,
             execution: (execution.backend() != PvmBackend::ForceInterpreter).then_some(execution),
+            heap: Some(heap_pages(layout)),
             lent: Some(ticket),
         }
     }
@@ -434,6 +459,12 @@ impl Machine {
 
     pub fn gas_remaining(&self) -> Gas {
         self.interp.gas
+    }
+
+    /// The pages a standard program's heap may grow over, `grow_heap`'s
+    /// `[a, b)`; none for a machine of a bare code blob.
+    pub fn heap_pages(&self) -> Option<core::ops::Range<u32>> {
+        self.heap.clone()
     }
 
     /// Whether the block containing the current counter is already funded.
@@ -523,44 +554,92 @@ impl Machine {
     }
 }
 
+/// Gray Paper v0.8.0 `grow_heap`'s page range `[a, b)` of `layout`
+/// (`pvm_invocations.tex`): from the first read-write page,
+/// `(2 Z_Z + rnq(|o|)) / Z_P`, to `(2^32 - 3 Z_Z - Z_I - rnp(s)) / Z_P`, a
+/// zone below the stack's first page.
+fn heap_pages(layout: &crate::spi::StandardLayout<'_>) -> core::ops::Range<u32> {
+    let page = u64::from(PVM_PAGE_SIZE);
+    let first = layout.rw.base / page;
+    let end = (layout.stack.base - u64::from(crate::PVM_ZONE_SIZE)) / page;
+    first as u32..end as u32
+}
+
+/// Why a halt's output is not handed over: the run's exit, an embedder's
+/// bound or the host's memory, never the guest's range itself, which
+/// Gray Paper Ψ_M reads as empty when any byte of it is unreadable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputError {
+    /// The run did not halt: Ψ_M's result is its panic or out-of-gas, no
+    /// output.
+    NotHalted,
+    /// The output is longer than the embedder's bound.
+    TooLong,
+    /// The host could not allocate the output.
+    Allocation,
+}
+
+impl core::fmt::Display for OutputError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::NotHalted => "the run did not halt",
+            Self::TooLong => "the output is past the embedder's bound",
+            Self::Allocation => "the output could not be allocated",
+        })
+    }
+}
+
+impl core::error::Error for OutputError {}
+
+/// Gray Paper v0.8.0 Ψ_M's output of a halt (`pvm.tex`, the argument
+/// invocation): the φ8 bytes of `memory` at φ7 of `registers`, those
+/// naturals as they are, unnarrowed. A zero length is the empty string
+/// whatever φ7; a range any byte of which is unreadable, past 2^32 among
+/// them, is the empty string too. Readability is checked before the
+/// `maximum` bound and before allocating, so a refusal is the embedder's
+/// bound ([`OutputError::TooLong`]) or the host's
+/// ([`OutputError::Allocation`]) alone.
+pub fn halt_output(
+    memory: &Memory,
+    registers: &[u64; PVM_REGISTER_COUNT],
+    maximum: usize,
+) -> Result<Vec<u8>, OutputError> {
+    let (address, len) = (registers[7], registers[8]);
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let readable = u32::try_from(address).ok().zip(usize::try_from(len).ok());
+    let Some((address, len)) = readable.filter(|&(address, len)| memory.is_readable(address, len))
+    else {
+        return Ok(Vec::new());
+    };
+    if len > maximum {
+        return Err(OutputError::TooLong);
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(len)
+        .map_err(|_| OutputError::Allocation)?;
+    output.resize(len, 0);
+    memory.read_bytes(address, &mut output);
+    Ok(output)
+}
+
 impl Invocation {
-    /// The output bytes designated by φ7/φ8 at a normal halt, per GP:
-    /// `o = μ[φ7 .. φ7+φ8]`.
-    ///
-    /// Read the designated output only when its guest-controlled length is at
-    /// most `maximum`. The bound is checked before reserving output memory;
-    /// allocation failure is reported as `None` rather than aborting a host.
-    /// Returns `None` unless the exit is [`ExitReason::Halt`] and the whole
-    /// range lies on readable pages (GP treats an unreadable output range at
-    /// halt as a panic ☇ — that judgement is the embedder's). A zero-length
-    /// range is trivially readable.
-    pub fn output_bounded(&self, maximum: usize) -> Option<Vec<u8>> {
+    /// The output of a normal halt, Gray Paper Ψ_M's ([`halt_output`]):
+    /// φ8 bytes at φ7, empty when φ8 is 0 or any byte is unreadable;
+    /// refused when the run did not halt, or the output is longer than
+    /// `maximum` or cannot be allocated, each its own [`OutputError`].
+    pub fn output(&self, maximum: usize) -> Result<Vec<u8>, OutputError> {
         if self.exit != ExitReason::Halt {
-            return None;
+            return Err(OutputError::NotHalted);
         }
-        let ptr = u32::try_from(self.registers[7]).ok()? as u64;
-        let len = u32::try_from(self.registers[8]).ok()? as u64;
-        let len = usize::try_from(len).ok()?;
-        if len > maximum {
-            return None;
-        }
-        if len == 0 {
-            return Some(Vec::new());
-        }
-        let end = ptr + len as u64;
-        if end > self.mem.span() {
-            return None;
-        }
-        let first = (ptr / PVM_PAGE_SIZE as u64) as usize;
-        let last = ((end - 1) / PVM_PAGE_SIZE as u64) as usize;
-        if !self.mem.pages_mapped(first, last - first + 1) {
-            return None;
-        }
-        let mut out = Vec::new();
-        out.try_reserve_exact(len).ok()?;
-        out.resize(len, 0);
-        self.mem.read_bytes(ptr as u32, &mut out);
-        Some(out)
+        halt_output(&self.mem, &self.registers, maximum)
+    }
+
+    /// [`Self::output`], its refusals `None`.
+    pub fn output_bounded(&self, maximum: usize) -> Option<Vec<u8>> {
+        self.output(maximum).ok()
     }
 
     /// The guest memory at exit. Address 0 up to the end of the highest
@@ -594,7 +673,7 @@ pub(crate) fn window(len: usize, offset: u64, max: u64) -> core::ops::Range<usiz
 /// selecting the memory representation automatically
 /// ([`MemoryModel::Auto`]).
 ///
-/// Parses the canonical bare `spi_blob`, builds the GP memory image and
+/// Parses the bare `spi_blob`, builds the GP memory image and
 /// register file for `args`, charges the standard per-page init gas, and runs
 /// the interpreter from instruction counter 0 (the refine entry) until it
 /// exits. Metadata-prefixed predecessor blobs are rejected. No hostcalls are
@@ -954,8 +1033,10 @@ mod tests {
         assert_eq!(final_state.registers[2], 9);
     }
 
+    /// Ψ_M: a halt whose output range is not all readable outputs the
+    /// empty string, not a panic and not a refusal.
     #[test]
-    fn output_range_must_be_readable() {
+    fn an_unreadable_output_range_is_empty() {
         // φ7 points into the unmapped gap between the rw region and the
         // stack; the designated output is not readable.
         let (mut code, mut bits) = (Vec::new(), Vec::new());
@@ -965,11 +1046,8 @@ mod tests {
         let blob = build_standard_program(&[], &[], 1, 4096, &code, &bits);
         let inv = execute(&blob, &[], 1_000_000).expect("executes");
         assert_eq!(inv.exit, ExitReason::Halt);
-        assert_eq!(
-            inv.output_bounded(PVM_PAGE_SIZE as usize),
-            None,
-            "unreadable output range"
-        );
+        assert_eq!(inv.output(PVM_PAGE_SIZE as usize), Ok(Vec::new()));
+        assert_eq!(inv.output(0), Ok(Vec::new()), "no bound reached");
     }
 
     #[test]
@@ -983,7 +1061,7 @@ mod tests {
         let inv = execute_with(&blob, &[], 1_000_000, MemoryModel::Sparse).expect("executes");
 
         assert_eq!(inv.exit, ExitReason::Halt);
-        assert_eq!(inv.output_bounded(64), None);
+        assert_eq!(inv.output(64), Err(OutputError::TooLong));
         assert_eq!(
             inv.output_bounded(PVM_PAGE_SIZE as usize),
             Some(vec![0; PVM_PAGE_SIZE as usize]),

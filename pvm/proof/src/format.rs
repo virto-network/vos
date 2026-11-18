@@ -8,7 +8,7 @@
 //! verifier build reads every admitted format, and a prover is told which
 //! format to produce.
 //!
-//! | number | proofs | channel | log blowup, queries, PoW, fold step, last layer, interaction PoW | floors | at its reference shape |
+//! | number | proofs | channel | log blowup, queries, PoW, fold step, last layer, interaction PoW | floors | at its reference shape: conjectured / proven, the least term |
 //! |---|---|---|---|---|---|
 //! | 32 | leaves and folds | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
 //! | 39 | the final wrap, masked | Blake2b-256 | 5, 16, 26, 3, 6, 8, affine DEEP batching | 104 / 63 | 106 / 65 |
@@ -56,7 +56,7 @@
 //!   the full CPU among them, at `2^17` rows, the most install, the prover
 //!   and the verifier admit); a per-program CPU's cut drops columns and
 //!   constraints, which only raises the count. It takes blowup 4, 47
-//!   queries, PoW 16 and affine batching (62.82
+//!   queries, PoW 16 and affine batching (62.81
 //!   proven bits): at a small program's shape every blowup costs the same
 //!   cells, and PoW 16's grind keeps a short tail on a phone; with `h = 256`
 //!   (`proving.md` §5, how large `h` must be): every device chip reveals at
@@ -69,15 +69,15 @@
 //!   ones left as they are, the composition committed whole at four times the
 //!   tallest component's rows and sampled at `π(z)`, R2's blinding, a FRI mask
 //!   of eight columns and salted trees. Its FRI runs at blowup 32 with 16
-//!   queries: 106 / 65 (65.80), the query term binding. Its floor, 104 /
+//!   queries: 106 / 65 (65.79), the query term binding. Its floor, 104 /
 //!   63, is the weakest inner format's (41) on either count: forging a
-//!   fold's input forges the final proof, so the system's proven bound is
-//!   the inner formats' (62.81) whatever the wrap's, and 16 queries is the
-//!   least that clears it (15 count 101 / 63). Blowup 64 at 13 queries
+//!   fold's input forges the final proof, so a statement is no stronger
+//!   than its inner formats (62.81) whatever the wrap's count, and 16
+//!   queries is the least that clears it (15 count 101 / 63). Blowup 64 at 13 queries
 //!   counts 104 / 64 at twice the prover's memory. It batches DEEP with an
 //!   independent coefficient a sampled value ([`DeepBatching::Affine`]), as
 //!   the device format does: batched by powers it would count 65.33, and
-//!   Stwo's powers of one coefficient cap a count at 76.98 at blowup 32,
+//!   Stwo's powers of one coefficient cap a count at 76.97 at blowup 32,
 //!   however many queries are taken. The fork batches affinely when a
 //!   configuration asks ([`FormatParams::batching`]).
 //!   Batching is not in a proof's bytes: a verifier sets it from the format
@@ -89,7 +89,9 @@
 //!   which a prover and a verifier take from the format, never from a
 //!   proof.
 //! - **The bit counts** ([`COUNTS`]) are [`crate::security`]'s, at each
-//!   entry's reference shape. The segment's and the recursion's verifiers count again at the
+//!   entry's reference shape, the proven one the least term: each bounds
+//!   one proof, not a statement (`SECURITY.md`'s format table, rendered
+//!   from these, gives the summed terms beside it). The segment's and the recursion's verifiers count again at the
 //!   proof's own shape and refuse a proof below either floor; the masked
 //!   formats' (39, 47) do not: their shapes are pinned at or under the
 //!   reference shape (a fixed layout, a device program's log sizes at most
@@ -168,6 +170,9 @@ pub fn count(format: &Format) -> Option<&'static Count> {
 
 #[cfg(test)]
 mod masked_tests;
+
+#[cfg(test)]
+mod table_tests;
 
 #[cfg(test)]
 mod tests;

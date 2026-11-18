@@ -1,5 +1,5 @@
 use super::*;
-use crate::core::step::{MemAccess, NUM_REGS, PvmStep};
+use crate::core::step::{CompactStep, MemAccess, NUM_REGS, PvmStep, WitnessWrite};
 use crate::page_merkle;
 use crate::side_note::SideNote;
 use vos_pvm::instruction::Opcode;
@@ -113,7 +113,8 @@ fn huge_page_budget_degenerates_to_step_cut() {
 ///   - window 1: at ts 5, output at 0x180;
 ///   - window 2: at ts 9 (slice-only — no later window observes its
 ///     write);
-/// and a Poseidon2 call in windows 0 and 1, at ts 3 and 7.
+/// and a Poseidon2 call in windows 0 and 1, at ts 3 and 7, and a
+/// witness-input call writing 70 bytes at ts 6.
 /// Regular stores carry distinct non-zero values, so a missed or
 /// misplaced write/slice can't vanish into an all-zero image. The
 /// register history is CONSISTENT (a non-zero seeded file threaded
@@ -156,6 +157,14 @@ fn threaded_trace() -> SideNote {
             s.branch_taken = true;
             s.branch_target = 0x30;
         }
+        // ts 6: a witness-input call, writing 70 bytes (two pieces).
+        if ts == 6 {
+            s.host_call_acknowledged = true;
+            s.witness = Some(Box::new(WitnessWrite {
+                address: 0x400,
+                bytes: (0..70).map(|i| 0x40 ^ i as u8).collect(),
+            }));
+        }
         steps.push(s);
     }
     let mut sn = SideNote::new(steps, vec![Opcode::Trap as u8], vec![1])
@@ -192,30 +201,156 @@ fn threaded_trace() -> SideNote {
     sn
 }
 
-/// Field-by-field equality of the two slicing paths over every field
-/// `segment_side_note` populates: the sliced steps, the entering image
-/// (raw bytes — both paths apply the identical write set, so even
-/// `replay_writes`' resize growth must agree byte-for-byte, no
-/// root-level indirection needed), the entering registers, the
-/// filtered call/mem-op streams, the program-static fields and the
-/// range-check counts.
-fn assert_windows_equal(via_cursor: &SideNote, via_slice: &SideNote) {
-    assert_eq!(via_cursor.steps, via_slice.steps);
-    assert_eq!(via_cursor.code, via_slice.code);
-    assert_eq!(via_cursor.bitmask, via_slice.bitmask);
-    assert_eq!(via_cursor.initial_memory, via_slice.initial_memory);
+/// Field-by-field equality of two windows over every field a window
+/// carries: the sliced steps, the entering image (raw bytes — both paths
+/// apply the identical write set, so even `replay_writes`' resize growth
+/// must agree byte-for-byte, no root-level indirection needed), the
+/// entering registers, the filtered call/mem-op streams, the
+/// program-static fields, and the counts, entries and payloads a proof
+/// fills later, all still empty.
+fn assert_windows_equal(left: &SideNote, right: &SideNote) {
+    assert_eq!(left.steps, right.steps);
+    assert_eq!(left.code, right.code);
+    assert_eq!(left.bitmask, right.bitmask);
+    assert_eq!(left.initial_memory, right.initial_memory);
+    assert_eq!(left.sparse_initial_memory, right.sparse_initial_memory);
+    assert_eq!(left.initial_regs, right.initial_regs);
+    assert_eq!(left.final_regs, right.final_regs);
+    assert_eq!(left.jump_table, right.jump_table);
+    assert_eq!(left.jump_table_counts, right.jump_table_counts);
+    assert_eq!(left.blake2b_calls, right.blake2b_calls);
+    assert_eq!(left.blake2b_mem_ops, right.blake2b_mem_ops);
+    assert_eq!(left.poseidon2_ops, right.poseidon2_ops);
+    assert_eq!(left.merkle_blake2b_calls, right.merkle_blake2b_calls);
+    assert_eq!(left.merkle_blake2b_mults, right.merkle_blake2b_mults);
+    assert_eq!(left.range256_counts, right.range256_counts);
+    assert_eq!(left.bitwise_and_counts, right.bitwise_and_counts);
+    assert_eq!(left.bitwise_and_byte_counts, right.bitwise_and_byte_counts);
+    assert_eq!(left.power_of_two_counts, right.power_of_two_counts);
+    assert_eq!(left.popcount_counts, right.popcount_counts);
+    assert_eq!(left.bitcount_counts, right.bitcount_counts);
+    assert_eq!(left.byte_to_bits_counts, right.byte_to_bits_counts);
+    assert_eq!(left.program_memory_counts, right.program_memory_counts);
+    assert_eq!(left.num_initial_mem_entries, right.num_initial_mem_entries);
+    assert_eq!(left.closing_chip_active, right.closing_chip_active);
+    assert_eq!(left.cpu_rows_local, right.cpu_rows_local);
+    assert_eq!(left.memory_layout(), right.memory_layout());
+    for window in [left, right] {
+        assert!(window.mul_entries.is_empty() && window.bitwise_entries.is_empty());
+        assert!(window.compare_entries.is_empty() && window.divrem_entries.is_empty());
+        assert!(window.memory_pages.is_none() && window.device.is_none());
+    }
+}
+
+/// A window as it is built without sharing or partition points: the
+/// steps' own `regs_before`, the program's code, bitmask and jump table
+/// copied, and every precompile record tested against the window by its
+/// timestamp. The oracle the windows are held to.
+fn copied_window(full: &SideNote, a: usize, b: usize) -> SideNote {
+    let ts_lo = full.steps[a].timestamp;
+    let ts_hi = full.steps.get(b).map(|s| s.timestamp).unwrap_or(u64::MAX);
+    let in_window = |ts: u64| ts >= ts_lo && ts < ts_hi;
+    let sn = SideNote::new(
+        full.steps[a..b].to_vec(),
+        full.code.to_vec(),
+        full.bitmask.to_vec(),
+    )
+    .with_jump_table(full.jump_table.to_vec())
+    .with_initial_regs(full.steps[a].regs_before)
+    .with_memory(replay_writes(full, Some(ts_lo)));
+    let mut sn = match full.memory_layout() {
+        Some(layout) => sn.with_memory_layout(layout),
+        None => sn,
+    };
+    for (call, op) in full.blake2b_calls.iter().zip(&full.blake2b_mem_ops) {
+        if in_window(op.ts) {
+            sn.blake2b_calls.push(call.clone());
+            sn.blake2b_mem_ops.push(op.clone());
+        }
+    }
+    sn.poseidon2_ops = full
+        .poseidon2_ops
+        .iter()
+        .filter(|op| in_window(op.ts))
+        .cloned()
+        .collect();
+    sn
+}
+
+/// `full`'s run as the tracer records it: its steps compact, its register
+/// file entering them in `initial_regs`.
+fn compact(full: &SideNote) -> SideNote<CompactStep> {
+    let mut run = SideNote::new(
+        full.steps.iter().map(PvmStep::to_compact).collect(),
+        full.code.to_vec(),
+        full.bitmask.to_vec(),
+    )
+    .with_jump_table(full.jump_table.to_vec())
+    .with_initial_regs(full.steps[0].regs_before)
+    .with_memory(full.initial_memory.clone());
+    run.blake2b_calls = full.blake2b_calls.clone();
+    run.blake2b_mem_ops = full.blake2b_mem_ops.clone();
+    run.poseidon2_ops = full.poseidon2_ops.clone();
+    run
+}
+
+/// Every window of the threaded trace, cut on and just after each of its
+/// register writes, its witness-input call, its BLAKE2b and Poseidon2
+/// calls and its stores, built four ways — sliced from the full steps,
+/// sliced from the compact ones, by a cursor over each — is the copied
+/// window; its code, bitmask and jump table are its run's own allocations.
+#[test]
+fn windows_at_every_cut_are_the_copied_construction() {
+    let full = threaded_trace();
+    assert_eq!(compact(&full).expand().steps, full.steps);
+    let run = compact(&full);
+    let n = full.steps.len();
+    for a in 0..n {
+        for b in a + 1..=n {
+            let oracle = copied_window(&full, a, b);
+            let from_full = segment_side_note(&full, a, b);
+            let from_run = segment_side_note(&run, a, b);
+            assert_windows_equal(&from_full, &oracle);
+            assert_windows_equal(&from_run, &oracle);
+            assert!(alloc::sync::Arc::ptr_eq(&from_full.code, &full.code));
+            assert!(alloc::sync::Arc::ptr_eq(&from_full.bitmask, &full.bitmask));
+            assert!(alloc::sync::Arc::ptr_eq(
+                &from_full.jump_table,
+                &full.jump_table
+            ));
+            assert!(alloc::sync::Arc::ptr_eq(&from_run.code, &run.code));
+            // A cursor's pass: `[0, a)`, then `[a, b)`, then `[b, n)`.
+            let mut over_full = SegmentCursor::new(&full);
+            let mut over_run = SegmentCursor::new(&run);
+            for (lo, hi) in [(0, a), (a, b), (b, n)] {
+                if lo < hi {
+                    let oracle = copied_window(&full, lo, hi);
+                    assert_windows_equal(&over_full.side_note(lo, hi), &oracle);
+                    assert_windows_equal(&over_run.side_note(lo, hi), &oracle);
+                }
+            }
+        }
+    }
+    // Non-vacuity: the cuts split each kind of step from its neighbours.
+    let witness = full.steps.iter().position(|s| s.witness.is_some());
+    assert_eq!(witness, Some(5));
+    assert!(full.steps.iter().filter(|s| s.reg_write.is_some()).count() > 6);
+    let entering = segment_side_note(&run, 6, 12);
     assert_eq!(
-        via_cursor.sparse_initial_memory,
-        via_slice.sparse_initial_memory
+        entering.initial_memory[0x400..0x446],
+        full.steps[5].witness.as_ref().unwrap().bytes[..]
     );
-    assert_eq!(via_cursor.initial_regs, via_slice.initial_regs);
-    assert_eq!(via_cursor.jump_table, via_slice.jump_table);
-    assert_eq!(via_cursor.jump_table_counts, via_slice.jump_table_counts);
-    assert_eq!(via_cursor.blake2b_calls, via_slice.blake2b_calls);
-    assert_eq!(via_cursor.blake2b_mem_ops, via_slice.blake2b_mem_ops);
-    assert_eq!(via_cursor.poseidon2_ops, via_slice.poseidon2_ops);
-    assert_eq!(via_cursor.range256_counts, via_slice.range256_counts);
-    assert_eq!(via_cursor.memory_layout(), via_slice.memory_layout());
+    assert_ne!(entering.initial_regs, full.steps[0].regs_before);
+}
+
+/// A window's records are sliced by partition points, so a stream out of
+/// timestamp order is refused rather than sliced wrongly.
+#[test]
+#[should_panic(expected = "out of timestamp order")]
+fn unsorted_records_are_refused() {
+    let mut full = threaded_trace();
+    full.poseidon2_ops.swap(0, 1);
+    let _ = SegmentCursor::new(&full);
 }
 
 #[test]

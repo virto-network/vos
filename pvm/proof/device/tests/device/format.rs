@@ -141,7 +141,8 @@ fn the_reference_bounds_the_per_program_cpu() {
     let blob = crate::support::blob();
     let code = vos_pvm_proof::kernel::trace_kernel(&blob, &crate::support::witness(1), 10_000)
         .unwrap()
-        .side_note;
+        .side_note
+        .expand();
     let cut = DeviceShape {
         cpu: vos_pvm_proof::chips::CpuColumns::of_code(&code.code, &code.bitmask),
         ..DEVICE_ALL.into()
