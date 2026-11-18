@@ -30,9 +30,9 @@ use vos_testkit::programs::program_elf;
 use vos_wire::batch::{Query, Work};
 use vos_wire::ingress::call_message;
 use vos_wire::personal::{
-    AdminClass, Attached, Attestation, Candidacy, DeviceId, Effect, HOUR_MS, Header, Kit, KitEntry,
-    KitKind, NewDevice, NewKit, Operation, Overview, PersonalError, Policy, Pushed, Recorded,
-    RecoveryView, Scope, Voted, Woken, r_hash, r2_hash,
+    AdminClass, Attached, Attestation, Candidacy, DeviceId, DeviceView, Effect, HOUR_MS, Header,
+    Kit, KitEntry, KitKind, NewDevice, NewKit, Operation, Overview, PersonalError, Policy, Pushed,
+    Recorded, RecoveryView, Scope, Voted, Woken, r_hash, r2_hash,
 };
 
 use crate::common::{AGENT, Node};
@@ -355,10 +355,19 @@ impl<W: BorrowMut<World>> Home<W> {
         name: &str,
         arguments: impl Encode,
     ) -> Result<T, PersonalError> {
-        let arguments = arguments.encode();
-        let answered = self.once(caller, name, &arguments);
+        self.call_encoded(caller, name, &arguments.encode())
+    }
+
+    /// [`Home::call`] with its arguments encoded.
+    fn call_encoded<T: Decode>(
+        &mut self,
+        caller: Principal,
+        name: &str,
+        arguments: &[u8],
+    ) -> Result<T, PersonalError> {
+        let answered = self.once(caller, name, arguments);
         if answered.as_ref().err() == Some(&PersonalError::Settling) && self.wake(caller).is_ok() {
-            return self.once(caller, name, &arguments);
+            return self.once(caller, name, arguments);
         }
         answered
     }
@@ -462,8 +471,51 @@ impl<W: BorrowMut<World>> Home<W> {
         candidacy
     }
 
-    /// `caller`'s operation `name`: its log index.
+    /// `caller`'s operation `name`: its log index. A removal's, an add's,
+    /// a replacement's or a regroup's evidence is posted beside it, by the
+    /// device's sync key or the kit, as a device's flow posts it; a
+    /// rotation's and a restore's carry an `R2`, which the test deposits.
     pub fn operate(
+        &mut self,
+        caller: Principal,
+        name: &str,
+        arguments: impl Encode,
+    ) -> Result<u64, PersonalError> {
+        let arguments = arguments.encode();
+        let index = self
+            .call_encoded::<Recorded>(caller, name, &arguments)?
+            .index;
+        if matches!(name, "remove" | "add" | "replace" | "regroup") {
+            let Principal::Client(key) = caller else {
+                return Ok(index);
+            };
+            let signed = message(key, self.method(name), &arguments);
+            let attached = Attached {
+                welcome: None,
+                r2: None,
+            };
+            self.call::<Recorded>(
+                self.poster(caller),
+                "evidence",
+                evidence(index, signed, attached),
+            )?;
+        }
+        Ok(index)
+    }
+
+    /// Who posts the evidence of `caller`'s admin call: the device's sync
+    /// key for its admin key, as the set shows it; else the caller itself
+    /// (the kit).
+    fn poster(&self, caller: Principal) -> Principal {
+        let views: Vec<DeviceView> = self.query(caller, "devices", ()).unwrap_or_default();
+        views
+            .into_iter()
+            .find(|view| Principal::Client(view.device.keys.admin) == caller)
+            .map_or(caller, |view| Principal::Client(view.device.keys.sync))
+    }
+
+    /// `caller`'s operation `name` with no evidence posted: its log index.
+    pub fn unevidenced(
         &mut self,
         caller: Principal,
         name: &str,

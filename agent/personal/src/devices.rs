@@ -85,8 +85,8 @@ fn removes(op: &Op) -> Vec<DeviceId> {
     }
 }
 
-/// Whether an operation matures only with its evidence, which carries its
-/// `R2`.
+/// Whether an operation's evidence carries its `R2`, without which it
+/// does not mature.
 fn needs_r2(op: &Op) -> bool {
     matches!(op, Op::Rotate(_) | Op::Restore { .. })
 }
@@ -164,6 +164,7 @@ impl Personal {
             self.operations.get(&index).is_some_and(|operation| {
                 operation.state == OpState::Pending
                     && operation.matures <= now
+                    && self.evidenced.contains(&index)
                     && (!needs_r2(&operation.op) || self.deposits.contains(&index))
             })
         };
@@ -801,7 +802,9 @@ impl Personal {
         if target_left {
             return self.cancel(index, Cancel::Moot, now);
         }
-        if needs_r2(&operation.op) && r2.is_none() {
+        // The devices take no maturity without the call's evidence: one
+        // due without it is cancelled, as they close it.
+        if !self.evidenced.contains(&index) || needs_r2(&operation.op) && r2.is_none() {
             return self.cancel(index, Cancel::Unevidenced, now);
         }
         if !self.applicable(&operation.op) {

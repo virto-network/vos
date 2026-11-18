@@ -443,7 +443,8 @@ pub enum Cancel {
     /// Its kit was replaced, by a rotation or a restore.
     #[codec(index = 5)]
     Retired = 5,
-    /// It matured without the evidence carrying its `R2`.
+    /// It fell due without its evidence, or without the evidence
+    /// carrying its `R2`.
     #[codec(index = 6)]
     Unevidenced = 6,
     /// A key it brings was admitted by its maturity.

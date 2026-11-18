@@ -157,7 +157,7 @@ fn the_kit_resolves_a_contest_at_once() {
 
     let mut home = seasoned(2);
     let removal = home.operate(admin(0), "remove", 1u32).unwrap();
-    home.pass(3 * MINUTE - 2);
+    home.pass(3 * MINUTE - 3);
     assert_eq!(standing(&home, sync(0), 1), Standing::Active);
     home.pass(1);
     assert_eq!(
@@ -200,6 +200,36 @@ fn two_seasoned_devices_remove_at_once() {
     }
     assert!(view(&home, sync(0), 3).seasoned, "seasoned, but delayed");
     home.operate(admin(1), "cosign", removal).unwrap();
+    assert!(matured(state(&home, sync(0), removal)));
+    assert_eq!(standing(&home, sync(0), 2), Standing::Removed);
+}
+
+/// An operation the devices hold no evidence of matures for none of them:
+/// a removal or a cosigned one due without its call's evidence is
+/// cancelled `Unevidenced`, its target keeps its voice, and the removal
+/// after it, its evidence posted, matures as usual.
+#[test]
+fn an_operation_due_without_its_evidence_is_cancelled() {
+    let mut home = seasoned(3);
+    let removal = home.unevidenced(admin(0), "remove", 2u32).unwrap();
+    home.pass(3 * MINUTE + 1);
+    home.wake(sync(0)).unwrap();
+    assert_eq!(
+        cancelled(state(&home, sync(0), removal)),
+        Some(Cancel::Unevidenced)
+    );
+    assert_eq!(standing(&home, sync(0), 2), Standing::Active);
+    // Cosigned at once, its own evidence never posted.
+    let removal = home.unevidenced(admin(0), "remove", 2u32).unwrap();
+    home.operate(admin(1), "cosign", removal).unwrap();
+    assert_eq!(
+        cancelled(state(&home, sync(0), removal)),
+        Some(Cancel::Unevidenced)
+    );
+    assert_eq!(standing(&home, sync(0), 2), Standing::Active);
+    let removal = home.operate(admin(0), "remove", 2u32).unwrap();
+    home.pass(3 * MINUTE + 1);
+    home.wake(sync(0)).unwrap();
     assert!(matured(state(&home, sync(0), removal)));
     assert_eq!(standing(&home, sync(0), 2), Standing::Removed);
 }
@@ -273,14 +303,14 @@ fn a_removal_freezes_its_targets_probation() {
 fn the_kits_operations_wait_and_a_veto_cancels_them() {
     let mut home = seasoned(2);
     let removal = home.operate(KIT, "remove", 0u32).unwrap();
-    home.pass(7 * MINUTE - 2);
+    home.pass(7 * MINUTE - 3);
     home.operate(admin(0), "veto", removal).unwrap();
     assert_eq!(
         cancelled(state(&home, sync(0), removal)),
         Some(Cancel::Veto)
     );
     let removal = home.operate(KIT, "remove", 1u32).unwrap();
-    home.pass(7 * MINUTE - 2);
+    home.pass(7 * MINUTE - 3);
     assert_eq!(standing(&home, sync(0), 1), Standing::Active);
     home.pass(1);
     home.call::<Recorded>(sync(0), "alive", ()).unwrap();
@@ -494,7 +524,7 @@ fn an_admin_key_replacement_keeps_the_seasoning() {
     let replacement = home
         .operate(admin(0), "replace", (1u32, new_admin(1)))
         .unwrap();
-    home.pass(3 * MINUTE - 2);
+    home.pass(3 * MINUTE - 3);
     let replaced = Principal::Client(new_admin(1).key);
     assert_eq!(
         home.operate(replaced, "remove", 2u32),
@@ -521,10 +551,8 @@ fn an_admin_key_replacement_keeps_the_seasoning() {
     home.operate(admin(0), "cosign", removal).unwrap();
     // The kit's replacement waits the kit's delay.
     let replacement = home.operate(KIT, "replace", (0u32, new_admin(2))).unwrap();
-    assert_eq!(
-        home.operation(sync(0), replacement).matures,
-        home.now() - 1 + 7 * MINUTE
-    );
+    let operation = home.operation(sync(0), replacement);
+    assert_eq!(operation.matures, operation.at + 7 * MINUTE);
 }
 
 /// E29: a replacement contested and resolved upheld still waits out the
@@ -728,7 +756,7 @@ fn a_contest_lifted_inside_the_delay_matures_at_its_own_time() {
 #[test]
 fn operations_are_signed_end_to_end_and_their_evidence_stored() {
     let mut home = seasoned(2);
-    let removal = home.operate(KIT, "remove", 1u32).unwrap();
+    let removal = home.unevidenced(KIT, "remove", 1u32).unwrap();
     let signed = message(KIT_KEY, home.method("remove"), &1u32.encode());
     assert_eq!(
         home.call::<Recorded>(

@@ -74,7 +74,7 @@ fn a_commit_from_a_sync_key_or_a_device_that_may_not_commit_is_refused() {
         Err(PersonalError::Delayed)
     );
     // Device 1's removal matured: its admin key commits nothing.
-    home.call::<Recorded>(admin(0), "remove", 1u32).unwrap();
+    home.operate(admin(0), "remove", 1u32).unwrap();
     home.pass(72 * HOUR_MS);
     for caller in [admin(1), sync(1)] {
         assert_eq!(
@@ -240,8 +240,8 @@ fn one_commit_carries_every_matured_removal_and_removed_devices_have_no_voice() 
     for n in 1..=4 {
         home.call::<Recorded>(sync(n), "alive", ()).unwrap();
     }
-    home.call::<Recorded>(admin(0), "remove", 3u32).unwrap();
-    home.call::<Recorded>(admin(1), "remove", 4u32).unwrap();
+    home.operate(admin(0), "remove", 3u32).unwrap();
+    home.operate(admin(1), "remove", 4u32).unwrap();
     assert_eq!(
         home.call::<Recorded>(admin(2), "remove", 4u32),
         Err(PersonalError::Pending)
@@ -306,7 +306,7 @@ fn one_commit_carries_every_matured_removal_and_removed_devices_have_no_voice() 
 
     // Device 2's removal matures while a candidate waits on it: once the
     // others confirmed, the maturity decides it.
-    home.call::<Recorded>(admin(0), "remove", 2u32).unwrap();
+    home.operate(admin(0), "remove", 2u32).unwrap();
     home.pass(70 * HOUR_MS);
     let epoch = epoch + 2;
     let candidacy: Candidacy = home.call(admin(0), "commit", update(epoch, 7)).unwrap();
@@ -383,7 +383,7 @@ fn a_maturity_inside_the_window_decides_before_the_timeout() {
     home.pair(0, 1);
     home.pass(62 * HOUR_MS);
     home.call::<Recorded>(sync(1), "alive", ()).unwrap();
-    home.call::<Recorded>(admin(0), "remove", 1u32).unwrap();
+    home.operate(admin(0), "remove", 1u32).unwrap();
     home.pass(62 * HOUR_MS);
     let candidacy: Candidacy = home.call(admin(0), "commit", update(2, 2)).unwrap();
     assert_eq!(candidacy.set, vec![0, 1]);

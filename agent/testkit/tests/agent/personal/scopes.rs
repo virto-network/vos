@@ -182,7 +182,7 @@ fn quotas_bound_pushes_and_exempt_what_removes_a_device() {
         Err(PersonalError::Quota)
     );
     // The same day, what removes the thief's device is taken.
-    home.call::<Recorded>(admin(0), "remove", 1u32).unwrap();
+    home.operate(admin(0), "remove", 1u32).unwrap();
     home.call::<Recorded>(sync(1), "alive", ()).unwrap();
     home.call::<Recorded>(sync(0), "alive", ()).unwrap();
     home.pass(HOUR_MS);

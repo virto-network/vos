@@ -81,7 +81,7 @@ fn queries_answer_only_admitted_keys() {
     }
     // Device 1's removal matured: before a call settles it, its reads are
     // refused by its standing.
-    home.call::<Recorded>(admin(0), "remove", 1u32).unwrap();
+    home.operate(admin(0), "remove", 1u32).unwrap();
     home.pass(72 * HOUR_MS);
     for (name, arguments) in reads() {
         assert_eq!(

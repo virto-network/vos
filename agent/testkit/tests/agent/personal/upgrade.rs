@@ -95,7 +95,7 @@ fn the_next_version_installed_over_a_populated_agent_reads_everything_back() {
         home.push(n % 3, envelope(scope(1 + n % 3), 2, n, len))
             .unwrap();
     }
-    home.call::<Recorded>(admin(0), "remove", 2u32).unwrap();
+    home.operate(admin(0), "remove", 2u32).unwrap();
     home.pass(72 * HOUR_MS);
     home.commit_removing(0, vec![2]);
     home.call::<Candidacy>(admin(0), "commit", update(4, 4))

@@ -48,7 +48,7 @@ fn a_lapsed_agent_takes_removals_alive_and_votes_and_refuses_pushes() {
     );
     // A stolen phone is still removed.
     home.call::<Recorded>(sync(1), "alive", ()).unwrap();
-    home.call::<Recorded>(admin(0), "remove", 1u32).unwrap();
+    home.operate(admin(0), "remove", 1u32).unwrap();
     home.pass(72 * HOUR_MS);
     let adding = Effect {
         add: Some(device(2)),
