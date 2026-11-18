@@ -143,8 +143,12 @@ among them, are tied to no commitment and the out-of-domain check holds
 for any trace. About `p^2` of the `p^4` circle points qualify, 2^-62 a
 point, and a transcript has one chance for each point of its DEEP plan
 (the out-of-domain point, each mask offset's, each periodicity point's;
-some 16 to 20 for the window kernel): a forgery would sit about 2^58
-grinding trials away, under the 60-bit proven floor and far below the conjectured count. The
+16 for the window kernel's leaf, `docs/design/recursion-air.md` §4), so
+some point is degenerate with probability about 16 times that. Only the
+out-of-domain point's case is shown to free the composition; what the
+other points free (previous-row samples, the running sums' among them)
+is not taken to a forgery. Either way the chance sits at the proven
+floor, about 40 bits under the conjectured count. The
 circuits therefore constrain `Im(z.y)` invertible for every DEEP plan
 point (one inverse a point, `recair/src/verifier/deep.rs`'s `prepare`),
 in the leaf (verifying format 41) and in the fold's and the wrap's child
@@ -178,14 +182,18 @@ verification (39) run Stwo's own quotient, which refuses the point.
   before proving, by its step count. The limit is also a soundness bound:
   the ledgers compare timestamps mod p, and it is what keeps two accesses
   2^30 steps apart from aliasing (the leaf's binding, below).
-- **φ7 after a precompile call:** a host that serves the precompile (a
-  VOS node, and the proof's CPU, which proves only served calls) leaves
-  every register as it was, so φ7 still holds the first argument, a
-  pointer; a host that serves none, the JAM-only host as a JAM node,
-  answers Gray Paper `WHAT` in φ7. The guest library's `call`
-  (`precompiles/src/ecalls.rs`) tells the two apart (a pointer is never
-  `WHAT`) and computes in software on `WHAT`; a guest that branches on φ7
-  otherwise runs differently on the two hosts.
+- **A precompile call a host does not serve:** a host that serves
+  `0x400` or `0x402` leaves every register unchanged, so φ7 still holds
+  the first argument, a pointer (`0x401` writes its count there). A call
+  a VOS node does not serve (a removed id, or any precompile on a node
+  that computes none) is no answer: the run exits to the host at the call
+  (`refine_host.rs`'s `dispatch`, `ExitReason::HostCall`), and the proof
+  ends the run there too (an unacknowledged call has no real successor
+  row, `src/chips/cpu/constraints/host_call.rs`). The JAM-only host, as
+  a JAM node, answers Gray Paper `WHAT` in φ7 and the run goes on. The
+  guest library's `call` (`precompiles/src/ecalls.rs`) is written for
+  both: on `WHAT` it computes in software, and a pointer is never `WHAT`.
+  A guest that reads φ7 otherwise runs to different ends on the two.
 - **The Ristretto and scalar chips are removed:** they were unsound.
   Precompile ids 110 to 114 are served nowhere, and `derive` refuses a
   kernel that reaches one.
@@ -417,7 +425,8 @@ an inner row's address to its group by 16-bit halves (`lo_diff`,
 `hi_diff` in `src/chips/word_memory/mod.rs`, each half `lo + 256·hi` of
 two limbs), so two rows are one word only because every producer's
 address limbs are bytes: each producer's own carry identity (the CPU's
-load and store addresses, each precompile's, the witness input's) is
+loads and stores, the BLAKE2b and Poseidon2 calls', the witness
+input's) is
 what makes that so, and each holds today; a new producer of word
 accesses must have one.
 
@@ -484,9 +493,11 @@ panic-free on every input by construction:
   format 39's; format 47 (the device verifier, natively at a node's
   ingress, where a panic is the caller's to catch, above) runs the same
   masked verifier and Stwo path, so its "shape" rows hold through the
-  same `check_shape`, but the rows that cite 39's numbers (3, 7, 8, 12,
-  19, 27: its trees' heights, its 16 queries, its last layer) are to be
-  re-derived at 47's shape, an audit item ([AUDIT.md](AUDIT.md)).
+  same `check_shape`, but every row that cites 39's parameters (its
+  trees' heights, its 16 queries, its fold step 3 and its subsets, its
+  last layer of 2^6 and 64 coefficients, its circle draw's odds) is to be
+  re-derived at 47's (fold step 1, last layer 2^0, 47 queries, its own
+  heights), an audit item ([AUDIT.md](AUDIT.md)).
 - **Fuzzing:** twelve targets (`fuzz/`, the justfile's
   `proof_fuzz_targets`): the final verifier on arbitrary bytes
   (`final_verifier_bytes`), on the golden wraps mutated

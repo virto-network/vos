@@ -136,9 +136,10 @@ leaf). Read it as trusted:
 - **Stwo's panic sites for format 47:** SECURITY.md's table of the
   fork's verify path is format 39's. The device verifier
   (`device/src/masked/verify.rs` → `final-verifier/src/masking.rs`'s
-  `verify_masked`) runs the same path; the rows that cite 39's heights,
-  queries and last layer (3, 7, 8, 12, 19, 27) are to be re-derived at
-  47's shape, the device's log sizes at most `DEVICE_MAX_LOG_SIZE`.
+  `verify_masked`) runs the same path; every row that cites 39's
+  parameters (heights, queries, fold step and subsets, last layer) is to
+  be re-derived at 47's, the device's log sizes at most
+  `DEVICE_MAX_LOG_SIZE`.
 - **The in-circuit verifier against the native one:** every refusal
   Stwo's verifier makes on a format 41 or 32 proof needs a constraint in
   `recair/src/verifier/` (the degenerate DEEP sample point's is

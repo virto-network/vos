@@ -167,15 +167,18 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   panic on values their callers validate, and `vos-pvm-codec`'s bound of
   a decoded `Vec` by items, not bytes: one line each, at the next re-pin
   of the node's programs.
-- **The fork's verify path, at its next pin** (`pvm/proof/SECURITY.md`,
-  "Stwo's verify path, audited"): the Blake2s-M31 channel's draws made
-  uniform (by rejection, as the Blake2b channel draws; 0 and 1 are 1.5
-  times as likely per coordinate today) and its doc corrected, a format
-  change for 47's transcript; the lifted Merkle verifier's height-0 `Ok`
-  moved after its shape check; and `verify_values` taking the DEEP
-  coefficient count and the batching mode from its caller's
-  configuration, mixed, rather than from the samples alone. VOS's own
-  checks make each unreachable or harmless today.
+- **The Blake2s-M31 channel's draws, in the fork:** made uniform (by
+  rejection, as the Blake2b channel draws; 0 and 1 are 1.5 times as
+  likely per coordinate today) and its doc corrected; a change of 47's
+  transcript, so a new device format (`pvm/proof/SECURITY.md`, "Stwo's
+  verify path, audited").
+- **The lifted Merkle verifier's height-0 tree, in the fork:** its `Ok`
+  moved after the shape check; unreachable here, every tree's height
+  VOS's own.
+- **The fork's PCS caller duties:** `verify_values` taking the DEEP
+  coefficient count and the batching mode from its configuration, the
+  mode mixed, rather than from the samples alone; VOS's shape check and
+  header give both today.
 - **Stwo's `hashbrown` requirement** is open (`>=0.15.2`), so a
   workspace whose graph holds a newer `hashbrown` re-resolves Stwo onto
   it: the fuzz targets run Stwo on `hashbrown 0.17.1` (`foldhash 0.2`)
