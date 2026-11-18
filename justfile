@@ -822,7 +822,8 @@ slice-gate: ci test-bench-proof
     with-env { LEAKAGE_N: "2000", LEAKAGE_WRAP_N: "32", LEAKAGE_SEGMENT_N: "256" } { just test-proof }
     just fuzz 300
 
-# Use the repository's hooks: fmt and clippy before commits, `just ci`
-# before pushes.
+# Use the repository's hooks, which run only once this sets them: fmt and
+# clippy before commits, `just ci` before pushes, on a push of HEAD from a
+# tree that is HEAD alone (`.githooks/pre-push`).
 install-hooks:
     git config core.hooksPath .githooks
