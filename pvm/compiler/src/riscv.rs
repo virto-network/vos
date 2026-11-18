@@ -69,9 +69,10 @@ pub(crate) struct TranslationContext {
     /// Enables fusion with a subsequent ADD/AND/OR/XOR/load/store into the
     /// immediate form, eliminating the load_imm instruction entirely.
     pub(crate) pending_load_imm: Option<(u8, i64, usize)>,
-    /// Last immediate loaded into t0 (x5): the id of the `ecalli` a marked
-    /// ecall becomes.
-    last_t0_imm: Option<i32>,
+    /// The constant t0 (x5) holds, when its basic block loaded it and
+    /// nothing wrote t0 since: the id of the `ecalli` a marked ecall
+    /// becomes.
+    pub(crate) last_t0_imm: Option<i64>,
     /// Set by the CSR marker 0x801: the next ecall becomes a PVM `ecalli`
     /// whose id was loaded into t0.
     ecalli_marked: bool,
@@ -129,9 +130,39 @@ impl TranslationContext {
     ) -> Result<(), TranspileError> {
         if is_control_flow_target {
             self.flush_pending()?;
+            // An edge in brings its own t0, and may skip an ecall's marker.
+            self.last_t0_imm = None;
+            if self.ecalli_marked {
+                return Err(TranspileError::UnsupportedInstruction {
+                    offset: address as usize,
+                    detail: "a control-flow target between an ecalli's marker and its ecall".into(),
+                });
+            }
         }
         self.address_map.insert(address, self.code.len() as u32);
         Ok(())
+    }
+
+    /// Forget t0's constant when `inst` writes t0 (x5) any other way than
+    /// as an immediate the translation tracks.
+    pub(crate) fn note_write(&mut self, inst: u32) {
+        let writes = matches!(
+            opcode(inst),
+            op::LUI
+                | op::AUIPC
+                | op::JAL
+                | op::JALR
+                | op::LOAD
+                | op::OP_IMM
+                | op::OP
+                | op::OP_IMM_32
+                | op::OP_32
+                | op::CUSTOM_0
+                | op::SYSTEM
+        );
+        if writes && rd(inst) == 5 {
+            self.last_t0_imm = None;
+        }
     }
 
     /// Translate the 32-bit RISC-V instruction `inst` at `addr`.
@@ -225,10 +256,20 @@ impl TranslationContext {
                 // ECALL: a marked one becomes `ecalli`; an unmarked one traps.
                 (0, 0) => {
                     if std::mem::take(&mut self.ecalli_marked) {
-                        let id = self.last_t0_imm.unwrap_or(0) as u32;
+                        // The id is t0's constant in this block; an ecall
+                        // whose t0 the block does not fix is refused.
+                        let id = self
+                            .last_t0_imm
+                            .take()
+                            .and_then(|id| u32::try_from(id).ok())
+                            .ok_or_else(|| TranspileError::UnsupportedInstruction {
+                                offset: addr as usize,
+                                detail: "a marked ecall whose t0 holds no constant id its \
+                                         block loads"
+                                    .into(),
+                            })?;
                         self.emit_ecalli(id);
                         self.host_calls.push((addr, id));
-                        self.last_t0_imm = None;
                     } else {
                         self.emit_op(Opcode::Trap);
                     }
@@ -239,8 +280,15 @@ impl TranslationContext {
                 // EBREAK, unimp, and every other CSR operation trap.
                 _ => self.emit_op(Opcode::Trap),
             },
-            // FENCE is a no-op.
-            op::MISC_MEM => self.emit_op(Opcode::Fallthrough),
+            // FENCE is a no-op: one thread, no device memory. FENCE.I and
+            // the cache-block operations are refused.
+            op::MISC_MEM if funct3 == 0 => self.emit_op(Opcode::Fallthrough),
+            op::MISC_MEM => {
+                return Err(TranspileError::UnsupportedInstruction {
+                    offset: addr as usize,
+                    detail: format!("MISC-MEM funct3={funct3}"),
+                });
+            }
             // T-Head extensions
             op::CUSTOM_0 => match (funct7, funct3) {
                 (0x20, 1) => {

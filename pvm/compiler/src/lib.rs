@@ -65,6 +65,20 @@ pub enum TranspileError {
     DiscardedLoad { at: u64 },
 }
 
+impl TranspileError {
+    /// The error of the instruction at `address`: an unsupported
+    /// instruction's offset, when the translation left it unnamed.
+    pub(crate) fn at(self, address: u64) -> Self {
+        match self {
+            Self::UnsupportedInstruction { offset: 0, detail } => Self::UnsupportedInstruction {
+                offset: address as usize,
+                detail,
+            },
+            other => other,
+        }
+    }
+}
+
 /// A program's functions: each one's first PVM instruction in its code, and
 /// its name (demangled), by offset.
 pub type Functions = Vec<(u32, String)>;

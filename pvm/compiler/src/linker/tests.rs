@@ -306,3 +306,106 @@ fn a_code_like_word_is_rewritten_only_without_relocations() {
     let unrelocated = transpile_with(&elf(0), Link::Whole).expect("translates");
     assert_ne!(unrelocated.ro_data, word, "a code pointer is rewritten");
 }
+
+/// `csrw 0x801, zero`, which marks the next ecall an `ecalli`, and `ecall`.
+const MARK: u32 = crate::riscv::rv::i_type(0x73, 1, 0, 0, 0x801);
+const ECALL: u32 = 0x73;
+
+/// `text` linked whole: each `ecalli` it emits, by its ecall's address, or
+/// the refusal.
+fn host_calls(text: &[u32]) -> Result<Vec<(u64, u32)>, TranspileError> {
+    let elf = LinkedElf::text(TEXT_VADDR, assemble(text));
+    transpile_with(&elf, Link::Whole).map(|linked| linked.host_calls)
+}
+
+/// A marked ecall's id is the constant its block loads into t0, by `li`
+/// whether one instruction or two.
+#[test]
+fn an_ecalli_takes_the_constant_its_block_loads_into_t0() {
+    let calls = host_calls(&[addi(T0, 0, 0x401), MARK, ECALL, jalr(0, RA)]);
+    assert_eq!(calls.unwrap(), [(TEXT_VADDR + 8, 0x401)]);
+    let calls = host_calls(&[lui(T0, 1), addi(T0, T0, 1), MARK, ECALL, jalr(0, RA)]);
+    assert_eq!(calls.unwrap(), [(TEXT_VADDR + 12, 0x1001)]);
+}
+
+/// A marked ecall whose t0 its block does not fix is refused, naming it:
+/// t0 written after its `li`, loaded in another block, or never loaded.
+/// Each was an `ecalli` of the last `li t0` translated, or of 0.
+#[test]
+fn an_ecalli_of_no_constant_t0_is_refused() {
+    let written = [
+        addi(T0, 0, 0x401),
+        addi(T0, A1, 0),
+        MARK,
+        ECALL,
+        jalr(0, RA),
+    ];
+    let other_block = [addi(T0, 0, 0x401), jal(0, 4), MARK, ECALL, jalr(0, RA)];
+    let never = [MARK, ECALL, jalr(0, RA)];
+    for (text, ecall) in [(&written[..], 12), (&other_block[..], 12), (&never[..], 4)] {
+        match host_calls(text) {
+            Err(TranspileError::UnsupportedInstruction { offset, detail }) => {
+                assert_eq!(offset as u64, TEXT_VADDR + ecall, "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    // A branch target between the marker and its ecall.
+    let split = [addi(T0, 0, 0x401), MARK, jal(0, 4), ECALL, jalr(0, RA)];
+    assert!(matches!(
+        host_calls(&split),
+        Err(TranspileError::UnsupportedInstruction { .. })
+    ));
+}
+
+/// Encodings the target never emits are refused at their address, never
+/// translated as another instruction: Zbs's `bseti` (once an SLLI) and
+/// `bexti` (once an SRAI), Zba's `slli.uw` (once an SLLIW), Zbkb's `packw`
+/// (once a `zext.h`), `fence.i` and a cache-block operation (once no-ops).
+#[test]
+fn encodings_the_target_never_emits_are_refused() {
+    use crate::riscv::rv::{i_type, r_type};
+    let refused = [
+        i_type(0x13, 1, A0, A1, (0x14 << 5) | 3), // bseti a0, a1, 3
+        i_type(0x13, 5, A0, A1, (0x24 << 5) | 3), // bexti a0, a1, 3
+        i_type(0x13, 5, A0, A1, (0x35 << 5) | 3), // rev8's funct7, another shift
+        i_type(0x1b, 1, A0, A1, (0x04 << 5) | 3), // slli.uw a0, a1, 3
+        i_type(0x1b, 5, A0, A1, (0x01 << 5) | 3), // srliw of a sixth shift bit
+        r_type(0x3b, 4, 0x04, A0, A1, A2),        // packw a0, a1, a2
+        0x0000_100f,                              // fence.i
+        0x0010_200f,                              // cbo.clean (a0)
+        i_type(0x13, 1, A0, 0, (0x14 << 5) | 3),  // bseti a0, x0, 3
+    ];
+    for inst in refused {
+        let text = assemble(&[addi(A0, A0, 0), inst, jalr(0, RA)]);
+        let elf = LinkedElf::text(TEXT_VADDR, text);
+        match transpile_with(&elf, Link::Whole) {
+            Err(TranspileError::UnsupportedInstruction { offset, .. }) => {
+                assert_eq!(offset as u64, TEXT_VADDR + 4, "{inst:#010x}")
+            }
+            other => panic!("{inst:#010x}: {:?}", other.err()),
+        }
+    }
+    // A plain fence, which the toolchain emits, is a no-op.
+    assert!(host_calls(&[0x0100_000f, jalr(0, RA)]).is_ok());
+}
+
+/// Zbb's counts of x0 are the counts of zero: `clz` and `ctz` give the
+/// width, not 0.
+#[test]
+fn zbb_counts_of_x0_are_the_widths() {
+    use crate::riscv::rv::i_type;
+    for (inst, value) in [
+        (i_type(0x13, 1, A0, 0, 0x600), 64), // clz a0, x0
+        (i_type(0x13, 1, A0, 0, 0x601), 64), // ctz a0, x0
+        (i_type(0x13, 1, A0, 0, 0x602), 0),  // cpop a0, x0
+        (i_type(0x1b, 1, A0, 0, 0x600), 32), // clzw a0, x0
+        (i_type(0x1b, 1, A0, 0, 0x601), 32), // ctzw a0, x0
+    ] {
+        let elf = LinkedElf::text(TEXT_VADDR, assemble(&[inst, jalr(0, RA)]));
+        let blob = spi_blob(transpile_with(&elf, Link::Whole).expect("translates")).expect("links");
+        let invocation = refine::execute(&blob, &[], 10_000_000).expect("executes");
+        assert_eq!(invocation.exit, ExitReason::Halt);
+        assert_eq!(invocation.registers[7], value, "{inst:#010x}");
+    }
+}
