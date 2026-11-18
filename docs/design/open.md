@@ -259,9 +259,9 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   start-up probe). A worker would hold the guest window, the JIT code and
   the context, the host keeping its alias of the memfd for host calls,
   and would also take the kernel's per-process mapping limit and a
-  backend crash off the host. To settle: confinement must not depend on namespaces (rootless
-  Podman breaks them, Docker's default profile denies them), so a
-  seccomp allowlist is the boundary (PolkaVM's worker needs ten system
+  backend crash off the host. To settle: confinement must not depend on
+  namespaces (rootless Podman breaks them, Docker's default profile
+  denies them), so a seccomp allowlist is the boundary (PolkaVM's worker needs ten system
   calls) with namespaces and Landlock as extra layers where available;
   which machines share a worker (inner machines never with their outer
   program; pooled per-machine workers, as PolkaVM does); write tracking
@@ -275,6 +275,12 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
 - **`RecompiledPvm`,** the recompiler's test-only machine with its own
   memory path: retired once the instruction vectors run on
   `backend::StandardMachine`, the production path, on both backends.
+- **Decoding bytes a kernel was given** (`vos_pvm_codec`,
+  `vos_tree::verify_encoded`): memory grows with the input by a factor
+  the types set (an item's size for each byte of a short encoding; about
+  56 bytes a three-byte branch entry), stated where each is; a kernel
+  sizes its heap or caps its input by it. A decoder held to a byte budget,
+  refusing past it, would make that a refusal rather than a trap.
 - **The JAM-only host's package** (`JamRefine`): `fetch` kinds 7 and 10
   serve the encoded package and context as the caller gives them; the
   fixture encodes no work package, so nothing holds them to its items.
@@ -291,3 +297,22 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   and statuses keep their holes until the pallet's port compacts them and
   regenerates the conformance vectors.
 - **The precompile block** `0x400..=0x4ff` reserved through a JIP.
+- **A guard below the venue guests' stack** (`final-verify`,
+  `statement-service`): their 1 MiB stack is a `.bss` array, above the
+  guest's statics, so an overflow writes them rather than trapping. A
+  standard program's read-write region has no holes, so the guard is a
+  placement: the stack first in that region, below it the unmapped gap or
+  the read-only data, where a push faults. That needs a linker script for
+  the venue guests (as `pvm/guest/pvm.ld` is the agents'), which moves
+  their blobs; or the Gray Paper stack with its own size, which the
+  compiler ties to the read-only base today.
+
+## Tooling
+
+- **Toolchains and tools by hash:** `rust-toolchain.toml` pins its nightly
+  by date and the kit's toolchain by version (rustup checks each by its
+  own signed manifest), and the gates' tools (`cargo-deny`, `cargo-fuzz`,
+  `just`, `nu`) are whatever the host installed. Neither rustup nor
+  `cargo install` takes a hash of what it installs; a tools manifest (each
+  tool's version and its binary's SHA-256) checked by a gate is the next
+  step.
