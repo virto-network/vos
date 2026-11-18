@@ -13,20 +13,29 @@ use super::{
 use crate::masked::{DeviceProgram, DeviceProof, DeviceProver, device_shape};
 use crate::{MaskRng, MaskStats, MaskedProof};
 
-/// The most gas a device kernel's run is traced with, 2^18: a step a unit,
-/// a Poseidon2 call 3,000, so the most steps the device format's CPU holds,
-/// `2^DEVICE_MAX_LOG_SIZE`, and as much again for its Poseidon2 calls
-/// (auth's 43 take 129,000 beside its 1,312 steps): about 87
-/// Poseidon2 calls a run, fewer as its steps grow, which a device kernel's
-/// install meets as a run out of gas. A longer run stops out of gas rather
-/// than being traced past twice any program's steps, on an executor that
-/// bounds no memory.
+/// The most gas a device kernel's run is traced with, 2^18: about 87
+/// Poseidon2 calls a run beside its steps (auth's 43 take 129,000 beside
+/// its 1,312 steps), which a device kernel's install meets as a run out of
+/// gas. A block's price is its pipeline's cycles, several instructions a
+/// cycle, so gas does not bound steps: a run is traced to at most
+/// [`STEPS`], the most the device format's CPU holds, and refused past them.
 pub const GAS: u64 = 2 << vos_pvm_proof::device::DEVICE_MAX_LOG_SIZE;
+
+/// The most steps a device kernel's run is traced to, `2^DEVICE_MAX_LOG_SIZE`:
+/// the most rows the device format's CPU takes, a row a step. A run past it
+/// fits no device program ([`Error::Fit`]), and its trace stops there.
+pub const STEPS: usize = 1 << vos_pvm_proof::device::DEVICE_MAX_LOG_SIZE;
 
 /// The most gas a reference program's run takes, 2^22: it is never
 /// proved, and returns a kernel's whole arguments, so it hashes them into
 /// its io-hash beside what it computes.
 pub const REFERENCE_GAS: u64 = 1 << 22;
+
+/// The most steps a reference program's run is traced to, 2^20: the
+/// reference is the install's, an untrusted kernel's package, so its trace
+/// is held to about a hundred MiB whatever its gas buys. A reference past
+/// it is refused ([`Error::Steps`]).
+pub const REFERENCE_STEPS: usize = 1 << 20;
 
 /// A device kernel's program under a device format, as its prover and its
 /// verifier pin it, and the kernel it proves.
@@ -67,7 +76,7 @@ impl Program {
         headroom: u8,
     ) -> Result<Self, Error> {
         let format = crate::format(format).ok_or(Error::Format(format))?;
-        let mut run = trace(kernel, reference.0, GAS)?;
+        let mut run = trace(kernel, reference.0, GAS, Error::Steps)?;
         let (active, log_sizes) = device_shape(format, kernel, &mut run)?;
         drop(run);
         let log_sizes: Vec<u32> = log_sizes
@@ -113,7 +122,7 @@ impl Program {
     /// that does not fit fails to prove ([`Error::Fit`], `light-node.md`
     /// §4.4).
     pub fn fits(&self, arguments: &[u8]) -> Result<(), Error> {
-        let mut run = trace(&self.kernel, arguments, GAS)?;
+        let mut run = trace(&self.kernel, arguments, GAS, Error::Fit)?;
         let (active, needed) =
             device_shape(&self.format, &self.kernel, &mut run).map_err(|_| Error::Fit)?;
         let program = self.program();
@@ -174,7 +183,7 @@ impl Program {
         arguments: &[u8],
         rng: MaskRng,
     ) -> Result<(DeviceProof<Hasher>, MaskStats), Error> {
-        let mut run = trace(&self.kernel, arguments, GAS)?;
+        let mut run = trace(&self.kernel, arguments, GAS, Error::Fit)?;
         let proved = self.prover.prove(&mut run, rng);
         drop(run);
         proved
@@ -202,7 +211,7 @@ impl ReferenceProgram<'_> {
     /// The reference arguments it returns: its output, run to its halt on
     /// no input within [`REFERENCE_GAS`], stating no public arguments.
     pub fn arguments(&self) -> Result<Vec<u8>, Error> {
-        let run = trace_run(self.0, &[], REFERENCE_GAS)?;
+        let run = trace_run(self.0, &[], REFERENCE_GAS, REFERENCE_STEPS, Error::Steps)?;
         match vos_pvm_precompiles::device_return_parts(&run.output) {
             Some(([], output)) => Ok(output.to_vec()),
             _ => Err(Error::Reference),
@@ -210,27 +219,34 @@ impl ReferenceProgram<'_> {
     }
 }
 
-/// `kernel`'s run on `arguments`, traced to its halt within `gas`.
-fn trace(kernel: &[u8], arguments: &[u8], gas: u64) -> Result<SideNote, Error> {
-    trace_run(kernel, arguments, gas).map(|trace| trace.side_note.expand())
+/// `kernel`'s run on `arguments`, traced to its halt within `gas` and
+/// [`STEPS`], `longer` its refusal past them.
+fn trace(kernel: &[u8], arguments: &[u8], gas: u64, longer: Error) -> Result<SideNote, Error> {
+    trace_run(kernel, arguments, gas, STEPS, longer).map(|trace| trace.side_note.expand())
 }
 
-/// [`trace`], the whole run: [`Error::Layout`] for a blob that is not a
-/// standard program, [`Error::Arguments`] for arguments the run does not
-/// read whole, [`Error::Halt`] for a run that does not halt.
+/// [`trace`], the whole run, within `steps`: [`Error::Layout`] for a blob
+/// that is not a standard program, [`Error::Arguments`] for arguments the
+/// run does not read whole, [`Error::Halt`] for a run that does not halt,
+/// `longer` for one past `steps`.
 fn trace_run(
     blob: &[u8],
     arguments: &[u8],
     gas: u64,
+    steps: usize,
+    longer: Error,
 ) -> Result<vos_pvm_proof::kernel::KernelTrace, Error> {
-    vos_pvm_proof::kernel::trace_kernel(blob, arguments, gas).map_err(|error| match error {
-        KernelTraceError::Program
-        | KernelTraceError::NotCanonical
-        | KernelTraceError::Code
-        | KernelTraceError::Transfer => Error::Layout,
-        KernelTraceError::Input | KernelTraceError::Unread => Error::Arguments,
-        KernelTraceError::Exit | KernelTraceError::Output | KernelTraceError::Allocation => {
-            Error::Halt
+    vos_pvm_proof::kernel::trace_kernel_within(blob, arguments, gas, steps).map_err(|error| {
+        match error {
+            KernelTraceError::Program
+            | KernelTraceError::NotCanonical
+            | KernelTraceError::Code
+            | KernelTraceError::Transfer => Error::Layout,
+            KernelTraceError::Input | KernelTraceError::Unread => Error::Arguments,
+            KernelTraceError::Exit | KernelTraceError::Output | KernelTraceError::Allocation => {
+                Error::Halt
+            }
+            KernelTraceError::Steps => longer,
         }
     })
 }

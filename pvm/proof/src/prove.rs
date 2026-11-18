@@ -60,6 +60,9 @@ pub enum SegmentError {
     /// The shape names a chip outside the segment AIR, has a log size more
     /// or fewer than its chips, or lacks the class named.
     MalformedShape,
+    /// The run is longer than [`MAX_RUN_STEPS`]: its ledgers' ordering
+    /// deltas would pass their bits. Refused before any trace.
+    RunLength,
 }
 
 impl SegmentError {
@@ -92,11 +95,32 @@ impl core::fmt::Display for SegmentError {
                 overflow: false,
             } => write!(formatter, "chip {chip} is another size than its shape"),
             Self::MalformedShape => formatter.write_str("the shape is not one of the segment AIR"),
+            Self::RunLength => formatter.write_str("the run is longer than a proof's ledgers order"),
         }
     }
 }
 
 impl std::error::Error for SegmentError {}
+
+/// The most steps a run proves, `2^27 − 1`. A ledger orders its rows by the
+/// key `2·ts + is_write`, each chain from its `ts = 0` write to its closing
+/// read at the run's last timestamp plus one, and range-checks each gap in
+/// 28 bits (`ORDER_DELTA_BITS`); timestamps are the run's, from 1. So a run
+/// of `n` steps has a gap up to `2(n + 1) − 1`, which fits 28 bits for `n`
+/// below `2^27`: an absolute bound on a run's length, whatever its segments.
+/// A longer run, or a segment ending past it, is refused
+/// ([`SegmentError::RunLength`]) before any trace.
+pub const MAX_RUN_STEPS: usize = (1 << 27) - 1;
+
+/// Whether `side_note`'s last step is within [`MAX_RUN_STEPS`] of the run's
+/// start: its ledgers' closing reads order within their bits.
+pub(crate) fn check_run_length(side_note: &SideNote) -> Result<(), SegmentError> {
+    let closing = crate::chips::register_memory_closing::closing_ts_for(side_note);
+    if closing > MAX_RUN_STEPS as u64 + 1 {
+        return Err(SegmentError::RunLength);
+    }
+    Ok(())
+}
 
 /// Cap rayon's global thread pool at a sensible default for our
 /// workload, unless the user has explicitly set `RAYON_NUM_THREADS`
@@ -364,17 +388,25 @@ pub fn prove_chip_isolated_format(
 }
 
 /// The components' main traces: the producers in order, filling the side
-/// note's multiplicities, then the consumers in parallel.
+/// note's multiplicities, then the consumers in parallel. With `pinned`, each
+/// at exactly its size in `min_log_sizes`: the position and log size of the
+/// first producer of another size are returned as soon as it is traced,
+/// before any later chip's; a consumer's is the caller's to compare.
 pub(crate) fn generate_component_traces(
     side_note: &mut SideNote,
     components: &[&dyn crate::framework::MachineProverComponent],
     min_log_sizes: &[u32],
-) -> Vec<ComponentTrace> {
+    pinned: bool,
+) -> Result<Vec<ComponentTrace>, (usize, u32)> {
     let mut traces: Vec<Option<ComponentTrace>> = (0..components.len()).map(|_| None).collect();
     for (index, component) in components.iter().enumerate() {
         if component.is_producer() {
             let min_log_size = min_log_sizes.get(index).copied().unwrap_or(0);
-            traces[index] = Some(component.generate_component_trace_min(side_note, min_log_size));
+            let trace = component.generate_component_trace_min(side_note, min_log_size);
+            if pinned && trace.log_size() != min_log_size {
+                return Err((index, trace.log_size()));
+            }
+            traces[index] = Some(trace);
         }
     }
     {
@@ -400,10 +432,16 @@ pub(crate) fn generate_component_traces(
             traces[index] = Some(trace);
         }
     }
-    traces
+    Ok(traces
         .into_iter()
         .map(|trace| trace.expect("every component is classified as producer or consumer"))
-        .collect()
+        .collect())
+}
+
+/// Whether `side_note`'s steps fit a CPU of `log_size`, a row a step: what a
+/// pinned trace checks before any chip is traced.
+pub(crate) fn steps_fit(side_note: &SideNote, log_size: u32) -> bool {
+    crate::trace::utils::ceil_log2_at_least_lanes(side_note.num_steps()) <= log_size
 }
 
 /// The boundary states a proof ships, with the page-Merkle roots the
@@ -513,7 +551,25 @@ where
     prepare(side_note)?;
 
     let t = Instant::now();
-    let traces = generate_component_traces(side_note, components, sizes.floors());
+    let pinned = matches!(sizes, Sizes::Pinned(_));
+    let refusal = |position: usize, overflow: bool| SegmentError::Shape {
+        chip: crate::chips_of_mask(component_mask)
+            .nth(position)
+            .unwrap_or(position),
+        overflow,
+    };
+    // The CPU is the first chip of a mask holding it, a row a step.
+    if pinned
+        && component_mask & 1 << crate::chip_idx::CPU != 0
+        && !steps_fit(side_note, sizes.floors().first().copied().unwrap_or(0))
+    {
+        return Err(refusal(0, true));
+    }
+    let traces = generate_component_traces(side_note, components, sizes.floors(), pinned)
+        .map_err(|(position, log_size)| {
+            let pinned = sizes.floors().get(position).copied().unwrap_or(0);
+            refusal(position, log_size > pinned)
+        })?;
     let log_sizes = traced_sizes(&traces, sizes, component_mask)?;
     let trace_gen = t.elapsed();
 
@@ -675,11 +731,12 @@ where
     ))
 }
 
-/// What a proof needs of `side_note` before its traces: its memory
-/// witnesses checked (a malformed or faulting trace is the caller's error,
+/// What a proof needs of `side_note` before its traces: its length within
+/// [`MAX_RUN_STEPS`], its memory witnesses checked (a malformed or faulting trace is the caller's error,
 /// not an expensive attempt at an unsatisfiable proof), its boundary
 /// registers filled, and its memory pages' Merkle payload built.
 fn prepare(side_note: &mut SideNote) -> Result<(), SegmentError> {
+    check_run_length(side_note)?;
     validate_memory_witnesses(side_note)?;
     // RegisterMemoryBoundaryChip needs `initial_regs` populated.
     backfill_initial_regs(side_note);

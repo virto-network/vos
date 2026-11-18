@@ -258,6 +258,18 @@ impl TracingPvm {
         }
     }
 
+    /// [`Self::run_with_precompiles`] for at most `max_steps` recorded
+    /// steps: the exit, or `None` when the run reaches `max_steps` steps
+    /// without one, its trace held to them.
+    pub fn run_with_precompiles_within(&mut self, max_steps: usize) -> Option<ExitReason> {
+        while self.steps.len() < max_steps {
+            if let Some(exit) = self.step_with_precompiles() {
+                return Some(exit);
+            }
+        }
+        None
+    }
+
     /// One iteration of [`Self::run_with_precompiles`]: execute exactly one
     /// recorded step, execute and acknowledge a precompile call, and return
     /// `Some(exit)` only when the run terminates.

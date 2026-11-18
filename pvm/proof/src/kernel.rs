@@ -78,6 +78,11 @@ pub enum KernelTraceError {
     /// It read fewer bytes than the input holds: it is not the run the
     /// input was recorded from.
     Unread,
+    /// The run took more steps than its trace is held to
+    /// ([`trace_kernel_within`]; [`crate::MAX_RUN_STEPS`], the most a proof
+    /// orders, for [`trace_kernel`] and [`trace_program`]): stopped there,
+    /// before its trace grows past them.
+    Steps,
 }
 
 /// Program `blob` loaded as the agent loads it, on `arguments` with `gas`:
@@ -177,7 +182,22 @@ pub fn kernel_side_note(blob: &[u8]) -> Result<SideNote, KernelTraceError> {
 /// is held to the kernel contract: a nonempty output is readable
 /// ([`KernelTraceError::Output`]); an empty one is empty whatever φ7.
 pub fn trace_kernel(blob: &[u8], input: &[u8], gas: u64) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, &[], Some(input), gas, Contract::Kernel, |_| {})
+    trace_kernel_within(blob, input, gas, crate::MAX_RUN_STEPS)
+}
+
+/// [`trace_kernel`] held to `max_steps` steps: a run that takes more is
+/// stopped at them and refused ([`KernelTraceError::Steps`]). The trace's
+/// memory is in its steps, about a hundred bytes each beside the calls'
+/// records, and the steps a gas are the gas model's (a block's price is
+/// its pipeline's cycles, several instructions a cycle): `max_steps` bounds
+/// it whatever `gas` is.
+pub fn trace_kernel_within(
+    blob: &[u8],
+    input: &[u8],
+    gas: u64,
+    max_steps: usize,
+) -> Result<KernelTrace, KernelTraceError> {
+    trace(blob, &[], Some(input), gas, max_steps, Contract::Kernel, |_| {})
 }
 
 /// [`trace_kernel`] with the machine's memory changed by `forge` before
@@ -191,7 +211,15 @@ pub fn trace_forged_kernel(
     gas: u64,
     forge: impl FnOnce(&mut Memory),
 ) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, &[], Some(input), gas, Contract::Kernel, forge)
+    trace(
+        blob,
+        &[],
+        Some(input),
+        gas,
+        crate::MAX_RUN_STEPS,
+        Contract::Kernel,
+        forge,
+    )
 }
 
 /// Run standard program `blob` with `gas` on `arguments`, mapped read-only
@@ -206,7 +234,15 @@ pub fn trace_program(
     arguments: &[u8],
     gas: u64,
 ) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, arguments, None, gas, Contract::Gray, |_| {})
+    trace(
+        blob,
+        arguments,
+        None,
+        gas,
+        crate::MAX_RUN_STEPS,
+        Contract::Gray,
+        |_| {},
+    )
 }
 
 /// [`trace_kernel`] run to whatever exit it reaches, a trap included: its
@@ -270,11 +306,14 @@ fn trace(
     arguments: &[u8],
     input: Option<&[u8]>,
     gas: u64,
+    max_steps: usize,
     contract: Contract,
     forge: impl FnOnce(&mut Memory),
 ) -> Result<KernelTrace, KernelTraceError> {
     let (mut tracer, image, permissions) = start(blob, arguments, input, gas, forge)?;
-    let exit = tracer.run_with_precompiles();
+    let exit = tracer
+        .run_with_precompiles_within(max_steps)
+        .ok_or(KernelTraceError::Steps)?;
     if exit != ExitReason::Halt {
         return Err(KernelTraceError::Exit);
     }

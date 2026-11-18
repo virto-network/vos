@@ -20,8 +20,8 @@ use crate::chip_idx;
 use crate::framework::MachineProverComponent;
 use crate::lookups::AllLookupElements;
 use crate::prove::{
-    SegmentError, generate_component_traces, prepare_side_note_for_verification,
-    validate_memory_witnesses,
+    SegmentError, check_run_length, generate_component_traces,
+    prepare_side_note_for_verification, steps_fit, validate_memory_witnesses,
 };
 use crate::side_note::SideNote;
 use crate::trace::component::ComponentTrace;
@@ -100,6 +100,7 @@ pub fn masked_device_trace(
     if chips.len() != log_sizes.len() {
         return Err(SegmentError::MalformedShape);
     }
+    check_run_length(side_note)?;
     validate_memory_witnesses(side_note)?;
     prepare_side_note_for_verification(side_note);
     side_note.device = Some(alloc::sync::Arc::new(crate::device::DeviceRun::of(
@@ -112,7 +113,23 @@ pub fn masked_device_trace(
         .collect();
     let cpu = shape.program_cpu();
     side_note.cpu_rows_local = cpu.is_some();
-    let mut traces = generate_component_traces(side_note, &components, log_sizes);
+    let pinned = matches!(sizes, DeviceSizes::Pinned(_));
+    // A run is refused at its first chip past its size, before any later
+    // chip is traced: the CPU, a row a step, before any.
+    if pinned
+        && chips.first() == Some(&chip_idx::CPU)
+        && !steps_fit(side_note, log_sizes[0])
+    {
+        return Err(SegmentError::Shape {
+            chip: chip_idx::CPU,
+            overflow: true,
+        });
+    }
+    let mut traces = generate_component_traces(side_note, &components, log_sizes, pinned)
+        .map_err(|(position, log_size)| SegmentError::Shape {
+            chip: chips[position],
+            overflow: log_size > log_sizes[position],
+        })?;
     if let Some(cpu) = &cpu {
         assert_eq!(
             chips.first(),

@@ -53,7 +53,7 @@ mod prove;
 mod verify;
 
 pub use error::{Error, Refusal};
-pub use prove::{GAS, Program, REFERENCE_GAS};
+pub use prove::{GAS, Program, REFERENCE_GAS, REFERENCE_STEPS, STEPS};
 pub use verify::{Verifier, claim_io, decode, encode};
 pub use vos_pvm_final_verifier::masking::MaskedProof;
 pub use vos_pvm_recair::masked::{MaskRng, MaskStats};

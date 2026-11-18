@@ -32,6 +32,10 @@ pub enum Error {
     Arguments,
     /// The reference program returns more than the arguments alone.
     Reference,
+    /// A run longer than its trace is held to: the kernel's reference run
+    /// past the device format's CPU, or the reference program's past
+    /// `REFERENCE_STEPS`.
+    Steps,
     /// The reference run does not trace over the device chips.
     Trace,
     /// A log size more or fewer than the program's chips, or a table (the
@@ -71,6 +75,7 @@ impl Error {
             | Self::Halt
             | Self::Arguments
             | Self::Reference
+            | Self::Steps
             | Self::Trace
             | Self::Sizes
             | Self::Floor { .. }
@@ -94,6 +99,7 @@ impl core::fmt::Display for Error {
             Self::Halt => f.write_str("the run does not halt within its gas"),
             Self::Arguments => f.write_str("the arguments are not the ones the run reads"),
             Self::Reference => f.write_str("the reference returns no arguments alone"),
+            Self::Steps => f.write_str("the run is longer than its trace is held to"),
             Self::Trace => f.write_str("the reference run does not trace over the device chips"),
             Self::Sizes => f.write_str("a log size more or fewer than the chips"),
             Self::Floor { chip } => write!(f, "chip {chip} under its floor"),
