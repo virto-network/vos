@@ -1,69 +1,50 @@
 //! Guest-side shims for vos-pvm-proof precompile ECALLs.
 //!
-//! The shim re-exports `Scalar`, `RistrettoPoint`, and basepoint
-//! constants from `curve25519-dalek` (under the `ristretto` feature)
-//! plus a streaming `blake2b_hash` (under the `blake2b` feature) so
-//! consumer code reads identically to plain dalek/blake2:
-//!
-//! ```ignore
-//! use vos_pvm_precompiles::{Scalar, RistrettoPoint, RISTRETTO_BASEPOINT_TABLE};
-//! let v: Scalar = ...;
-//! let g = &RISTRETTO_BASEPOINT_TABLE;
-//! let h: RistrettoPoint = ...;
-//! let p = &v * g + b * &h;
-//! ```
-//!
-//! On `target_arch = "riscv64"` (the vos-pvm-proof guest target), the
-//! `Mul` / `Add` impls dispatch to inline-asm `ecall` that the
-//! prover's chips intercept and accelerate.  On non-riscv64 targets
-//! they fall through to dalek's / a bundled software reference.
+//! The shim provides a streaming `blake2b_hash` (under the `blake2b`
+//! feature), a kernel's io-hash, a device kernel's over Poseidon2
+//! (`compute_device_io_hash`) and the Poseidon2-M31 compression
+//! (`poseidon2_compress`). On `target_arch = "riscv64"` (the guest target)
+//! each compression makes a precompile host call, which the prover's chips
+//! record, and computes in software when the host answers `WHAT`. On other
+//! targets it runs a software reference: the BLAKE2b one bundled here, the
+//! Poseidon2 permutation of `vos-pvm-poseidon2`.
 //!
 //! ## Features
 //!
-//! - `ristretto` (default) — `Scalar`, `RistrettoPoint`,
-//!   `RISTRETTO_BASEPOINT_TABLE`, plus the low-level
-//!   `ristretto_scalar_mult`, `ristretto_point_add`,
-//!   `scalar_mul_mod_l`, `scalar_add_mod_l`,
-//!   `scalar_from_bytes_mod_order_wide` ABI fns.  Pulls in
-//!   `curve25519-dalek`.
 //! - `blake2b` (default) — `blake2b_compress` (one compression per
 //!   call) plus the streaming `blake2b_hash::<N>(domain, parts)`
-//!   high-level helper.  Self-contained — no extra runtime deps.
-//!
-//! Default = `["ristretto", "blake2b"]`.  Guests that only need
-//! hashing can opt out of dalek with `default-features = false,
-//! features = ["blake2b"]`.
+//!   high-level helper, and a kernel's io-hash (`compute_io_hash`).
+//!   Self-contained — no extra runtime deps.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
 // Cryptographic code paths use index-based loops to mirror reference
-// implementations (RFC 7693 round constants, dalek's named lifetimes
-// across multiple impls). Allowed crate-wide so the workspace's
-// `-D warnings` gate doesn't reject this verbatim port.
-#![allow(clippy::needless_range_loop, clippy::needless_lifetimes)]
+// implementations (RFC 7693 round constants). Allowed crate-wide so the
+// workspace's `-D warnings` gate doesn't reject this verbatim port.
+#![allow(clippy::needless_range_loop)]
 
+#[cfg(test)]
 extern crate alloc;
 
 pub mod ecalls;
-pub use ecalls::{
-    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
-    ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
+pub use ecalls::{ECALL_BLAKE2B_COMPRESS, ECALL_POSEIDON2};
+
+pub mod blake2b;
+pub use blake2b::{
+    BLAKE2B_IV, Blake2b256, blake2b_256, blake2b_compress, blake2b_compress_words, blake2b_hash,
 };
 
-#[cfg(feature = "blake2b")]
-pub mod blake2b;
-#[cfg(feature = "blake2b")]
-pub use blake2b::{blake2b_compress, blake2b_hash};
+pub mod io;
+pub use io::{RootKind, RootRead, UnknownRootKind, compute_io_hash};
 
-#[cfg(feature = "ristretto")]
-pub mod scalar;
-#[cfg(feature = "ristretto")]
-pub use scalar::{Scalar, scalar_add_mod_l, scalar_from_bytes_mod_order_wide, scalar_mul_mod_l};
+pub mod device_io;
+pub use device_io::{
+    DEVICE_IO_TAG, DeviceIoHasher, MAX_DEVICE_IO, Poseidon2Call, Poseidon2Software,
+    compute_device_io_hash, device_return_parts,
+};
 
-#[cfg(feature = "ristretto")]
-pub mod ristretto;
-#[cfg(feature = "ristretto")]
-pub use ristretto::{
-    RISTRETTO_BASEPOINT_TABLE, RistrettoBasepointTable, RistrettoPoint, ristretto_point_add,
-    ristretto_scalar_mult,
+pub mod poseidon2;
+pub use poseidon2::{
+    checked_poseidon2_compress_block, poseidon2_compress, poseidon2_compress_block,
+    poseidon2_compress_into,
 };

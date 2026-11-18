@@ -1,0 +1,40 @@
+{
+  "expected": {
+    "blocks": [
+      {
+        "gas": 180,
+        "pc": 0
+      }
+    ],
+    "first": {
+      "remaining_gas": 320,
+      "status": "panic"
+    },
+    "resume": null
+  },
+  "initial": {
+    "gas": 500,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "three_register_destination_dependency_chain",
+  "program": {
+    "bitmask": "0x4902",
+    "code": "0xcb1002cb3204cb540600"
+  },
+  "rule": "gray-paper-v0.8-rob-block-gas",
+  "spec": "gray-paper-0.8.0"
+}

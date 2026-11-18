@@ -1,0 +1,753 @@
+//! The masked prover: masking variant (c) (`docs/design/proving.md` §5,
+//! R1–R8), over any component set ([`MaskedComponents`]) and any Merkle
+//! channel, in the masked transcript's order
+//! (`vos_pvm_final_verifier::masking`):
+//!
+//! 1. the header, at the format's number and configuration, and the log
+//!    sizes;
+//! 2. the preprocessed tree: its columns extended one level, unmasked and
+//!    unsalted;
+//! 3. the main tree: each component's columns, then its blinding columns
+//!    (one QM31 on its first row, the set's summing to zero: R2), every one
+//!    masked `f + v_H·r` (`layout::MaskLayout`), then the salts;
+//! 4. the public values; the interaction PoW;
+//! 5. the set's relations, then the blinding relation
+//!    ([`MaskedComponents::draw`]);
+//! 6. the blinded claimed sums; the interaction tree, masked and salted;
+//! 7. the composition coefficient;
+//! 8. the composition tree: the composition's 4 coordinates whole at its
+//!    bound, never split, the FRI mask `R`'s uniform columns, the salts;
+//! 9. the out-of-domain point `z`: the masks sampled at the AIR's level, the
+//!    composition at `π(z)`, `R` at `z`, no salt sampled;
+//! 10. Stwo's `prove_values`: the DEEP coefficients, FRI, the PoW, the
+//!     queries.
+//!
+//! **The randomness** is hedged (R4, [`MaskRng`]). **R1** is checked on
+//! every transcript: the randomizer's revealed functionals of full rank
+//! over M31 (`rank::rank_m31`); a deficient transcript is discarded and every
+//! mask drawn again, at most [`MAX_ATTEMPTS`] times. Whether a transcript
+//! passes is a function of public coins and the format, so the retry
+//! conditions on a public event. **R3** holds by construction: `R`'s
+//! columns are the format's (8 for `format::MASKED_WRAP`), whose
+//! independent DEEP coefficients span QM31 over M31 but with probability
+//! about `p^-5`; no check.
+//!
+//! The format pins the masking ([`Masking`]); nothing here names the wrap,
+//! whose set is [`WrapComponents`].
+
+mod commit;
+mod drawn;
+mod layout;
+mod rank;
+mod rng;
+mod salts;
+
+use std::time::{Duration, Instant};
+
+use num_traits::{One, Zero};
+use rand::Rng;
+use rand_chacha::ChaCha20Rng;
+use stwo::core::ColumnVec;
+use stwo::core::air::accumulation::PointEvaluationAccumulator;
+use stwo::core::air::{Component, Components};
+use stwo::core::channel::{Channel, MerkleChannel};
+use stwo::core::circle::CirclePoint;
+use stwo::core::fields::m31::BaseField;
+use stwo::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
+use stwo::core::pcs::TreeVec;
+use stwo::core::poly::circle::CanonicCoset;
+use stwo::core::proof::StarkProof;
+use stwo::core::utils::MaybeOwned;
+use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+use stwo::core::verifier::PREPROCESSED_TRACE_IDX;
+use stwo::prover::backend::simd::SimdBackend;
+use stwo::prover::backend::simd::column::BaseColumn;
+use stwo::prover::backend::{BackendForChannel, Column};
+use stwo::prover::mempool::BaseColumnPool;
+use stwo::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
+use stwo::prover::poly::twiddles::TwiddleTree;
+use stwo::prover::{
+    CommitmentSchemeProver, CommitmentTreeProver, ComponentProver, ComponentProvers,
+    DomainEvaluationAccumulator, ProvingError, Trace,
+};
+use stwo_constraint_framework::Relation;
+use vos_pvm_final_verifier::masking::{MaskedProof, mask_rows};
+use vos_pvm_proof::format::mix_statement_header;
+use vos_pvm_proof::format::{Format, Masking};
+use vos_pvm_proof::masked::DeviceComponents;
+use vos_pvm_recair_air::masking::{
+    self as air, BLIND_COLUMNS, BlindRelation, MASKED_COLUMN_EXPANSION,
+    MASKED_LOG_CONSTRAINT_EXPANSION, MaskedComponent, MaskedComponents,
+};
+use vos_pvm_recair_air::wrap::WrapComponents;
+
+pub use drawn::{Drawn, drawn_in};
+use layout::MaskLayout;
+#[cfg(feature = "seeded-masks")]
+pub use rank::rank_m31;
+pub use rng::MaskRng;
+
+use crate::prove::CircuitError;
+use crate::trace::{self, Evaluations, FirstRowFraction};
+use commit::{commit_composition, commit_interaction, commit_main};
+
+/// The attempts R1 may refuse before the prover gives up
+/// ([`CircuitError::MaskRank`]).
+pub const MAX_ATTEMPTS: u32 = 8;
+
+/// The masked lifting height of components of `log_sizes` under
+/// `format`'s blowup: the tallest, raised by the masked constraint
+/// expansion. `None` for no components, or a height that overflows.
+pub(crate) fn lifting_log_size(format: &Format, log_sizes: &[u32]) -> Option<u32> {
+    log_sizes
+        .iter()
+        .max()?
+        .checked_add(MASKED_LOG_CONSTRAINT_EXPANSION)?
+        .checked_add(format.params.log_blowup)
+}
+
+/// The preprocessed columns as a masked format commits them: interpolated
+/// on `twiddles` and each extended one level.
+pub(crate) fn extend_preprocessed(
+    preprocessed: Evaluations,
+    twiddles: &TwiddleTree<SimdBackend>,
+) -> Vec<CircleCoefficients<SimdBackend>> {
+    SimdBackend::interpolate_columns(preprocessed, twiddles)
+        .into_iter()
+        .map(|poly| poly.extend(poly.log_size() + MASKED_COLUMN_EXPANSION))
+        .collect()
+}
+
+/// A component set's provers: what the masked prover evaluates the
+/// composition with, beside [`MaskedComponents`]' verifier-side view.
+pub trait MaskedProvers: MaskedComponents {
+    /// The components in commitment order, their bounds at their rows'
+    /// level, as [`MaskedComponents::components`].
+    fn provers(&self) -> Vec<&dyn ComponentProver<SimdBackend>>;
+}
+
+impl MaskedProvers for WrapComponents {
+    fn provers(&self) -> Vec<&dyn ComponentProver<SimdBackend>> {
+        vec![&self.p2, &self.qm31, &self.h8]
+    }
+}
+
+/// The device's masked chip set (`vos_pvm_proof::masked`), which
+/// `vos-pvm-device` proves.
+impl MaskedProvers for DeviceComponents {
+    fn provers(&self) -> Vec<&dyn ComponentProver<SimdBackend>> {
+        DeviceComponents::provers(self)
+    }
+}
+
+/// A component prover whose columns are committed one level up
+/// ([`MaskedComponent`]); it evaluates its constraints on the committed
+/// evaluations as they are.
+struct Lifted<'a>(MaskedComponent<'a, dyn ComponentProver<SimdBackend> + 'a>);
+
+impl Component for Lifted<'_> {
+    fn n_constraints(&self) -> usize {
+        self.0.n_constraints()
+    }
+
+    fn max_constraint_log_degree_bound(&self) -> u32 {
+        self.0.max_constraint_log_degree_bound()
+    }
+
+    fn trace_log_degree_bounds(&self) -> TreeVec<ColumnVec<u32>> {
+        self.0.trace_log_degree_bounds()
+    }
+
+    fn mask_points(
+        &self,
+        point: CirclePoint<SecureField>,
+        max_log_degree_bound: u32,
+    ) -> TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>> {
+        self.0.mask_points(point, max_log_degree_bound)
+    }
+
+    fn preprocessed_column_indices(&self) -> ColumnVec<usize> {
+        self.0.preprocessed_column_indices()
+    }
+
+    fn evaluate_constraint_quotients_at_point(
+        &self,
+        point: CirclePoint<SecureField>,
+        mask: &TreeVec<ColumnVec<Vec<SecureField>>>,
+        evaluation_accumulator: &mut PointEvaluationAccumulator,
+        max_log_degree_bound: u32,
+    ) {
+        self.0.evaluate_constraint_quotients_at_point(
+            point,
+            mask,
+            evaluation_accumulator,
+            max_log_degree_bound,
+        )
+    }
+}
+
+impl ComponentProver<SimdBackend> for Lifted<'_> {
+    fn evaluate_constraint_quotients_on_domain(
+        &self,
+        trace: &Trace<'_, SimdBackend>,
+        evaluation_accumulator: &mut DomainEvaluationAccumulator<SimdBackend>,
+    ) {
+        self.0
+            .inner
+            .evaluate_constraint_quotients_on_domain(trace, evaluation_accumulator)
+    }
+}
+
+/// A component set's interaction trace under its relations: each
+/// component's columns and claimed sum, its fractions in pairs with its
+/// blinding's fraction after its own.
+pub type Interaction<'a, R> =
+    dyn Fn(&R, &[FirstRowFraction]) -> Vec<(Evaluations, SecureField)> + 'a;
+
+/// Component `c`'s main columns, without its blinding columns, in Stwo's
+/// storage order: borrowed, the prover interpolating them a component at a
+/// time, so it keeps no copy of the trace.
+pub type MainColumns<'a> = dyn Fn(usize) -> Vec<&'a BaseColumn> + Sync + 'a;
+
+/// What the masked prover proves: a component set's columns, unmasked, at
+/// their rows' level.
+pub struct MaskedTrace<'a, R, A = ()> {
+    /// The components the set holds ([`MaskedComponents::Active`]).
+    pub active: A,
+    /// Each component's log size, in commitment order.
+    pub log_sizes: &'a [u32],
+    /// The preprocessed columns, in commitment order.
+    pub preprocessed: Evaluations,
+    /// Each component's main columns ([`MainColumns`]).
+    pub main: &'a MainColumns<'a>,
+    /// The values mixed after the main tree's root.
+    pub public: &'a [SecureField],
+    /// The interaction trace.
+    pub interaction: &'a Interaction<'a, R>,
+}
+
+/// What a masked prove measured.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MaskStats {
+    /// The attempts made, the last accepted.
+    pub attempts: u32,
+    /// R1 on the accepted attempt.
+    pub rank_check: Duration,
+    /// The column classes R1 checked: every masked column's level, its
+    /// quotient's lift and its offsets, each once.
+    pub classes: usize,
+    /// The most functionals one column class revealed, against `h`.
+    pub revealed_rows: usize,
+}
+
+/// Proves `trace` masked under `format`, a masked format that pins its
+/// masking, as the component set `C` on `MC`'s trees and channel, its
+/// randomness from `rng` hedged with the statement's and the main columns'
+/// digest.
+///
+/// The claimed sums are blinded (R2) by values summing to zero, so their
+/// total is the unblinded one; the sums the public values fix
+/// ([`MaskedComponents::public_sums`]) are left unblinded. A set of one
+/// blinded component is refused ([`air::blinds_its_sums`]): its blinding
+/// would be zero and its claimed sum in the clear.
+///
+/// Each component's mask takes its own `h` ([`mask_rows`]).
+pub fn prove_masked<MC: MerkleChannel, C: MaskedProvers>(
+    format: &Format,
+    trace: MaskedTrace<'_, C::Relations, C::Active>,
+    rng: MaskRng,
+) -> Result<(MaskedProof<MC::H>, MaskStats), CircuitError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    prove_masked_checked::<MC, C>(format, trace, rng, Checks::ALL)
+}
+
+/// [`prove_masked`] without the prover's out-of-domain check of the
+/// constraints: a witness that breaks one is proved all the same, so the
+/// soundness tests can hand the verifier a forced proof. Only the prover's
+/// tests have it, on the dev edge that gives them [`MaskRng::Seeded`]
+/// (`seeded-masks`); no production build does.
+#[cfg(feature = "seeded-masks")]
+pub fn prove_masked_unchecked<MC: MerkleChannel, C: MaskedProvers>(
+    format: &Format,
+    trace: MaskedTrace<'_, C::Relations, C::Active>,
+    rng: MaskRng,
+) -> Result<(MaskedProof<MC::H>, MaskStats), CircuitError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    prove_masked_checked::<MC, C>(
+        format,
+        trace,
+        rng,
+        Checks {
+            constraints: false,
+            ..Checks::ALL
+        },
+    )
+}
+
+/// What the prover holds itself to: the honest prover all of it; a forced
+/// proof, on the tests' dev edge, without one.
+#[derive(Clone, Copy, Debug)]
+pub struct Checks {
+    /// The out-of-domain check of the constraints.
+    pub constraints: bool,
+    /// The public sums ([`MaskedComponents::public_sums`]) left unblinded.
+    pub public_unblinded: bool,
+}
+
+impl Checks {
+    pub const ALL: Self = Self {
+        constraints: true,
+        public_unblinded: true,
+    };
+}
+
+/// [`prove_masked`], held to `checks`.
+pub(crate) fn prove_masked_checked<MC: MerkleChannel, C: MaskedProvers>(
+    format: &Format,
+    trace: MaskedTrace<'_, C::Relations, C::Active>,
+    rng: MaskRng,
+    checks: Checks,
+) -> Result<(MaskedProof<MC::H>, MaskStats), CircuitError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    prove_masked_held::<MC, C>(format, &[], trace, None, rng, checks)
+}
+
+/// What every proof of one program shares, computed once: the twiddles
+/// at its lifting height and its preprocessed tree, committed as a masked
+/// format commits it (each column interpolated and extended one level), its
+/// coefficients kept.
+pub struct Committed<MC: MerkleChannel>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    twiddles: TwiddleTree<SimdBackend>,
+    tree: CommitmentTreeProver<SimdBackend, MC>,
+}
+
+impl<MC: MerkleChannel> Committed<MC>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    /// The preprocessed columns of components of `log_sizes`, committed
+    /// under `format`. `None` when a log size overflows.
+    pub fn new(format: &Format, log_sizes: &[u32], preprocessed: Evaluations) -> Option<Self> {
+        let lifting = lifting_log_size(format, log_sizes)?;
+        let twiddles =
+            SimdBackend::precompute_twiddles(CanonicCoset::new(lifting).circle_domain().half_coset);
+        let config = format.pcs_config();
+        let tree = CommitmentTreeProver::new(
+            extend_preprocessed(preprocessed, &twiddles),
+            config.fri_config.log_blowup_factor,
+            &twiddles,
+            true,
+            config.lifting_log_size,
+            &BaseColumnPool::new(),
+        );
+        Some(Self { twiddles, tree })
+    }
+
+    /// The preprocessed root.
+    pub fn root(&self) -> <MC::H as MerkleHasherLifted>::Hash {
+        self.tree.commitment.root()
+    }
+}
+
+/// The preprocessed tree a proof commits: its columns, extended and
+/// committed for this proof alone, or a program's, committed once.
+enum Preprocessed<'a, MC: MerkleChannel>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    Columns(Vec<CircleCoefficients<SimdBackend>>),
+    Committed(&'a CommitmentTreeProver<SimdBackend, MC>),
+}
+
+/// [`prove_masked`] of `program`, words the transcript mixes right after
+/// the header (`MaskedFormat::program`); its preprocessed tree
+/// `committed`'s when given, which must be the trace's columns committed
+/// under `format` (`trace.preprocessed` is then not read): a device
+/// program's proofs.
+pub fn prove_masked_program<MC: MerkleChannel, C: MaskedProvers>(
+    format: &Format,
+    program: &[u64],
+    trace: MaskedTrace<'_, C::Relations, C::Active>,
+    committed: Option<&Committed<MC>>,
+    rng: MaskRng,
+) -> Result<(MaskedProof<MC::H>, MaskStats), CircuitError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    prove_masked_held::<MC, C>(format, program, trace, committed, rng, Checks::ALL)
+}
+
+/// [`prove_masked_program`] held to `checks` alone: the forgery gates'
+/// forced proofs. Only the tests' dev edge has it (`seeded-masks`).
+#[cfg(feature = "seeded-masks")]
+pub fn prove_masked_program_forced<MC: MerkleChannel, C: MaskedProvers>(
+    format: &Format,
+    program: &[u64],
+    trace: MaskedTrace<'_, C::Relations, C::Active>,
+    committed: Option<&Committed<MC>>,
+    rng: MaskRng,
+    checks: Checks,
+) -> Result<(MaskedProof<MC::H>, MaskStats), CircuitError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    prove_masked_held::<MC, C>(format, program, trace, committed, rng, checks)
+}
+
+/// [`prove_masked_checked`] of `program`, its preprocessed tree
+/// `committed`'s when given ([`prove_masked_program`]).
+fn prove_masked_held<MC: MerkleChannel, C: MaskedProvers>(
+    format: &Format,
+    program: &[u64],
+    trace: MaskedTrace<'_, C::Relations, C::Active>,
+    committed: Option<&Committed<MC>>,
+    rng: MaskRng,
+    checks: Checks,
+) -> Result<(MaskedProof<MC::H>, MaskStats), CircuitError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    let Some(masking) = format.masking else {
+        return Err(CircuitError::UnmaskedFormat);
+    };
+    if trace.log_sizes.is_empty() {
+        return Err(CircuitError::TraceShape("no component"));
+    }
+    for (component, &log_size) in trace.log_sizes.iter().enumerate() {
+        if (trace.main)(component)
+            .iter()
+            .any(|column| column.len() != 1usize.checked_shl(log_size).unwrap_or(0))
+        {
+            return Err(CircuitError::TraceShape(
+                "a main column of another size than its component",
+            ));
+        }
+    }
+    let lifting = lifting_log_size(format, trace.log_sizes)
+        .ok_or(CircuitError::TraceShape("a component's log size overflows"))?;
+    let composition = lifting - format.params.log_blowup;
+    let own;
+    let (twiddles, preprocessed) = match committed {
+        Some(committed) => (
+            &committed.twiddles,
+            Preprocessed::Committed(&committed.tree),
+        ),
+        None => {
+            own = SimdBackend::precompute_twiddles(
+                CanonicCoset::new(lifting).circle_domain().half_coset,
+            );
+            let columns = extend_preprocessed(trace.preprocessed, &own);
+            (&own, Preprocessed::Columns(columns))
+        }
+    };
+    let witness = rng::witness_digest(
+        &rng::Statement {
+            format,
+            masking: &masking,
+            log_sizes: trace.log_sizes,
+            public: trace.public,
+        },
+        trace.main,
+    );
+    drawn::note("the witness digest", &witness);
+    let set_layout = C::layout(trace.active, trace.log_sizes).ok_or(CircuitError::TraceShape(
+        "the component set refuses its log sizes",
+    ))?;
+    if !air::blinds_its_sums(&set_layout) {
+        return Err(CircuitError::Masking(
+            "one blinded component: its claimed sum would be in the clear",
+        ));
+    }
+    let mask_rows = mask_rows(format, &set_layout).ok_or(CircuitError::Masking(
+        "the set's masks do not fit its trees",
+    ))?;
+    let public_sums = if checks.public_unblinded {
+        set_layout.public_sums()
+    } else {
+        Vec::new()
+    };
+    drop(set_layout);
+    let classes: Vec<(u32, u32)> = trace
+        .log_sizes
+        .iter()
+        .copied()
+        .zip(mask_rows.iter().copied())
+        .collect();
+    let layouts = layout::layouts(&classes)?;
+    let setup = Setup {
+        format,
+        program,
+        masking,
+        active: trace.active,
+        mask_rows: &mask_rows,
+        public_sums: &public_sums,
+        composition,
+        lifting,
+        twiddles,
+        layouts: &layouts,
+        log_sizes: trace.log_sizes,
+        public: trace.public,
+        main: trace.main,
+        interaction: trace.interaction,
+        check_constraints: checks.constraints,
+    };
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut stream = rng.attempt(&witness, attempt)?;
+        if let Some((proof, r1)) = prove_once::<MC, C>(&setup, &preprocessed, &mut stream)? {
+            let stats = MaskStats {
+                attempts: attempt + 1,
+                rank_check: r1.took,
+                classes: r1.classes,
+                revealed_rows: r1.rows,
+            };
+            return Ok((proof, stats));
+        }
+    }
+    Err(CircuitError::MaskRank)
+}
+
+/// What every attempt shares.
+struct Setup<'a, 'm, R, A> {
+    format: &'a Format,
+    /// The words mixed after the header.
+    program: &'a [u64],
+    masking: Masking,
+    active: A,
+    /// Each component's `log2 h`.
+    mask_rows: &'a [u32],
+    /// The components left unblinded.
+    public_sums: &'a [usize],
+    composition: u32,
+    lifting: u32,
+    twiddles: &'a TwiddleTree<SimdBackend>,
+    layouts: &'a [std::sync::Arc<MaskLayout>],
+    log_sizes: &'a [u32],
+    public: &'a [SecureField],
+    main: &'m MainColumns<'m>,
+    interaction: &'a Interaction<'a, R>,
+    check_constraints: bool,
+}
+
+/// A commitment scheme on `MC`'s trees.
+type Scheme<'a, MC> = CommitmentSchemeProver<'a, SimdBackend, MC>;
+
+/// The sample points, one list a column, one tree a list.
+type Points = TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>;
+
+/// What R1 measured on a transcript it accepted.
+struct R1 {
+    took: Duration,
+    classes: usize,
+    rows: usize,
+}
+
+/// An attempt's proof and what R1 measured, `None` when R1 refuses its
+/// transcript.
+type Attempt<H> = Option<(MaskedProof<H>, R1)>;
+
+/// One attempt from `rng`'s stream.
+fn prove_once<'a, MC: MerkleChannel, C: MaskedProvers>(
+    setup: &Setup<'a, '_, C::Relations, C::Active>,
+    preprocessed: &Preprocessed<'a, MC>,
+    rng: &mut ChaCha20Rng,
+) -> Result<Attempt<MC::H>, CircuitError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    let format = setup.format;
+    let config = format.pcs_config();
+    let channel = &mut MC::C::default();
+    mix_statement_header(channel, format.number, &config, setup.log_sizes);
+    for &word in setup.program {
+        channel.mix_u64(word);
+    }
+    let mut scheme = Scheme::<MC>::new(config, setup.twiddles);
+    scheme.set_store_polynomials_coefficients();
+
+    match preprocessed {
+        Preprocessed::Columns(columns) => {
+            let mut builder = scheme.tree_builder();
+            builder.extend_polys(columns.to_vec());
+            builder.commit(channel);
+        }
+        Preprocessed::Committed(tree) => scheme.commit_tree(MaybeOwned::Borrowed(tree), channel),
+    }
+
+    let blinding = commit_main(setup, &mut scheme, rng, channel)?;
+
+    channel.mix_felts(setup.public);
+    let interaction_pow = <SimdBackend as stwo::core::proof_of_work::GrindOps<MC::C>>::grind(
+        channel,
+        format.interaction_pow_bits(),
+    );
+    channel.mix_u64(interaction_pow);
+    let (relations, blind) = C::draw(setup.active, channel);
+
+    let claimed_sums = commit_interaction(
+        setup,
+        &mut scheme,
+        (&relations, &blind),
+        &blinding,
+        rng,
+        channel,
+    )?;
+
+    let (set, air_level) = masked_set::<C>(setup, &relations, &blind, &claimed_sums)?;
+    let lifted: Vec<Lifted<'_>> = set
+        .provers()
+        .into_iter()
+        .map(|inner| Lifted(MaskedComponent { inner }))
+        .collect();
+    let provers = ComponentProvers {
+        components: lifted
+            .iter()
+            .map(|component| component as &dyn ComponentProver<SimdBackend>)
+            .collect(),
+        n_preprocessed_columns: scheme.trees[PREPROCESSED_TRACE_IDX].polynomials.len(),
+    };
+
+    let random_coeff = commit_composition(setup, &mut scheme, &provers, rng, channel)?;
+
+    let oods_point = CirclePoint::<SecureField>::get_random_point(channel);
+    let points = checked_points(setup, &set, &scheme, oods_point)?;
+    let extended = scheme.prove_values(points.clone(), channel);
+    let stark_proof = StarkProof(extended.proof);
+
+    let components = Components {
+        components: lifted.iter().map(|c| c as &dyn Component).collect(),
+        n_preprocessed_columns: provers.n_preprocessed_columns,
+    };
+    let composition_value = air::composition_oods_eval(&stark_proof.sampled_values).ok_or(
+        CircuitError::Masking("the composition's coordinates are not sampled once each"),
+    )?;
+    if setup.check_constraints
+        && composition_value
+            != components.eval_composition_polynomial_at_point(
+                oods_point,
+                &stark_proof.sampled_values,
+                random_coeff,
+                air_level,
+            )
+    {
+        return Err(CircuitError::Stwo(ProvingError::ConstraintsNotSatisfied));
+    }
+
+    let Some(r1) = rank_check(
+        setup,
+        &components,
+        &points,
+        oods_point,
+        &extended.aux.unsorted_query_locations,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        MaskedProof {
+            interaction_pow,
+            claimed_sums,
+            stark_proof,
+        },
+        r1,
+    )))
+}
+
+/// The component set at the drawn relations and the blinded claimed sums,
+/// its composition at the setup's bound, and its AIR level.
+fn masked_set<C: MaskedProvers>(
+    setup: &Setup<'_, '_, C::Relations, C::Active>,
+    relations: &C::Relations,
+    blind: &BlindRelation,
+    claimed_sums: &[SecureField],
+) -> Result<(C, u32), CircuitError> {
+    let set = C::new(
+        setup.active,
+        relations,
+        blind,
+        setup.log_sizes,
+        claimed_sums,
+    )
+    .ok_or(CircuitError::TraceShape(
+        "the component set refuses its log sizes or claimed sums",
+    ))?;
+    if air::composition_log_degree_bound(&set) != Some(setup.composition) {
+        return Err(CircuitError::Masking(
+            "the set's composition bound is not its tallest log size plus 2",
+        ));
+    }
+    let air_level =
+        air::air_log_size(&set).ok_or(CircuitError::Masking("the set has no AIR level"))?;
+    Ok((set, air_level))
+}
+
+/// `set`'s sample points around `oods_point`, checked to fit the committed
+/// trees with no salt sampled.
+fn checked_points<MC: MerkleChannel, R, A>(
+    setup: &Setup<'_, '_, R, A>,
+    set: &impl MaskedComponents,
+    scheme: &Scheme<'_, MC>,
+    oods_point: CirclePoint<SecureField>,
+) -> Result<Points, CircuitError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    let points = air::sample_points(set, oods_point, &setup.masking).ok_or(
+        CircuitError::Masking("the set's mask points do not fit its trees"),
+    )?;
+    let fits = points.len() == scheme.trees.len()
+        && points
+            .iter()
+            .zip(scheme.trees.iter())
+            .all(|(columns, tree)| columns.len() == tree.polynomials.len());
+    let salts_unsampled = points.iter().skip(1).all(|columns| {
+        columns
+            .len()
+            .checked_sub(setup.masking.salt_columns)
+            .is_some_and(|start| columns[start..].iter().all(Vec::is_empty))
+    });
+    if !fits || !salts_unsampled {
+        return Err(CircuitError::Masking(
+            "the sample points do not fit the trees, or a salt is sampled",
+        ));
+    }
+    Ok(points)
+}
+
+/// R1 on the transcript: the randomizer's revealed functionals at `points`
+/// and the queried `query_positions`, timed. `None` when they are not of
+/// full rank.
+fn rank_check<R, A>(
+    setup: &Setup<'_, '_, R, A>,
+    components: &Components<'_>,
+    points: &Points,
+    oods_point: CirclePoint<SecureField>,
+    query_positions: &[usize],
+) -> Result<Option<R1>, CircuitError> {
+    let started = Instant::now();
+    let revealed = rank::revealed_functionals(
+        components,
+        points,
+        oods_point,
+        query_positions,
+        setup.lifting,
+        setup.mask_rows,
+    )
+    .ok_or(CircuitError::Masking(
+        "R1's column classes do not fit the sample points",
+    ))?;
+    let took = started.elapsed();
+    Ok(revealed.independent.then_some(R1 {
+        took,
+        classes: revealed.classes,
+        rows: revealed.rows,
+    }))
+}

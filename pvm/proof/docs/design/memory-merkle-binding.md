@@ -1,16 +1,16 @@
-# Phase A design: in-circuit Merkle binding of the RAM boundary (`initial_root`/`final_root`)
+# In-circuit Merkle binding of the RAM boundary (`initial_root`/`final_root`)
 
-Replaces the unbound `memory_commitment = blake3(flat image)` metadata with
-Merkle roots of the RAM that are **bound in-circuit**, so chain verification
-becomes sound for memory. This is the per-segment memory binding that the
-recursion decision record (`recursion-decision.md`) identifies as required
-regardless of aggregation. Design decisions (not re-litigated here): approach
-A (Merkle memory), tree keyed by **page address** (not hashed keys),
-**4096-byte pages**, **blake2b** (the existing compression AIR), no PCS change.
+Each segment states Merkle roots of its RAM that are **bound in-circuit**,
+so chain verification is sound for memory. The recursion rests on this
+per-segment binding: a fold checks state continuity between adjacent
+segments (`docs/design/recursion-air.md` §6), and for memory that is the
+roots' equality. The choices: Merkle memory, a tree keyed by **page
+address** (not hashed keys), **4096-byte pages**, **blake2b** (the existing
+compression AIR), no PCS change. §6 lists the negative tests each binding
+rule demands.
 
-This is v2, after a five-lens adversarial review of v1. The review's breaks
-and the resulting changes are folded in throughout; §7 lists the negative
-tests each one demands.
+The roots are `SegmentState.memory_root`: `initial_state.memory_root` and
+`final_state.memory_root`, written `initial_root` and `final_root` below.
 
 ## 0. The page Merkle tree (host-side spec)
 
@@ -42,8 +42,8 @@ tests each one demands.
   covered by witness siblings pinned by root equality, the cipher-clerk
   `BatchProof` argument).
 - Host module `page_merkle`: full-image root; **the single shared
-  touched-page enumeration** (absorbing `collect_initial_bytes`'s
-  byte-granular union over steps + all five precompile mem-op families — one
+  touched-page enumeration** (`touched_pages`: the byte-granular union over
+  steps, witness-input writes and the BLAKE2b and Poseidon2 mem-ops — one
   source of truth used by BOTH the ledger entry builder and the page-image /
   frontier builder); entering/exit page images via `segment::replay_writes`;
   the multiproof witness (frontier sibling hashes per witness slot of the
@@ -52,8 +52,8 @@ tests each one demands.
   `max(touched_pages, {page 0})`. A segment with no RAM access lists page 0
   read-only (before == after). This makes every chip below unconditionally
   active and removes any verifier-side empty/non-empty branch — there is no
-  prover-controlled signal selecting a degenerate path (review: the
-  empty-path branch was attackable however it was signalled).
+  prover-controlled signal selecting a degenerate path (an empty-path
+  branch would be attackable however it was signalled).
 
 ## 1. The boundary multiproof, in-AIR (cipher-clerk `BatchProof` design)
 
@@ -69,8 +69,7 @@ The trie is enforced by **logup balance** on an internal relation
 (`MerkleNode`): tuples `(level[1], index[1], hash_before[32], hash_after[32])`
 = 66 limbs. **`index` is a single M31 limb** (2^20 − 1 < p), NOT byte limbs —
 logup tuples match per-limb, and a byte-limbed index breaks the degree-1
-child arithmetic on doubling carries (review BREAK: honest proofs would
-reject). The leaf producer emits `index` as the degree-1 recomposition of its
+child arithmetic on doubling carries (honest proofs would reject). The leaf producer emits `index` as the degree-1 recomposition of its
 range-pinned byte decomposition (§3.2), so all produced leaf indices are
 < 2^20.
 
@@ -80,7 +79,7 @@ range-pinned byte decomposition (§3.2), so all produced leaf indices are
   the parent: for each child slot, either consume `(ℓ+1, 2n+b, h_b, h_a)`
   with −1 (computed child) or take a **witness** sibling occupying **one
   physical column set referenced by both passes' H_node lookups** — the
-  witness-reuse rule is structural, not a separate equality (review: two
+  witness-reuse rule is structural, not a separate equality (two
   independent sibling columns would allow a clean untouched-subtree forgery;
   this is the single most load-bearing wiring rule in the chip, gate-tested).
   Produce `(ℓ, n, H_node(...before...), H_node(...after...))` with +1, both
@@ -105,13 +104,12 @@ Why balance enforces the schedule:
   but only one consumable path to the single root → imbalance; omitting a
   merge or inventing extras → unconsumed tuples → imbalance.
 
-## 2. Binding page images to the RAM ledger (closes the page-set hole)
+## 2. Binding page images to the RAM ledger
 
-v1's open soundness hole: nothing forces the multiproof's page set to cover
-every page the segment touched — a prover could write page P, omit it from
-the multiproof, and carry forged values across the boundary while both roots
-verify. Fix: make the ledger itself force every accessed address into the
-page set.
+The multiproof alone does not force its page set to cover every page the
+segment touched: a prover could write page P, omit it from the multiproof,
+and carry forged values across the boundary while both roots verify. So
+the ledger itself forces every accessed address into the page set.
 
 Per **listed** page, for **every** one of its 4096 bytes, the ledger
 (MemoryChip) gets two injected entries (unconditionally — no gating flag) and
@@ -125,7 +123,8 @@ MemoryPageChip produces the matching tuples:
   (shared `closing_ts_for`) — value = the exit page image byte (also a
   leaf-hash input byte, same column).
 
-Read-consistency + `(addr, ts)` sortedness (the v6 machinery) then force:
+Read-consistency + `(addr, ts)` sortedness (`ledger-read-consistency.md`)
+then force:
 - the closing read chains to the byte's last written value → `after_byte` =
   true exit value;
 - for never-written bytes the closing read chains to the ts=0 write →
@@ -134,9 +133,10 @@ Read-consistency + `(addr, ts)` sortedness (the v6 machinery) then force:
   `before_byte`.
 
 New MemoryChip structural constraints (forward-only, next-row masks; the
-guaranteed ≥1 padding row makes the cyclic wrap a padding transition, which
-is **load-bearing**: it is what lets the group-start rule cover natural row 0
-via the wraparound):
+trace generator's ≥1 padding row makes the cyclic wrap a padding transition,
+which lets the group-start rule cover natural row 0 via the wraparound; the
+AIR fixes no place for padding, so the real rows may be several sorted runs,
+and a byte is one group because its page's boundary is produced once):
 - **group start** — gate `g := is_real_next · (1 − is_same_addr)` (on
   padding→real wrap, `is_same_addr` is constraint-forced 0, so `g = 1` and
   row 0 is covered): `g · ts_next[i] = 0` for all 8 limbs, and
@@ -147,54 +147,47 @@ via the wraparound):
   production that doesn't exist (the page chip emits exactly one per byte) →
   imbalance.
 
-`IsClosing` is a new boolean MemoryChip column **added to the memory logup
-tuple** (`REL_MEMORY_ACCESS_LOOKUP_SIZE` 14 → 15), the v6 precedent of adding
-`is_write` to the register tuple. All other producers emit the constant 0
-limb: CpuChip (constraint + interaction sides), Blake2bChip (256
-emissions/compression), RistrettoEcall / RistrettoCombScalarBoundary /
-RistrettoCombCompressOutput. Only MemoryPageChip emits `is_closing = 1` (on
-closing-read tuples). A limb (not a chip-local column alone) is needed
-because MemoryChip cannot otherwise recognize "closing row" — `closing_ts`
-is per-proof data, and MemoryChip's claimed sum is not closed-form.
+`IsClosing` is a boolean MemoryChip column **carried in the memory logup
+tuple**, as `is_write` is in the register tuple. A limb (not a chip-local
+column alone) is needed because MemoryChip cannot otherwise recognize
+"closing row" — `closing_ts` is per-proof data, and MemoryChip's claimed
+sum is not closed-form.
 
-**ts-exclusivity prerequisites (review BREAKs — the v1 premise was false in
-code, and both holes also undermine the v6 read-consistency claims on their
-own):** the scheme requires that ts=0 and ts=closing_ts memory tuples are
-producible ONLY by MemoryPageChip. Today:
+The limb is `is_closing + 2·permission`. Only MemoryPageChip emits a
+non-zero one: `is_closing = 1` on its closing-read tuples, and on its ts=0
+writes its page's permission (0 unmapped, 1 readable, 2 writable), proven
+against the program's layout, its preprocessed regions. Every other
+producer (CpuChip, Blake2bChip, the Poseidon2 and witness-input chips)
+emits 0. MemoryChip holds the permission along the address group and
+refuses a write to a page not writable and any access to a page not
+readable.
 
-1. **CpuChip step timestamps are not chained in-AIR.** `NextTimestamp` is
-   filled as ts+1 but appears in no constraint; the program-execution relation
-   is a multiset permutation that admits disjoint ts cycles, so a phantom
-   step at ts=0 can emit an arbitrary store tuple. FIX (prerequisite, lands
-   first): constrain `NextTimestamp = Timestamp + 1` limb-canonically on real
-   rows (8-limb carry chain with boolean carries). With the v4/v5 boundary
-   binding anchoring `initial_ts`/`final_ts`, every step ts is then provably
-   in `[initial_ts, final_ts)`.
-2. **Ristretto precompile mem-op timestamps are free witnesses.** The
-   ristretto family's `Ts` columns are packed into memory tuples with no
-   call-lookup binding to the ECALL step's timestamp (blake2b, by contrast,
-   binds `CallTs` via `Blake2bCallLookupElements`). A from-scratch prover
-   sets a ristretto output-write to ts=0 (entry forgery) or closing_ts (exit
-   forgery, sorting just before the closing read). FIX (prerequisite, lands
-   first): bind every ristretto mem-op ts to its ECALL step timestamp via the
-   family's call/anchor relations (mirror the blake2b CallTs pattern).
-3. **`initial_state.timestamp >= 1` is checked per-segment in
-   `verify_standalone`** (NOT only in the chain wrapper — the production
-   consumer verifies single proofs through `verify_standalone`; review
-   BREAK). The chain check follows from per-segment checks + continuity.
+**ts-exclusivity:** the scheme requires that ts=0 and ts=closing_ts memory
+tuples are producible ONLY by MemoryPageChip. It rests on:
 
-**MemoryBoundaryChip is superseded and deleted**: its role (ts=0 values for
-read-before-write addresses) is strictly contained in the per-page ts=0
-injection. Its `collect_initial_bytes` enumeration moves into `page_merkle`
-as the shared touched-set function. Deletion fallout (review-enumerated):
-`chip_idx::MEMORY_BOUNDARY` + constant renumbering, both `BASE_COMPONENTS`
-arrays, `chips/mod.rs` re-export, the per-address ts=0 injection block in
-`memory.rs`, the positional `debug_claimed_sums` name table, dead
-`side_note.num_initial_mem_entries`, and the explicit-components test
-harnesses (`chip_isolated.rs`, `comb_value_sweep.rs`,
-`ledger_readconsistency_gate.rs`, `memory*.rs`, `register_ledger_negative.rs`,
-`bitmanip.rs`, `control_flow.rs`, `prove_vos_actor.rs`) which must carry the
-new chip cluster wherever real memory traffic flows through a slice.
+1. **CpuChip step timestamps chained in-AIR.** `NextTimestamp = Timestamp +
+   1` limb-canonically on real rows (8-limb carry chain with boolean
+   carries). The program-execution relation alone is a multiset
+   permutation that admits disjoint ts cycles, so without the chain a
+   phantom step at ts=0 could emit an arbitrary store tuple. With the
+   boundary binding anchoring `initial_ts`/`final_ts`, every step ts is in
+   `[initial_ts, final_ts)`.
+2. **Every precompile memory tuple at its call's step timestamp,** bound
+   by the call's relation (blake2b's `CallTs` via
+   `Blake2bCallLookupElements`; the Poseidon2 and witness-input calls'
+   tuples). A free precompile timestamp would let a prover set an output
+   write to ts=0 (entry forgery) or closing_ts (exit forgery, sorting just
+   before the closing read).
+3. **`initial_state.timestamp >= 1` checked per-segment in
+   `verify_standalone`** (not only in the chain wrapper: a consumer may
+   verify single proofs through `verify_standalone`). The chain check
+   follows from per-segment checks + continuity.
+
+There is no separate memory-boundary chip: ts=0 values for
+read-before-write addresses come from the per-page ts=0 injection, and the
+touched-set enumeration lives in `page_merkle`. Explicit-components test
+harnesses carry the memory chip cluster wherever real memory traffic flows
+through a chip-isolated proof.
 
 ## 3. New chips
 
@@ -206,10 +199,9 @@ All four are **unconditionally active** (the page set is never empty, §0).
    `side_note.merkle_blake2b_calls`. Produces one value tuple per compression
    on a new `Blake2bCompression` relation: `(h_in[64], m[128], t[8], f[1],
    h_out[64])` (265 limbs; stwo relations are const-generic with linear
-   combine — the 130-limb ristretto-comb relation is working precedent),
-   gated at row 95 where H/M/T/F replication and Output coexist.
-   **Review-mandated additions over a naive core copy:**
-   - **IsReal anchor (BREAK fix):** in the main chip, "IsReal is honest" is
+   combine), gated at row 95 where H/M/T/F replication and Output coexist.
+   **Beyond the compression core:**
+   - **IsReal anchor:** in the main chip, "IsReal is honest" is
      anchored by the CPU call-lookup balance, which this chip drops. Without
      a replacement, a prover lights up only row 95 and emits a fully forged
      tuple. So this chip adds: `is_real · (is_real − 1) = 0`, IsReal marked
@@ -260,25 +252,23 @@ All four are **unconditionally active** (the page set is never empty, §0).
 
 ## 4. Plumbing
 
-- `SegmentState` gains `initial_root: [u8;32]`, `final_root: [u8;32]`
-  (keep `memory_commitment` as-is); derived `PartialEq` automatically extends
-  both chain-continuity struct-eqs.
+- `SegmentState` carries `memory_root: [u8; 32]`; derived `PartialEq`
+  extends both chain-continuity struct-eqs to it.
 - FS mix: the roots enter the channel immediately after the `final_ts` mix,
-  identically at the three sites (`prove.rs`, `verify.rs`,
-  `verifier/src/lib.rs`) — before lookup-element draw, so the claimed-sum
-  recomputation is sound. The standalone-verifier mix and the root binding
-  equality are **strictly unconditional** (no gating on any prover-derived
-  signal); the host `verify.rs` path keeps parity with its existing
-  `closing_chip_active` gate, which is not a trust boundary.
+  identically at the prover (`prove.rs`) and the one verifier
+  (`proof::replay_prefix`, which `src/standalone.rs` runs, the prover-side
+  `verify.rs` through it) — before lookup-element draw, so the claimed-sum
+  recomputation is sound. The mix and the root binding equality are
+  **strictly unconditional** (no gating on any prover-derived signal).
 - `boundary_positions_in_mask` **requires** the new chips' mask bits
   (returns None → reject if `MEMORY_ROOT_BOUNDARY`, `MEMORY_PAGE`,
-  `MEMORY_MERKLE`, or `BLAKE2B_BOUNDARY` is missing) — the mask-level guard
-  the v1 text wrongly assumed already existed. `check_boundary_claimed_sums`
-  gains the fourth equality (`expected_memory_root_sum` vs the root chip's
-  claimed sum).
-- `chip_idx` / both `BASE_COMPONENTS` arrays: remove `MEMORY_BOUNDARY`, add
-  `BLAKE2B_BOUNDARY`, `MEMORY_PAGE`, `MEMORY_MERKLE`, `MEMORY_ROOT_BOUNDARY`
-  (net +3, `COUNT` 28 → 31), all unconditionally active.
+  `MEMORY_MERKLE`, or `BLAKE2B_BOUNDARY` is missing).
+  `check_boundary_claimed_sums` checks the memory root equality
+  (`expected_memory_root_sum` vs the root chip's claimed sum) beside the
+  other boundary chips'.
+- `chip_idx` / both `BASE_COMPONENTS` arrays hold `BLAKE2B_BOUNDARY`,
+  `MEMORY_PAGE`, `MEMORY_MERKLE` and `MEMORY_ROOT_BOUNDARY`, all
+  unconditionally active.
 - Side note: `ingest_memory_pages(&mut SideNote)` builds the **idempotent**
   per-segment payload (listed page set via the shared enumeration, entering/
   exit page images, frontier, the merge schedule, and
@@ -288,8 +278,8 @@ All four are **unconditionally active** (the page set is never empty, §0).
   whose before/after passes coincide. The boundary chip produces each
   unique compression once with the count as its logup multiplicity
   (`EmitMult`), which balances the consumers' −1-per-consumption exactly
-  as the earlier one-block-per-consumption scheme did — a bare dedup
-  without the multiplicity would under-produce and reject honest proofs).
+  — a bare dedup without the multiplicity would under-produce and reject
+  honest proofs).
   Called on the **prove path only** (prove_impl +
   segment driver), rebuild-from-scratch each time. The verify paths never
   need the payload: the FS mix reads proof fields, preprocessed regeneration
@@ -297,68 +287,39 @@ All four are **unconditionally active** (the page set is never empty, §0).
   always-on).
 - `prove.rs` assembles `initial_root`/`final_root` from the same side-note
   data the chips trace (by-construction equality, like `initial_regs`).
-- Format bump **v6 → v7** + history entry (component-set change, tuple-width
-  change, new mixes, new SegmentState fields).
-- **Chain/segment anchoring (review BREAK fix — v1 left the anchor
-  out-of-band, making the chain's memory claim only relative):**
+- **Chain/segment anchoring** (without it the chain's memory claim would
+  be only relative):
   - `verify_standalone` rejects `initial_state.timestamp < 1` (§2);
-  - `verify_chain_standalone(proofs, preprocessed_commitment,
-    expected_initial_root)` — the expected starting-image root is a
-    **required parameter** checked against `proofs[0].initial_state
-    .initial_root` (the memory analogue of the program commitment), and the
-    function returns the chain's `final_root` so consumers pin the
-    post-state. Callers compute the expected root host-side via
-    `page_merkle` (the prover extension knows the program + input image).
-- Cost (review-corrected): Blake2bBoundary ≈ **1504 cells/row** (2544 minus
-  the 1040 pointer/address cells) × 2 passes × (23×32 leaf + ~460 node) =
-  **2392 compressions max** → ~230K rows (2^18) — the dominant new cost,
-  plausibly ~5–8 GB peak in the prover pipeline. Before the capstone, run
-  the single worst segment (max touched pages) with peak-RSS instrumentation;
-  fall-backs if over budget: smaller segments, or trimming the boundary
-  chip's row-95-only witness columns. MemoryPageChip ≈ 736 rows (~530
-  cells/row). Ledger growth: 2×4096×23 ≈ 188K rows (may bump MemoryChip's
-  log_size by 1 near pow2 boundaries).
+  - `verify_kernel_chain(proofs, program, entry)` checks the first
+    segment's `initial_state.memory_root` against the kernel's image root
+    (`program.image_root`, the memory analogue of the program commitment),
+    computed host-side via `page_merkle` from the kernel's blob; a leaf
+    binds the same in-circuit.
+- Cost [est, for a segment touching 23 pages]: Blake2bBoundary ≈ **1504
+  cells/row** (2544 minus the 1040 pointer/address cells) × 2 passes ×
+  (23×32 leaf + ~460 node) = **2392 compressions max** → ~230K rows (2^18),
+  the binding's dominant cost. MemoryPageChip ≈ 736 rows (~530 cells/row).
+  Ledger growth: 2×4096×23 ≈ 188K rows (may bump MemoryChip's log_size by 1
+  near pow2 boundaries).
 
 ## 5. What the verifier ends up guaranteeing
 
-For a chain accepted by `verify_chain_standalone(proofs, commitment,
-expected_initial_root)`:
+For a chain accepted by `verify_kernel_chain(proofs, program, entry)`:
 - every segment executed the committed program (preprocessed commitment),
-  with register/pc/ts continuity (v4–v6) and `initial_ts ≥ 1`;
-- within each segment, every RAM read/write is ledger-consistent (v6), every
+  with register/pc/ts continuity and `initial_ts ≥ 1`;
+- within each segment, every RAM read/write is ledger-consistent, every
   accessed address lies in the listed page set (§2 group constraints), the
   entering bytes of listed pages hash to `initial_root` and the exit bytes to
   `final_root` (§1–§3), and untouched subtrees are carried unchanged (§1
   witness reuse);
 - across segments, `final_root_i == initial_root_{i+1}` (struct-eq over
-  bound fields), and `initial_root_0 == expected_initial_root`;
-- hence the returned final root commits the true RAM image produced by
-  running the committed program from the supplied starting image. The
-  remaining trust scope: the caller must know `expected_initial_root`
+  bound fields), and `initial_root_0` is the kernel's image root;
+- hence the last segment's final root commits the true RAM image produced
+  by running the committed program from the kernel's image. The
+  remaining trust scope: the caller must know the kernel's image root
   (program + input image), exactly as it must know the program commitment.
 
-## 6. Implementation order (each step keeps the tree green)
-
-0. **Prerequisite AIR fixes** (independently valuable; harden v6 claims):
-   CpuChip `NextTimestamp = Timestamp + 1` carry-chain constraint; ristretto
-   mem-op ts binding to the ECALL step. Negative tests for both.
-1. `page_merkle` host module + spec tests (root vs naive full tree;
-   multiproof vs reference; default-page chains; host↔library blake2b-256
-   equivalence on tagged messages).
-2. Blake2b core-sharing refactor (macro-extract arithmetic core + fill; **no
-   behavior change**, all blake2b tests green) — isolated commit.
-3. Blake2bBoundaryChip + `Blake2bCompression` relation + side-note plumbing +
-   chip-isolated tests (known compression; tamper bytes → reject; tamper the
-   IsReal pattern (1 only at row 95) → reject).
-4. Ledger restructure: `is_closing` limb (14→15) across the producer chips +
-   MemoryChip group-start/group-end constraints + per-page injection +
-   MemoryBoundaryChip deletion + harness migration (§2 fallout list).
-5. MemoryPageChip + MemoryMerkleChip + MemoryRootBoundaryChip.
-6. SegmentState/FS/boundary_binding/format v7 + verifier API changes (§4).
-7. Gate tests + full regressions + worst-segment RSS measurement + capstone
-   re-prove + rebuild prover cdylib.
-
-## 7. Gate tests (negative; mirror `ledger_readconsistency_gate`)
+## 6. Gate tests (negative; mirror `ledger_readconsistency_gate`)
 
 - forged `before_byte` on a ts=0 row (entry forgery) → REJECTED;
 - forged `after_byte` / closing-read value (exit forgery) → REJECTED;
@@ -369,93 +330,7 @@ expected_initial_root)`:
   review + a tamper test on the merge row's witness columns;
 - Blake2bBoundary IsReal=1 only at row 95 (forged compression) → REJECTED;
 - single proof with `initial_ts = 0` → REJECTED by `verify_standalone`;
-- chain with wrong `expected_initial_root` → REJECTED;
+- chain not starting at the kernel's image root → REJECTED;
 - mask missing any of the four new chips → REJECTED;
 - boundary-override harness (`prove_with_boundary_override`) extended to
   ship forged roots over honest columns → REJECTED.
-
-## Appendix A — Prerequisite step 0.2: ristretto mem-op ts binding
-
-**SUPERSEDED by the dedicated design `ristretto-ts-binding.md` (v4 — converged,
-adversarially validated over two rounds, implementation-ready). The multiplicity
-problem this appendix flags is solved there (universal anchor + kind-aware
-tier-2). Read that doc to implement; the notes below are kept for context.**
-
-**Status: NOT YET BUILT — design done (see `ristretto-ts-binding.md`).**
-
-### The gap (verified in code)
-
-The three ristretto-family memory producers emit `MemoryAccessLookupElements`
-tuples `(addr[4], value[1], ts[8], is_write[1])` whose **`ts` limbs are free
-witness columns** with no binding to a genuine ECALL step timestamp (contrast
-blake2b, which binds `CallTs` via `Blake2bCallLookupElements` carrying the
-step ts):
-- `RistrettoEcallChip` (`ristretto_ecall.rs:82-113`): only IsReal/IsWrite
-  booleans constrained; `ts` packed straight into the tuple.
-- `RistrettoCombScalarBoundaryChip` (`ristretto_comb_scalar_boundary.rs`):
-  free `Ts`.
-- `RistrettoCombCompressOutputChip` (`ristretto_comb_compress_output.rs`):
-  free `Ts`.
-
-A from-scratch prover sets a ristretto output-write tuple's `ts` to **0**
-(collides with the §2 per-page ts=0 boundary write → entry forgery) or to
-**closing_ts** (sorts just before the §2 closing read → exit forgery). With
-CpuChip step timestamps now chained (commit `515c5b4`), the fix only has to
-prove every ristretto mem-op ts is a genuine ristretto-ECALL step timestamp:
-that lands it in `[initial_ts, final_ts)`, excluding both 0 (`< initial_ts`,
-since `initial_ts ≥ 1`) and `closing_ts` (`= final_ts`, never a step ts).
-
-**Money-path relevance (verified):** all three chips are ACTIVE on the
-voucher/clerk conservation proof — cipher-clerk's Schnorr signatures and
-Pedersen commitments use fixed-basepoint mult (`crypto/sig.rs:54-63,91-122`,
-`crypto/commit.rs:36-50`), which routes through the comb family
-(`side_note.rs:530-538`, gated active at `lib.rs:411-415`), plus variable-base
-+ scalar_reduce_wide + scalar_binop through `RistrettoEcallChip`. So the fix
-must cover all three chips.
-
-### The mechanism (call relation, mirror of blake2b)
-
-A new `RistrettoCallLookupElements` relation carrying the ECALL step ts (and
-ideally the output_ptr, to also pin the address). CpuChip detects ristretto
-ECALL steps (imm ∈ the 5 ECALL ids — needs a new `IsRistrettoEcall` column +
-pointer snapshot columns, parallel to `IsBlakeEcall`/`Phi*`) and PRODUCES one
-tuple per ristretto ECALL step. The handling chip(s) CONSUME one per call.
-
-### The open problem (why it needs its own pass)
-
-The consumer multiplicity is split across chips by ECALL kind, and the split
-is **not derivable from the opcode**:
-- variable-base scalar_mult / point_add / scalar_reduce_wide / scalar_binop:
-  `RistrettoEcallChip` handles all 96 mem-ops (consumer count k = 1);
-- **fixed-base** scalar_mult: `RistrettoEcallChip` handles the 32 point reads,
-  `RistrettoCombScalarBoundaryChip` the 32 scalar reads,
-  `RistrettoCombCompressOutputChip` the 32 output writes (k = 3).
-
-`ECALL_RISTRETTO_SCALAR_MULT` covers both fixed and variable; fixed-vs-variable
-is decided at runtime by whether the point argument equals the basepoint
-(`tracing.rs:132-142`), which CpuChip cannot see. So CpuChip cannot emit a
-per-step multiplicity of "k chips will consume this call." Candidate
-resolutions to evaluate in the dedicated pass:
-1. **Universal anchor:** `RistrettoEcallChip` handles ≥ the input/point reads
-   of EVERY ristretto call, so CpuChip produces +1 per ristretto ECALL step
-   and `RistrettoEcallChip` consumes −1 per call (clean 1:1). The comb chips'
-   ts is then bound **separately** by threading a ts limb through the existing
-   comb cross-chip relations (`RistrettoCombScalarBoundary`,
-   `RistrettoCombCompressOutput`) so their ts is forced equal to a value the
-   anchor/comb chain already vouches for — needs verifying those relations'
-   producers are themselves ts-bound (avoid circularity: both ends read
-   side_note today).
-2. **Per-role relations** keyed by output_ptr / a role discriminator so each
-   chip consumes a distinct tuple and CpuChip produces all of them — but
-   CpuChip still can't tell which roles exist for a SCALAR_MULT step.
-3. **Intra-call ts-equality prerequisite:** whichever option, confirm each
-   chip forces all rows of one call block to share a single `Ts` (mask-next-row
-   within the block) — else binding one row per call leaves the other 95 free.
-
-### Deliverables for the dedicated pass
-
-Deep-read the exact row/call-block layout + call-boundary preprocessed signals
-of all three chips and the comb cross-chip relations; pick a resolution;
-adversarially review it (free-ts entry/exit forgery REJECTED; honest money
-path still balances); validate with the ristretto chip-isolated tests + a
-`voucher_check_smoke` prove/verify (207s). Format bump folds into v7.

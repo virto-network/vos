@@ -1,0 +1,268 @@
+//! The venue's JAM refine program, `final-verify`'s
+//! (`src/bin/final-verify.rs` describes it).
+
+#[macro_use]
+mod runtime;
+
+use alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use core::fmt::Write;
+
+use runtime::{Call, Cursor, FetchKind, HEAP, NONE, Output, STACK_BYTES, Static, gas_left};
+use vos_pvm_final_verifier::PUBLIC_WORDS;
+use vos_statement::model::Input;
+use vos_statement::{Refusal, StatementId};
+
+entries!("_start" => "verify_main");
+
+// ── The verify ──────────────────────────────────────────────────────────
+
+/// The payload's buffer: a judgement's input holds the statement.
+const PAYLOAD_MAX: usize = 16 << 10;
+
+/// The payload's modes, its first byte: the program accepts nothing
+/// without a proof.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum Mode {
+    Words = 0,
+    Judge = 1,
+}
+
+impl Mode {
+    fn of(byte: u8) -> Option<Self> {
+        Some(match byte {
+            0 => Self::Words,
+            1 => Self::Judge,
+            _ => return None,
+        })
+    }
+}
+
+/// The report's last field's bytes, zeros: the layout the harness reads.
+const DIGESTS_BYTES: usize = 5 * 32;
+
+/// The program's verdicts, `Report::verdict`.
+#[derive(Clone, Copy)]
+#[repr(u64)]
+enum Verdict {
+    Reject = 0,
+    Accept = 1,
+    BadPayload = 2,
+    NoPreimage = 3,
+    Undecodable = 4,
+}
+
+static PAYLOAD: Static<[u8; PAYLOAD_MAX]> = Static(UnsafeCell::new([0; PAYLOAD_MAX]));
+static REPORT: Static<Report> = Static(UnsafeCell::new(Report::new()));
+
+/// What the program returns.
+#[repr(C)]
+pub struct Report {
+    verdict: u64,
+    gas_start: u64,
+    gas_after_lookup: u64,
+    gas_after_decode: u64,
+    gas_end: u64,
+    proof_len: u64,
+    peak_live: u64,
+    high_water: u64,
+    allocs: u64,
+    error_len: u64,
+    error: [u8; 192],
+    /// A judgement's code (`vos_statement::code`).
+    code: u64,
+    /// An accepted statement's id.
+    id: [u8; 32],
+    /// Zeros, the report's layout's last field.
+    digests: [u8; DIGESTS_BYTES],
+}
+
+impl Report {
+    const fn new() -> Self {
+        Self {
+            verdict: u64::MAX,
+            gas_start: 0,
+            gas_after_lookup: 0,
+            gas_after_decode: 0,
+            gas_end: 0,
+            proof_len: 0,
+            peak_live: 0,
+            high_water: 0,
+            allocs: 0,
+            error_len: 0,
+            error: [0; 192],
+            code: u64::MAX,
+            id: [0; 32],
+            digests: [0; DIGESTS_BYTES],
+        }
+    }
+
+    /// A judgement's verdict: its code, an accepted statement's id.
+    fn judged(&mut self, verdict: Result<StatementId, Refusal>) -> Verdict {
+        self.code = u64::from(vos_statement::code(&verdict));
+        match verdict {
+            Ok(id) => {
+                self.id = id.0;
+                Verdict::Accept
+            }
+            Err(refusal) => self.refuse(&refusal),
+        }
+    }
+
+    /// `error`'s text, and the verdict [`Verdict::Reject`].
+    fn refuse(&mut self, error: &dyn core::fmt::Display) -> Verdict {
+        let mut cursor = Cursor {
+            buf: &mut self.error,
+            len: 0,
+        };
+        let _ = write!(cursor, "{error}");
+        self.error_len = cursor.len as u64;
+        Verdict::Reject
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn verify_main() -> Output {
+    // SAFETY: single-threaded; the host reads the report after halt.
+    let report = unsafe { &mut *REPORT.0.get() };
+    report.gas_start = gas_left();
+    report.verdict = verify(report) as u64;
+    report.gas_end = gas_left();
+    let state = HEAP.state();
+    report.peak_live = state.peak_live as u64;
+    report.high_water = HEAP.peak_top() as u64;
+    report.allocs = state.allocs as u64;
+    Output {
+        address: report as *mut Report as u64,
+        len: core::mem::size_of::<Report>() as u64,
+    }
+}
+
+/// What the payload asks: a proof checked against the words alone under a
+/// format, or a judgement's statement (`J`, its input, then the checks
+/// before the proof admitted).
+#[allow(clippy::large_enum_variant, reason = "one a run, never moved")]
+enum Request<J> {
+    Words(u32, [u32; PUBLIC_WORDS]),
+    Judge(J),
+}
+
+/// The payload: its request, the proof's hash and its length.
+fn request(mode: Mode, body: &[u8]) -> Option<(Request<Input>, [u8; 32], usize)> {
+    let (request, rest) = match mode {
+        Mode::Words => {
+            let (format, body) = body.split_first_chunk::<4>()?;
+            let (words, rest) = body.split_at_checked(4 * PUBLIC_WORDS)?;
+            let mut out = [0; PUBLIC_WORDS];
+            for (word, bytes) in out.iter_mut().zip(words.as_chunks::<4>().0) {
+                *word = u32::from_le_bytes(*bytes);
+            }
+            (Request::Words(u32::from_le_bytes(*format), out), rest)
+        }
+        Mode::Judge => {
+            let (input, used) = Input::decode_prefix(body).ok()?;
+            (Request::Judge(input), body.get(used..)?)
+        }
+    };
+    let [hash @ .., l0, l1, l2, l3] = <[u8; 36]>::try_from(rest).ok()?;
+    Some((request, hash, u32::from_le_bytes([l0, l1, l2, l3]) as usize))
+}
+
+/// The proof of `proof_len` bytes whose hash is `hash`, a preimage the
+/// host's `historical_lookup` reads; `None` when the host has not all of it.
+fn lookup_proof(hash: &[u8; 32], proof_len: usize) -> Option<Vec<u8>> {
+    let mut bytes: Vec<u8> = Vec::with_capacity(proof_len);
+    let found = hostcall!(
+        Call::HistoricalLookup,
+        [
+            NONE,
+            hash.as_ptr() as u64,
+            bytes.as_mut_ptr() as u64,
+            0,
+            proof_len as u64,
+            0
+        ]
+    );
+    if found != proof_len as u64 {
+        return None;
+    }
+    // SAFETY: the host wrote all `proof_len` bytes.
+    unsafe { bytes.set_len(proof_len) };
+    Some(bytes)
+}
+
+fn verify(report: &mut Report) -> Verdict {
+    // SAFETY: single-threaded; nothing else borrows the payload buffer.
+    let payload = unsafe { &mut *PAYLOAD.0.get() };
+    let len = hostcall!(
+        Call::Fetch,
+        [
+            payload.as_mut_ptr() as u64,
+            0,
+            payload.len() as u64,
+            FetchKind::Payload as u64,
+            0,
+            0
+        ]
+    );
+    let Some(payload) = usize::try_from(len).ok().and_then(|len| payload.get(..len)) else {
+        return Verdict::BadPayload;
+    };
+    let Some((mode, body)) = payload
+        .split_first()
+        .and_then(|(&mode, body)| Some((Mode::of(mode)?, body)))
+    else {
+        return Verdict::BadPayload;
+    };
+    let Some((request, hash, proof_len)) = request(mode, body) else {
+        return Verdict::BadPayload;
+    };
+    report.proof_len = proof_len as u64;
+    let check = match request {
+        Request::Words(format, words) => Request::Words(format, words),
+        Request::Judge(input) => match input.admit() {
+            Ok(admitted) => Request::Judge(admitted),
+            Err(refusal) => return report.judged(Err(refusal)),
+        },
+    };
+    if proof_len > vos_pvm_final_verifier::MAX_PROOF_BYTES {
+        let error = vos_pvm_final_verifier::Error::Length;
+        return match check {
+            Request::Words(..) => {
+                report.refuse(&error);
+                Verdict::Undecodable
+            }
+            Request::Judge(_) => report.judged(Err(Refusal::Proof(error))),
+        };
+    }
+
+    let Some(bytes) = lookup_proof(&hash, proof_len) else {
+        return Verdict::NoPreimage;
+    };
+    report.gas_after_lookup = gas_left();
+
+    match check {
+        Request::Words(format, words) => {
+            let decoded = match vos_pvm_final_verifier::decode(
+                format,
+                vos_pvm_final_verifier::LINKED,
+                &bytes,
+            ) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    report.gas_after_decode = gas_left();
+                    report.refuse(&error);
+                    return Verdict::Undecodable;
+                }
+            };
+            drop(bytes);
+            report.gas_after_decode = gas_left();
+            match decoded.verify(&words) {
+                Ok(_) => Verdict::Accept,
+                Err(error) => report.refuse(&error),
+            }
+        }
+        Request::Judge(admitted) => report.judged(admitted.verify(&bytes)),
+    }
+}

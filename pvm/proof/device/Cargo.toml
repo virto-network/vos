@@ -1,0 +1,53 @@
+[package]
+name = "vos-pvm-device"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The device profile: a device kernel's program under the device format, computed from the kernel, its runs proved masked on the Blake2s-M31 channel, and a proof's bytes verified against the program."
+
+[dependencies]
+# The masked prover and its randomness, without the recursion.
+vos-pvm-recair = { workspace = true }
+# The masked verifier, over any masked component set, and the masking's
+# component sets.
+vos-pvm-final-verifier = { workspace = true }
+vos-pvm-recair-air = { workspace = true }
+# The device chip set, its masked layout and trace, the format registry and
+# the kernel's tracer.
+vos-pvm-proof = { workspace = true }
+vos-pvm-precompiles = { workspace = true }
+# The credentials tree a device kernel's auth arguments are laid out over,
+# and a release artifact's encoding.
+vos-abi = { workspace = true }
+scale = { package = "vos-pvm-codec", path = "../../codec", default-features = false }
+stwo = { workspace = true, features = ["std", "prover", "parallel"] }
+num-traits = "0.2"
+serde = { version = "1", features = ["derive"] }
+# A device proof's bytes, and a program's id (BLAKE2b-256).
+postcard = { version = "1", features = ["alloc"] }
+blake2 = "0.10"
+
+[features]
+# The masked prover's test seams (`vos-pvm-recair`'s): the seeded masks and
+# the forced proof of the forgery gates (`masked::prove_device_forced`), for
+# the tests' dev edge. No production build enables it (`just
+# check-no-seeded-masks`).
+seeded-masks = ["vos-pvm-recair/seeded-masks"]
+# The device format's leakage gate at a medium N, for `just test-proof`. No
+# code of the crate's.
+heavy-gates = []
+# A second device format (`TEST_FORMAT`), the node's format-window tests',
+# for a dev edge. No production build enables it (`just check-no-leaks`).
+test-device-format = []
+
+[dev-dependencies]
+# The device tests reproduce a proof byte for byte from a seed, and force
+# proofs past the prover's own checks.
+vos-pvm-device = { path = ".", features = ["seeded-masks", "test-device-format"] }
+vos-pvm-recair = { workspace = true, features = ["seeded-masks"] }
+vos-pvm-poseidon2 = { workspace = true }
+vos-pvm = { workspace = true }
+# A small kernel, laid out as the loader lays it out.
+vos-pvm-program = { workspace = true }
+vos-pvm-compiler = { workspace = true }
+stwo-constraint-framework = { workspace = true, features = ["std", "prover", "parallel"] }

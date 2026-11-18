@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3e743fb0423aca17b383f793c7b6d45406ba989bc74a6cb48779c92c18cd33c1 # shrinks to raws = [(false, []), (true, [0]), (true, [])], cursor = [], hashed = false, limit = 1
+cc f6bd3aa1a85db39bab97ef2faa5d92a5f1a8e062a1a5d94464b23a2016c247be # shrinks to pool = [[97, 47, 0, 0], [97, 47, 0, 255, 0, 0], [97, 47, 0, 255, 0, 255, 0, 0], [97, 47, 0, 255, 1, 0, 0], [97, 47, 0, 255, 127, 0, 0], [97, 47, 1, 0, 0], [97, 47, 127, 0, 0], [97, 47, 127, 0, 255, 0, 0], [97, 47, 128, 0, 0], [98, 47, 18, 84, 254, 147, 85, 63, 2, 126, 34, 94, 96, 6, 157, 55, 118, 232, 0, 0], [98, 47, 146, 20, 232, 113, 207, 24, 252, 162, 174, 2, 143, 12, 64, 89, 160, 116, 0, 255, 0, 0]], contents = [(649216871679129, 0), (908979011649608621, 0), (2438324954861529, 0)], from = (15487150558824659, 0), to = None, values = [None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None]

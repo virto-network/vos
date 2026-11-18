@@ -3,3 +3,5 @@ target/
 corpus/
 artifacts/
 coverage/
+# A pack interrupted before its rename.
+replay/*.partial

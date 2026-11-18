@@ -1,0 +1,16 @@
+[package]
+name = "vos-pvm-program"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Portable codec and memory layout for standard PVM programs."
+
+[features]
+default = []
+
+[dependencies]
+vos-pvm-precompiles = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

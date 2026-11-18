@@ -1,43 +1,49 @@
-//! Hostcall ID constants — wire ABI between guest precompile shims
-//! and the prover's `RistrettoChip` / `Blake2bChip` / `RistrettoEcallChip`.
-//!
-//! Always-on (no feature gate): these are tiny integer constants and
-//! both the `ristretto` and `blake2b` modules reference them.  Mirrors
-//! the corresponding constants in `vos_pvm_proof::core::ecall`.
-//!
-//! **Slot range**: vos_pvm's `dispatch_ecalli` rejects `imm > 127` with a
-//! fault, so every precompile ID fits in `0..=127` — packed into the
-//! contiguous `100..=114` block within vos_pvm's program-cap range
-//! (slots 64..=127). The original categorisation by hundreds
-//! (1xx hash, 2xx asymmetric crypto) didn't survive the imm budget.
-
-/// Ristretto255 scalar-mult precompile.
-/// Mirrors `vos_pvm_proof::core::ecall::ECALL_RISTRETTO_SCALAR_MULT`.
-pub const ECALL_RISTRETTO_SCALAR_MULT: u32 = 110;
-
-/// Ristretto255 compressed-point addition precompile.
-/// Mirrors `vos_pvm_proof::core::ecall::ECALL_RISTRETTO_POINT_ADD`.
-pub const ECALL_RISTRETTO_POINT_ADD: u32 = 111;
-
-/// Wide-scalar reduction precompile.
-/// Mirrors `vos_pvm_proof::core::ecall::ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE`.
-pub const ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE: u32 = 112;
-
-/// `Scalar * Scalar mod ℓ`.
-pub const ECALL_SCALAR_MUL_MOD_L: u32 = 113;
-
-/// `Scalar + Scalar mod ℓ`.
-pub const ECALL_SCALAR_ADD_MOD_L: u32 = 114;
+//! Host-call identifiers — the wire ABI between guest precompile shims
+//! and the prover's `Blake2bChip`. Mirrors the corresponding constants in
+//! `vos_pvm_proof::core::ecall`.
 
 /// One blake2b compression per call.
 /// Mirrors `vos_pvm_proof::core::ecall::ECALL_BLAKE2B_COMPRESS`.
-/// Convention: φ[10]=h_ptr (64B in/out), φ[11]=m_ptr (128B in),
-/// φ[12]=t_low (counter low 64 bits), φ[7]=f (finalize flag).
-pub const ECALL_BLAKE2B_COMPRESS: u32 = 100;
+/// Convention: φ\[7\]=h_ptr (64B in/out), φ\[8\]=m_ptr (128B in),
+/// φ\[9\]=t_low (counter low 64 bits), φ\[10\]=f (finalize flag).
+pub const ECALL_BLAKE2B_COMPRESS: u32 = 0x400;
 
-/// VOS object capability slot used by the inline-asm ECALL dispatch.
-/// Set into `a5` on every call.  Only referenced from
-/// `cfg(target_arch = "riscv64")` blocks — on host builds it's
-/// unreachable but kept defined for symmetry.
+/// One Poseidon2-M31 compression per call.
+/// Mirrors `vos_pvm_proof::core::ecall::ECALL_POSEIDON2`.
+/// Convention: φ\[7\]=input pointer (sixteen words, 64B in), φ\[8\]=output
+/// pointer (eight words, 32B out); a word at or above p traps the call.
+pub const ECALL_POSEIDON2: u32 = 0x402;
+
+/// Gray Paper `WHAT`: the host does not know this call.
 #[cfg(target_arch = "riscv64")]
-pub(crate) const VOS_OBJECT_CAP: u64 = 65;
+pub(crate) const WHAT: u64 = u64::MAX - 1;
+
+/// Call precompile `ID` with arguments in a0..a3 (φ[7..10]). Returns `false`
+/// when the host answered `WHAT`, as a JAM node does for an id it does not
+/// assign; the caller then computes in software. A serving host leaves every
+/// register unchanged, so φ[7] still holds the first argument, a pointer.
+///
+/// The id is loaded with `li` inside the block so the transpiler always sees
+/// it immediately before the call.
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+pub(crate) fn call<const ID: u32>(a0: u64, a1: u64, a2: u64, a3: u64) -> bool {
+    let answer: u64;
+    // SAFETY: the arguments name buffers the caller keeps live for the call;
+    // the host writes only the output buffer they describe and φ[7] on WHAT.
+    unsafe {
+        core::arch::asm!(
+            "li t0, {id}",
+            "csrw 0x801, zero",
+            "ecall",
+            id = const ID,
+            out("t0") _,
+            inlateout("a0") a0 => answer,
+            in("a1") a1,
+            in("a2") a2,
+            in("a3") a3,
+            options(nostack),
+        );
+    }
+    answer != WHAT
+}

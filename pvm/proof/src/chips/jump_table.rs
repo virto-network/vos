@@ -1,6 +1,5 @@
 //! JumpTableChip — preprocessed table committing to the program's
-//! jump_table[].  Closes the JumpInd / LoadImmJumpInd target-trust
-//! soundness gap.
+//! jump_table[], which binds the JumpInd / LoadImmJumpInd targets.
 //!
 //! At runtime, JumpInd computes a virtual address `addr =
 //! (regs[reg_a] + imm) mod 2^32` and dispatches to
@@ -28,35 +27,19 @@
 //!                   - val_b[i] - imm_bytes[i] - carry[i-1]) = 0`
 //! that pins JumpIndAddr to the runtime-computed virtual address.
 
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
-use stwo::core::fields::m31::BaseField;
-#[cfg(feature = "prover")]
-use stwo::{
-    core::{ColumnVec, fields::qm31::SecureField},
-    prover::{
-        backend::simd::SimdBackend,
-        poly::{BitReversedOrder, circle::CircleEvaluation},
-    },
-};
+use crate::prelude::*;
+use num_traits::One;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::trace::eval::TraceEval;
-#[cfg(feature = "prover")]
-use crate::trace::{
-    builder::{FinalizedTrace, TraceBuilder},
-    component::ComponentTrace,
+
+use crate::{
+    framework::{BuiltInComponent, Logup},
+    lookups::JumpTableLookupElements,
 };
 
-#[cfg(feature = "prover")]
-use crate::framework::BuiltInProverComponent;
-#[cfg(feature = "prover")]
-use crate::lookups::{AllLookupElements, LogupTraceBuilder};
-#[cfg(feature = "prover")]
-use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::JumpTableLookupElements};
-
+#[derive(Clone, Copy)]
 pub struct JumpTableChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]
@@ -80,9 +63,14 @@ pub enum PreprocessedColumn {
     /// `jump_table[N]` as 4 little-endian bytes.  0 on padding rows.
     #[size = 4]
     Target,
+    /// 1 on the table's entries, 0 on its padding rows, whose `(0, 0)`
+    /// tuple no dynamic jump may use: a jump to address 0 panics.
+    #[size = 1]
+    IsEntry,
 }
 
 impl BuiltInComponent for JumpTableChip {
+    const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = JumpTableLookupElements;
@@ -95,7 +83,10 @@ impl BuiltInComponent for JumpTableChip {
     ) {
         let addr = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Addr);
         let target = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Target);
+        let is_entry =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsEntry);
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
+        eval.add_constraint((E::F::one() - is_entry[0].clone()) * mult[0].clone());
 
         // Tuple: (addr[4], target[4]) — 8 limbs.
         let mut tuple: Vec<E::F> = addr.to_vec();
@@ -107,81 +98,12 @@ impl BuiltInComponent for JumpTableChip {
             (-mult[0].clone()).into(),
             &tuple,
         ));
-
-        eval.finalize_logup();
     }
 }
 
 #[cfg(feature = "prover")]
-impl BuiltInProverComponent for JumpTableChip {
-    const IS_PRODUCER: bool = false;
-
-    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
-        let log_size = chip_log_size(side_note.jump_table.len());
-        let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
-        let num_rows = trace.num_rows();
-
-        for row in 0..num_rows {
-            if row < side_note.jump_table.len() {
-                let addr: u32 = 2 * ((row as u32) + 1);
-                trace.fill_columns_bytes(row, &addr.to_le_bytes(), PreprocessedColumn::Addr);
-                trace.fill_columns_bytes(
-                    row,
-                    &side_note.jump_table[row].to_le_bytes(),
-                    PreprocessedColumn::Target,
-                );
-            }
-            // Padding rows: addr/target stay at 0.
-        }
-
-        trace.finalize_bit_reversed()
-    }
-
-    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
-        let log_size = chip_log_size(side_note.jump_table.len());
-        let mut trace = TraceBuilder::<Column>::new(log_size);
-        let num_rows = trace.num_rows();
-
-        for row in 0..num_rows {
-            // CpuChip emits 2 paired JumpInd lookups per step (so the
-            // per-pair degree stays under 4 — same trick as
-            // ProgramMemory).  Producer multiplicity matches.
-            let count = side_note.jump_table_counts.get(row).copied().unwrap_or(0);
-            trace.fill_columns(row, BaseField::from(2 * count), Column::Multiplicity);
-        }
-
-        trace.finalize_bit_reversed()
-    }
-
-    fn generate_interaction_trace(
-        &self,
-        component_trace: ComponentTrace,
-        _side_note: &SideNote,
-        lookup_elements: &AllLookupElements,
-    ) -> (
-        ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
-        SecureField,
-    ) {
-        let log_size = component_trace.log_size();
-        let mut logup = LogupTraceBuilder::new(log_size);
-
-        let jt: &JumpTableLookupElements = lookup_elements.as_ref();
-        let addr =
-            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Addr);
-        let target =
-            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::Target);
-        let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
-
-        let mut tuple: Vec<_> = addr.to_vec();
-        tuple.extend_from_slice(&target);
-
-        logup.add_to_relation_with(jt, [mult[0].clone()], |[m]| (-m).into(), &tuple);
-
-        logup.finalize()
-    }
-}
-
+mod fill;
 #[cfg(feature = "prover")]
-fn chip_log_size(len: usize) -> u32 {
-    crate::trace::utils::ceil_log2_at_least_lanes(len.max(1))
-}
+mod pin;
+#[cfg(feature = "prover")]
+pub(crate) use pin::table_log_size;

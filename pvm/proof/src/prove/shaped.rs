@@ -1,0 +1,163 @@
+//! Proving over a kernel's shape ([`crate::shape`]): exactly its chips, each
+//! at exactly a class's log size.
+
+use super::{
+    ProveRequest, SegmentError, Sizes, Target, install_thread_pool,
+    prepare_side_note_for_verification, prove_with,
+};
+use crate::format::Format;
+use crate::framework::MachineProverComponent;
+use crate::pcs::Commitment;
+use crate::proof::Proof;
+use crate::shape::{KernelShape, ProofShape};
+use crate::side_note::SideNote;
+
+/// The chips `components` selects, in chip order.
+fn selected(components: u32) -> Vec<&'static dyn MachineProverComponent> {
+    crate::chips_of_mask(components)
+        .map(|chip| crate::all_components()[chip])
+        .collect()
+}
+
+/// Whether `shape` names chips of the segment AIR, a log size each.
+fn check(shape: &ProofShape) -> Result<(), SegmentError> {
+    if shape.components & !crate::chip_idx::ALL != 0
+        || shape.components.count_ones() as usize != shape.log_sizes.len()
+    {
+        return Err(SegmentError::MalformedShape);
+    }
+    Ok(())
+}
+
+/// Prove a segment under `format` over `shape`: exactly its chips, each at
+/// exactly its log size. [`SegmentError::Shape`] when a chip's rows need a
+/// larger size than the shape gives it, or a fixed chip's size is not the
+/// shape's; [`SegmentError::MalformedShape`] when the shape is not one of
+/// the segment AIR.
+pub fn prove_shaped(
+    side_note: &mut SideNote,
+    shape: &ProofShape,
+    format: &'static Format,
+) -> Result<Proof, SegmentError> {
+    check(shape)?;
+    install_thread_pool();
+    prepare_side_note_for_verification(side_note);
+    let components = selected(shape.components);
+    let request = ProveRequest::new(
+        Target::of(format)?,
+        &components,
+        shape.components,
+        Sizes::Pinned(&shape.log_sizes),
+    );
+    let (proof, _) = prove_with(side_note, request)?;
+    Ok(proof)
+}
+
+/// The preprocessed root of a segment over `shape` under `format`, for the
+/// program `side_note` holds ([`crate::kernel::kernel_side_note`]): the
+/// root every segment of the class commits, whatever its run, which a
+/// kernel's program id pins. `None` on a format the registry does not admit
+/// or a malformed or empty shape.
+pub fn program_commitment_for_shape(
+    side_note: &SideNote,
+    shape: &ProofShape,
+    format: &'static Format,
+) -> Option<Commitment> {
+    use crate::pcs::ProofHash;
+    check(shape).ok()?;
+    if shape.components == 0 || shape.log_sizes.contains(&0) {
+        return None;
+    }
+    install_thread_pool();
+    let config = Target::of(format).ok()?.format.pcs_config();
+    let components = selected(shape.components);
+    crate::with_stack!(format.channel, Stack => {
+        Some(
+            super::preprocessed_root::<Stack>(side_note, &components, &shape.log_sizes, config)
+                .into_commitment(),
+        )
+    }, unbuilt => None)
+}
+
+/// A segment of a kernel's run, proved: its steps `[a, b)`, its class and
+/// its proof.
+pub struct KernelSegment {
+    pub steps: (usize, usize),
+    pub class: usize,
+    pub proof: Proof,
+}
+
+/// A kernel's run, traced whole in `full`, proved under `format` over
+/// `shape`: cut by class `cut`'s budgets, its steps and its pages
+/// ([`crate::segment::segment_bounds_budgeted`]), and each window proved at
+/// the first class whose sizes hold its rows. A class is tried by proving
+/// at it: its traces are generated once, at its sizes, and a chip whose
+/// rows need more refuses it before any commitment; a class of fewer steps
+/// than the window's is skipped, as its CPU holds a row a step. A window
+/// none holds is cut in half, down to one step; a step no class holds is
+/// refused with [`SegmentError::Shape`]: one touching more pages than the
+/// largest class's (24, or 17 for a shape holding the Poseidon2 chip), as
+/// a witness-input call writing more than about 64 KiB at once.
+pub fn prove_kernel(
+    full: &SideNote,
+    shape: &KernelShape,
+    cut: usize,
+    format: &'static Format,
+) -> Result<Vec<KernelSegment>, SegmentError> {
+    shape.check().map_err(|_| SegmentError::MalformedShape)?;
+    let class = shape.classes.get(cut).ok_or(SegmentError::MalformedShape)?;
+    let bounds = crate::segment::segment_bounds_budgeted(
+        full,
+        1 << class.log_steps,
+        usize::from(class.pages),
+    );
+    let mut cursor = crate::segment::SegmentCursor::new(full);
+    let mut segments = Vec::with_capacity(bounds.len());
+    for (a, b) in bounds {
+        let mut pending = vec![(a, b)];
+        while let Some((a, b)) = pending.pop() {
+            match prove_at_first_class(&mut cursor, (a, b), shape, format) {
+                Ok((class, proof)) => segments.push(KernelSegment {
+                    steps: (a, b),
+                    class,
+                    proof,
+                }),
+                Err(SegmentError::Shape { overflow: true, .. }) if b - a > 1 => {
+                    let middle = a + (b - a) / 2;
+                    pending.push((middle, b));
+                    pending.push((a, middle));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(segments)
+}
+
+/// Window `[a, b)` proved at the first class of `shape` that holds its
+/// rows, and the class; or the overflow of the last class tried, a
+/// [`SegmentError::Shape`] whose size is past its pin.
+fn prove_at_first_class(
+    cursor: &mut crate::segment::SegmentCursor<'_>,
+    (a, b): (usize, usize),
+    shape: &KernelShape,
+    format: &'static Format,
+) -> Result<(usize, Proof), SegmentError> {
+    let steps = (b - a).next_power_of_two().trailing_zeros();
+    let mut overflow = SegmentError::Shape {
+        chip: crate::chip_idx::CPU,
+        overflow: true,
+    };
+    for (index, class) in shape.classes.iter().enumerate() {
+        if steps > u32::from(class.log_steps) {
+            continue;
+        }
+        let segment = shape.segment(index).ok_or(SegmentError::MalformedShape)?;
+        match prove_shaped(&mut cursor.side_note(a, b), &segment, format) {
+            Ok(proof) => return Ok((index, proof)),
+            Err(error @ SegmentError::Shape { overflow: true, .. }) => overflow = error,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(overflow)
+}

@@ -1,62 +1,543 @@
-//! Program-identity commitment.
+//! A kernel's program id (`proving.md` §3.6): the Poseidon2-M31 hash of
+//! what pins its proofs, so a fold can recompute it in-circuit.
 //!
-//! In vos-pvm-proof, a proof's preprocessed-trace Merkle root IS the program
-//! commitment.  No separate computation is needed — the prover commits to
-//! it as part of `prove`, and the verifier checks it via
-//! `verify_standalone(proof, expected_commitment)`.
+//! **Two levels,** so that one fold circuit recomputes the id of every
+//! kernel: the kernel's fields hash to its digest, a run of words whose
+//! length is the kernel's, and the id hashes a preimage of fixed length,
+//! [`ID_WORDS`], every field on whole wires of four words:
 //!
-//! Workflow:
-//!   1. Run the prover once on representative input:
-//!      `let proof = prove(&mut side_note)?`
-//!   2. Extract the program hash:
-//!      `let hash = program_commitment_of_proof(&proof)`
-//!      (also accessible as `proof.stark_proof.commitments[0]`)
-//!   3. Publish (hash, proof.log_sizes) as the program identity record.
-//!   4. For every later proof of the same program, verify with:
-//!      `verify_standalone(later_proof, hash)`
-//!      The verifier rejects unless `later_proof.log_sizes == proof.log_sizes`
-//!      AND its preprocessed commitment matches `hash`.
+//! | words | field |
+//! |---|---|
+//! | 0..8 | the kernel's digest |
+//! | 8..12 | the leaf-circuit slot's version and its hashes' count (a u32 each) |
+//! | 12..44 | [`MAX_LEAF_CIRCUITS`] hashes, eight words each, zeros past the count |
 //!
-//! Why this works: ProgramMemoryChip's preprocessed columns
-//! include every PC's decoded instruction tuple plus the
-//! 20 category flags; two programs with different bytecode necessarily
-//! produce different ProgramMemoryChip preprocessed columns, and
-//! therefore different Merkle roots.  The other chips' preprocessed
-//! tables (BitwiseLookupChip, RangeMultiplicity256, PowerOfTwoChip,
-//! Blake2bChip schedule) contribute fixed-per-log_size constants.
+//! The fold takes the id's preimage as a witness: the leaf circuits a fold
+//! admits are its hashes. A zero hash past the count admits none, as no
+//! circuit hashes to zero.
 //!
-//! Limitation we accept: the commitment depends on `proof.log_sizes` and
-//! thus on the execution shape (number of steps, ECALLs, memory ops).
-//! Two proofs of the same program at different log_sizes produce
-//! different commitments.  A chain operator sets canonical log_sizes
-//! by running the prover at sufficient capacity, then refuses smaller
-//! proofs.  Future work could fix log_sizes to per-chip maxima at
-//! compile time so the commitment is purely program-derived.
+//! **The kernel's digest** is over a run of M31 words, every value in A.3's
+//! lossless limbs: a u32 two 16-bit limbs, little-endian, a 32-byte hash 16,
+//! a byte or a log size one; a Poseidon2-M31 root its own eight words. In
+//! order:
+//!
+//! 1. the domain, `vos/program-id`'s 14 bytes as 7 limbs, and the
+//!    preimage's version, 1 ([`VERSION`], a u32);
+//! 2. `TRANSPILER_VERSION`, the derivation's version (a u32);
+//! 3. the kernel's `ProgramHash` (32 bytes);
+//! 4. its shape: its chips' mask (a u32), its classes' count (a u32), and
+//!    each class's `log_steps`, `pages` and the log size of each of its
+//!    chips in chip order (a limb each);
+//! 5. the segment format its proofs are in (a u32), which names their
+//!    channel;
+//! 6. each class's preprocessed root, in the classes' order, in the format's
+//!    channel: eight words for Poseidon2-M31, 16 limbs for Blake2s-M31;
+//! 7. the image root, the page tree's over the kernel's initial memory (32
+//!    bytes).
+//!
+//! **The leaf-circuit slot:** version 1 holds each class's leaf circuit's
+//! hash, in the classes' order (`vos_pvm_recair::leaf`, the prover role's);
+//! version 0 holds none, a program whose leaves are not built.
+//!
+//! **Both hashes** are the recursion AIR's `p2` leaf mode: eight words a
+//! permutation, absorbed into the rate, then a 1 and zeros to the next
+//! eight (`P2MerkleHasher`'s leaf).
 
-use crate::Proof;
+use alloc::vec::Vec;
 
-/// Program-identity hash type — the preprocessed-trace Merkle root, in the
-/// per-build PCS hash (Blake2s by default; `P2Hash` under `poseidon2-channel`).
-pub type ProgramCommitment = crate::recursion_pcs::ProverMerkleHash;
+use stwo::core::fields::m31::BaseField;
+use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 
-/// Extract the program-commitment Merkle root from a proof.
-///
-/// Equivalent to `proof.stark_proof.commitments[0]`, but expressed as a
-/// named API so callers don't reach into the StarkProof internals.
-///
-/// Use this once at program-deploy time:
-///   ```ignore
-///   let proof = vos_pvm_proof::prove(&mut side_note)?;
-///   let id_hash = vos_pvm_proof::program_commitment_of_proof(&proof);
-///   let id_log_sizes = proof.log_sizes.clone();
-///   // publish (id_hash, id_log_sizes) on-chain or alongside the program.
-///   ```
-pub fn program_commitment_of_proof(proof: &Proof) -> ProgramCommitment {
-    proof.stark_proof.commitments[0]
+pub use vos_pvm_final_verifier::ProgramId;
+
+use crate::format::ChannelKind;
+use crate::pcs::Commitment;
+use crate::poseidon2::{P2Hash, P2MerkleHasher, u32_limbs};
+use crate::shape::{KernelShape, MAX_CLASSES};
+
+/// The kernel digest's domain.
+pub const DOMAIN: &[u8; 14] = b"vos/program-id";
+
+/// The preimage's version.
+pub const VERSION: u32 = 1;
+
+/// The leaf-circuit hashes an id's preimage holds: one a class.
+pub const MAX_LEAF_CIRCUITS: usize = MAX_CLASSES;
+
+/// The words of an id's preimage.
+pub const ID_WORDS: usize = 8 + 4 + 8 * MAX_LEAF_CIRCUITS;
+
+/// The leaf circuits' slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeafCircuits {
+    /// Version 0: no leaf circuit, a program no fold binds.
+    None,
+    /// Version 1: each class's leaf circuit's hash, in the classes' order.
+    Hashes(Vec<P2Hash>),
 }
 
-/// Convenience: hex-encoded program commitment.
-pub fn program_commitment_hex(proof: &Proof) -> alloc::string::String {
-    use alloc::string::ToString;
-    program_commitment_of_proof(proof).to_string()
+impl LeafCircuits {
+    /// The slot's version.
+    pub fn version(&self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Hashes(_) => 1,
+        }
+    }
+
+    /// Its hashes: none in version 0.
+    pub fn hashes(&self) -> &[P2Hash] {
+        match self {
+            Self::None => &[],
+            Self::Hashes(hashes) => hashes,
+        }
+    }
+}
+
+/// An id's preimage: a kernel's digest and its leaf circuits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdPreimage {
+    pub kernel: P2Hash,
+    pub leaf_circuits: LeafCircuits,
+}
+
+impl IdPreimage {
+    /// Its [`ID_WORDS`] words.
+    ///
+    /// # Panics
+    /// When the slot holds more than [`MAX_LEAF_CIRCUITS`] hashes, which
+    /// [`KernelProgram::check`] refuses.
+    pub fn words(&self) -> [BaseField; ID_WORDS] {
+        let hashes = self.leaf_circuits.hashes();
+        assert!(
+            hashes.len() <= MAX_LEAF_CIRCUITS,
+            "at most {MAX_LEAF_CIRCUITS} leaf circuits"
+        );
+        let mut words = [BaseField::from(0); ID_WORDS];
+        words[..8].copy_from_slice(&self.kernel.0);
+        let slot: Vec<BaseField> = u32_limbs(self.leaf_circuits.version())
+            .into_iter()
+            .chain(u32_limbs(hashes.len() as u32))
+            .collect();
+        words[8..12].copy_from_slice(&slot);
+        for (k, hash) in hashes.iter().enumerate() {
+            words[12 + 8 * k..20 + 8 * k].copy_from_slice(&hash.0);
+        }
+        words
+    }
+
+    /// The id it hashes to.
+    pub fn id(&self) -> ProgramId {
+        ProgramId::from(leaf_sponge(&self.words()).0)
+    }
+}
+
+/// The `p2` leaf mode's sponge over `words`.
+fn leaf_sponge(words: &[BaseField]) -> P2Hash {
+    let mut hasher = P2MerkleHasher::default();
+    hasher.update_leaf(words);
+    hasher.finalize()
+}
+
+/// What a kernel's program id pins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelProgram {
+    pub transpiler: u32,
+    pub program: [u8; 32],
+    pub shape: KernelShape,
+    /// The segment format its proofs are in.
+    pub format: u32,
+    /// Each class's preprocessed root, in the classes' order.
+    pub preprocessed_roots: Vec<Commitment>,
+    pub image_root: [u8; 32],
+    pub leaf_circuits: LeafCircuits,
+}
+
+/// Where a run of a kernel starts, as the loader lays the kernel out with no
+/// arguments: its first step's pc and timestamp, and its registers. A chain
+/// of the kernel's segments starts there, and ends at [`HALT_PC`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelEntry {
+    /// A standard program starts at its code's first byte.
+    pub pc: u32,
+    /// φ0 the halt address, φ1 the stack's top, φ7 the argument window,
+    /// the rest 0.
+    pub registers: [u64; vos_pvm_program::REGISTER_COUNT],
+}
+
+/// A run's first step's timestamp.
+pub const ENTRY_TIMESTAMP: u64 = 1;
+
+/// The pc a run ends at when it halts: the halt address.
+pub const HALT_PC: u32 = vos_pvm_program::HALT_ADDRESS as u32;
+
+impl KernelEntry {
+    /// The entry of `blob`, the kernel `program` pins: refused when `blob`
+    /// is not the program it names, by its hash and its image root, or not
+    /// a standard program.
+    pub fn of(program: &KernelProgram, blob: &[u8]) -> Result<Self, KernelError> {
+        if vos_pvm_precompiles::blake2b_256(blob) != program.program {
+            return Err(KernelError::Blob);
+        }
+        let standard =
+            vos_pvm_program::parse_standard_program(blob).ok_or(KernelError::NotStandard)?;
+        if standard.image_root() != Some(program.image_root) {
+            return Err(KernelError::ImageRoot);
+        }
+        let layout = standard.layout(&[]).ok_or(KernelError::Layout)?;
+        Ok(Self {
+            pc: 0,
+            registers: layout.registers,
+        })
+    }
+}
+
+/// Why a kernel's program, or its blob against it, is refused. Value-free:
+/// a kernel is public, and a variant names the rule it breaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelError {
+    /// The blob is not the program the kernel names, by its hash.
+    Blob,
+    /// The blob is not a standard program.
+    NotStandard,
+    /// The blob's image root is not the kernel's.
+    ImageRoot,
+    /// The kernel's layout does not fit.
+    Layout,
+    /// The kernel's shape is refused.
+    Shape(crate::shape::ShapeError),
+    /// The kernel's format is no segment format the registry holds.
+    Format,
+    /// A preprocessed root more or fewer than the shape's classes.
+    Roots,
+    /// A preprocessed root in another channel than its format's.
+    Channel,
+    /// A leaf circuit more or fewer than the shape's classes.
+    LeafCircuits,
+    /// A class's preprocessed root cannot be computed from the kernel's
+    /// code at its sizes.
+    Preprocessed,
+}
+
+impl KernelError {
+    /// What it says, a static text a log may hold.
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::Blob => "the blob is not the kernel's program",
+            Self::NotStandard => "the kernel is not a standard program",
+            Self::ImageRoot => "the blob's image root is not the kernel's",
+            Self::Layout => "the kernel's layout does not fit",
+            Self::Shape(error) => error.reason(),
+            Self::Format => "the kernel's format is no segment format",
+            Self::Roots => "a preprocessed root more or fewer than the classes",
+            Self::Channel => "a preprocessed root is not in its format's channel",
+            Self::LeafCircuits => "a leaf circuit more or fewer than the classes",
+            Self::Preprocessed => "a class's preprocessed root cannot be computed",
+        }
+    }
+}
+
+impl core::fmt::Display for KernelError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl core::error::Error for KernelError {}
+
+impl From<KernelError> for stwo::core::verifier::VerificationError {
+    fn from(refusal: KernelError) -> Self {
+        Self::InvalidStructure(alloc::string::ToString::to_string(&refusal))
+    }
+}
+
+/// A byte string's 16-bit limbs, little-endian, the last zero-extended.
+fn byte_limbs(bytes: &[u8]) -> impl Iterator<Item = BaseField> + '_ {
+    bytes.chunks(2).map(|pair| {
+        BaseField::from_u32_unchecked(
+            u32::from(pair[0]) | u32::from(*pair.get(1).unwrap_or(&0)) << 8,
+        )
+    })
+}
+
+impl KernelProgram {
+    /// Whether it is one a venue may pin: a well-formed shape, a segment
+    /// format the registry knows, and a root per class in its channel.
+    pub fn check(&self) -> Result<(), KernelError> {
+        self.shape.check().map_err(KernelError::Shape)?;
+        let format = crate::format::lookup(self.format)
+            .filter(|format| format.kind == crate::format::ProofKind::Segment)
+            .ok_or(KernelError::Format)?;
+        if self.preprocessed_roots.len() != self.shape.classes.len() {
+            return Err(KernelError::Roots);
+        }
+        if self
+            .preprocessed_roots
+            .iter()
+            .any(|root| root.channel() != format.channel)
+        {
+            return Err(KernelError::Channel);
+        }
+        if let LeafCircuits::Hashes(hashes) = &self.leaf_circuits
+            && hashes.len() != self.shape.classes.len()
+        {
+            return Err(KernelError::LeafCircuits);
+        }
+        Ok(())
+    }
+
+    /// The words its digest hashes: every field but the leaf circuits.
+    pub fn kernel_words(&self) -> Vec<BaseField> {
+        let mut words: Vec<BaseField> = byte_limbs(DOMAIN).collect();
+        words.extend(u32_limbs(VERSION));
+        words.extend(u32_limbs(self.transpiler));
+        words.extend(byte_limbs(&self.program));
+        words.extend(u32_limbs(self.shape.components));
+        words.extend(u32_limbs(self.shape.classes.len() as u32));
+        for class in &self.shape.classes {
+            words.push(BaseField::from(u32::from(class.log_steps)));
+            words.push(BaseField::from(u32::from(class.pages)));
+            words.extend(
+                class
+                    .log_sizes
+                    .iter()
+                    .map(|&size| BaseField::from(u32::from(size))),
+            );
+        }
+        words.extend(u32_limbs(self.format));
+        for root in &self.preprocessed_roots {
+            match root {
+                Commitment::Poseidon2M31(hash) => words.extend(hash.0),
+                Commitment::Blake2sM31(_) => words.extend(byte_limbs(&root.to_bytes())),
+            }
+        }
+        words.extend(byte_limbs(&self.image_root));
+        words
+    }
+
+    /// The kernel's digest.
+    pub fn kernel_digest(&self) -> P2Hash {
+        leaf_sponge(&self.kernel_words())
+    }
+
+    /// Its id's preimage.
+    pub fn id_preimage(&self) -> IdPreimage {
+        IdPreimage {
+            kernel: self.kernel_digest(),
+            leaf_circuits: self.leaf_circuits.clone(),
+        }
+    }
+
+    /// Its program id.
+    pub fn id(&self) -> ProgramId {
+        self.id_preimage().id()
+    }
+
+    /// The channel its proofs commit in.
+    pub fn channel(&self) -> Option<ChannelKind> {
+        crate::format::lookup(self.format).map(|format| format.channel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chip_idx;
+    use crate::shape::ClassShape;
+    use alloc::vec;
+
+    /// A program whose every field differs from its neighbours'.
+    fn program() -> KernelProgram {
+        let components = chip_idx::ALWAYS | 1 << chip_idx::MUL | 1 << chip_idx::COMPARE;
+        let chips = components.count_ones() as usize;
+        let class = |log_steps: u8| ClassShape {
+            log_steps,
+            pages: 8,
+            log_sizes: (0..chips as u8).map(|chip| 4 + chip % 13).collect(),
+        };
+        KernelProgram {
+            transpiler: 3,
+            program: core::array::from_fn(|i| i as u8),
+            shape: KernelShape {
+                components,
+                classes: vec![class(12), class(15)],
+            },
+            format: crate::format::SEGMENT.number,
+            preprocessed_roots: vec![
+                Commitment::Poseidon2M31(P2Hash(core::array::from_fn(|i| {
+                    BaseField::from(1_000 + i as u32)
+                }))),
+                Commitment::Poseidon2M31(P2Hash(core::array::from_fn(|i| {
+                    BaseField::from(2_000 + i as u32)
+                }))),
+            ],
+            image_root: core::array::from_fn(|i| 0xa0 + i as u8),
+            leaf_circuits: LeafCircuits::None,
+        }
+    }
+
+    /// The kernel digest's words, word by word, and the id's golden
+    /// vector.
+    #[test]
+    fn the_program_id_is_pinned() {
+        let program = program();
+        program.check().unwrap();
+        let words: Vec<u32> = program.kernel_words().iter().map(|word| word.0).collect();
+        let chips = program.shape.components.count_ones() as usize;
+        assert_eq!(chips, 18);
+        assert_eq!(
+            words.len(),
+            7 + 2 + 2 + 16 + 2 + 2 + 2 * (2 + chips) + 2 + 2 * 8 + 16
+        );
+        assert_eq!(
+            &words[..7],
+            &[0x6f76, 0x2f73, 0x7270, 0x676f, 0x6172, 0x2d6d, 0x6469]
+        );
+        assert_eq!(&words[7..11], &[1, 0, 3, 0]);
+        assert_eq!(&words[11..13], &[0x0100, 0x0302]);
+        let shape = 27;
+        assert_eq!(
+            &words[shape..shape + 6],
+            &[
+                program.shape.components & 0xffff,
+                program.shape.components >> 16,
+                2,
+                0,
+                12,
+                8
+            ]
+        );
+        let format = shape + 4 + 2 * (2 + chips);
+        assert_eq!(&words[format..format + 3], &[41, 0, 1_000]);
+        assert_eq!(&words[words.len() - 2..], &[0xbdbc, 0xbfbe]);
+        let id = program.id_preimage().words();
+        assert_eq!(id[..8], program.kernel_digest().0);
+        assert!(id[8..].iter().all(|&word| word == BaseField::from(0)));
+        assert_eq!(
+            program.id().0,
+            [
+                355615325, 1545380536, 453447273, 279479272, 1435617632, 1368078553, 1372432483,
+                1394946262
+            ],
+            "the golden vector"
+        );
+    }
+
+    /// The `p2` leaf mode's sponge over `words`: eight words added into the
+    /// rate a permutation, then a 1 and zeros to the next eight, the first
+    /// eight words of the state out.
+    fn sponge(words: &[BaseField]) -> [BaseField; 8] {
+        let mut words = words.to_vec();
+        words.push(BaseField::from(1));
+        words.resize(words.len().next_multiple_of(8), BaseField::from(0));
+        let mut state = [BaseField::from(0); 16];
+        for block in words.chunks_exact(8) {
+            for (lane, word) in state.iter_mut().zip(block) {
+                *lane += *word;
+            }
+            crate::poseidon2::permute(&mut state);
+        }
+        state[..8].try_into().unwrap()
+    }
+
+    /// The kernel's digest and the id are the `p2` leaf mode's sponges over
+    /// their words.
+    #[test]
+    fn the_id_is_the_leaf_modes_sponge() {
+        let mut program = program();
+        program.leaf_circuits = LeafCircuits::Hashes(vec![
+            P2Hash(core::array::from_fn(|i| {
+                BaseField::from(9 + i as u32)
+            }));
+            2
+        ]);
+        assert_eq!(program.kernel_digest().0, sponge(&program.kernel_words()));
+        assert_eq!(program.id().felts(), sponge(&program.id_preimage().words()));
+    }
+
+    /// Every field reaches the id.
+    #[test]
+    fn every_field_moves_the_id() {
+        let id = program().id();
+        let changed: [fn(&mut KernelProgram); 10] = [
+            |p| p.transpiler += 1,
+            |p| p.program[31] ^= 1,
+            |p| p.shape.components |= 1 << chip_idx::DIVREM,
+            |p| p.shape.classes[1].log_steps += 1,
+            |p| p.shape.classes[1].pages += 1,
+            |p| p.shape.classes[0].log_sizes[3] += 1,
+            |p| p.format = crate::format::DEVICE_PROOF.number,
+            |p| {
+                if let Commitment::Poseidon2M31(hash) = &mut p.preprocessed_roots[1] {
+                    hash.0[7] = BaseField::from(7);
+                }
+            },
+            |p| p.image_root[0] ^= 1,
+            |p| {
+                p.leaf_circuits = LeafCircuits::Hashes(vec![P2Hash::default(); 2]);
+            },
+        ];
+        for (index, change) in changed.iter().enumerate() {
+            let mut program = program();
+            change(&mut program);
+            assert_ne!(program.id(), id, "field {index}");
+        }
+    }
+
+    /// A root in another channel than the format's, a root count other than
+    /// the classes', or a format that proves no segments is refused.
+    #[test]
+    fn a_malformed_program_is_refused() {
+        let mut blake = program();
+        blake.preprocessed_roots[0] = Commitment::Blake2sM31(Default::default());
+        assert_eq!(blake.check(), Err(KernelError::Channel));
+        let mut short = program();
+        short.preprocessed_roots.pop();
+        assert!(short.check().is_err());
+        let mut leaf = program();
+        leaf.format = crate::format::LEAF_FOLD.number;
+        assert!(leaf.check().is_err());
+        let mut leaves = program();
+        leaves.leaf_circuits = LeafCircuits::Hashes(vec![P2Hash::default()]);
+        assert_eq!(leaves.check(), Err(KernelError::LeafCircuits));
+    }
+
+    /// Version 1's slot: its version, the hashes' count and each hash's
+    /// words, after the kernel's digest, zeros past the count; a hash's word
+    /// moves the id, and the kernel's digest does not depend on the slot.
+    #[test]
+    fn the_leaf_circuits_slot_is_pinned() {
+        let mut program = program();
+        let hashes: Vec<P2Hash> = (0..2u32)
+            .map(|class| {
+                P2Hash(core::array::from_fn(|i| {
+                    BaseField::from(3_000 + 100 * class + i as u32)
+                }))
+            })
+            .collect();
+        let kernel = program.kernel_digest();
+        program.leaf_circuits = LeafCircuits::Hashes(hashes.clone());
+        program.check().unwrap();
+        assert_eq!(program.kernel_digest(), kernel);
+        let words: Vec<u32> = program
+            .id_preimage()
+            .words()
+            .iter()
+            .map(|word| word.0)
+            .collect();
+        assert_eq!(words.len(), ID_WORDS);
+        assert_eq!(&words[..8], &kernel.0.map(|word| word.0)[..]);
+        let slot = &words[8..];
+        assert_eq!(&slot[..4], &[1, 0, 2, 0]);
+        for (k, hash) in hashes.iter().enumerate() {
+            assert_eq!(&slot[4 + 8 * k..12 + 8 * k], &hash.0.map(|word| word.0)[..]);
+        }
+        assert!(slot[4 + 16..].iter().all(|&word| word == 0));
+        let id = program.id();
+        let LeafCircuits::Hashes(hashes) = &mut program.leaf_circuits else {
+            unreachable!()
+        };
+        hashes[1].0[7] = BaseField::from(1);
+        assert_ne!(program.id(), id);
+    }
 }

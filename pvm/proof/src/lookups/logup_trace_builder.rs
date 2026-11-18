@@ -30,6 +30,14 @@ pub struct LogupTraceBuilder {
     /// dead majority.  The reference (always-combine) path is kept for the
     /// bit-identity test.
     skip_dead_rows: bool,
+    /// How many of the next fractions take a column each, never paired:
+    /// the first `singles` for `Logup::SingleThenPairs`, none otherwise.
+    singles: usize,
+    /// The fractions written, by their index among the chip's: bit `i` of
+    /// the `i`-th, every one by default ([`Self::keeping`]).
+    kept: u128,
+    /// The index of the next fraction.
+    next: usize,
 }
 
 impl LogupTraceBuilder {
@@ -44,6 +52,39 @@ impl LogupTraceBuilder {
             logup_trace_gen: LogupTraceGenerator::new(log_size),
             pending_logup: Vec::with_capacity(1 << (log_size - LOG_N_LANES)),
             skip_dead_rows,
+            singles: 0,
+            kept: u128::MAX,
+            next: 0,
+        }
+    }
+
+    /// A builder that writes only the fractions `kept` names, bit `i` the
+    /// `i`-th the chip adds: the others' numerators are zero on every row
+    /// of an instance that omits them.
+    pub fn keeping(self, kept: u128) -> Self {
+        Self { kept, ..self }
+    }
+
+    /// Whether the next fraction is written, counting it: every one past
+    /// the 128 a mask names is, and a builder keeping fewer takes none.
+    fn take(&mut self) -> bool {
+        let index = self.next;
+        self.next += 1;
+        match index {
+            0..128 => self.kept >> index & 1 == 1,
+            _ => {
+                assert_eq!(self.kept, u128::MAX, "a fraction past a builder's mask");
+                true
+            }
+        }
+    }
+
+    /// A builder that gives each of the first `singles` fractions its own
+    /// column and pairs the rest: a `Logup::SingleThenPairs` chip's.
+    pub fn single_then_pairs(log_size: u32, singles: usize) -> Self {
+        Self {
+            singles,
+            ..Self::new(log_size)
         }
     }
 }
@@ -80,20 +121,6 @@ impl LogupTraceBuilder {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn add_to_relation<'a, T, R>(
-        &mut self,
-        relation: &'a R,
-        mult: T,
-        tuple: &'a [FinalizedColumn<'a>],
-    ) where
-        T: Into<FinalizedColumn<'a>>,
-        R: RegisteredLookupBound,
-    {
-        let mult = mult.into();
-        self.add_to_relation_with(relation, [mult], |[col]| col.into(), tuple);
-    }
-
     pub fn add_to_relation_with<'a, const N: usize, R, F>(
         &mut self,
         relation: &R,
@@ -104,6 +131,9 @@ impl LogupTraceBuilder {
         R: RegisteredLookupBound,
         F: Fn([PackedBaseField; N]) -> PackedSecureField,
     {
+        if !self.take() {
+            return;
+        }
         let frac_iter = Self::iter_logup_fractions(
             self.log_size,
             self.skip_dead_rows,
@@ -113,19 +143,7 @@ impl LogupTraceBuilder {
             tuple,
         );
 
-        if self.pending_logup.is_empty() {
-            self.pending_logup.extend(frac_iter);
-        } else {
-            let mut logup_col_gen = self.logup_trace_gen.new_col();
-
-            for (vec_row, (a, b)) in frac_iter.enumerate() {
-                let (c, d) = self.pending_logup[vec_row];
-                logup_col_gen.write_frac(vec_row, a * d + b * c, b * d);
-            }
-
-            logup_col_gen.finalize_col();
-            self.pending_logup.clear();
-        }
+        self.push_fractions(frac_iter);
     }
 
     /// Like `add_to_relation_with`, but the tuple values are computed per-row
@@ -142,6 +160,9 @@ impl LogupTraceBuilder {
         F: Fn([PackedBaseField; N]) -> PackedSecureField,
         G: Fn(usize) -> Vec<PackedBaseField>,
     {
+        if !self.take() {
+            return;
+        }
         let num_vecs = 1 << (self.log_size - LOG_N_LANES);
         let skip_dead_rows = self.skip_dead_rows;
         let frac_iter = (0..num_vecs).map(|vec_idx| {
@@ -158,19 +179,37 @@ impl LogupTraceBuilder {
             (p0, p1)
         });
 
-        if self.pending_logup.is_empty() {
-            self.pending_logup.extend(frac_iter);
+        self.push_fractions(frac_iter);
+    }
+
+    /// One relation's fractions: a column of their own while `singles`
+    /// lasts, otherwise held until the next relation's and paired with them in one
+    /// column.
+    fn push_fractions(&mut self, fractions: impl Iterator<Item = LogUpFrac>) {
+        if self.singles > 0 {
+            self.singles -= 1;
+            self.write_column(fractions);
+        } else if self.pending_logup.is_empty() {
+            self.pending_logup.extend(fractions);
         } else {
-            let mut logup_col_gen = self.logup_trace_gen.new_col();
-
-            for (vec_row, (a, b)) in frac_iter.enumerate() {
-                let (c, d) = self.pending_logup[vec_row];
-                logup_col_gen.write_frac(vec_row, a * d + b * c, b * d);
-            }
-
-            logup_col_gen.finalize_col();
-            self.pending_logup.clear();
+            let mut pending = core::mem::take(&mut self.pending_logup);
+            self.write_column(
+                fractions
+                    .zip(&pending)
+                    .map(|((a, b), &(c, d))| (a * d + b * c, b * d)),
+            );
+            pending.clear();
+            self.pending_logup = pending;
         }
+    }
+
+    /// One interaction column of `fractions`, a packed row each.
+    fn write_column(&mut self, fractions: impl IntoIterator<Item = LogUpFrac>) {
+        let mut logup_col_gen = self.logup_trace_gen.new_col();
+        for (vec_row, (a, b)) in fractions.into_iter().enumerate() {
+            logup_col_gen.write_frac(vec_row, a, b);
+        }
+        logup_col_gen.finalize_col();
     }
 
     pub fn finalize(
@@ -180,18 +219,15 @@ impl LogupTraceBuilder {
         SecureField,
     ) {
         if !self.pending_logup.is_empty() {
-            let mut logup_col_gen = self.logup_trace_gen.new_col();
-            for (vec_row, (a, b)) in self.pending_logup.into_iter().enumerate() {
-                logup_col_gen.write_frac(vec_row, a, b);
-            }
-            logup_col_gen.finalize_col();
+            let pending = core::mem::take(&mut self.pending_logup);
+            self.write_column(pending);
         }
 
         self.logup_trace_gen.finalize_last()
     }
 }
 
-#[cfg(all(test, feature = "prover"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::chips::blake2b::{Blake2bBoundaryChip, BoundaryColumn};
@@ -202,7 +238,7 @@ mod tests {
     };
     use crate::side_note::SideNote;
     use crate::trace::component::ComponentTrace;
-    use stwo::core::channel::Blake2sChannel;
+    use stwo::core::channel::Blake2sM31Channel;
     use stwo::prover::backend::Column as _;
 
     /// A real `Blake2bBoundaryChip` component trace over a handful of
@@ -219,7 +255,7 @@ mod tests {
                 h,
                 m,
                 t: (k as u128) * 128,
-                f: k % 2 == 0,
+                f: k.is_multiple_of(2),
             });
             sn.merkle_blake2b_mults.push((k as u32) + 1);
         }
@@ -300,7 +336,8 @@ mod tests {
     fn dead_row_skip_is_bit_identical() {
         let trace = boundary_component_trace();
         let mut lookups = AllLookupElements::default();
-        Blake2bBoundaryChip.draw_lookup_elements(&mut lookups, &mut Blake2sChannel::default());
+        Blake2bBoundaryChip
+            .draw_lookup_elements(&mut lookups, (&mut Blake2sM31Channel::default()).into());
 
         let (cols_skip, sum_skip) = replay_cols(&trace, &lookups, true);
         let (cols_ref, sum_ref) = replay_cols(&trace, &lookups, false);

@@ -1,0 +1,233 @@
+//! The masking's randomness (`proving.md` §5, R4): hedged, so neither a
+//! replayed operating-system state nor a known witness alone fixes the
+//! masks.
+//!
+//! Each attempt's stream is ChaCha20 seeded with
+//! `BLAKE2b-256("vos/mask/seed/v1" ‖ 32 OS bytes ‖ witness digest ‖ attempt as u32 LE)`,
+//! the witness digest binding the statement (the format, its configuration
+//! and masking, its channel, the log sizes, the public values) and the
+//! main columns. Two proofs from one replayed OS state differ when their
+//! witnesses or their statements do, so one witness proved under two formats
+//! or channels never reuses a mask; two proofs of one witness differ when the
+//! OS bytes do. Every mask, salt, `R` column and blinding value of the attempt
+//! is drawn from that stream.
+
+use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest};
+use rand_chacha::ChaCha20Rng;
+use rand_chacha::rand_core::SeedableRng;
+use rayon::prelude::*;
+use stwo::core::fields::qm31::SecureField;
+use stwo::core::pcs::DeepBatching;
+use vos_pvm_proof::format::statement_header_words;
+use vos_pvm_proof::format::{Format, Masking};
+
+use super::MainColumns;
+use crate::prove::CircuitError;
+
+type Blake2b256 = Blake2b<U32>;
+
+const SEED_DOMAIN: &[u8] = b"vos/mask/seed/v1";
+const WITNESS_DOMAIN: &[u8] = b"vos/mask/witness/v1";
+
+/// Where an attempt's 32 entropy bytes come from: the operating system's
+/// ([`MaskRng::default`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MaskRng {
+    /// The operating system's randomness: every build's.
+    #[default]
+    Os,
+    /// A test's seed in place of the OS bytes, the witness digest and the
+    /// attempt still hashed in, so a proof is reproducible byte for byte.
+    /// Only the prover's tests have it, on a dev edge (`seeded-masks`); no
+    /// production build does.
+    #[cfg(feature = "seeded-masks")]
+    Seeded(u64),
+}
+
+impl MaskRng {
+    /// The stream of attempt `attempt` over the witness digest `witness`.
+    pub(crate) fn attempt(
+        self,
+        witness: &[u8; 32],
+        attempt: u32,
+    ) -> Result<ChaCha20Rng, CircuitError> {
+        let mut entropy = [0u8; 32];
+        match self {
+            Self::Os => getrandom::getrandom(&mut entropy).map_err(|_| CircuitError::Entropy)?,
+            #[cfg(feature = "seeded-masks")]
+            Self::Seeded(seed) => entropy[..8].copy_from_slice(&seed.to_le_bytes()),
+        }
+        let mut seed = [0u8; 32];
+        Blake2b256::new()
+            .chain_update(SEED_DOMAIN)
+            .chain_update(entropy)
+            .chain_update(witness)
+            .chain_update(attempt.to_le_bytes())
+            .finalize_into((&mut seed).into());
+        super::drawn::note("an attempt's entropy", &entropy);
+        super::drawn::note("an attempt's seed", &seed);
+        let rng = ChaCha20Rng::from_seed(seed);
+        wipe(&mut entropy);
+        wipe(&mut seed);
+        Ok(rng)
+    }
+}
+
+/// `bytes` overwritten with zeros by volatile writes, which the compiler
+/// keeps though nothing reads them after: the attempt's entropy and seed
+/// arrays, once its stream is keyed. The stream holds its key until it is
+/// dropped, and the hasher's and the key's copies are not wiped.
+fn wipe(bytes: &mut [u8; 32]) {
+    for byte in bytes.iter_mut() {
+        // SAFETY: `byte` is a valid, aligned, exclusive reference.
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// What a masked proof states beside its columns: the hedge binds it.
+pub(crate) struct Statement<'a> {
+    pub format: &'a Format,
+    pub masking: &'a Masking,
+    pub log_sizes: &'a [u32],
+    pub public: &'a [SecureField],
+}
+
+/// The witness digest R4 hedges with: `BLAKE2b-256` of the domain, the
+/// statement's words as u64 little-endian (the count of its header's words,
+/// then the header the transcript mixes,
+/// `vos_pvm_proof::format::statement_header_words`: the format's number, its
+/// configuration and each log size; then its DEEP batching, its interaction
+/// PoW, its channel's tag and its masking), the public values' count and
+/// each value's 4 limbs, as u32 little-endian, then each main column's digest
+/// in commitment order, a column's the `BLAKE2b-256` of its values, 4 bytes
+/// little-endian each in Stwo's storage order. Every private value of the
+/// witness is in the main columns.
+pub(crate) fn witness_digest(statement: &Statement<'_>, main: &MainColumns<'_>) -> [u8; 32] {
+    let columns: Vec<[u8; 32]> = (0..statement.log_sizes.len())
+        .flat_map(main)
+        .collect::<Vec<_>>()
+        .par_iter()
+        .map(|column| {
+            let bytes: &[u8] = bytemuck::cast_slice(column.as_slice());
+            Blake2b256::digest(bytes).into()
+        })
+        .collect();
+    let config = statement.format.pcs_config();
+    let header = statement_header_words(statement.format.number, &config, statement.log_sizes);
+    let batching = match config.deep_batching {
+        DeepBatching::Powers => 0,
+        DeepBatching::Affine => 1,
+    };
+    let masking = statement.masking;
+    let mut hasher = Blake2b256::new().chain_update(WITNESS_DOMAIN);
+    for word in core::iter::once(header.len() as u64).chain(header).chain([
+        batching,
+        u64::from(statement.format.interaction_pow_bits()),
+        statement.format.channel as u64,
+        masking.salt_columns as u64,
+        masking.fri_mask_columns as u64,
+        u64::from(masking.log_mask_rows),
+    ]) {
+        hasher.update(word.to_le_bytes());
+    }
+    hasher.update((statement.public.len() as u64).to_le_bytes());
+    for value in statement.public {
+        for limb in value.to_m31_array() {
+            hasher.update(limb.0.to_le_bytes());
+        }
+    }
+    for column in columns {
+        hasher.update(column);
+    }
+    hasher.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use stwo::core::fields::m31::BaseField;
+    use stwo::prover::backend::simd::column::BaseColumn;
+    use vos_pvm_proof::format::{ChannelKind, Format, MASKED_WRAP};
+
+    use super::*;
+
+    fn column(values: &[u32]) -> BaseColumn {
+        values
+            .iter()
+            .map(|&value| BaseField::from(value))
+            .collect::<BaseColumn>()
+    }
+
+    /// The digest of a one-column witness.
+    fn digest(statement: &Statement<'_>, column: &BaseColumn) -> [u8; 32] {
+        witness_digest(statement, &|_| vec![column])
+    }
+
+    /// R4 against a replayed state: one OS state hedged with two witnesses
+    /// differing in one value, or with one witness under two channels,
+    /// public values, log sizes, format numbers or masks' heights, seeds
+    /// two other streams; the same witness and state seed one.
+    #[test]
+    fn a_replayed_state_draws_other_masks_for_another_witness() {
+        use rand::RngCore;
+        let masking = MASKED_WRAP.masking.unwrap();
+        let public = [SecureField::from(BaseField::from(7))];
+        let poseidon = Format {
+            channel: ChannelKind::Poseidon2M31,
+            ..MASKED_WRAP
+        };
+        let renumbered = Format {
+            number: MASKED_WRAP.number + 1,
+            ..MASKED_WRAP
+        };
+        let taller = Masking {
+            log_mask_rows: masking.log_mask_rows + 1,
+            ..masking
+        };
+        let statement = |format, public| Statement {
+            format,
+            masking: &masking,
+            log_sizes: &[4],
+            public,
+        };
+        let values: Vec<u32> = (0..16).collect();
+        let mut amount = values.clone();
+        amount[3] += 1;
+        let digests = [
+            digest(&statement(&MASKED_WRAP, &public), &column(&values)),
+            digest(&statement(&MASKED_WRAP, &public), &column(&amount)),
+            digest(&statement(&poseidon, &public), &column(&values)),
+            digest(&statement(&MASKED_WRAP, &[]), &column(&values)),
+            digest(
+                &Statement {
+                    log_sizes: &[5],
+                    ..statement(&MASKED_WRAP, &public)
+                },
+                &column(&values),
+            ),
+            digest(&statement(&renumbered, &public), &column(&values)),
+            digest(
+                &Statement {
+                    masking: &taller,
+                    ..statement(&MASKED_WRAP, &public)
+                },
+                &column(&values),
+            ),
+        ];
+        let first_word = |digest: &[u8; 32], attempt| {
+            MaskRng::Seeded(5)
+                .attempt(digest, attempt)
+                .unwrap()
+                .next_u64()
+        };
+        let words: Vec<u64> = digests.iter().map(|digest| first_word(digest, 0)).collect();
+        for (i, a) in words.iter().enumerate() {
+            for b in &words[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(first_word(&digests[0], 0), words[0]);
+        assert_ne!(first_word(&digests[0], 1), words[0]);
+    }
+}

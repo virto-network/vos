@@ -1,0 +1,40 @@
+{
+  "expected": {
+    "blocks": [
+      {
+        "gas": 26,
+        "pc": 0
+      }
+    ],
+    "first": {
+      "remaining_gas": 25,
+      "status": "out_of_gas"
+    },
+    "resume": null
+  },
+  "initial": {
+    "gas": 25,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "out_of_gas_precedes_memory_fault",
+  "program": {
+    "bitmask": "0x2101",
+    "code": "0x3a02000003c8320400"
+  },
+  "rule": "gray-paper-v0.8-rob-block-gas",
+  "spec": "gray-paper-0.8.0"
+}

@@ -1,11 +1,15 @@
-//! Test helpers shared across `tests/*.rs` integration tests.
-//!
-//! Cargo treats files directly under `tests/` as separate test binaries, but
-//! `tests/common/mod.rs` is included via `mod common;` in each binary without
-//! triggering a duplicate-binary warning.  Callers do `mod common;` then
-//! `use common::*;`.
+//! Test helpers shared across the test binaries that include this module:
+//! `gates`, `isa` and `kernel`, and on the node side `vos-kernel-tests`'
+//! `witness_input` and, through its own `common`, `kernel`. Each binary uses
+//! a part of them, and each helper has a user among the five.
 
 #![allow(dead_code)]
+
+/// The venue's JAM refine program on the JAM-only host.
+#[path = "../../statement/tests/support/jam.rs"]
+pub mod jam;
+
+pub mod every_chip;
 
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
@@ -22,7 +26,6 @@ const DEFAULT_FLAT_MEM: usize = 4 * 1024 * 1024;
 /// Default gas + max-steps that programs run with.  Generous because tests
 /// typically have ≤ 50 steps.
 const DEFAULT_GAS: u64 = 10_000;
-const DEFAULT_MAX_STEPS: u8 = 25;
 
 /// Encode a TwoReg instruction at `code[0..2]`: opcode byte then a packed
 /// register byte where `rd` lands in the low 4 bits and `ra` in the high 4.
@@ -43,9 +46,9 @@ pub fn two_reg_program(op: Opcode, rd: u8, ra: u8) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Run a program in the tracing interpreter and return the recorded steps.
-/// Asserts the program exits with `Trap` (the canonical happy-path
-/// terminator for these tests).
-pub fn trace_until_trap(
+/// Asserts the standard interpreter exits with `Panic` after recording the
+/// terminal opcode-0 (`Trap`) row.
+pub fn trace_until_opcode_zero(
     code: Vec<u8>,
     bitmask: Vec<u8>,
     regs: [u64; PVM_REGISTER_COUNT],
@@ -57,11 +60,14 @@ pub fn trace_until_trap(
         regs,
         vec![0u8; DEFAULT_FLAT_MEM],
         DEFAULT_GAS,
-        DEFAULT_MAX_STEPS,
     );
     let mut tracing = TracingPvm::new(pvm);
     let exit = tracing.run();
-    assert_eq!(exit, vos_pvm::ExitReason::Trap, "expected Trap exit");
+    assert_eq!(
+        exit,
+        vos_pvm::ExitReason::Panic,
+        "expected standard Panic exit"
+    );
     tracing.into_trace()
 }
 
@@ -73,31 +79,13 @@ pub fn prove_and_verify(steps: Vec<PvmStep>, code: &[u8], bitmask: &[u8]) {
     verify(proof, &side_note).expect("verification failed");
 }
 
-/// Same as `prove_and_verify` but additionally prints per-component logup
-/// claimed sums via `debug_claimed_sums` before proving.  Useful when a
-/// constraint addition produces a `ConstraintsNotSatisfied` and you need to
-/// distinguish "logup imbalance" (per-component sums non-zero, total
-/// non-zero) from "structural pair-shape blow-up" (sums zero, prover still
-/// rejects).  See `pvm/proof/src/chips/cpu/CONSTRAINTS.md`.
-///
-/// This helper requires the `debug-internals` feature
-/// (`cargo test -p vos-pvm-proof --features debug-internals`).
-#[cfg(feature = "debug-internals")]
-pub fn prove_and_verify_with_debug(steps: Vec<PvmStep>, code: &[u8], bitmask: &[u8]) {
-    let mut side_note = vos_pvm_proof::SideNote::new(steps, code.to_vec(), bitmask.to_vec());
-    eprintln!("--- per-component logup sums ---");
-    vos_pvm_proof::debug_claimed_sums(&mut side_note);
-    let proof = prove(&mut side_note).expect("proving failed");
-    verify(proof, &side_note).expect("verification failed");
-}
-
 /// Convenience: trace a TwoReg program with `regs[ra] = input`, then run
 /// `prove_and_verify`.  Asserts `regs_after[rd] == expected`.
 pub fn prove_two_reg(op: Opcode, rd: u8, ra: u8, input: u64, expected: u64) {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[ra as usize] = input;
     let (code, bitmask) = two_reg_program(op, rd, ra);
-    let steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    let steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     assert_eq!(steps[0].opcode, op);
     assert_eq!(
         steps[0].regs_after[rd as usize], expected,
@@ -107,16 +95,29 @@ pub fn prove_two_reg(op: Opcode, rd: u8, ra: u8, input: u64, expected: u64) {
     prove_and_verify(steps, &code, &bitmask);
 }
 
-/// Convenience for negative tests: trace a TwoReg program, mutate
-/// `steps[0].regs_after[rd]` to `forged`, then attempt prove + verify.
+/// Make register `reg` hold `forged` after the first step, in that step
+/// and every later one, as a prover forging the step's result does: the
+/// register ledger and the closing state then agree with the forgery, so
+/// only the step's own constraints can refuse it.
+pub fn forge_first_result(steps: &mut [PvmStep], reg: usize, forged: u64) {
+    assert_ne!(steps[0].regs_after[reg], forged, "the forgery must differ");
+    steps[0].regs_after[reg] = forged;
+    for step in steps.iter_mut().skip(1) {
+        step.regs_before[reg] = forged;
+        step.regs_after[reg] = forged;
+    }
+}
+
+/// Convenience for negative tests: trace a TwoReg program, forge `rd`'s
+/// result (`forge_first_result`), then attempt prove + verify.
 /// Caller wraps in `#[should_panic(expected = "ConstraintsNotSatisfied")]`.
 pub fn forge_two_reg_result(op: Opcode, rd: u8, ra: u8, input: u64, forged: u64) {
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[ra as usize] = input;
     let (code, bitmask) = two_reg_program(op, rd, ra);
-    let mut steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    let mut steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     assert_eq!(steps[0].opcode, op);
-    steps[0].regs_after[rd as usize] = forged;
+    forge_first_result(&mut steps, rd as usize, forged);
     prove_and_verify(steps, &code, &bitmask);
 }
 
@@ -133,7 +134,7 @@ where
     let mut regs = [0u64; PVM_REGISTER_COUNT];
     regs[ra as usize] = input;
     let (code, bitmask) = two_reg_program(op, rd, ra);
-    let mut steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    let mut steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     assert_eq!(steps[0].opcode, op);
     mutate(&mut steps[0]);
     prove_and_verify(steps, &code, &bitmask);
@@ -153,6 +154,18 @@ pub fn three_reg_program(op: Opcode, rd: u8, ra: u8, rb: u8) -> (Vec<u8>, Vec<u8
     (code, bitmask)
 }
 
+/// Trace a ThreeReg program with the given registers.
+pub fn trace_three_reg(
+    op: Opcode,
+    rd: u8,
+    ra: u8,
+    rb: u8,
+    regs: [u64; PVM_REGISTER_COUNT],
+) -> Vec<PvmStep> {
+    let (code, bitmask) = three_reg_program(op, rd, ra, rb);
+    trace_until_opcode_zero(code, bitmask, regs)
+}
+
 /// Trace a ThreeReg program with given (input_a, input_b) in the source
 /// registers, then prove+verify.  Asserts the destination register holds
 /// `expected`.
@@ -169,7 +182,7 @@ pub fn prove_three_reg(
     regs[ra as usize] = input_a;
     regs[rb as usize] = input_b;
     let (code, bitmask) = three_reg_program(op, rd, ra, rb);
-    let steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    let steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     assert_eq!(steps[0].opcode, op);
     assert_eq!(
         steps[0].regs_after[rd as usize], expected,
@@ -179,7 +192,8 @@ pub fn prove_three_reg(
     prove_and_verify(steps, &code, &bitmask);
 }
 
-/// Negative test for ThreeReg ops: trace, mutate `regs_after[rd]`, prove+verify.
+/// Negative test for ThreeReg ops: trace, forge `rd`'s result
+/// (`forge_first_result`), prove+verify.
 pub fn forge_three_reg_result(
     op: Opcode,
     rd: u8,
@@ -193,8 +207,335 @@ pub fn forge_three_reg_result(
     regs[ra as usize] = input_a;
     regs[rb as usize] = input_b;
     let (code, bitmask) = three_reg_program(op, rd, ra, rb);
-    let mut steps = trace_until_trap(code.clone(), bitmask.clone(), regs);
+    let mut steps = trace_until_opcode_zero(code.clone(), bitmask.clone(), regs);
     assert_eq!(steps[0].opcode, op);
-    steps[0].regs_after[rd as usize] = forged;
+    forge_first_result(&mut steps, rd as usize, forged);
     prove_and_verify(steps, &code, &bitmask);
+}
+
+/// A kernel's program under `format`, as its install records the kernel:
+/// each class's preprocessed root computed from its code alone.
+pub fn kernel_program(
+    blob: &[u8],
+    record: &vos_abi::records::Kernel,
+    format: &'static vos_pvm_proof::format::Format,
+) -> vos_pvm_proof::program_id::KernelProgram {
+    let shape =
+        vos_pvm_proof::shape::KernelShape::try_from(&record.shape).expect("an install's shape");
+    let side_note = vos_pvm_proof::kernel::kernel_side_note(blob).expect("a standard program");
+    let preprocessed_roots = (0..shape.classes.len())
+        .map(|class| {
+            vos_pvm_proof::program_commitment_for_shape(
+                &side_note,
+                &shape.segment(class).expect("a class"),
+                format,
+            )
+            .expect("the class's root")
+        })
+        .collect();
+    vos_pvm_proof::program_id::KernelProgram {
+        transpiler: vos_pvm_compiler::TRANSPILER_VERSION,
+        program: record.program.0,
+        shape,
+        format: format.number,
+        preprocessed_roots,
+        image_root: record.image_root,
+        leaf_circuits: vos_pvm_proof::program_id::LeafCircuits::None,
+    }
+}
+
+/// The system allocator, counting the bytes allocated and their peak: a
+/// test binary that measures a prover's memory installs it as its global
+/// allocator. A resident-set figure would miss memory the allocator keeps
+/// from an earlier proof and hands to the next.
+pub struct Counting;
+
+static ALLOCATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        use std::sync::atomic::Ordering::Relaxed;
+        // SAFETY: the caller's contract for `GlobalAlloc::alloc`.
+        let pointer = unsafe { std::alloc::System.alloc(layout) };
+        if !pointer.is_null() {
+            let allocated = ALLOCATED.fetch_add(layout.size(), Relaxed) + layout.size();
+            PEAK.fetch_max(allocated, Relaxed);
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: the caller's contract for `GlobalAlloc::dealloc`.
+        unsafe { std::alloc::System.dealloc(pointer, layout) };
+        ALLOCATED.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `work`'s result, its time, and its peak heap past the allocations
+/// before it, in MiB (0 unless the binary installs [`Counting`]).
+pub fn measured<T>(work: impl FnOnce() -> T) -> (T, std::time::Duration, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let base = ALLOCATED.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let started = std::time::Instant::now();
+    let result = work();
+    let elapsed = started.elapsed();
+    trim();
+    (result, elapsed, ((PEAK.load(Relaxed) - base) >> 20) as u64)
+}
+
+/// The heap a finished proof freed, handed back to the system: glibc keeps
+/// its threads' arenas' free pages otherwise, and a binary proving one
+/// window after another outgrows its memory limit on pages it no longer
+/// uses.
+fn trim() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` only releases free memory.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+/// What a node, a leaf or a fold, measured: its rows, its proving time and its peak
+/// heap over the allocations before it (0 unless the binary installs
+/// [`Counting`]); the node, its proof and the output it states.
+pub struct NodeRun {
+    pub rows: [usize; 3],
+    pub finalized: [usize; 3],
+    pub proving: std::time::Duration,
+    pub peak_mib: u64,
+    pub node: vos_pvm_recair::tree::Node,
+}
+
+/// `proof`, a segment of `program`'s class `class`, verified in its leaf at
+/// `position` under the fold word `fold_word`, as natively (its transcript
+/// the native recorder's, permutation for permutation, and no mismatch);
+/// the leaf within the padded shape, its circuit's hash the program's for
+/// the class, proved and verified, its public output the native output's
+/// digest.
+pub fn prove_leaf(
+    program: &vos_pvm_proof::program_id::KernelProgram,
+    entry: &vos_pvm_proof::program_id::KernelEntry,
+    class: usize,
+    proof: &vos_pvm_proof::Proof,
+    position: u32,
+    fold_word: vos_pvm_proof::poseidon2::P2Hash,
+) -> NodeRun {
+    use stwo::core::fields::qm31::SecureField;
+    use vos_pvm_proof::poseidon2::P2Hash;
+    use vos_pvm_proof::program_id::LeafCircuits;
+    use vos_pvm_recair::leaf::{LeafCircuit, PADDED_ROWS};
+    use vos_pvm_recair::verifier::witness::digest_wires;
+
+    let leaf = LeafCircuit::of_class(program, entry, class);
+    let (values, output) = leaf
+        .values(proof, P2Hash(program.id().felts()), fold_word, position)
+        .expect("the segment's values");
+
+    let mut transcript = vos_pvm_recair::Context::<SecureField>::new();
+    let verified =
+        vos_pvm_recair::verifier::verify_segment(&mut transcript, &leaf.shape, &values.segment);
+    let records = vos_pvm_proof::extract_recursion_data(proof)
+        .transcript
+        .records;
+    let permutations = verified.channel.transcript().permutations();
+    assert_eq!(permutations.len(), records.len());
+    for (i, (permutation, record)) in permutations.iter().zip(&records).enumerate() {
+        let words = record.output.map(|w| vos_pvm_poseidon2::M31::new(w.0));
+        assert_eq!(
+            *permutation,
+            vos_pvm_recair::value::wires_of(words),
+            "permutation {i}"
+        );
+    }
+    drop(transcript);
+
+    let context = leaf.build(&values);
+    let rows = context.rows();
+    assert!(
+        rows.iter()
+            .zip(PADDED_ROWS)
+            .all(|(&rows, padded)| rows <= padded),
+        "{rows:?}"
+    );
+    // A derivation's bound: the built rows exactly, and the finalizing's
+    // within its allowance.
+    let mut sizes = program.shape.classes[class].log_sizes.iter();
+    let record: [u8; vos_pvm_proof::chip_idx::COUNT] = core::array::from_fn(|chip| {
+        if program.shape.components & 1 << chip != 0 {
+            *sizes.next().expect("a size a chip")
+        } else {
+            0
+        }
+    });
+    let terms = vos_pvm_compiler::leaf::leaf_terms(program.shape.components, &record);
+    assert_eq!(terms.rows(), rows, "the derivation's rows");
+    let finalized = context.finalized_rows();
+    assert!(
+        finalized[1] - rows[1] <= vos_pvm_compiler::leaf::FINALIZE,
+        "{finalized:?} against {rows:?}"
+    );
+    assert_eq!([finalized[0], finalized[2]], [rows[0], rows[2]]);
+    let filled = context
+        .finalize_to(Some(PADDED_ROWS))
+        .expect("the wiring checks");
+    let (_, hash) = vos_pvm_recair::circuit_commitment(&filled.circuit).expect("checks");
+    let LeafCircuits::Hashes(hashes) = &program.leaf_circuits else {
+        panic!("a program with its leaf circuits")
+    };
+    assert_eq!(
+        hashes[class].0.map(|word| word.0),
+        hash.map(|word| word.value()),
+        "the class's leaf circuit"
+    );
+
+    let (leaf_proof, proving, peak_mib) =
+        measured(|| vos_pvm_recair::prove(&filled.circuit, &filled.witness).expect("proves"));
+    assert_eq!(
+        leaf_proof.outputs,
+        digest_wires(&output.digest()).to_vec(),
+        "the leaf states the native output"
+    );
+    vos_pvm_recair::verify(leaf_proof.clone(), &hash).expect("the leaf verifies");
+    NodeRun {
+        rows,
+        finalized,
+        proving,
+        peak_mib,
+        node: vos_pvm_recair::tree::Node {
+            proof: leaf_proof,
+            output,
+        },
+    }
+}
+
+/// The fold of `left` and `right`, nodes of `program`'s run under the fold
+/// word `fold_word`, the fold circuit's hash: verified as natively (no
+/// mismatch), within the padded shape, proved and verified against
+/// `fold_word`, its public output the native output's digest. Its rows
+/// finalized, proving time and peak heap (0 unless the binary installs
+/// [`Counting`]), its proof and output.
+pub fn prove_fold(
+    fold: &vos_pvm_recair::fold::FoldCircuit,
+    program: &vos_pvm_proof::program_id::KernelProgram,
+    left: &NodeRun,
+    right: &NodeRun,
+    fold_word: vos_pvm_proof::poseidon2::P2Hash,
+) -> NodeRun {
+    use vos_pvm_recair::leaf::PADDED_ROWS;
+    use vos_pvm_recair::verifier::witness::digest_wires;
+
+    let (values, output) = fold
+        .values(
+            left.node.proved(),
+            right.node.proved(),
+            &program.id_preimage(),
+            fold_word,
+        )
+        .expect("the children's values");
+    let context = fold.build(&values);
+    let rows = context.rows();
+    let finalized = context.finalized_rows();
+    let filled = context
+        .finalize_to(Some(PADDED_ROWS))
+        .expect("the wiring checks");
+    let (fold_proof, proving, peak_mib) =
+        measured(|| vos_pvm_recair::prove(&filled.circuit, &filled.witness).expect("proves"));
+    assert_eq!(
+        fold_proof.outputs,
+        digest_wires(&output.digest()).to_vec(),
+        "the fold states the native output"
+    );
+    let hash = vos_pvm_poseidon2::Digest::from(fold_word);
+    vos_pvm_recair::verify(fold_proof.clone(), &hash).expect("the fold verifies");
+    NodeRun {
+        rows,
+        finalized,
+        proving,
+        peak_mib,
+        node: vos_pvm_recair::tree::Node {
+            proof: fold_proof,
+            output,
+        },
+    }
+}
+
+/// `instructions` as code, each one's start marked in the bitmask, with no
+/// jump table.
+pub fn code_of(instructions: &[Vec<u8>]) -> vos_pvm_program::CodeBlob {
+    let mut code = Vec::new();
+    let mut bitmask = Vec::new();
+    for instruction in instructions {
+        code.extend_from_slice(instruction);
+        bitmask.push(1);
+        bitmask.resize(code.len(), 0);
+    }
+    vos_pvm_program::CodeBlob {
+        jump_table: vec![],
+        code,
+        bitmask,
+    }
+}
+
+/// A standard program of `instructions`, laid out as the loader lays it
+/// out: no data, one heap page, a 4 KiB stack.
+pub fn standard_program(instructions: &[Vec<u8>]) -> Vec<u8> {
+    vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
+        ro_data: vec![],
+        rw_data: vec![],
+        heap_pages: 1,
+        stack_size: 4096,
+        code: code_of(instructions),
+    })
+    .expect("a standard program")
+}
+
+/// Whether `code` is a refused proof's: [`vos_statement::Refusal::Proof`]'s
+/// class, `0x100` and the final verifier's code.
+pub fn by_proof(code: u32) -> bool {
+    code >> 8 == 1
+}
+
+/// Whether a venue's `code` refuses a proof against the words its
+/// statement makes: the interaction PoW, drawn from other words, falls
+/// short, or the claimed sums and the public terms do not add to zero.
+pub fn by_words(code: u32) -> bool {
+    use vos_pvm_final_verifier::Error;
+    use vos_statement::Refusal;
+    [Error::InteractionPow, Error::Logup]
+        .into_iter()
+        .any(|error| code == Refusal::Proof(error).code())
+}
+
+/// Write `constants` into the proof crate's `src/constants.rs` at `path`,
+/// each its array's values, as rustfmt lays an array out: `just repin`'s
+/// write (`VOS_PINS=write`), for its `constants::` tests.
+pub fn write_constants(
+    path: &std::path::Path,
+    constants: impl Iterator<Item = (&'static str, Vec<u64>)>,
+) {
+    let mut source = std::fs::read_to_string(path).unwrap();
+    for (name, values) in constants {
+        let start = source
+            .find(&format!("pub const {name}: "))
+            .unwrap_or_else(|| panic!("no {name} in {}", path.display()));
+        let open = start + source[start..].find("= [").expect("its array") + 3;
+        let close = open + source[open..].find("];").expect("its end");
+        let mut body = String::from("\n   ");
+        let mut width = 3;
+        for value in values {
+            let item = format!(" {value},");
+            if width + item.len() > 100 {
+                body.push_str("\n   ");
+                width = 3;
+            }
+            body.push_str(&item);
+            width += item.len();
+        }
+        body.push('\n');
+        source.replace_range(open..close, &body);
+    }
+    std::fs::write(path, source).unwrap();
+    eprintln!("{}: written", path.display());
 }

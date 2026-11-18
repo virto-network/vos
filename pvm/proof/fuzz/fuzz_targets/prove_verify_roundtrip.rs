@@ -20,8 +20,8 @@
 //!     cargo fuzz run prove_verify_roundtrip -- -max_total_time=300
 //!
 //! Corpus seeds in `corpus/prove_verify_roundtrip/` accumulate
-//! over runs; each seed is a `FuzzInput` Postcard / arbitrary
-//! encoding of (code, bitmask, regs, gas, max_steps).
+//! over runs; each seed is a `FuzzInput`'s `arbitrary` encoding (code,
+//! registers). The gas bounds the run.
 
 #![no_main]
 
@@ -32,7 +32,7 @@ use vos_pvm::interpreter::Interpreter;
 use vos_pvm::PVM_REGISTER_COUNT;
 
 use vos_pvm_proof::core::tracing::TracingPvm;
-use vos_pvm_proof::{prove, program_commitment_of_proof, SideNote};
+use vos_pvm_proof::{prove, SideNote};
 use vos_pvm_proof_verifier::verify_standalone;
 
 /// Bounds for fuzz input — keep proving fast (single-digit seconds
@@ -40,8 +40,10 @@ use vos_pvm_proof_verifier::verify_standalone;
 /// shifts coverage toward shorter executions; widening makes each
 /// case more expensive.
 const MAX_CODE_BYTES: usize = 64;
-const MAX_STEPS: u8 = 16;
 const FLAT_MEM_BYTES: usize = 64 * 1024; // 64 KiB
+/// The gas a run gets: a looping program's trace stays a few thousand
+/// steps, proved in seconds.
+const GAS: vos_pvm::Gas = 2_000;
 
 #[derive(Debug, Arbitrary)]
 struct FuzzInput {
@@ -92,8 +94,7 @@ fuzz_target!(|input: FuzzInput| {
         vec![],
         regs,
         vec![0u8; FLAT_MEM_BYTES],
-        100_000,
-        MAX_STEPS,
+        GAS,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run();
@@ -112,7 +113,7 @@ fuzz_target!(|input: FuzzInput| {
         Err(_) => return,
     };
 
-    let prog_hash = program_commitment_of_proof(&proof);
+    let prog_hash = proof.preprocessed_commitment().unwrap();
 
     // Property: every successful prove + correct hash must verify.
     verify_standalone(proof, prog_hash).expect("verify_standalone failed for honest prove output");

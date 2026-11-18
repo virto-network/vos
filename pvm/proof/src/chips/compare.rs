@@ -3,45 +3,26 @@
 //! CpuChip emits one CompareLookup producer per `is_compare + is_branch`
 //! row; CompareChip consumes once per real row.  CompareChip witnesses
 //! the byte-wise subtraction carry chain (val_b + ~val_d + 1) and pins
-//! cmp_lt_flag = 1 - cmp_carry[7].  Per-byte Range256 lookups on
+//! cmp_lt_flag = 1 - cmp_carry\[7\].  Per-byte Range256 lookups on
 //! cmp_sub_result emit from here too.
 //!
-//! Lookup tuple (17 limbs): val_b[8] + val_d[8] + cmp_lt_flag.
+//! Lookup tuple (17 limbs): val_b\[8\] + val_d\[8\] + cmp_lt_flag.
 
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
+use crate::prelude::*;
 use num_traits::One;
 use stwo::core::fields::m31::BaseField;
-#[cfg(feature = "prover")]
-use stwo::{
-    core::{ColumnVec, fields::qm31::SecureField},
-    prover::{
-        backend::simd::{SimdBackend, m31::LOG_N_LANES},
-        poly::{BitReversedOrder, circle::CircleEvaluation},
-    },
-};
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::core::step::WORD_SIZE;
 use crate::trace::eval::TraceEval;
-#[cfg(feature = "prover")]
-use crate::trace::{
-    builder::{FinalizedTrace, TraceBuilder},
-    component::ComponentTrace,
-};
 
-#[cfg(feature = "prover")]
-use crate::framework::BuiltInProverComponent;
-#[cfg(feature = "prover")]
-use crate::lookups::{AllLookupElements, LogupTraceBuilder};
-#[cfg(feature = "prover")]
-use crate::side_note::SideNote;
 use crate::{
     framework::BuiltInComponent,
     lookups::{CompareLookupElements, Range256LookupElements},
 };
 
+#[derive(Clone, Copy)]
 pub struct CompareChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]
@@ -149,100 +130,8 @@ impl BuiltInComponent for CompareChip {
                 &tuple,
             ));
         }
-
-        eval.finalize_logup_in_pairs();
     }
 }
 
 #[cfg(feature = "prover")]
-impl BuiltInProverComponent for CompareChip {
-    const IS_PRODUCER: bool = false;
-
-    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
-        let entries = &side_note.compare_entries;
-        const MIN_LOG_SIZE: u32 = 5;
-
-        if entries.is_empty() {
-            let log_size = LOG_N_LANES.max(MIN_LOG_SIZE);
-            let mut trace = TraceBuilder::<Column>::new(log_size);
-            for row in 0..trace.num_rows() {
-                trace.fill_columns(row, true, Column::IsPadding);
-            }
-            return trace.finalize_bit_reversed();
-        }
-
-        let log_size =
-            crate::trace::utils::ceil_log2_at_least_lanes(entries.len()).max(MIN_LOG_SIZE);
-        let mut trace = TraceBuilder::<Column>::new(log_size);
-        let num_rows = trace.num_rows();
-
-        for (row, e) in entries.iter().enumerate() {
-            trace.fill_columns_bytes(row, &e.val_b.to_le_bytes(), Column::ValB);
-            trace.fill_columns_bytes(row, &e.val_d.to_le_bytes(), Column::ValD);
-            trace.fill_columns(row, e.cmp_lt_flag, Column::CmpLtFlag);
-            trace.fill_columns_bytes(row, &e.cmp_sub_result, Column::CmpSubResult);
-            trace.fill_columns_bytes(row, &e.cmp_carry, Column::CmpCarry);
-            trace.fill_columns(row, false, Column::IsPadding);
-            // Helper fills.  Boolean helpers are 0 in valid
-            // traces (cmp_lt_flag, cmp_carry[i] ∈ {0, 1}).
-        }
-
-        for row in entries.len()..num_rows {
-            trace.fill_columns(row, true, Column::IsPadding);
-        }
-
-        trace.finalize_bit_reversed()
-    }
-
-    fn generate_interaction_trace(
-        &self,
-        component_trace: ComponentTrace,
-        side_note: &SideNote,
-        lookup_elements: &AllLookupElements,
-    ) -> (
-        ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
-        SecureField,
-    ) {
-        use stwo::prover::backend::simd::m31::PackedBaseField;
-
-        let log_size = component_trace.log_size();
-        let mut logup = LogupTraceBuilder::new(log_size);
-
-        let compare: &CompareLookupElements = lookup_elements.as_ref();
-        let range256: &Range256LookupElements = lookup_elements.as_ref();
-        let val_b = crate::trace::original_base_column!(component_trace, Column::ValB);
-        let val_d = crate::trace::original_base_column!(component_trace, Column::ValD);
-        let cmp_lt_flag = crate::trace::original_base_column!(component_trace, Column::CmpLtFlag);
-        let cmp_sub_result =
-            crate::trace::original_base_column!(component_trace, Column::CmpSubResult);
-        let is_padding = crate::trace::original_base_column!(component_trace, Column::IsPadding);
-
-        let _ = side_note;
-
-        // Range256 emissions for cmp_sub_result bytes (8 per row).
-        for col in &cmp_sub_result {
-            logup.add_to_relation_with(
-                range256,
-                [is_padding[0].clone()],
-                |[pad]| (PackedBaseField::one() - pad).into(),
-                &[col.clone()],
-            );
-        }
-
-        // CompareLookup consumer.
-        let mut tuple: Vec<_> = val_b.to_vec();
-        tuple.extend_from_slice(&val_d);
-        tuple.push(cmp_lt_flag[0].clone());
-
-        for _ in 0..2 {
-            logup.add_to_relation_with(
-                compare,
-                [is_padding[0].clone()],
-                |[pad]| (-(PackedBaseField::one() - pad)).into(),
-                &tuple,
-            );
-        }
-
-        logup.finalize()
-    }
-}
+mod fill;

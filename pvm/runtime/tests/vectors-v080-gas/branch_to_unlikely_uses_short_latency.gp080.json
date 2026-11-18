@@ -1,0 +1,44 @@
+{
+  "expected": {
+    "blocks": [
+      {
+        "gas": 1,
+        "pc": 0
+      },
+      {
+        "gas": 40,
+        "pc": 4
+      }
+    ],
+    "first": {
+      "remaining_gas": 59,
+      "status": "panic"
+    },
+    "resume": null
+  },
+  "initial": {
+    "gas": 100,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "branch_to_unlikely_uses_short_latency",
+  "program": {
+    "bitmask": "0x31",
+    "code": "0x511200040200"
+  },
+  "rule": "gray-paper-v0.8-rob-block-gas",
+  "spec": "gray-paper-0.8.0"
+}

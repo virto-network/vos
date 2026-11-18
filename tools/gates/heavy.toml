@@ -1,0 +1,14 @@
+# The heavy test targets: the workspace's test binaries `just check` leaves
+# to `just gate`, each with its warm run's seconds [measured, this
+# repository's development machine, 2026-11-13]. A test binary past about
+# 20 s belongs here; `just check-tiers` holds the recipes to the list.
+
+[[heavy]]
+package = "vos-pvm-recair"
+target = "recursion"
+seconds = 191
+
+[[heavy]]
+package = "vos-pvm-recair"
+target = "gates"
+seconds = 38

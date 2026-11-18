@@ -3,6 +3,7 @@ name = "vos-pvm-proof-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
+license = "AGPL-3.0-or-later"
 
 [package.metadata]
 cargo-fuzz = true
@@ -19,6 +20,22 @@ arbitrary = { version = "1", features = ["derive"] }
 vos-pvm = { path = "../../runtime" }
 vos-pvm-proof = { path = ".." }
 vos-pvm-proof-verifier = { path = "../verifier" }
+# The final verifier on the bytes a venue receives: arbitrary bytes, and the
+# golden wrap's bytes and structure mutated.
+vos-pvm-final-verifier = { path = "../final-verifier" }
+vos-statement = { path = "../statement", features = ["fixtures"] }
+# A space's genesis, anchors, migrations and golden vectors, as a venue
+# decodes them.
+vos-anchor = { path = "../anchor", features = ["vectors"] }
+# The device verifier on the bytes ingress receives, under a small kernel's
+# program the assembler builds.
+vos-pvm-device = { path = "../device" }
+vos-pvm-compiler = { path = "../../compiler" }
+# The device proof's encoding, its interaction PoW nonce written again.
+postcard = { version = "1", features = ["alloc"] }
+# The JAM statements service's refine, on the work items a JAM node gives.
+vos-statement-service = { path = "../statement/service" }
+stwo = { git = "https://github.com/olanod/stwo", rev = "e14925a81606b4d68c6a5d3047d382a20bd953d3", default-features = false }
 
 # Skip the test profile's default panic strategy override;
 # libfuzzer-sys requires panic=abort on its own targets.
@@ -32,5 +49,72 @@ panic = "abort"
 [[bin]]
 name = "prove_verify_roundtrip"
 path = "fuzz_targets/prove_verify_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "final_verifier_bytes"
+path = "fuzz_targets/final_verifier_bytes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "final_verifier_mutate"
+path = "fuzz_targets/final_verifier_mutate.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "statement_decode"
+path = "fuzz_targets/statement_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "masked_bytes"
+path = "fuzz_targets/masked_bytes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "masked_shape"
+path = "fuzz_targets/masked_shape.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "anchor_decode"
+path = "fuzz_targets/anchor_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "device_verify_bytes"
+path = "fuzz_targets/device_verify_bytes.rs"
+test = false
+doc = false
+
+
+[[bin]]
+name = "device_verify_mutate"
+path = "fuzz_targets/device_verify_mutate.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "derive_elf"
+path = "fuzz_targets/derive_elf.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "program_blob"
+path = "fuzz_targets/program_blob.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "service_item"
+path = "fuzz_targets/service_item.rs"
 test = false
 doc = false

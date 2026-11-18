@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 69362a1c04aba74b6ade69d534e1bfd49e23772dce1f2b0b2ed6f61a9c60ece9 # shrinks to (pool, contents, picks) = ([[97, 47, 0, 0], [97, 47, 0, 255, 0, 0], [98, 47, 18, 84, 254, 147, 85, 63, 2, 126, 34, 94, 96, 6, 157, 55, 118, 232, 0, 0]], [(4638884442776740215, 0), (12521011851525586732, 0), (585358403043554075, 0)], [385837649943585312])
+cc e8a46e83dc66eebece28081907e4b925f552695ad1b301fec5552a7e91d9cd89 # shrinks to (pool, contents, picks) = ([[97, 47, 0, 0], [98, 47, 18, 84, 254, 147, 85, 63, 2, 126, 34, 94, 96, 6, 157, 55, 118, 232, 0, 0], [98, 47, 146, 20, 232, 113, 207, 24, 252, 162, 174, 2, 143, 12, 64, 89, 160, 116, 0, 255, 0, 0], [98, 47, 148, 82, 209, 18, 81, 9, 194, 225, 108, 248, 223, 10, 120, 161, 81, 42, 127, 0, 0], [98, 47, 247, 113, 179, 204, 207, 87, 104, 173, 122, 158, 109, 1, 76, 58, 167, 120, 1, 0, 0]], [(8206226432411998651, 0), (556700696046311932, 0), (126110854987717258, 0)], [2209429995828750647]), values = [None, None, None, None, None, None, None, None]

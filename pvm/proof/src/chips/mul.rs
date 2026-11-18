@@ -5,44 +5,34 @@
 //! (via MulCarry/MulCarryHi); and the MulUpper SS/SU sign-correction
 //! (via UnsignedProductHi/MulCorrTermA/B/Carry).
 //!
-//! Lookup tuple (47 limbs): val_b[8] + val_d[8] + result[8] +
-//! mul_high[8] + unsigned_product_low[8] + sign_bit_b + sign_bit_d +
-//! 5 flags.  CpuChip witnesses val_b/val_d/result/mul_high/
-//! unsigned_product_low + sign_bit_b/d (the latter two pinned by
-//! CpuChip's existing nibble-AND lookups); MulChip's AIR pins them all
-//! via the schoolbook + sign-correction chain.
+//! Every product byte and carry the chains read is Range256-checked, so
+//! each chain equation stays far below the field's modulus and holds over
+//! the integers: the schoolbook is the exact product `b·d`, the
+//! correction the exact `result + term_a + term_b ≡ uph (mod 2^64)`.
+//!
+//! Lookup tuple (37 limbs): val_b\[8\] + val_d\[8\] + result\[8\] +
+//! sign_bit_b + sign_bit_d + the 4 rotate flags + the logical right
+//! shift's flag and its zero-amount flag + 5 mul flags.  CpuChip witnesses
+//! val_b/val_d/result + sign_bit_b/d (the latter two pinned by CpuChip's
+//! nibble-AND lookups); MulChip witnesses mul_high and the product's
+//! words, and its AIR pins them all via the schoolbook + sign-correction
+//! chain.
 
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
+use crate::prelude::*;
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
-#[cfg(feature = "prover")]
-use stwo::{
-    core::{ColumnVec, fields::qm31::SecureField},
-    prover::{
-        backend::simd::{SimdBackend, m31::LOG_N_LANES},
-        poly::{BitReversedOrder, circle::CircleEvaluation},
-    },
-};
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 use crate::core::step::WORD_SIZE;
 use crate::trace::eval::TraceEval;
-#[cfg(feature = "prover")]
-use crate::trace::{
-    builder::{FinalizedTrace, TraceBuilder},
-    component::ComponentTrace,
+
+use crate::{
+    framework::BuiltInComponent,
+    lookups::{MultiplicationLookupElements, Range256LookupElements},
 };
 
-#[cfg(feature = "prover")]
-use crate::framework::BuiltInProverComponent;
-#[cfg(feature = "prover")]
-use crate::lookups::{AllLookupElements, LogupTraceBuilder};
-#[cfg(feature = "prover")]
-use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::MultiplicationLookupElements};
-
+#[derive(Clone, Copy)]
 pub struct MulChip;
 
 #[derive(Debug, Copy, Clone, AirColumn)]
@@ -102,6 +92,13 @@ pub enum Column {
     IsRotateL32,
     #[size = 1]
     IsRotateR32,
+    /// A logical right shift: the result is the product's high word, its
+    /// low word when the amount is 0 (`ShiftZero`). Pinned via the lookup
+    /// tuple to CpuChip's IsShloR and ShiftZero.
+    #[size = 1]
+    IsShloR,
+    #[size = 1]
+    ShiftZero,
     /// 1 iff this row is a low-output mul variant.
     #[size = 1]
     IsMulLo,
@@ -118,12 +115,13 @@ pub enum Column {
     #[size = 1]
     IsPadding,
 
-    // ── Stwo-v2.x degree-flatten helpers ──
+    // ── Degree-flatten helpers ──
     //
-    // Stwo's lifted protocol enforces algebraic constraint degree ≤ 2.
-    // Several MulChip constraints sit at degree 3-5 in their natural
-    // form — chiefly the schoolbook chain (`gate · partial_sum`) and the
-    // multi-flag selectors `is_real · is_64bit · is_mul_lo · …`.
+    // The chip's degree bound admits degree ≤ 3, which the paired logup
+    // constraints use; the body stays at degree ≤ 2. Several MulChip
+    // constraints sit at degree 3-5 in their natural form — chiefly the
+    // schoolbook chain (`gate · partial_sum`) and the multi-flag
+    // selectors `is_real · is_64bit · is_mul_lo · …`.
     // These helpers materialise the high-degree intermediates so every
     // gated constraint factors into (deg 1 column ref) × (deg 1 body).
     /// `(1 - IsPadding) · (1 - Is32Bit)` — deg-1 helper standing in for
@@ -142,14 +140,18 @@ pub enum Column {
     /// `(1 - IsPadding) · Is32Bit` — full 32-bit row selector.
     #[size = 1]
     Is32BitActive,
-    /// `MulLoActive · (1 - IsRotateL64 - IsRotateR64)` —
+    /// `MulLoActive · (1 - IsRotateL64 - IsRotateR64 - IsShloR)` —
     /// full mul_lo 64-bit non-rotate selector for `result = upl` binding.
     #[size = 1]
     MulLoNoRotate64,
-    /// `Is32BitActive · (1 - IsRotateL32 - IsRotateR32)` —
+    /// `Is32BitActive · (1 - IsRotateL32 - IsRotateR32 - IsShloR)` —
     /// full 32-bit non-rotate selector for `result = upl` binding.
     #[size = 1]
     Is32BitNoRotate32,
+    /// `NotPadding64bit · IsShloR` — the 64-bit logical right shift's
+    /// selector for its result's high four bytes.
+    #[size = 1]
+    ShloR64Active,
 
     /// 64-bit schoolbook partial-sum helper at position k:
     /// `PartialSum64[k] := Σ_{i+j=k, i,j<8} ValB[i]·ValD[j]` (deg 2 def).
@@ -176,22 +178,20 @@ pub enum Column {
 pub enum PreprocessedColumn {}
 
 impl BuiltInComponent for MulChip {
-    // Schoolbook constraint is degree 4 (`is_real * is_64bit *
-    // is_mul_lo * (val_b*val_d - ...)`).  Sign-correction term
-    // pinning is `(mu_su + mu_ss) * (term_a - sign_bit_b * val_d[i])`
-    // = degree 3.  Both fit log_size + 2.
+    // Degree ≤ 3; the helpers above keep the body at degree ≤ 2.
     const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
-    type LookupElements = MultiplicationLookupElements;
+    type LookupElements = (MultiplicationLookupElements, Range256LookupElements);
 
     fn add_constraints<E: EvalAtRow>(
         &self,
         eval: &mut E,
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &MultiplicationLookupElements,
+        lookup_elements: &(MultiplicationLookupElements, Range256LookupElements),
     ) {
+        let (lookup_elements, range256_lookup) = lookup_elements;
         let val_b = crate::trace::trace_eval!(trace_eval, Column::ValB);
         let val_d = crate::trace::trace_eval!(trace_eval, Column::ValD);
         let result = crate::trace::trace_eval!(trace_eval, Column::Result);
@@ -209,6 +209,8 @@ impl BuiltInComponent for MulChip {
         let is_rot_r64 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR64);
         let is_rot_l32 = crate::trace::trace_eval!(trace_eval, Column::IsRotateL32);
         let is_rot_r32 = crate::trace::trace_eval!(trace_eval, Column::IsRotateR32);
+        let is_shlo_r = crate::trace::trace_eval!(trace_eval, Column::IsShloR);
+        let shift_zero = crate::trace::trace_eval!(trace_eval, Column::ShiftZero);
         let is_mul_lo = crate::trace::trace_eval!(trace_eval, Column::IsMulLo);
         let is_mu_uu = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperUU);
         let is_mu_su = crate::trace::trace_eval!(trace_eval, Column::IsMulUpperSU);
@@ -223,6 +225,7 @@ impl BuiltInComponent for MulChip {
         let is_32bit_active = crate::trace::trace_eval!(trace_eval, Column::Is32BitActive);
         let mul_lo_no_rotate64 = crate::trace::trace_eval!(trace_eval, Column::MulLoNoRotate64);
         let is_32bit_no_rotate32 = crate::trace::trace_eval!(trace_eval, Column::Is32BitNoRotate32);
+        let shlo_r64_active = crate::trace::trace_eval!(trace_eval, Column::ShloR64Active);
         let partial_sum_64 = crate::trace::trace_eval!(trace_eval, Column::PartialSum64);
         let partial_sum_32 = crate::trace::trace_eval!(trace_eval, Column::PartialSum32);
         let sign_d_a = crate::trace::trace_eval!(trace_eval, Column::SignDA);
@@ -259,14 +262,19 @@ impl BuiltInComponent for MulChip {
             mul_upper_active[0].clone() - not_padding_64bit[0].clone() * is_mul_upper_e.clone(),
         );
         eval.add_constraint(is_32bit_active[0].clone() - is_real.clone() * is_32bit[0].clone());
-        let one_minus_rotate_64 = E::F::one() - is_rot_l64[0].clone() - is_rot_r64[0].clone();
-        let one_minus_rotate_32 = E::F::one() - is_rot_l32[0].clone() - is_rot_r32[0].clone();
+        let one_minus_rotate_64 =
+            E::F::one() - is_rot_l64[0].clone() - is_rot_r64[0].clone() - is_shlo_r[0].clone();
+        let one_minus_rotate_32 =
+            E::F::one() - is_rot_l32[0].clone() - is_rot_r32[0].clone() - is_shlo_r[0].clone();
         eval.add_constraint(
             mul_lo_no_rotate64[0].clone() - mul_lo_active[0].clone() * one_minus_rotate_64.clone(),
         );
         eval.add_constraint(
             is_32bit_no_rotate32[0].clone()
                 - is_32bit_active[0].clone() * one_minus_rotate_32.clone(),
+        );
+        eval.add_constraint(
+            shlo_r64_active[0].clone() - not_padding_64bit[0].clone() * is_shlo_r[0].clone(),
         );
 
         // PartialSum64[k] = Σ_{i+j=k, i,j<8} ValB[i]·ValD[j] for k=0..16.
@@ -393,6 +401,9 @@ impl BuiltInComponent for MulChip {
         //   sum, no carry — bits non-overlapping by construction of rotation).
         // For non-rotate is_mul_lo 32-bit: result[0..4] = upl[0..4].
         // For RotL32 / RotR32: result[0..4] = upl[0..4] + mul_high[0..4].
+        // For a logical right shift: result = mul_high, the product's high
+        // word, plus upl when the amount is 0 (val_d = 1, mul_high = 0); on
+        // a 32-bit one over bytes 0..4.
         // 32-bit upper result limbs (i ∈ 4..8) are pinned by CpuChip's
         // sign-extension constraint (on CpuChip side).
         {
@@ -419,12 +430,48 @@ impl BuiltInComponent for MulChip {
                         * (result[i].clone() - upl[i].clone() - mul_high[i].clone()),
                 );
             }
+            // The low half's gate is IsShloR without the padding factor:
+            // inert, as a gate only adds constraints, and a padding row's
+            // tuple is consumed at multiplicity −is_real = 0, so its
+            // IsShloR binds nothing; the CPU's rows that produce a shift
+            // have IsMul, which padding pins to 0.
+            for i in 0..WORD_SIZE {
+                let shifted = result[i].clone()
+                    - mul_high[i].clone()
+                    - shift_zero[0].clone() * upl[i].clone();
+                let gate = if i < 4 { &is_shlo_r } else { &shlo_r64_active };
+                eval.add_constraint(gate[0].clone() * shifted);
+            }
+        }
+
+        // ── Range256: the product bytes and every carry (64 per real row,
+        // in `range_checked_bytes`' order).  Bytes make the schoolbook an
+        // integer identity — `Σ out·256^k + 256^16·c₁₅ = b·d < 2^128`
+        // forces `c₁₅ = 0` and `out = b·d` — and bound the correction
+        // carries to {0, 1, 2}. ──
+        for value in [
+            &upl[..],
+            &mul_high,
+            &uph,
+            &mul_carry,
+            &mul_carry_hi,
+            &corr_carry,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            eval.add_to_relation(RelationEntry::new(
+                range256_lookup,
+                is_real.clone().into(),
+                core::slice::from_ref(value),
+            ));
         }
 
         // ── Lookup consumer ──
-        // Tuple (35 limbs): val_b[8] + val_d[8] + result[8] +
-        //   sign_bit_b + sign_bit_d + 4 rotate flags + 5 mul flags.
-        let mut tuple: Vec<E::F> = Vec::with_capacity(35);
+        // Tuple (37 limbs): val_b[8] + val_d[8] + result[8] +
+        //   sign_bit_b + sign_bit_d + 4 rotate flags + is_shlo_r +
+        //   shift_zero + 5 mul flags.
+        let mut tuple: Vec<E::F> = Vec::with_capacity(37);
         tuple.extend_from_slice(&val_b);
         tuple.extend_from_slice(&val_d);
         tuple.extend_from_slice(&result);
@@ -434,6 +481,8 @@ impl BuiltInComponent for MulChip {
         tuple.push(is_rot_r64[0].clone());
         tuple.push(is_rot_l32[0].clone());
         tuple.push(is_rot_r32[0].clone());
+        tuple.push(is_shlo_r[0].clone());
+        tuple.push(shift_zero[0].clone());
         tuple.push(is_mul_lo[0].clone());
         tuple.push(is_mu_uu[0].clone());
         tuple.push(is_mu_su[0].clone());
@@ -447,188 +496,10 @@ impl BuiltInComponent for MulChip {
                 &tuple,
             ));
         }
-
-        eval.finalize_logup_in_pairs();
     }
 }
 
 #[cfg(feature = "prover")]
-impl BuiltInProverComponent for MulChip {
-    const IS_PRODUCER: bool = false;
-
-    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
-        let entries = &side_note.mul_entries;
-        const MIN_LOG_SIZE: u32 = 5;
-
-        if entries.is_empty() {
-            let log_size = LOG_N_LANES.max(MIN_LOG_SIZE);
-            let mut trace = TraceBuilder::<Column>::new(log_size);
-            for row in 0..trace.num_rows() {
-                trace.fill_columns(row, true, Column::IsPadding);
-            }
-            return trace.finalize_bit_reversed();
-        }
-
-        let log_size =
-            crate::trace::utils::ceil_log2_at_least_lanes(entries.len()).max(MIN_LOG_SIZE);
-        let mut trace = TraceBuilder::<Column>::new(log_size);
-        let num_rows = trace.num_rows();
-
-        for (row, e) in entries.iter().enumerate() {
-            trace.fill_columns_bytes(row, &e.val_b.to_le_bytes(), Column::ValB);
-            trace.fill_columns_bytes(row, &e.val_d.to_le_bytes(), Column::ValD);
-            trace.fill_columns_bytes(row, &e.result.to_le_bytes(), Column::Result);
-            trace.fill_columns_bytes(row, &e.mul_high.to_le_bytes(), Column::MulHigh);
-            trace.fill_columns_bytes(
-                row,
-                &e.unsigned_product_low.to_le_bytes(),
-                Column::UnsignedProductLow,
-            );
-            trace.fill_columns_bytes(
-                row,
-                &e.unsigned_product_hi.to_le_bytes(),
-                Column::UnsignedProductHi,
-            );
-            trace.fill_columns_bytes(row, &e.mul_carry, Column::MulCarry);
-            trace.fill_columns_bytes(row, &e.mul_carry_hi, Column::MulCarryHi);
-            trace.fill_columns_bytes(row, &e.mul_corr_term_a, Column::MulCorrTermA);
-            trace.fill_columns_bytes(row, &e.mul_corr_term_b, Column::MulCorrTermB);
-            trace.fill_columns_bytes(row, &e.mul_corr_carry, Column::MulCorrCarry);
-            trace.fill_columns(row, e.sign_bit_b, Column::SignBitB);
-            trace.fill_columns(row, e.sign_bit_d, Column::SignBitD);
-            trace.fill_columns(row, e.is_rotate_l64, Column::IsRotateL64);
-            trace.fill_columns(row, e.is_rotate_r64, Column::IsRotateR64);
-            trace.fill_columns(row, e.is_rotate_l32, Column::IsRotateL32);
-            trace.fill_columns(row, e.is_rotate_r32, Column::IsRotateR32);
-            trace.fill_columns(row, e.is_mul_lo, Column::IsMulLo);
-            trace.fill_columns(row, e.is_mul_upper_uu, Column::IsMulUpperUU);
-            trace.fill_columns(row, e.is_mul_upper_su, Column::IsMulUpperSU);
-            trace.fill_columns(row, e.is_mul_upper_ss, Column::IsMulUpperSS);
-            trace.fill_columns(row, e.is_32bit, Column::Is32Bit);
-            trace.fill_columns(row, false, Column::IsPadding);
-
-            // ── Helper fills ──
-            // Selector helpers — in valid traces, evaluated bool products.
-            let real = true; // not padding
-            let np_64 = real && !e.is_32bit;
-            let mu_e = e.is_mul_upper_uu || e.is_mul_upper_su || e.is_mul_upper_ss;
-            let mlo_active = np_64 && e.is_mul_lo;
-            let mup_active = np_64 && mu_e;
-            let i32_active = real && e.is_32bit;
-            let no_rot_64 = !e.is_rotate_l64 && !e.is_rotate_r64;
-            let no_rot_32 = !e.is_rotate_l32 && !e.is_rotate_r32;
-            trace.fill_columns(row, np_64, Column::NotPadding64bit);
-            trace.fill_columns(row, mlo_active, Column::MulLoActive);
-            trace.fill_columns(row, mup_active, Column::MulUpperActive);
-            trace.fill_columns(row, i32_active, Column::Is32BitActive);
-            trace.fill_columns(row, mlo_active && no_rot_64, Column::MulLoNoRotate64);
-            trace.fill_columns(row, i32_active && no_rot_32, Column::Is32BitNoRotate32);
-
-            // PartialSum helpers — values can exceed u8, so fill via BaseField.
-            use stwo::core::fields::m31::BaseField;
-            let val_b_bytes = e.val_b.to_le_bytes();
-            let val_d_bytes = e.val_d.to_le_bytes();
-            let mut psum_64 = [BaseField::from(0u32); 16];
-            for k in 0..16usize {
-                let mut s: u32 = 0;
-                for i in 0..WORD_SIZE {
-                    let j = k.wrapping_sub(i);
-                    if j < WORD_SIZE {
-                        s += val_b_bytes[i] as u32 * val_d_bytes[j] as u32;
-                    }
-                }
-                psum_64[k] = BaseField::from(s);
-            }
-            trace.fill_columns_base_field(row, &psum_64, Column::PartialSum64);
-            let mut psum_32 = [BaseField::from(0u32); 8];
-            for k in 0..8usize {
-                let mut s: u32 = 0;
-                for i in 0..4usize {
-                    let j = k.wrapping_sub(i);
-                    if j < 4 {
-                        s += val_b_bytes[i] as u32 * val_d_bytes[j] as u32;
-                    }
-                }
-                psum_32[k] = BaseField::from(s);
-            }
-            trace.fill_columns_base_field(row, &psum_32, Column::PartialSum32);
-
-            // Sign-correction body helpers.  SignBitB · ValD[i] and
-            // SignBitD · ValB[i] both fit in u8 (sign_bit ∈ {0,1},
-            // val ∈ 0..256).
-            let mut sda = [0u8; 8];
-            let mut sdb = [0u8; 8];
-            for i in 0..WORD_SIZE {
-                sda[i] = e.sign_bit_b * val_d_bytes[i];
-                sdb[i] = e.sign_bit_d * val_b_bytes[i];
-            }
-            trace.fill_columns_bytes(row, &sda, Column::SignDA);
-            trace.fill_columns_bytes(row, &sdb, Column::SignDB);
-        }
-
-        for row in entries.len()..num_rows {
-            trace.fill_columns(row, true, Column::IsPadding);
-        }
-
-        trace.finalize_bit_reversed()
-    }
-
-    fn generate_interaction_trace(
-        &self,
-        component_trace: ComponentTrace,
-        _side_note: &SideNote,
-        lookup_elements: &AllLookupElements,
-    ) -> (
-        ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
-        SecureField,
-    ) {
-        let log_size = component_trace.log_size();
-        let mut logup = LogupTraceBuilder::new(log_size);
-
-        let mul: &MultiplicationLookupElements = lookup_elements.as_ref();
-        let val_b = crate::trace::original_base_column!(component_trace, Column::ValB);
-        let val_d = crate::trace::original_base_column!(component_trace, Column::ValD);
-        let result = crate::trace::original_base_column!(component_trace, Column::Result);
-        let sign_bit_b = crate::trace::original_base_column!(component_trace, Column::SignBitB);
-        let sign_bit_d = crate::trace::original_base_column!(component_trace, Column::SignBitD);
-        let is_rot_l64 = crate::trace::original_base_column!(component_trace, Column::IsRotateL64);
-        let is_rot_r64 = crate::trace::original_base_column!(component_trace, Column::IsRotateR64);
-        let is_rot_l32 = crate::trace::original_base_column!(component_trace, Column::IsRotateL32);
-        let is_rot_r32 = crate::trace::original_base_column!(component_trace, Column::IsRotateR32);
-        let is_mul_lo = crate::trace::original_base_column!(component_trace, Column::IsMulLo);
-        let is_mu_uu = crate::trace::original_base_column!(component_trace, Column::IsMulUpperUU);
-        let is_mu_su = crate::trace::original_base_column!(component_trace, Column::IsMulUpperSU);
-        let is_mu_ss = crate::trace::original_base_column!(component_trace, Column::IsMulUpperSS);
-        let is_32bit = crate::trace::original_base_column!(component_trace, Column::Is32Bit);
-        let is_padding = crate::trace::original_base_column!(component_trace, Column::IsPadding);
-
-        let mut tuple: Vec<_> = val_b.to_vec();
-        tuple.extend_from_slice(&val_d);
-        tuple.extend_from_slice(&result);
-        tuple.push(sign_bit_b[0].clone());
-        tuple.push(sign_bit_d[0].clone());
-        tuple.push(is_rot_l64[0].clone());
-        tuple.push(is_rot_r64[0].clone());
-        tuple.push(is_rot_l32[0].clone());
-        tuple.push(is_rot_r32[0].clone());
-        tuple.push(is_mul_lo[0].clone());
-        tuple.push(is_mu_uu[0].clone());
-        tuple.push(is_mu_su[0].clone());
-        tuple.push(is_mu_ss[0].clone());
-        tuple.push(is_32bit[0].clone());
-
-        for _ in 0..2 {
-            logup.add_to_relation_with(
-                mul,
-                [is_padding[0].clone()],
-                |[pad]| {
-                    use stwo::prover::backend::simd::m31::PackedBaseField;
-                    (-(PackedBaseField::one() - pad)).into()
-                },
-                &tuple,
-            );
-        }
-
-        logup.finalize()
-    }
-}
+mod fill;
+#[cfg(feature = "prover")]
+pub use fill::range_checked_bytes;

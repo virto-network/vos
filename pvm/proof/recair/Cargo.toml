@@ -1,0 +1,82 @@
+[package]
+name = "vos-pvm-recair"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The recursion AIR's prover: circuits built by a Context, their wiring checked, traced, proved and verified on the Poseidon2-M31 channel."
+
+[dependencies]
+vos-pvm-recair-air = { workspace = true }
+# The wrap's proof, its public words and its layout, which the prover
+# produces and the final verifier reads; format 39's fixed layout.
+vos-pvm-final-verifier = { workspace = true }
+# A watched tree's proofs' encoding (`watch`).
+postcard = { version = "1", features = ["alloc"], optional = true }
+vos-pvm-poseidon2 = { workspace = true }
+vos-pvm-precompiles = { workspace = true }
+# The Poseidon2-M31 channel and its SIMD backend, the format registry, the
+# transcript's header and the security accounting.
+vos-pvm-proof = { workspace = true }
+# A kernel's install record, which a leaf's program is computed from.
+vos-abi = { workspace = true }
+stwo = { workspace = true, features = ["std", "prover", "parallel"] }
+stwo-constraint-framework = { workspace = true, features = ["std", "prover", "parallel"] }
+num-traits = "0.2"
+serde = { version = "1", features = ["derive"] }
+# The masked wrap's randomness (`proving.md` §5, R4): ChaCha20 seeded with the
+# BLAKE2b-256 of the OS's bytes, the witness digest and the attempt; and its
+# parallel masking and salts, written into packed columns.
+rand = { version = "0.8", default-features = false }
+rand_chacha = "0.3"
+getrandom = "0.2"
+blake2 = "0.10"
+bytemuck = "1"
+rayon = { workspace = true }
+
+[features]
+default = ["recursion"]
+# The recursion prover: kernel leaves, folds, a run's tree and the final
+# wrap (`leaf`, `fold`, `tree`, `wrap`). A device proves its kernels
+# without it (`vos-pvm-device`), so the light node links less
+# (`light-node.md` §7.1).
+recursion = []
+# The masked prover's test seams, for the prover's tests (a dev edge): its
+# seeded randomness (`MaskRng::Seeded`), a proof forced past its own
+# check of the constraints (`prove_masked_unchecked`) and the rank over M31
+# R1 takes (`masked::rank_m31`). No production build
+# enables it (`just check-no-seeded-masks`).
+seeded-masks = ["vos-pvm-proof/seeded-masks"]
+# The masking's heavy gates, for `just test-proof`: the statistical leakage
+# tests at a medium N (500 proofs a witness on the small circuit, 16 on the
+# real wrap; `LEAKAGE_N` and `LEAKAGE_WRAP_N` set others, and `just
+# slice-gate` the full 2,000 and 32), the masked acceptance above 2^16
+# rows, and the final verifier's gas and Wasm gates over seeds (the device
+# format's leakage gate is `vos-pvm-device`'s). No code of the crate's.
+heavy-gates = []
+# A run's tree shown proof by proof as it is built (`tree::prove_final_watched`,
+# `tree::Built`'s roots and encoding): the carrier audit's seam, for its
+# tests (a dev edge or a test's feature). No production build enables it
+# (`just check-no-debug-internals`).
+watch = ["recursion", "dep:postcard"]
+
+[dev-dependencies]
+# The masked prover's tests reproduce a proof byte for byte from a seed;
+# `watch` so the tests and `clippy --all-targets` compile its code.
+vos-pvm-recair = { path = ".", features = ["recursion", "seeded-masks", "watch"] }
+# A verifier pinning other salts, `R` or widths, which refuses the wrap's
+# proofs.
+vos-pvm-final-verifier = { workspace = true, features = ["other-pins"] }
+# The fixtures' and the proofs' encoding, and their sizes.
+postcard = { version = "1", features = ["alloc"] }
+vos-pvm = { workspace = true }
+# A small kernel, laid out as the loader lays it out.
+vos-pvm-program = { workspace = true }
+# A derivation's leaf rows, held to the built leaves.
+vos-pvm-compiler = { workspace = true }
+# The shape's security counts against the standalone verifier's.
+vos-pvm-proof-verifier = { workspace = true }
+# The venue's JAM refine program, run on the JAM-only host, and its
+# judgements' input (the model venue's).
+vos-statement = { workspace = true, features = ["model-judge"] }
+# A chip-isolated proof, COMPARE's leaf's (`prove_chip_isolated_format`).
+vos-pvm-proof = { workspace = true, features = ["debug-internals"] }

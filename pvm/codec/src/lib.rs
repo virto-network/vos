@@ -14,6 +14,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+#[cfg(feature = "anchor")]
+mod anchor;
 mod error;
 
 pub use error::DecodeError;
@@ -23,6 +25,17 @@ pub use scale_derive::{Decode, Encode};
 pub trait Encode {
     /// Encode self, appending to `buf`.
     fn encode_to(&self, buf: &mut Vec<u8>);
+
+    /// Encode a sequence's items, appending to `buf`: one by one, or in a
+    /// single copy for bytes.
+    fn encode_items(items: &[Self], buf: &mut Vec<u8>)
+    where
+        Self: Sized,
+    {
+        for item in items {
+            item.encode_to(buf);
+        }
+    }
 
     /// Encode self into a new Vec.
     fn encode(&self) -> Vec<u8> {
@@ -36,6 +49,32 @@ pub trait Encode {
 pub trait Decode: Sized {
     /// Decode from `data`, returning `(value, bytes_consumed)`.
     fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError>;
+
+    /// Decode all of `data` as one value: `None` when it is not one, or
+    /// has bytes left over.
+    fn decode_exact(data: &[u8]) -> Option<Self> {
+        match Self::decode(data) {
+            Ok((value, used)) if used == data.len() => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Decode `count` items from `data`: one by one, or in a single copy
+    /// for bytes. The count only claims items: what is reserved up front
+    /// is at most four times `data`'s own size (honest items are rarely
+    /// smaller encoded than a quarter of their size in memory), and the
+    /// rest grows as items decode.
+    fn decode_items(data: &[u8], count: usize) -> Result<(Vec<Self>, usize), DecodeError> {
+        let reserve = data.len().saturating_mul(4) / size_of::<Self>().max(1);
+        let mut items = Vec::with_capacity(count.min(reserve));
+        let mut off = 0;
+        for _ in 0..count {
+            let (item, used) = Self::decode(&data[off..])?;
+            off += used;
+            items.push(item);
+        }
+        Ok((items, off))
+    }
 }
 
 // ============================================================================
@@ -45,6 +84,10 @@ pub trait Decode: Sized {
 impl Encode for u8 {
     fn encode_to(&self, buf: &mut Vec<u8>) {
         buf.push(*self);
+    }
+
+    fn encode_items(items: &[Self], buf: &mut Vec<u8>) {
+        buf.extend_from_slice(items);
     }
 }
 
@@ -72,6 +115,53 @@ impl Encode for bool {
     }
 }
 
+/// Fixed-width little-endian integers beyond the unsigned ones above.
+macro_rules! fixed_width {
+    ($($ty:ty),*) => {$(
+        impl Encode for $ty {
+            fn encode_to(&self, buf: &mut Vec<u8>) {
+                buf.extend_from_slice(&self.to_le_bytes());
+            }
+        }
+
+        impl Decode for $ty {
+            fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError> {
+                const WIDTH: usize = core::mem::size_of::<$ty>();
+                let bytes = data.get(..WIDTH).ok_or(DecodeError::UnexpectedEof)?;
+                Ok((<$ty>::from_le_bytes(bytes.try_into().unwrap()), WIDTH))
+            }
+        }
+    )*};
+}
+
+fixed_width!(i8, i16, i32, i64, u128, i128);
+
+/// The unit type encodes to nothing: a handler with no reply.
+impl Encode for () {
+    fn encode_to(&self, _: &mut Vec<u8>) {}
+}
+
+impl Decode for () {
+    fn decode(_: &[u8]) -> Result<(Self, usize), DecodeError> {
+        Ok(((), 0))
+    }
+}
+
+/// A string encodes as its UTF-8 bytes.
+impl Encode for alloc::string::String {
+    fn encode_to(&self, buf: &mut Vec<u8>) {
+        self.as_bytes().encode_to(buf);
+    }
+}
+
+impl Decode for alloc::string::String {
+    fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let (bytes, used) = Vec::<u8>::decode(data)?;
+        let string = alloc::string::String::from_utf8(bytes).map_err(|_| DecodeError::NotUtf8)?;
+        Ok((string, used))
+    }
+}
+
 // ============================================================================
 // Primitive Decode impls — fixed-width LE
 // ============================================================================
@@ -82,6 +172,11 @@ impl Decode for u8 {
             return Err(DecodeError::UnexpectedEof);
         }
         Ok((data[0], 1))
+    }
+
+    fn decode_items(data: &[u8], count: usize) -> Result<(Vec<Self>, usize), DecodeError> {
+        let bytes = data.get(..count).ok_or(DecodeError::UnexpectedEof)?;
+        Ok((bytes.to_vec(), count))
     }
 }
 
@@ -131,9 +226,7 @@ impl Decode for bool {
 
 impl<T: Encode, const N: usize> Encode for [T; N] {
     fn encode_to(&self, buf: &mut Vec<u8>) {
-        for item in self {
-            item.encode_to(buf);
-        }
+        T::encode_items(self, buf);
     }
 }
 
@@ -159,9 +252,7 @@ impl<const N: usize> Decode for [u8; N] {
 impl<T: Encode> Encode for [T] {
     fn encode_to(&self, buf: &mut Vec<u8>) {
         (self.len() as u32).encode_to(buf);
-        for item in self {
-            item.encode_to(buf);
-        }
+        T::encode_items(self, buf);
     }
 }
 
@@ -182,13 +273,25 @@ impl<T: Decode> Decode for Vec<T> {
                 remaining: data.len() as u32,
             });
         }
-        let mut items = Vec::with_capacity(count);
-        for _ in 0..count {
-            let (item, c) = T::decode(&data[off..])?;
-            off += c;
-            items.push(item);
-        }
+        let (items, used) = T::decode_items(&data[off..], count)?;
+        off += used;
         Ok((items, off))
+    }
+}
+
+// ============================================================================
+// Box<T> — as T
+// ============================================================================
+
+impl<T: Encode> Encode for alloc::boxed::Box<T> {
+    fn encode_to(&self, buf: &mut Vec<u8>) {
+        (**self).encode_to(buf);
+    }
+}
+
+impl<T: Decode> Decode for alloc::boxed::Box<T> {
+    fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError> {
+        T::decode(data).map(|(value, used)| (alloc::boxed::Box::new(value), used))
     }
 }
 
@@ -279,6 +382,23 @@ impl<A: Decode, B: Decode> Decode for (A, B) {
         let (a, c1) = A::decode(data)?;
         let (b, c2) = B::decode(&data[c1..])?;
         Ok(((a, b), c1 + c2))
+    }
+}
+
+impl<A: Encode, B: Encode, C: Encode> Encode for (A, B, C) {
+    fn encode_to(&self, buf: &mut Vec<u8>) {
+        self.0.encode_to(buf);
+        self.1.encode_to(buf);
+        self.2.encode_to(buf);
+    }
+}
+
+impl<A: Decode, B: Decode, C: Decode> Decode for (A, B, C) {
+    fn decode(data: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let (a, c1) = A::decode(data)?;
+        let (b, c2) = B::decode(&data[c1..])?;
+        let (c, c3) = C::decode(&data[c1 + c2..])?;
+        Ok(((a, b, c), c1 + c2 + c3))
     }
 }
 

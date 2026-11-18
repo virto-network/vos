@@ -1,0 +1,657 @@
+//! Masking variant (c) (`docs/design/proving.md` §5, R1–R8), over any
+//! component set a masked format proves: the masked wrap's
+//! ([`crate::wrap::WrapComponents`], [`crate::format::MASKED_WRAP`]) and the
+//! device set's (`vos_pvm_proof::masked`, [`crate::format::DEVICE_PROOF`]).
+//! A masked format's [`Masking`] lays its trees out.
+//!
+//! - **Constraint bound `log_size + 2`**
+//!   ([`MASKED_LOG_CONSTRAINT_EXPANSION`]): every main and interaction
+//!   column is committed as `f + v_H·r`, of degree bound twice its rows, and
+//!   the composition is committed whole at `4N`, so a cubic constraint over
+//!   the masked columns fits.
+//! - **Claimed-sum blinding (R2):** each component reads [`BLIND_COLUMNS`]
+//!   more main columns `b` (one QM31) after its own, and adds one fraction
+//!   `b / combine_B(1)` on [`BlindRelation`], a relation nothing else uses,
+//!   before its fractions are finalized in pairs ([`MaskedEval`]).
+//! - **Committed degree bounds `log_size + 1`** ([`MaskedComponent`]): the
+//!   main and interaction columns masked, the preprocessed columns extended
+//!   to the same level, unmasked.
+//! - **The composition sampled at `π(z)`** ([`composition_point`]): its
+//!   quotients lift one doubling less than the masked columns'.
+//!
+//! Leaves and folds never read this module, and their components keep
+//! [`crate::LOG_CONSTRAINT_EXPANSION`]. Everything here is generic over the
+//! component set ([`MaskedComponents`]).
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::array::from_fn;
+
+use num_traits::One;
+use stwo::core::ColumnVec;
+use stwo::core::air::{Component, Components};
+use stwo::core::channel::Channel;
+use stwo::core::circle::CirclePoint;
+use stwo::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
+use stwo::core::pcs::TreeVec;
+use stwo_constraint_framework::{EvalAtRow, FrameworkEval, RelationEntry, relation};
+
+use crate::Body;
+use crate::format::Masking;
+
+/// The constraint bound over the log size: `4N`, the composition whole.
+pub const MASKED_LOG_CONSTRAINT_EXPANSION: u32 = 2;
+
+/// The committed degree bound over the log size: `2N`, a column `f + v_H·r`
+/// (the preprocessed ones extended to the same level, unmasked).
+pub const MASKED_COLUMN_EXPANSION: u32 = 1;
+
+/// A component's blinding columns: one QM31.
+pub const BLIND_COLUMNS: usize = SECURE_EXTENSION_DEGREE;
+
+/// The composition's coordinate columns, committed whole.
+pub const COMPOSITION_COLUMNS: usize = SECURE_EXTENSION_DEGREE;
+
+/// The trees a masked proof commits: preprocessed, main, interaction, and
+/// the composition's last.
+pub const TREES: usize = 4;
+
+/// The trees the components' columns fill, before the composition's.
+const AIR_TREES: usize = TREES - 1;
+
+mod component;
+
+pub use component::{MaskedComponent, Rebound};
+
+relation!(BlindRelation, 1);
+
+/// A component masked: its body, then its blinding columns and their one
+/// fraction on [`BlindRelation`], then its fractions finalized in pairs, at
+/// the bound `log_size + 2`. The only evaluation that reads the blinding.
+#[derive(Clone)]
+pub struct MaskedEval<B> {
+    pub inner: B,
+    pub blind: BlindRelation,
+}
+
+impl<B> MaskedEval<B> {
+    pub fn new(inner: B, blind: &BlindRelation) -> Self {
+        Self {
+            inner,
+            blind: blind.clone(),
+        }
+    }
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "a component's log size is a circuit's, below 32, so adding the constraint expansion cannot overflow"
+)]
+impl<B: Body> FrameworkEval for MaskedEval<B> {
+    fn log_size(&self) -> u32 {
+        self.inner.log_size()
+    }
+
+    fn max_constraint_log_degree_bound(&self) -> u32 {
+        self.inner.log_size() + MASKED_LOG_CONSTRAINT_EXPANSION
+    }
+
+    fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+        self.inner.body(&mut eval);
+        let b: [E::F; BLIND_COLUMNS] = from_fn(|_| eval.next_trace_mask());
+        eval.add_to_relation(RelationEntry::new(
+            &self.blind,
+            E::combine_ef(b),
+            &[E::F::one()],
+        ));
+        eval.finalize_logup_in_pairs();
+        eval
+    }
+}
+
+/// A component set a masked format proves: its components, each a body
+/// masked as [`MaskedEval`] masks one, at their log sizes.
+pub trait MaskedComponents: Sized {
+    /// The relations the bodies read, drawn right before [`BlindRelation`].
+    type Relations;
+
+    /// Which of the set's components a proof holds (the segment AIR's
+    /// active-chip mask; `()` for a set that always holds all of them),
+    /// which the relations drawn follow.
+    type Active: Copy;
+
+    fn draw_relations(active: Self::Active, channel: &mut impl Channel) -> Self::Relations;
+
+    /// Pin B's fifth step, the masked transcript's challenges: the set's
+    /// relations, then [`BlindRelation`].
+    fn draw(active: Self::Active, channel: &mut impl Channel) -> (Self::Relations, BlindRelation) {
+        let relations = Self::draw_relations(active, channel);
+        let blind = BlindRelation::draw(channel);
+        (relations, blind)
+    }
+
+    /// The set at `log_sizes` with its claimed sums, `None` when either
+    /// count is not the set's.
+    fn new(
+        active: Self::Active,
+        relations: &Self::Relations,
+        blind: &BlindRelation,
+        log_sizes: &[u32],
+        claimed_sums: &[SecureField],
+    ) -> Option<Self>;
+
+    /// The set at `log_sizes` under any relations and claimed sums: its
+    /// trees' layout and its masks, which neither changes. `None` where
+    /// [`new`](Self::new) is.
+    fn layout(active: Self::Active, log_sizes: &[u32]) -> Option<Self>;
+
+    /// The components the set holds.
+    fn active(&self) -> Self::Active;
+
+    /// Each component's log size, in commitment order.
+    fn log_sizes(&self) -> &[u32];
+
+    /// The components whose claimed sums the verifier recomputes from the
+    /// public values: the prover leaves them unblinded, as they are public.
+    fn public_sums(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    /// The preprocessed tree's column log sizes, in commitment order, at the
+    /// rows' level (unextended).
+    fn preprocessed_log_sizes(&self) -> Vec<u32>;
+
+    /// The components in commitment order, their bounds at their rows'
+    /// level: wrap each in [`MaskedComponent`] for the committed levels.
+    fn components(&self) -> Vec<&dyn Component>;
+
+    /// The components laid out as `self`, their constraints evaluated under
+    /// `relations`, `blind` and `claimed_sums` ([`Rebound`]): the verifier's
+    /// set once the challenges are drawn, without laying it out again. `None`
+    /// when the count of claimed sums is not the set's, or an evaluation is
+    /// not at its layout's log size ([`Rebound::new`]).
+    fn bind<'a>(
+        &'a self,
+        relations: &Self::Relations,
+        blind: &BlindRelation,
+        claimed_sums: &[SecureField],
+    ) -> Option<Vec<Box<dyn Component + 'a>>>;
+}
+
+/// The components whose claimed sums the prover blinds: every one but
+/// [`MaskedComponents::public_sums`]'.
+pub fn blinded_components(set: &impl MaskedComponents) -> usize {
+    let public = set.public_sums();
+    (0..set.components().len())
+        .filter(|component| !public.contains(component))
+        .count()
+}
+
+/// Whether the set blinds its claimed sums: two blinded components at
+/// least, or none. One blinded component's sum is the logup total's less
+/// the public ones', a value the verifier computes, so a set of one carries
+/// it in the clear: the prover and the verifier refuse it.
+pub fn blinds_its_sums(set: &impl MaskedComponents) -> bool {
+    blinded_components(set) != 1
+}
+
+/// The level the AIR is evaluated at, its tallest masked column's: `m + 1`.
+pub fn air_log_size(set: &impl MaskedComponents) -> Option<u32> {
+    set.components()
+        .into_iter()
+        .flat_map(|inner| {
+            MaskedComponent { inner }
+                .trace_log_degree_bounds()
+                .0
+                .into_iter()
+                .flatten()
+        })
+        .max()
+}
+
+/// The composition's degree bound, FRI's `k`: `m + 2`.
+pub fn composition_log_degree_bound(set: &impl MaskedComponents) -> Option<u32> {
+    set.components()
+        .iter()
+        .map(|component| component.max_constraint_log_degree_bound())
+        .max()
+}
+
+/// Each committed tree's column degree bounds: the preprocessed tree's at
+/// `log_size + 1`, unsalted; the main and interaction trees' columns at
+/// `log_size + 1` ([`MaskedComponent`]), then their salt columns; the
+/// composition tree's coordinates, `R` and salts. Salts, `R` and the
+/// composition at the composition's bound, so every salted tree reaches the
+/// lifting height. `None` for an empty set or a level past `u32`.
+pub fn committed_log_sizes(
+    set: &impl MaskedComponents,
+    masking: &Masking,
+) -> Option<TreeVec<Vec<u32>>> {
+    let composition = composition_log_degree_bound(set)?;
+    let preprocessed = set
+        .preprocessed_log_sizes()
+        .into_iter()
+        .map(|log_size| log_size.checked_add(MASKED_COLUMN_EXPANSION))
+        .collect::<Option<Vec<u32>>>()?;
+    let mut trace = [Vec::new(), Vec::new()];
+    for inner in set.components() {
+        let bounds = MaskedComponent { inner }.trace_log_degree_bounds();
+        for (tree, columns) in trace.iter_mut().zip(1..) {
+            tree.extend(bounds.get(columns).into_iter().flatten());
+        }
+    }
+    let [mut main, mut interaction] = trace;
+    for tree in [&mut main, &mut interaction] {
+        tree.extend(core::iter::repeat_n(composition, masking.salt_columns));
+    }
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a format's masking pins a few columns each: their sum with the composition's 4 cannot overflow"
+    )]
+    let composition_tree = core::iter::repeat_n(
+        composition,
+        COMPOSITION_COLUMNS + masking.fri_mask_columns + masking.salt_columns,
+    )
+    .collect();
+    Some(TreeVec(alloc::vec![
+        preprocessed,
+        main,
+        interaction,
+        composition_tree
+    ]))
+}
+
+/// Where the whole composition is sampled: `π(z)`, `z` doubled once for each
+/// level the composition's bound stands above the AIR's.
+pub fn composition_point(
+    set: &impl MaskedComponents,
+    oods_point: CirclePoint<SecureField>,
+) -> Option<CirclePoint<SecureField>> {
+    let doublings = composition_log_degree_bound(set)?.checked_sub(air_log_size(set)?)?;
+    Some(oods_point.repeated_double(doublings))
+}
+
+/// The sample points, tree by tree: the components' masks at the AIR's level
+/// (none for a salt column); the composition's coordinates at
+/// [`composition_point`], `R`'s columns at `z`, none for the composition
+/// tree's salts. `None` when the set's masks do not fit its trees.
+pub fn sample_points(
+    set: &impl MaskedComponents,
+    oods_point: CirclePoint<SecureField>,
+    masking: &Masking,
+) -> Option<TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>> {
+    let committed = committed_log_sizes(set, masking)?;
+    let air_level = air_log_size(set)?;
+    let at_composition = composition_point(set, oods_point)?;
+    let n_preprocessed = committed.first()?.len();
+    let components = set.components();
+    let indexed = components.iter().all(|component| {
+        component
+            .preprocessed_column_indices()
+            .iter()
+            .all(|&index| index < n_preprocessed)
+    });
+    if !indexed {
+        return None;
+    }
+    let mut points = Components {
+        components,
+        n_preprocessed_columns: n_preprocessed,
+    }
+    .mask_points(oods_point, air_level, false);
+    if points.len() > AIR_TREES {
+        return None;
+    }
+    points.resize(AIR_TREES, Vec::new());
+    for (tree, width) in points.iter_mut().zip(committed.iter().map(Vec::len)) {
+        if tree.len() > width {
+            return None;
+        }
+        tree.resize(width, Vec::new());
+    }
+    let composition = core::iter::repeat_n(at_composition, COMPOSITION_COLUMNS)
+        .chain(core::iter::repeat_n(oods_point, masking.fri_mask_columns))
+        .map(|point| alloc::vec![point])
+        .chain(core::iter::repeat_n(Vec::new(), masking.salt_columns))
+        .collect();
+    points.push(composition);
+    Some(points)
+}
+
+/// [`sample_points`] at `oods_point` made from `points`, the set's sample
+/// points at `CirclePoint::zero()`, in place. Each point at zero is its
+/// mask's offset from it, the group's identity: `oods_point` added to it,
+/// and [`composition_point`] to the composition's coordinates', gives each
+/// point exactly, without laying the masks out again. `None` where
+/// [`sample_points`] is.
+pub fn sample_points_from_zero(
+    points: &mut TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+    set: &impl MaskedComponents,
+    oods_point: CirclePoint<SecureField>,
+) -> Option<()> {
+    let at_composition = composition_point(set, oods_point)?;
+    let composition_tree = points.len().checked_sub(1)?;
+    for (tree, columns) in points.iter_mut().enumerate() {
+        for (column, column_points) in columns.iter_mut().enumerate() {
+            let base = if tree == composition_tree && column < COMPOSITION_COLUMNS {
+                at_composition
+            } else {
+                oods_point
+            };
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "the circle group's addition is modular: it neither overflows nor panics"
+            )]
+            for point in column_points {
+                *point = base + *point;
+            }
+        }
+    }
+    Some(())
+}
+
+/// The composition's value at its point, from its coordinates' samples, the
+/// first [`COMPOSITION_COLUMNS`] of the last tree. `None` unless each holds
+/// exactly one.
+pub fn composition_oods_eval(
+    sampled_values: &TreeVec<ColumnVec<Vec<SecureField>>>,
+) -> Option<SecureField> {
+    let tree = sampled_values.last()?;
+    let mut coordinates = [SecureField::default(); COMPOSITION_COLUMNS];
+    for (coordinate, column) in coordinates.iter_mut().zip(tree.get(..COMPOSITION_COLUMNS)?) {
+        let [value] = column[..] else {
+            return None;
+        };
+        *coordinate = value;
+    }
+    Some(SecureField::from_partial_evals(coordinates))
+}
+
+/// The composition at `oods_point` of `components`, each lifted
+/// ([`MaskedComponent`]), from `samples` under `random_coeff`, the AIR at
+/// `air_level`: what the composition's coordinates, sampled at
+/// [`composition_point`], must give.
+pub fn eval_lifted_composition(
+    components: &[&dyn Component],
+    n_preprocessed_columns: usize,
+    oods_point: CirclePoint<SecureField>,
+    samples: &TreeVec<ColumnVec<Vec<SecureField>>>,
+    random_coeff: SecureField,
+    air_level: u32,
+) -> SecureField {
+    let lifted: Vec<MaskedComponent<'_, dyn Component>> = components
+        .iter()
+        .map(|&inner| MaskedComponent { inner })
+        .collect();
+    Components {
+        components: lifted.iter().map(|c| c as &dyn Component).collect(),
+        n_preprocessed_columns,
+    }
+    .eval_composition_polynomial_at_point(oods_point, samples, random_coeff, air_level)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use stwo::core::circle::SECURE_FIELD_CIRCLE_GEN;
+
+    use crate::wrap::WrapComponents;
+    use crate::{GateRelation, LogSizes, h8, p2, qm31};
+
+    /// `format::MASKED_WRAP`'s log sizes.
+    const LOG_SIZES: LogSizes = [14, 15, 11];
+
+    /// Pin A's: 8 salt columns a tree and an `R` of 8, `h = 256`.
+    const MASKED_WRAP_MASKING: Masking = crate::format::MASKED_WRAP_MASKING;
+
+    fn wrap() -> WrapComponents {
+        WrapComponents::layout(&LOG_SIZES)
+    }
+
+    /// Pin A's trees: 57 preprocessed columns at `n + 1`, unsalted; 373
+    /// main and 40 interaction columns at `n + 1`, each tree with 8 salts at
+    /// `m + 2`; the composition's 4 coordinates, `R`'s 8 and 8 salts at
+    /// `m + 2`. The main and interaction levels are the components' own,
+    /// lifted one level ([`MaskedComponent`]).
+    #[test]
+    fn the_masked_trees_match_pin_a() {
+        let wrap = wrap();
+        let trees = committed_log_sizes(&wrap, &MASKED_WRAP_MASKING).unwrap();
+        assert_eq!(
+            trees.iter().map(Vec::len).collect::<Vec<_>>(),
+            [57, 381, 48, 20]
+        );
+        assert_eq!(
+            [
+                p2::N_MAIN + BLIND_COLUMNS,
+                qm31::N_MAIN + BLIND_COLUMNS,
+                h8::N_MAIN + BLIND_COLUMNS
+            ]
+            .iter()
+            .sum::<usize>(),
+            373
+        );
+        assert_eq!(air_log_size(&wrap), Some(16));
+        assert_eq!(composition_log_degree_bound(&wrap), Some(17));
+        assert_eq!(
+            trees[0],
+            crate::preprocessed_log_sizes(&LOG_SIZES)
+                .iter()
+                .map(|n| n + 1)
+                .collect::<Vec<_>>()
+        );
+        let lifted: Vec<MaskedComponent<'_, dyn Component>> = wrap
+            .components()
+            .into_iter()
+            .map(|inner| MaskedComponent { inner })
+            .collect();
+        let own = Components {
+            components: lifted.iter().map(|c| c as &dyn Component).collect(),
+            n_preprocessed_columns: trees[0].len(),
+        }
+        .column_log_sizes();
+        assert_eq!(own[0], trees[0]);
+        for tree in 1..3 {
+            let (columns, salts) = trees[tree].split_at(trees[tree].len() - 8);
+            assert_eq!(columns, own[tree], "tree {tree}");
+            assert!(salts.iter().all(|&level| level == 17));
+        }
+        assert!(trees[3].iter().all(|&level| level == 17));
+        assert_eq!(
+            wrap.components()
+                .iter()
+                .map(|c| c.n_constraints())
+                .collect::<Vec<_>>(),
+            [
+                p2::N_CONSTRAINTS,
+                qm31::N_CONSTRAINTS + 1,
+                h8::N_CONSTRAINTS + 1
+            ]
+        );
+    }
+
+    /// The blinding's one fraction a row is the masked evaluation's alone:
+    /// no component's own evaluation adds to [`BlindRelation`], and each
+    /// masked one adds exactly one fraction a row to it (`vos-pvm-recair`'s
+    /// circuit tests check that no other source names it).
+    #[test]
+    fn only_the_masked_evaluation_uses_the_blinding_relation() {
+        let blind = BlindRelation::dummy();
+        let name = <BlindRelation as stwo_constraint_framework::Relation<
+            stwo::core::fields::m31::BaseField,
+            SecureField,
+        >>::get_name(&blind);
+        let unmasked = crate::Components::new(
+            &GateRelation::dummy(),
+            &LOG_SIZES,
+            &[SecureField::default(); 3],
+        );
+        for counts in [
+            unmasked.p2.logup_counts(),
+            unmasked.qm31.logup_counts(),
+            unmasked.h8.logup_counts(),
+        ] {
+            assert!(!counts.contains_key(name));
+            assert_eq!(counts.len(), 1);
+        }
+        let wrap = wrap();
+        for (counts, &log_size) in [
+            wrap.p2.logup_counts(),
+            wrap.qm31.logup_counts(),
+            wrap.h8.logup_counts(),
+        ]
+        .iter()
+        .zip(&LOG_SIZES)
+        {
+            assert_eq!(counts.get(name), Some(&(1 << log_size)));
+            assert_eq!(counts.len(), 2);
+        }
+    }
+
+    /// The masks at the AIR's level, the composition's coordinates at
+    /// `π(z)`, `R` at `z`, no salt sampled; a column at most twice.
+    #[test]
+    fn the_sample_points_match_pin_b() {
+        let wrap = wrap();
+        let z = SECURE_FIELD_CIRCLE_GEN.mul(7);
+        let points = sample_points(&wrap, z, &MASKED_WRAP_MASKING).unwrap();
+        let trees = committed_log_sizes(&wrap, &MASKED_WRAP_MASKING).unwrap();
+        assert_eq!(
+            points.iter().map(Vec::len).collect::<Vec<_>>(),
+            trees.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert!(points[0].iter().all(|column| column[..] == [z]));
+        for tree in 1..3 {
+            let (columns, salts) = points[tree].split_at(points[tree].len() - 8);
+            assert!(columns.iter().all(|c| (1..=2).contains(&c.len())));
+            assert!(columns.iter().all(|c| c.last() == Some(&z)));
+            assert!(salts.iter().all(Vec::is_empty));
+        }
+        assert_eq!(composition_point(&wrap, z), Some(z.double()));
+        let composition = &points[3];
+        assert!(composition[..4].iter().all(|c| c[..] == [z.double()]));
+        assert!(composition[4..12].iter().all(|c| c[..] == [z]));
+        assert!(composition[12..].iter().all(Vec::is_empty));
+        // `p2`'s last round read at the previous row, and each component's
+        // running sum.
+        let twice = points.iter().flatten().filter(|c| c.len() == 2).count();
+        assert_eq!(twice, 16 + 3 * 4);
+    }
+
+    /// The sample points at `z` made from those at zero are
+    /// [`sample_points`]' at `z`, point for point.
+    #[test]
+    fn the_sample_points_from_zero_are_the_sample_points() {
+        let wrap = wrap();
+        for z in [
+            SECURE_FIELD_CIRCLE_GEN.mul(7),
+            SECURE_FIELD_CIRCLE_GEN.mul(0x1234_5678_9abc),
+        ] {
+            let mut points =
+                sample_points(&wrap, CirclePoint::zero(), &MASKED_WRAP_MASKING).unwrap();
+            sample_points_from_zero(&mut points, &wrap, z).unwrap();
+            assert_eq!(
+                points.0,
+                sample_points(&wrap, z, &MASKED_WRAP_MASKING).unwrap().0
+            );
+        }
+    }
+
+    /// The wrap laid out under dummy relations and bound to drawn ones
+    /// evaluates its composition at a point as the set built under them:
+    /// the same value for the same samples, and the same metadata.
+    #[test]
+    fn a_bound_layout_evaluates_as_the_set_built_anew() {
+        let mut channel = stwo::core::channel::Blake2bChannel::default();
+        let (relation, blind) = WrapComponents::draw((), &mut channel);
+        let claimed_sums = [
+            channel.draw_secure_felt(),
+            channel.draw_secure_felt(),
+            channel.draw_secure_felt(),
+        ];
+        let layout = wrap();
+        let bound = layout.bind(&relation, &blind, &claimed_sums).unwrap();
+        assert!(layout.bind(&relation, &blind, &claimed_sums[..2]).is_none());
+        let other_size = MaskedEval::new(
+            p2::P2Eval {
+                log_size: LOG_SIZES[0] + 1,
+                relation: relation.clone(),
+            },
+            &blind,
+        );
+        assert!(Rebound::new(&layout.p2, other_size, claimed_sums[0]).is_none());
+        let built = WrapComponents::build(&relation, &blind, &LOG_SIZES, &claimed_sums);
+        assert!(<WrapComponents as MaskedComponents>::layout((), &LOG_SIZES[..2]).is_none());
+        let z = SECURE_FIELD_CIRCLE_GEN.mul(11);
+        let points = sample_points(&layout, z, &MASKED_WRAP_MASKING).unwrap();
+        let samples = TreeVec(
+            points
+                .iter()
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .map(|column| {
+                            column
+                                .iter()
+                                .map(|_| channel.draw_secure_felt())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        );
+        let coefficient = channel.draw_secure_felt();
+        let air_level = air_log_size(&layout).unwrap();
+        let evaluate = |components: Vec<&dyn Component>| {
+            eval_lifted_composition(
+                &components,
+                points[0].len(),
+                z,
+                &samples,
+                coefficient,
+                air_level,
+            )
+        };
+        let rebound = evaluate(bound.iter().map(|c| &**c).collect());
+        assert_eq!(rebound, evaluate(built.components()));
+        assert_ne!(rebound, evaluate(layout.components()));
+        for (bound, built) in bound.iter().zip(built.components()) {
+            assert_eq!(bound.n_constraints(), built.n_constraints());
+            assert_eq!(
+                bound.max_constraint_log_degree_bound(),
+                built.max_constraint_log_degree_bound()
+            );
+            assert_eq!(
+                bound.trace_log_degree_bounds().0,
+                built.trace_log_degree_bounds().0
+            );
+            assert_eq!(bound.mask_points(z, 16).0, built.mask_points(z, 16).0);
+            assert_eq!(
+                bound.preprocessed_column_indices(),
+                built.preprocessed_column_indices()
+            );
+        }
+    }
+
+    /// The composition's value from exactly one sample a coordinate.
+    #[test]
+    fn the_composition_is_read_from_its_four_coordinates() {
+        let value = |i: u32| SecureField::from_u32_unchecked(i, 2 * i, 3 * i, 5 * i);
+        let mut sampled = TreeVec(alloc::vec![
+            alloc::vec![],
+            (1..=6).map(|i| alloc::vec![value(i)]).collect(),
+        ]);
+        assert_eq!(
+            composition_oods_eval(&sampled),
+            Some(SecureField::from_partial_evals(from_fn(|i| value(
+                i as u32 + 1
+            ))))
+        );
+        sampled[1][2].push(value(9));
+        assert_eq!(composition_oods_eval(&sampled), None);
+        sampled[1].truncate(3);
+        assert_eq!(composition_oods_eval(&sampled), None);
+        assert_eq!(composition_oods_eval(&TreeVec(alloc::vec![])), None);
+    }
+}

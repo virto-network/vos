@@ -2,24 +2,28 @@
 name = "vos-pvm"
 version.workspace = true
 edition.workspace = true
-license = "Apache-2.0"
+license.workspace = true
 authors.workspace = true
-description = "Capability-based PVM runtime used by VOS."
+description = "Gray Paper v0.8.0 PVM runtime used by VOS."
 
 [features]
 default = ["std"]
-std = ["dep:libc", "dep:memoffset", "dep:blake2"]
+std = ["dep:libc", "dep:memoffset"]
+# The run's debug outputs: each instruction traced (its pc, opcode and gas)
+# and, with `VOS_PVM_DEBUG` set, the recompiler's registers at each entry
+# and exit and its native code in `/tmp/pvm_native.bin`. They show a
+# kernel's steps and registers, which never leave the prover role: no
+# production build enables it (`just check-no-debug-internals`).
+debug-internals = []
 
 [dependencies]
-blake2 = { version = "0.10", default-features = false, optional = true }
 libc = { version = "0.2", optional = true }
 memoffset = { version = "0.9", optional = true }
-scale = { package = "vos-pvm-codec", path = "../codec", default-features = false }
-# Non-workspace dep lines: the workspace pins enable default features (std),
-# and workspace-inherited features are additive. vos_pvm's always-compiled
-# modules must stay no_std-clean (thiserror 2 derives core::error::Error
-# without its std feature).
-thiserror = { version = "2", default-features = false }
+vos-pvm-program = { path = "../program" }
+# The Poseidon2-M31 permutation the `0x402` precompile computes.
+vos-pvm-poseidon2 = { path = "../proof/poseidon2" }
+# Not a workspace dependency: workspace pins enable default features, and
+# vos_pvm's always-compiled modules must stay no_std-clean.
 tracing = { version = "0.1", default-features = false }
 
 [dev-dependencies]

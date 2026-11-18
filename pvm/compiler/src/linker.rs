@@ -1,182 +1,205 @@
-//! Linker-based RISC-V ELF to PVM transpilation.
+//! An ELF linked into a standard program, its relocations followed, so
+//! its code finds the data it references (`.rodata` constants, tables) and
+//! its data the code it points at.
 //!
-//! Unlike the basic `transpile_elf`, this module processes ELF relocations
-//! to correctly handle data references in code. This is required for
-//! real-world programs (like k256 crypto) that reference .rodata constants.
-//!
-//! Approach:
-//! 1. Parse ELF sections and relocations
-//! 2. Compute PVM memory layout (stack, ro_data, rw_data addresses)
-//! 3. Build a relocation map: code_offset → resolved_address
-//! 4. Translate RISC-V instructions, using relocation info to replace
-//!    AUIPC+LO12 pairs with direct load_imm of the final PVM address
+//! The parse reads the ELF's sections and symbols ([`elf`]), lays its data
+//! out ([`layout`]), reads its relocations ([`relocs`]) and finds where
+//! control may enter its code ([`targets`]). Translation then turns each
+//! instruction into PVM code, an AUIPC and the instruction completing its
+//! address into one load of the final address, and rewrites the code
+//! pointers in the data ([`translate`]).
+
+mod elf;
+mod layout;
+mod relocs;
+mod targets;
+mod translate;
+
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use vos_pvm::instruction::Opcode;
 
 use crate::TranspileError;
-use crate::emitter;
 use crate::riscv::TranslationContext;
-use std::collections::HashMap;
 
-/// RISC-V relocation types we care about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RelocType {
-    /// R_RISCV_32 (1): Absolute 32-bit address
-    Abs32,
-    /// R_RISCV_64 (2): Absolute 64-bit address
-    Abs64,
-    /// R_RISCV_CALL_PLT (19): AUIPC+JALR pair for function calls
-    CallPlt,
-    /// R_RISCV_PCREL_HI20 (23): Upper 20 bits of PC-relative address (AUIPC)
-    PcrelHi20,
-    /// R_RISCV_PCREL_LO12_I (24): Lower 12 bits, I-type (load/addi)
-    PcrelLo12I,
-    /// R_RISCV_PCREL_LO12_S (25): Lower 12 bits, S-type (store)
-    PcrelLo12S,
-    /// R_RISCV_ADD32 (35): Add 32-bit (paired with SUB32 for relative jump tables)
-    Add32,
-    /// R_RISCV_SUB32 (39): Subtract 32-bit (paired with ADD32 for relative jump tables)
-    Sub32,
+pub(crate) use elf::{name_at, name_is, without_temporary_names};
+pub(crate) use layout::{Z_Z, spi_blob, zone_round};
+pub(crate) use relocs::{in_ranges, merge_ranges, range_at};
+pub(crate) use targets::{direct_targets, raw_code_pointers};
+
+use elf::sections;
+use layout::{HEAP_PAGES, layout};
+use relocs::relocations;
+use targets::control_flow_targets;
+use translate::{rewrite_data_code_ptrs, translate_section_linked};
+
+/// A symbol's type: a function.
+pub(crate) const STT_FUNC: u8 = 2;
+
+/// A defined symbol: its value, size, type (`STT_*`), and where its name
+/// starts in [`LinkedElf::names`].
+#[derive(Clone, Copy)]
+pub(crate) struct Symbol {
+    pub(crate) value: u64,
+    pub(crate) size: u64,
+    pub(crate) kind: u8,
+    pub(crate) name: usize,
 }
 
-impl RelocType {
-    fn from_raw(r: u32) -> Option<Self> {
-        match r {
-            1 => Some(Self::Abs32),
-            2 => Some(Self::Abs64),
-            19 => Some(Self::CallPlt),
-            23 => Some(Self::PcrelHi20),
-            24 => Some(Self::PcrelLo12I),
-            25 => Some(Self::PcrelLo12S),
-            35 => Some(Self::Add32),
-            39 => Some(Self::Sub32),
-            _ => None,
+/// Parsed ELF with relocation info for linking.
+#[derive(Default)]
+pub(crate) struct LinkedElf {
+    /// All code sections: (file_offset, vaddr, data)
+    pub(crate) code_sections: Vec<(u64, u64, Vec<u8>)>,
+    /// RO data blob and the vaddr its first byte is linked at: the
+    /// page-floored lowest ro section address, or 16 KiB without one. It
+    /// is also the stack's size, so RO data is at the right PVM address.
+    pub(crate) ro_data: Vec<u8>,
+    pub(crate) ro_base: u64,
+    /// RW data blob, its initialized part, and the vaddr its first byte is
+    /// linked at (`min(rw_pvm_base, lowest rw section address)`).
+    pub(crate) rw_data: Vec<u8>,
+    pub(crate) rw_base: u64,
+    /// Lowest rw section vaddr (== `rw_base` when there are no rw sections).
+    pub(crate) rw_min: u64,
+    /// The rw span from `rw_base`, NOBITS included: zeros past `rw_data`.
+    pub(crate) rw_len: u64,
+    /// Heap pages
+    pub(crate) heap_pages: u32,
+    /// Every defined symbol, in the table's order.
+    pub(crate) symbols: Vec<Symbol>,
+    /// The symbols' string table, its names read only where needed.
+    pub(crate) names: Vec<u8>,
+    /// Relocations in loaded sections that place an address in data:
+    /// `R_RISCV_32`, `_64` and `_ADD32`, each where and what it names.
+    pub(crate) data_relocs: Vec<(u64, u64)>,
+    /// Relocations in loaded sections naming an address by a symbol, a
+    /// PC-relative pair's or data's: where, and the symbol's own value.
+    pub(crate) symbol_refs: Vec<(u64, u64)>,
+    /// How many relocation entries the ELF holds, of any type.
+    pub(crate) relocations: usize,
+    /// The first relocation type the linker does not follow, in a section
+    /// the program loads, branches and jumps aside.
+    pub(crate) unknown_relocation: Option<u32>,
+    /// The `.vos_schema` section's bytes, an actor program's schema.
+    pub(crate) schema: Option<Vec<u8>>,
+    /// The `.vos_heap` section, the heap's arena: its address and size.
+    pub(crate) heap: Option<(u64, u64)>,
+    /// PCREL_HI20: AUIPC instruction vaddr → resolved data address.
+    /// The AUIPC itself should emit load_imm with this address.
+    pub(crate) hi20_targets: BTreeMap<u64, u64>,
+    /// PCREL_LO12 instruction vaddrs whose paired HI20 is known. These
+    /// instructions use the address already loaded by the AUIPC.
+    pub(crate) lo12_sites: BTreeSet<u64>,
+    /// CALL_PLT: AUIPC instruction vaddr → target function RISC-V vaddr.
+    pub(crate) call_targets: BTreeMap<u64, u64>,
+    /// Absolute code pointers in data sections: (data_vaddr, target_code_vaddr, entry_size).
+    /// entry_size is 4 for 32-bit or 8 for 64-bit entries.
+    pub(crate) abs_code_ptrs: Vec<(u64, u64, u8)>,
+    /// SUB32 relocations: (data_vaddr, subtracted_addr).
+    /// For LLVM relative jump tables: entry = target - subtracted_addr.
+    /// Combined with the resolved entry value, we can recover the target.
+    pub(crate) sub32_relocs: Vec<(u64, u64)>,
+    /// Bytes whose data-pointer interpretation is already defined by a
+    /// relocation, including non-code targets. Never rescan as raw pointers.
+    pub(crate) data_relocation_ranges: Vec<(u64, u64)>,
+    /// Code section address ranges for detecting code pointers, sorted
+    /// and merged.
+    pub(crate) code_ranges: Vec<(u64, u64)>,
+    /// Every statically reachable RISC-V instruction address. Translation-time
+    /// predecessor fusion must stop at these boundaries.
+    pub(crate) control_flow_targets: HashSet<u64>,
+    /// ELF entry point (e_entry) — the RISC-V vaddr of _start (refine entry).
+    pub(crate) entry_vaddr: u64,
+    /// RISC-V vaddr of the exported `accumulate` symbol, if the service
+    /// defines one (the accumulate entry). `None` for refine-only blobs, whose
+    /// IC-5 prologue slot becomes a trap.
+    pub(crate) accumulate_vaddr: Option<u64>,
+}
+
+impl LinkedElf {
+    /// The initialized data, each region by the address its first byte is
+    /// linked at: the read-only data, then the read-write data's
+    /// initialized part.
+    pub(crate) fn initialized(&self) -> [(u64, &[u8]); 2] {
+        [(self.ro_base, &self.ro_data), (self.rw_base, &self.rw_data)]
+    }
+}
+
+#[cfg(test)]
+impl LinkedElf {
+    /// A linked ELF of `code` alone at `vaddr`, its entry, with the
+    /// read-only base at 0x1_0000 and the read-write one at 0x2_0000. Its
+    /// control-flow targets are the entry and what its direct branches and
+    /// jumps reach, as [`parse_linked_elf`] finds them.
+    pub(crate) fn text(vaddr: u64, code: Vec<u8>) -> Self {
+        let len = code.len() as u64;
+        let code_sections = vec![(0, vaddr, code)];
+        Self {
+            control_flow_targets: targets::direct_targets(&code_sections)
+                .chain([vaddr])
+                .collect(),
+            code_sections,
+            code_ranges: vec![(vaddr, vaddr + len)],
+            ro_base: 0x1_0000,
+            rw_base: 0x2_0000,
+            rw_min: 0x2_0000,
+            entry_vaddr: vaddr,
+            ..Self::default()
         }
     }
 }
 
-/// Parsed ELF with relocation info for linking.
-struct LinkedElf {
-    is_64bit: bool,
-    /// All code sections: (file_offset, vaddr, data)
-    code_sections: Vec<(u64, u64, Vec<u8>)>,
-    /// RO data blob and the vaddr its first byte is linked at
-    /// (`stack_size`, the page-floored lowest ro section address).
-    ro_data: Vec<u8>,
-    ro_base: u64,
-    /// RW data blob and the vaddr its first byte is linked at
-    /// (`min(rw_pvm_base, lowest rw section address)`).
-    rw_data: Vec<u8>,
-    rw_base: u64,
-    /// Lowest rw section vaddr (== `rw_base` when there are no rw sections).
-    rw_min: u64,
-    /// Stack size in bytes (= ro_base, so RO data is at the right PVM address)
-    stack_size: u32,
-    /// Heap pages
-    heap_pages: u32,
-    /// PCREL_HI20: AUIPC instruction vaddr → resolved data address.
-    /// The AUIPC itself should emit load_imm with this address.
-    hi20_targets: HashMap<u64, u64>,
-    /// PCREL_LO12: instruction vaddr → resolved data address (looked up from paired HI20).
-    /// These instructions should use the already-loaded address (from AUIPC/load_imm).
-    lo12_targets: HashMap<u64, u64>,
-    /// CALL_PLT: AUIPC instruction vaddr → target function RISC-V vaddr.
-    call_targets: HashMap<u64, u64>,
-    /// Absolute code pointers in data sections: (data_vaddr, target_code_vaddr, entry_size).
-    /// entry_size is 4 for 32-bit or 8 for 64-bit entries.
-    abs_code_ptrs: Vec<(u64, u64, u8)>,
-    /// SUB32 relocations: (data_vaddr, subtracted_addr).
-    /// For LLVM relative jump tables: entry = target - subtracted_addr.
-    /// Combined with the resolved entry value, we can recover the target.
-    sub32_relocs: Vec<(u64, u64)>,
-    /// Code section address ranges for detecting code pointers.
-    code_ranges: Vec<(u64, u64)>,
-    /// ELF entry point (e_entry) — the RISC-V vaddr of _start (refine entry).
-    entry_vaddr: u64,
-    /// RISC-V vaddr of the exported `accumulate` symbol, if the service
-    /// defines one (the accumulate entry). `None` for refine-only blobs, whose
-    /// IC-5 prologue slot becomes a trap.
-    accumulate_vaddr: Option<u64>,
-}
-
-/// The container-independent result of transpiling an ELF: the code in GP
-/// instruction encoding (plus bitmask and jump table) and the memory-section
-/// blobs at their linked base addresses. Both containers — the `JAR\x02`
-/// capability manifest ([`link_elf`]) and the GP standard program
-/// ([`link_elf_spi`]) — are serializations of exactly these fields.
-struct TranspiledElf {
+/// The result of transpiling an ELF: the code in GP instruction encoding
+/// (plus bitmask and jump table) and the memory-section blobs at their linked
+/// base addresses. [`link_elf_spi`] serializes exactly these fields.
+pub(crate) struct TranspiledElf {
     code: Vec<u8>,
     bitmask: Vec<u8>,
     jump_table: Vec<u32>,
-    /// RO data blob; its first byte is linked at `ro_base`.
+    /// RO data blob; its first byte is linked at `ro_base`, which is also
+    /// the stack's byte capacity.
     ro_data: Vec<u8>,
     ro_base: u64,
-    /// RW data blob; its first byte is linked at `rw_base`.
+    /// RW data blob, its initialized part; its first byte is linked at
+    /// `rw_base`.
     rw_data: Vec<u8>,
     rw_base: u64,
     /// Lowest rw section vaddr (real data starts here; `[rw_base, rw_min)`
     /// is zero padding).
     rw_min: u64,
-    /// Stack byte capacity (= the page-floored lowest ro vaddr, min 16 KiB).
-    stack_size: u32,
+    /// The rw span from `rw_base`: zeros past `rw_data`.
+    rw_len: u64,
     /// Zeroed heap pages beyond `rw_data`.
     heap_pages: u32,
+    /// Each function's first PVM instruction, and its name, by offset.
+    functions: crate::Functions,
+    /// Each `ecalli` emitted, by the address of its `ecall`, and its id.
+    pub(crate) host_calls: Vec<(u64, u32)>,
 }
 
-/// Transpile an rv64em ELF into a JAR capability manifest PVM blob.
-pub fn link_elf(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
-    link_elf_with_argument_pages(elf_data, 1)
-}
-
-/// Transpile an ELF with an explicitly sized ordinary slot-0 argument DATA
-/// capability. The default [`link_elf`] remains one page.
-pub fn link_elf_with_argument_pages(
-    elf_data: &[u8],
-    argument_pages: u32,
-) -> Result<Vec<u8>, TranspileError> {
-    if argument_pages == 0 {
-        return Err(TranspileError::InvalidSection(
-            "argument DATA capability must contain at least one page".into(),
-        ));
+impl TranspiledElf {
+    /// The code, its bitmask and its jump table.
+    pub(crate) fn code(&self) -> (&[u8], &[u8], &[u32]) {
+        (&self.code, &self.bitmask, &self.jump_table)
     }
-    let t = transpile_elf(elf_data)?;
-    Ok(emitter::build_service_program_with_args_pages(
-        &t.code,
-        &t.bitmask,
-        &t.jump_table,
-        &t.ro_data,
-        &t.rw_data,
-        t.stack_size / 4096,
-        t.heap_pages,
-        t.heap_pages,
-        argument_pages,
-    ))
-}
-
-/// `Z_Z` — the GP initialization zone size (2¹⁶).
-const Z_Z: u64 = vos_pvm::PVM_ZONE_SIZE as u64;
-
-/// Round `x` up to a multiple of the zone size `Z_Z`.
-fn zone_round(x: u64) -> u64 {
-    x.div_ceil(Z_Z) * Z_Z
 }
 
 /// Transpile an rv64em ELF into a **GP standard-program (SPI) blob** — the
 /// format `vos_pvm::spi::parse_standard_program` consumes and
-/// `vos_pvm::refine::execute_with` runs. Same translation as [`link_elf`]
-/// (identical code, bitmask, and jump table; entry prologue at IC 0 =
-/// refine, IC 5 = accumulate-or-trap), re-containered per GP Appendix A.
+/// `vos_pvm::refine::execute_with` runs. The entry prologue places refine at
+/// IC 0 and accumulate (or a trap) at IC 5.
 ///
-/// Header-field derivation (manifest ↔ SPI mapping):
+/// Header-field derivation:
 ///
-/// - **`s` (stack size, `E₃`)** = the linker's `stack_size` = the manifest's
-///   `stack_pages × 4096` (the page-floored lowest ro section vaddr, minimum
-///   16 KiB). The byte capacity is identical in both containers; only the
-///   placement differs — the manifest maps the stack at `[0, s)` with
-///   `φ1 = s`, while `StandardProgram::layout` maps `page_round(s)` bytes
-///   just below the argument zone with `φ1 = 0xFEFE_0000`. `φ1` is
-///   host-installed in both, so SP-relative guest code is placement-blind.
-/// - **`z` (heap pages, `E₂`)** = the manifest's `heap_pages`. The layout
-///   maps `page_round(|w| + z·4096)` read-write bytes, which equals the
-///   manifest's separate rw + heap caps page-for-page.
+/// - **`s` (stack size, `E₃`)** = the page-floored lowest ro section vaddr,
+///   or 16 KiB without one. `StandardProgram::layout` maps `page_round(s)` bytes
+///   just below the argument zone with `φ1 = 0xFEFE_0000`; guest code is
+///   SP-relative, so placement needs no linker cooperation.
+/// - **`z` (heap pages, `E₂`)** includes every trailing all-zero read-write
+///   page (normally `.bss`). Standard programs distinguish initialized bytes
+///   from zero pages directly, so encoding those pages in `w` would only
+///   inflate the artifact.
 /// - **`o` (read-only data)** = the ro blob **re-based to the GP ro base
 ///   `Z_Z` = `0x1_0000`**: zero-prefix padding covers `[Z_Z, ro_base)`. An
 ///   ELF whose ro sections are linked below `Z_Z` is rejected — its embedded
@@ -194,101 +217,54 @@ fn zone_round(x: u64) -> u64 {
 /// placement need no linker cooperation (code addresses are translated;
 /// the stack is SP-relative).
 pub fn link_elf_spi(elf_data: &[u8]) -> Result<Vec<u8>, TranspileError> {
-    let t = transpile_elf(elf_data)?;
-
-    // Re-base the ro blob from its linked base to the GP ro base Z_Z.
-    let ro_data = if t.ro_data.is_empty() {
-        Vec::new()
-    } else if t.ro_base >= Z_Z {
-        let mut v = vec![0u8; (t.ro_base - Z_Z) as usize];
-        v.extend_from_slice(&t.ro_data);
-        v
-    } else {
-        return Err(TranspileError::InvalidSection(format!(
-            "SPI: read-only data linked at {:#x}, below the GP read-only base {Z_Z:#x}",
-            t.ro_base,
-        )));
-    };
-
-    // Re-base the rw blob to the GP rw base 2·Z_Z + zone_round(|o|).
-    let rw_spi_base = 2 * Z_Z + zone_round(ro_data.len() as u64);
-    let rw_data = if t.rw_data.is_empty() {
-        Vec::new()
-    } else if t.rw_min < rw_spi_base {
-        return Err(TranspileError::InvalidSection(format!(
-            "SPI: read-write data linked at {:#x}, below the GP read-write base {rw_spi_base:#x} \
-             (= 2 * Z_Z + zone_round(ro_size))",
-            t.rw_min,
-        )));
-    } else if t.rw_base >= rw_spi_base {
-        let mut v = vec![0u8; (t.rw_base - rw_spi_base) as usize];
-        v.extend_from_slice(&t.rw_data);
-        v
-    } else {
-        // rw_base < rw_spi_base <= rw_min: everything stripped is the blob's
-        // own leading zero padding, so the data keeps its linked vaddr.
-        t.rw_data[(rw_spi_base - t.rw_base) as usize..].to_vec()
-    };
-
-    // Wire-width guards: |o|, |w|, s are E₃-encoded; z is E₂-encoded.
-    for (what, len) in [("read-only", ro_data.len()), ("read-write", rw_data.len())] {
-        if len >= 1 << 24 {
-            return Err(TranspileError::InvalidSection(format!(
-                "SPI: {what} data spans {len:#x} bytes, exceeding the E3 field width",
-            )));
-        }
-    }
-    if t.stack_size >= 1 << 24 {
-        return Err(TranspileError::InvalidSection(format!(
-            "SPI: stack size {:#x} exceeds the E3 field width",
-            t.stack_size,
-        )));
-    }
-    let heap_pages = u16::try_from(t.heap_pages).map_err(|_| {
-        TranspileError::InvalidSection(format!(
-            "SPI: heap page count {} exceeds the E2 field width",
-            t.heap_pages,
-        ))
-    })?;
-
-    let blob = crate::spi::build_spi_blob(
-        &ro_data,
-        &rw_data,
-        heap_pages,
-        t.stack_size,
-        &t.code,
-        &t.bitmask,
-        &t.jump_table,
-    );
-
-    // Fail-early self-check: the blob must re-parse and its layout must fit
-    // the 32-bit guest address space (GP eq A.42's total-size guard).
-    let prog = vos_pvm::spi::parse_standard_program(&blob).ok_or_else(|| {
-        TranspileError::InvalidSection("SPI: emitted blob does not re-parse".into())
-    })?;
-    prog.layout(&[]).ok_or_else(|| {
-        TranspileError::InvalidSection(
-            "SPI: memory layout exceeds the 32-bit guest address space".into(),
-        )
-    })?;
-
-    Ok(blob)
+    spi_blob(transpile_with(&parse_linked_elf(elf_data)?, Link::Whole)?)
 }
 
-/// The shared ELF → GP-encoded-program translation both containers build on.
-fn transpile_elf(elf_data: &[u8]) -> Result<TranspiledElf, TranspileError> {
-    let elf = parse_linked_elf(elf_data)?;
-    let mut ctx = TranslationContext::new(elf.is_64bit);
+/// [`link_elf_spi`], and each function's first PVM instruction in the
+/// blob's code, with its name (demangled), by offset: what a profiler
+/// names compiled code by.
+pub fn link_elf_spi_with_symbols(
+    elf_data: &[u8],
+) -> Result<(Vec<u8>, crate::Functions), TranspileError> {
+    let mut transpiled = transpile_with(&parse_linked_elf(elf_data)?, Link::Named)?;
+    let functions = std::mem::take(&mut transpiled.functions);
+    Ok((spi_blob(transpiled)?, functions))
+}
+
+/// A djump address no jump table reaches, even, and not the halt address:
+/// jumping to it panics.
+pub(crate) const PRUNED: u32 = u32::MAX - 1;
+
+/// How a parsed ELF is linked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Link {
+    /// Whole, as [`link_elf_spi`] links it.
+    Whole,
+    /// Whole, and each function's place named for a profiler.
+    Named,
+    /// A kernel, its code pruned to what its entry reaches: a trap follows
+    /// each of its code sections, so none falls into another, a branch to
+    /// code never translated reaches a trap, and a code pointer in its data
+    /// to such code becomes [`PRUNED`].
+    Kernel,
+}
+
+/// Translate a parsed ELF's code into PVM code with the GP entry prologue,
+/// and rewrite its data's code pointers, as `link` links it: the program,
+/// with each `ecalli` it emitted, by the address of its `ecall`.
+pub(crate) fn transpile_with(elf: &LinkedElf, link: Link) -> Result<TranspiledElf, TranspileError> {
+    let kernel = link == Link::Kernel;
+    let mut ctx = TranslationContext::default();
     ctx.code_ranges = elf.code_ranges.clone();
+    ctx.trap_unresolved = kernel;
 
     // Emit the two-slot GP entry prologue. ICs are byte offsets into the code,
     // and a plain jump (opcode 40 + imm32) is exactly 5 bytes, so the two
     // jumps land at IC 0 and IC 5 respectively — the entry points a GP host
     // selects by starting the instruction counter at 0 (refine / is-authorized)
-    // or 5 (accumulate). SP is no longer initialized here: the host owns it
-    // (kernel installs φ[1]=stack_top from the blob's container metadata). Each
-    // jump ends its basic block, so IC 5 begins a fresh block. Both fixups are
-    // resolved after translation in apply_fixups() (RISC-V vaddr → PVM PC).
+    // or 5 (accumulate). SP is the host's (φ1 = stack top). Each jump ends
+    // its basic block, so IC 5 begins a fresh block. Both fixups are resolved
+    // after translation in apply_fixups() (RISC-V vaddr → PVM PC).
     //
     // IC 0 → refine body = the ELF entry point (e_entry / _start).
     ctx.emit_jump(elf.entry_vaddr);
@@ -302,28 +278,50 @@ fn transpile_elf(elf_data: &[u8]) -> Result<TranspiledElf, TranspileError> {
     // through into the refine body).
     match elf.accumulate_vaddr {
         Some(vaddr) => ctx.emit_jump(vaddr),
-        None => {
-            ctx.emit_inst(0); // trap
-        }
+        None => ctx.emit_op(Opcode::Trap),
     }
 
     for (_file_off, vaddr, data) in &elf.code_sections {
-        translate_section_linked(&mut ctx, data, *vaddr, &elf)?;
+        translate_section_linked(&mut ctx, data, *vaddr, elf)?;
+        if kernel {
+            ctx.emit_op(Opcode::Trap);
+        }
     }
-    ctx.apply_fixups();
+    ctx.apply_fixups()?;
 
     let mut ro_data = elf.ro_data.clone();
     let mut rw_data = elf.rw_data.clone();
-    rewrite_data_code_ptrs(&elf, &mut ctx, &mut ro_data, &mut rw_data);
+    let pruned = kernel.then_some(PRUNED);
+    rewrite_data_code_ptrs(elf, &mut ctx, &mut ro_data, &mut rw_data, pruned);
 
     crate::peephole_fuse_load_imm_alu(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
     crate::peephole_fuse_load_imm_memory(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
-    crate::peephole_eliminate_dead_load_imm(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
+    // The pass may insert instructions: the functions' offsets move with it.
+    let mut moved: Option<Vec<u32>> = None;
     crate::ensure_branch_targets_are_block_starts(
         &mut ctx.code,
         &mut ctx.bitmask,
         &mut ctx.jump_table,
+        |offsets| moved = Some(offsets.to_vec()),
     );
+    let mut functions: Vec<(u32, String)> = match link {
+        Link::Named => elf
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.kind == STT_FUNC)
+            .filter_map(|symbol| {
+                let name = name_at(&elf.names, symbol.name);
+                if name.is_empty() {
+                    return None;
+                }
+                let at = *ctx.address_map.get(&symbol.value)?;
+                let at = moved.as_ref().map_or(at, |offsets| offsets[at as usize]);
+                Some((at, format!("{:#}", rustc_demangle::demangle(name))))
+            })
+            .collect(),
+        Link::Whole | Link::Kernel => Vec::new(),
+    };
+    functions.sort();
 
     Ok(TranspiledElf {
         code: ctx.code,
@@ -334,672 +332,61 @@ fn transpile_elf(elf_data: &[u8]) -> Result<TranspiledElf, TranspileError> {
         rw_data,
         rw_base: elf.rw_base,
         rw_min: elf.rw_min,
-        stack_size: elf.stack_size,
+        rw_len: elf.rw_len,
         heap_pages: elf.heap_pages,
+        functions,
+        host_calls: ctx.host_calls,
     })
 }
 
-/// Parse ELF with full relocation info.
-fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
-    if data.len() < 64 || data[0..4] != [0x7F, b'E', b'L', b'F'] {
-        return Err(TranspileError::ElfParse("not an ELF file".into()));
-    }
-
-    let is_64bit = match data[4] {
-        1 => false,
-        2 => true,
-        _ => return Err(TranspileError::ElfParse("unsupported ELF class".into())),
-    };
-
-    if !is_64bit {
-        return Err(TranspileError::ElfParse(
-            "linker requires 64-bit ELF (rv64em)".into(),
-        ));
-    }
-
-    // ELF64 header fields
-    let e_entry = u64::from_le_bytes(data[24..32].try_into().unwrap());
-    let e_shoff = u64::from_le_bytes(data[40..48].try_into().unwrap()) as usize;
-    let e_shentsize = u16::from_le_bytes(data[58..60].try_into().unwrap()) as usize;
-    let e_shnum = u16::from_le_bytes(data[60..62].try_into().unwrap()) as usize;
-    let e_shstrndx = u16::from_le_bytes(data[62..64].try_into().unwrap()) as usize;
-
-    // Section name string table
-    let strtab = {
-        let sh = e_shoff + e_shstrndx * e_shentsize;
-        let off = u64::from_le_bytes(data[sh + 24..sh + 32].try_into().unwrap()) as usize;
-        let sz = u64::from_le_bytes(data[sh + 32..sh + 40].try_into().unwrap()) as usize;
-        &data[off..off + sz]
-    };
-
-    let get_name = |name_off: usize| -> &str {
-        if name_off >= strtab.len() {
-            return "";
-        }
-        let end = strtab[name_off..].iter().position(|&b| b == 0).unwrap_or(0);
-        std::str::from_utf8(&strtab[name_off..name_off + end]).unwrap_or("")
-    };
-
-    // First pass: collect section metadata
-    struct SectionInfo {
-        name_off: usize,
-        sh_type: u32,
-        flags: u64,
-        addr: u64,
-        file_off: usize,
-        size: usize,
-        link: usize,
-        _info: usize,
-    }
-
-    let mut sections = Vec::with_capacity(e_shnum);
-    for i in 0..e_shnum {
-        let sh = e_shoff + i * e_shentsize;
-        if sh + e_shentsize > data.len() {
-            break;
-        }
-        sections.push(SectionInfo {
-            name_off: u32::from_le_bytes(data[sh..sh + 4].try_into().unwrap()) as usize,
-            sh_type: u32::from_le_bytes(data[sh + 4..sh + 8].try_into().unwrap()),
-            flags: u64::from_le_bytes(data[sh + 8..sh + 16].try_into().unwrap()),
-            addr: u64::from_le_bytes(data[sh + 16..sh + 24].try_into().unwrap()),
-            file_off: u64::from_le_bytes(data[sh + 24..sh + 32].try_into().unwrap()) as usize,
-            size: u64::from_le_bytes(data[sh + 32..sh + 40].try_into().unwrap()) as usize,
-            link: u32::from_le_bytes(data[sh + 40..sh + 44].try_into().unwrap()) as usize,
-            _info: u32::from_le_bytes(data[sh + 44..sh + 48].try_into().unwrap()) as usize,
-        });
-    }
-
-    // Collect code sections, ro sections, rw sections
-    let mut code_sections = Vec::new();
-    let mut ro_sections: Vec<(u64, usize, Vec<u8>)> = Vec::new();
-    let mut rw_sections: Vec<(u64, usize, Option<Vec<u8>>)> = Vec::new();
-    let mut rela_section_indices = Vec::new();
-    let mut symtab_idx = None;
-
-    for (i, s) in sections.iter().enumerate() {
-        let name = get_name(s.name_off);
-        let is_alloc = s.flags & 2 != 0;
-        let is_exec = s.flags & 4 != 0;
-        let is_write = s.flags & 1 != 0;
-
-        if s.sh_type == 2 {
-            // SYMTAB
-            symtab_idx = Some(i);
-        }
-        if s.sh_type == 4 {
-            // RELA
-            rela_section_indices.push(i);
-        }
-        if !is_alloc || s.sh_type == 0 {
-            continue;
-        }
-
-        if is_exec && s.file_off + s.size <= data.len() {
-            code_sections.push((
-                s.file_off as u64,
-                s.addr,
-                data[s.file_off..s.file_off + s.size].to_vec(),
-            ));
-        } else if !is_exec
-            && (name.starts_with(".rodata")
-                || name == ".srodata"
-                || name.starts_with(".data.rel.ro"))
-        {
-            if s.file_off + s.size <= data.len() {
-                ro_sections.push((
-                    s.addr,
-                    s.size,
-                    data[s.file_off..s.file_off + s.size].to_vec(),
-                ));
-            }
-        } else if is_write {
-            if s.sh_type == 8 {
-                // NOBITS (.bss)
-                rw_sections.push((s.addr, s.size, None));
-            } else if s.file_off + s.size <= data.len() {
-                rw_sections.push((
-                    s.addr,
-                    s.size,
-                    Some(data[s.file_off..s.file_off + s.size].to_vec()),
-                ));
-            }
-        }
-    }
-
-    // Parse symbol table
-    let mut symbols_by_idx: Vec<(String, u64)> = Vec::new();
-    if let Some(si) = symtab_idx {
-        let s = &sections[si];
-        // Get associated string table
-        let sym_strtab = {
-            let ss = &sections[s.link];
-            &data[ss.file_off..ss.file_off + ss.size]
-        };
-        // ELF64 symbol = 24 bytes
-        let count = s.size / 24;
-        for j in 0..count {
-            let off = s.file_off + j * 24;
-            if off + 24 > data.len() {
-                break;
-            }
-            let st_name = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
-            let st_value = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
-
-            let name = {
-                if st_name < sym_strtab.len() {
-                    let end = sym_strtab[st_name..]
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(0);
-                    std::str::from_utf8(&sym_strtab[st_name..st_name + end]).unwrap_or("")
-                } else {
-                    ""
-                }
-            };
-
-            symbols_by_idx.push((name.to_string(), st_value));
-        }
-    }
-
-    // Resolve the exported `accumulate` entry symbol (the GP IC-5 slot). A
-    // defined symbol has a nonzero code vaddr; an undefined reference (value 0)
-    // is treated as absent so the blob stays refine-only (IC 5 → trap).
-    let accumulate_vaddr = symbols_by_idx
-        .iter()
-        .find(|(name, value)| name == "accumulate" && *value != 0)
-        .map(|(_, value)| *value);
-
-    // Compute PVM memory layout
-    // PVM linear memory: [stack: 0..s) [ro: s..s+|o|) [rw: s+P(|o|)..] [heap...]
-    // We set stack_size = minimum power-of-2 page boundary that contains all ro section addrs.
-    let ro_min = ro_sections.iter().map(|(a, _, _)| *a).min().unwrap_or(0);
-    let ro_max = ro_sections
-        .iter()
-        .map(|(a, sz, _)| *a + *sz as u64)
-        .max()
-        .unwrap_or(0);
-
-    // Round ro_min down to page boundary for stack_size.
-    // Minimum 4 pages (16KB) so the stack is usable even without rodata.
-    let page_size: u64 = 4096;
-    let stack_size = if ro_min > 0 {
-        (ro_min / page_size) * page_size
-    } else {
-        4 * page_size
-    };
-
-    // Build ro_data blob: section data placed at (section_addr - stack_size) offset
-    let ro_blob_size = if ro_max > stack_size {
-        (ro_max - stack_size) as usize
-    } else {
-        0
-    };
-    let mut ro_data = vec![0u8; ro_blob_size];
-    for (addr, sz, d) in &ro_sections {
-        let off = (*addr - stack_size) as usize;
-        if off + sz <= ro_data.len() {
-            ro_data[off..off + sz].copy_from_slice(d);
-        }
-    }
-
-    // RW data: placed after ro_data (with page rounding)
-    let ro_pages = ro_data.len().div_ceil(page_size as usize);
-    let rw_pvm_base = stack_size + (ro_pages as u64 * page_size);
-    let mut rw_data = Vec::new();
-    let mut rw_base = rw_pvm_base;
-    let mut rw_min = rw_pvm_base;
-    if !rw_sections.is_empty() {
-        rw_min = rw_sections.iter().map(|(a, _, _)| *a).min().unwrap();
-        let rw_max = rw_sections
+/// Parse ELF with full relocation info. Every field the bytes claim is
+/// checked against the file and [`elf::limits`]: a malformed ELF is refused,
+/// never read out of bounds.
+pub(crate) fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
+    let elf = sections(data)?;
+    let layout = layout(&elf.ro, &elf.rw)?;
+    // Code address ranges for detecting code pointers, sorted and merged.
+    let code_ranges = merge_ranges(
+        elf.code
             .iter()
-            .map(|(a, sz, _)| *a + *sz as u64)
-            .max()
-            .unwrap();
-        rw_base = rw_pvm_base.min(rw_min);
-        let rw_blob_size = (rw_max - rw_base) as usize;
-        rw_data = vec![0u8; rw_blob_size];
-        for (addr, sz, d) in &rw_sections {
-            let off = (*addr - rw_base) as usize;
-            if let Some(d) = d
-                && off + sz <= rw_data.len()
-            {
-                rw_data[off..off + sz].copy_from_slice(d);
-            }
-        }
-    }
-
-    // Parse relocations in two passes:
-    // Pass 1: collect HI20 targets and CALL_PLT targets
-    // Pass 2: resolve LO12 by looking up their paired HI20
-    let mut hi20_targets: HashMap<u64, u64> = HashMap::new();
-    let mut lo12_targets: HashMap<u64, u64> = HashMap::new();
-    let mut call_targets: HashMap<u64, u64> = HashMap::new();
-
-    // Temporary: collect LO12 entries for pass 2
-    let mut lo12_entries: Vec<(u64, u64)> = Vec::new(); // (lo12_addr, hi20_addr)
-    let mut abs64_relocs: Vec<(u64, u64, u8)> = Vec::new(); // (offset, target, entry_size)
-    let mut sub32_relocs: Vec<(u64, u64)> = Vec::new();
-    // Code address ranges for detecting code pointers
-    let code_ranges: Vec<(u64, u64)> = code_sections
-        .iter()
-        .map(|(_, vaddr, data)| (*vaddr, *vaddr + data.len() as u64))
-        .collect();
-
-    for &ri in &rela_section_indices {
-        let rs = &sections[ri];
-        let count = rs.size / 24;
-        for j in 0..count {
-            let off = rs.file_off + j * 24;
-            if off + 24 > data.len() {
-                break;
-            }
-            let r_offset = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-            let r_info = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
-            let r_addend = i64::from_le_bytes(data[off + 16..off + 24].try_into().unwrap());
-            let r_type = (r_info & 0xFFFFFFFF) as u32;
-            let r_sym = (r_info >> 32) as usize;
-
-            let rtype = match RelocType::from_raw(r_type) {
-                Some(t) => t,
-                None => continue,
-            };
-
-            let sym_value = if r_sym < symbols_by_idx.len() {
-                symbols_by_idx[r_sym].1
-            } else {
-                0
-            };
-
-            let target_addr = (sym_value as i64 + r_addend) as u64;
-
-            match rtype {
-                RelocType::Abs32 => {
-                    let is_code_ptr = code_ranges
-                        .iter()
-                        .any(|(lo, hi)| target_addr >= *lo && target_addr < *hi);
-                    if is_code_ptr {
-                        abs64_relocs.push((r_offset, target_addr, 4));
-                    }
-                }
-                RelocType::Abs64 => {
-                    let is_code_ptr = code_ranges
-                        .iter()
-                        .any(|(lo, hi)| target_addr >= *lo && target_addr < *hi);
-                    if is_code_ptr {
-                        abs64_relocs.push((r_offset, target_addr, 8));
-                    }
-                }
-                RelocType::Add32 => {
-                    let is_code_ptr = code_ranges
-                        .iter()
-                        .any(|(lo, hi)| target_addr >= *lo && target_addr < *hi);
-                    if is_code_ptr {
-                        abs64_relocs.push((r_offset, target_addr, 4));
-                    }
-                }
-                RelocType::Sub32 => {
-                    // R_RISCV_SUB32: the subtracted address (typically table base).
-                    sub32_relocs.push((r_offset, target_addr));
-                }
-                RelocType::CallPlt => {
-                    call_targets.insert(r_offset, target_addr);
-                }
-                RelocType::PcrelHi20 => {
-                    // target_addr is the resolved data/function address
-                    hi20_targets.insert(r_offset, target_addr);
-                }
-                RelocType::PcrelLo12I | RelocType::PcrelLo12S => {
-                    // sym_value is the address of the paired HI20 instruction.
-                    // r_offset is the address of this LO12 instruction.
-                    lo12_entries.push((r_offset, sym_value));
-                }
-            }
-        }
-    }
-
-    // Pass 2: resolve LO12 targets by looking up paired HI20
-    for (lo12_addr, hi20_addr) in lo12_entries {
-        if let Some(&data_addr) = hi20_targets.get(&hi20_addr) {
-            lo12_targets.insert(lo12_addr, data_addr);
-        }
-    }
-
-    let heap_pages = 16u32; // 64KB heap
-
-    Ok(LinkedElf {
-        is_64bit,
-        code_sections,
-        ro_data,
-        ro_base: stack_size,
-        rw_data,
-        rw_base,
-        rw_min,
-        stack_size: stack_size as u32,
-        heap_pages,
-        hi20_targets,
-        lo12_targets,
-        call_targets,
-        abs_code_ptrs: abs64_relocs,
-        sub32_relocs,
+            .map(|(_, vaddr, data)| (*vaddr, *vaddr + data.len() as u64))
+            .collect(),
+    );
+    let relocations = relocations(data, &elf, &code_ranges)?;
+    let mut linked = LinkedElf {
+        code_sections: elf.code,
+        ro_data: layout.ro_data,
+        ro_base: layout.ro_base,
+        rw_data: layout.rw_data,
+        rw_base: layout.rw_base,
+        rw_min: layout.rw_min,
+        rw_len: layout.rw_len,
+        heap_pages: HEAP_PAGES,
+        symbols: elf.symbols,
+        names: elf.names,
+        data_relocs: relocations.data_relocs,
+        symbol_refs: relocations.symbol_refs,
+        relocations: relocations.count,
+        unknown_relocation: relocations.unknown,
+        schema: elf.schema,
+        heap: elf.heap,
+        hi20_targets: relocations.hi20_targets,
+        lo12_sites: relocations.lo12_sites,
+        call_targets: relocations.call_targets,
+        abs_code_ptrs: relocations.abs_code_ptrs,
+        sub32_relocs: relocations.sub32_relocs,
+        data_relocation_ranges: relocations.ranges,
         code_ranges,
-        entry_vaddr: e_entry,
-        accumulate_vaddr,
-    })
-}
-
-/// Translate a code section with relocation awareness.
-/// Rewrite code pointers in data sections (LLVM switch/jump tables, vtables).
-///
-/// Detects code pointers via:
-/// 1. R_RISCV_32/64 absolute relocations targeting code sections
-/// 2. R_RISCV_SUB32 relocations (relative jump table entries: value = target - table_base)
-/// 3. Heuristic scan for 8-byte values in rodata that match code addresses
-///
-/// Creates PVM jump table entries for each target and rewrites the data
-/// so that the loaded values are valid PVM djump addresses.
-fn rewrite_data_code_ptrs(
-    elf: &LinkedElf,
-    ctx: &mut TranslationContext,
-    ro_data: &mut [u8],
-    _rw_data: &mut [u8],
-) {
-    let ro_base = elf.stack_size as u64;
-    let is_code_addr = |addr: u64| -> bool {
-        elf.code_ranges
-            .iter()
-            .any(|(lo, hi)| addr >= *lo && addr < *hi)
+        control_flow_targets: HashSet::new(),
+        entry_vaddr: elf.entry,
+        accumulate_vaddr: elf.accumulate,
     };
-
-    struct Entry {
-        data_vaddr: u64,
-        rv_target: u64,
-        size: u8,
-        table_base_rv: Option<u64>,
-    }
-    let mut entries: Vec<Entry> = Vec::new();
-
-    // From absolute relocations (R_RISCV_32/64/ADD32).
-    // If a matching SUB32 exists at the same offset, this is a relative entry
-    // (ADD32/SUB32 pair for jump tables). Use the SUB32 target as table base.
-    for &(vaddr, target, size) in &elf.abs_code_ptrs {
-        let table_base = elf
-            .sub32_relocs
-            .iter()
-            .find(|(v, _)| *v == vaddr)
-            .map(|(_, base)| *base);
-        entries.push(Entry {
-            data_vaddr: vaddr,
-            rv_target: target,
-            size,
-            table_base_rv: table_base,
-        });
-    }
-
-    // SUB32 entries without matching ADD32 (shouldn't happen, but handle gracefully).
-    for &(data_vaddr, base_addr) in &elf.sub32_relocs {
-        if entries.iter().any(|e| e.data_vaddr == data_vaddr) {
-            continue; // Already handled via ADD32 pairing above
-        }
-        if data_vaddr >= ro_base {
-            let off = (data_vaddr - ro_base) as usize;
-            if off + 4 <= ro_data.len() {
-                let val = i32::from_le_bytes(ro_data[off..off + 4].try_into().unwrap());
-                let target = (base_addr as i64 + val as i64) as u64;
-                if is_code_addr(target) {
-                    entries.push(Entry {
-                        data_vaddr,
-                        rv_target: target,
-                        size: 4,
-                        table_base_rv: Some(base_addr),
-                    });
-                }
-            }
-        }
-    }
-
-    // Heuristic: 8-byte values in rodata that are code addresses
-    {
-        let mut off = 0;
-        while off + 8 <= ro_data.len() {
-            let val = u64::from_le_bytes(ro_data[off..off + 8].try_into().unwrap());
-            if is_code_addr(val) {
-                let vaddr = ro_base + off as u64;
-                if !entries.iter().any(|e| e.data_vaddr == vaddr) {
-                    entries.push(Entry {
-                        data_vaddr: vaddr,
-                        rv_target: val,
-                        size: 8,
-                        table_base_rv: None,
-                    });
-                }
-            }
-            off += 8;
-        }
-    }
-
-    if entries.is_empty() {
-        return;
-    }
-
-    let targets: std::collections::HashSet<u64> = entries.iter().map(|e| e.rv_target).collect();
-    let rv_to_jt = ctx.build_function_pointer_map(&targets);
-
-    for entry in &entries {
-        if let Some(&jt_addr) = rv_to_jt.get(&entry.rv_target)
-            && entry.data_vaddr >= ro_base
-            && (entry.data_vaddr - ro_base) as usize + entry.size as usize <= ro_data.len()
-        {
-            let off = (entry.data_vaddr - ro_base) as usize;
-            match (entry.size, entry.table_base_rv) {
-                (8, _) => {
-                    ro_data[off..off + 8].copy_from_slice(&(jt_addr as u64).to_le_bytes());
-                }
-                (4, None) => {
-                    ro_data[off..off + 4].copy_from_slice(&jt_addr.to_le_bytes());
-                }
-                (4, Some(rv_base)) => {
-                    // Relative entry: code does `lw off, table(idx); add target, off, base; jr target`.
-                    // base register holds the PVM mapping of rv_base (from load_imm).
-                    // new_val + pvm_base = jt_addr → new_val = jt_addr - pvm_base.
-                    let pvm_base = ctx
-                        .address_map
-                        .get(&rv_base)
-                        .copied()
-                        .unwrap_or(rv_base as u32);
-                    let new_val = (jt_addr as i64 - pvm_base as i64) as i32;
-                    ro_data[off..off + 4].copy_from_slice(&new_val.to_le_bytes());
-                }
-                _ => {}
-            }
-        }
-    }
+    linked.control_flow_targets = control_flow_targets(&linked, &elf.values);
+    Ok(linked)
 }
 
-fn translate_section_linked(
-    ctx: &mut TranslationContext,
-    data: &[u8],
-    base_addr: u64,
-    elf: &LinkedElf,
-) -> Result<(), TranspileError> {
-    let mut offset = 0;
-    while offset < data.len() {
-        let rv_addr = base_addr + offset as u64;
-        ctx.address_map.insert(rv_addr, ctx.code.len() as u32);
+#[cfg(test)]
+mod tests;
 
-        if offset + 4 > data.len() {
-            break;
-        }
-
-        let inst = u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]);
-
-        // Skip non-instruction bytes
-        if inst & 0x3 != 0x3 {
-            // Compressed instruction — not supported for rv64em
-            return Err(TranspileError::UnsupportedInstruction {
-                offset: rv_addr as usize,
-                detail: "compressed instruction in rv64em ELF".into(),
-            });
-        }
-
-        let opcode = inst & 0x7f;
-
-        // Check for relocation overrides
-        if opcode == 0x17 {
-            // AUIPC
-            let rd = ((inst >> 7) & 0x1f) as u8;
-
-            if let Some(&target_addr) = elf.call_targets.get(&rv_addr) {
-                // CALL_PLT: AUIPC+JALR pair for function call
-                // Peek at JALR to get link register
-                if offset + 8 <= data.len() {
-                    let jalr = u32::from_le_bytes([
-                        data[offset + 4],
-                        data[offset + 5],
-                        data[offset + 6],
-                        data[offset + 7],
-                    ]);
-                    let jalr_rd = ((jalr >> 7) & 0x1f) as u8;
-                    let ret_addr = rv_addr + 8;
-
-                    // A call is not a load_imm-fusing instruction. `translate_one`
-                    // clears a stale `pending_load_imm` for any opcode that can't
-                    // consume it, but this CALL_PLT path bypasses `translate_one`.
-                    // Clearing it here is essential: otherwise a `pending_load_imm`
-                    // left by a preceding PCREL (AUIPC+ADDI) survives across the
-                    // emitted call, and the next fusable instruction (branch, load,
-                    // store, ALU) "undoes" the fusion back to the load_imm's
-                    // position — truncating the call's bytes and desyncing every
-                    // address_map entry past it (a branch target then lands
-                    // mid-instruction → a PVM trap). The load_imm is already
-                    // emitted, so dropping the tracking simply forgoes fusion.
-                    ctx.pending_load_imm = None;
-                    // Fused load_imm_jump: set return address and jump in one instruction
-                    ctx.emit_call(jalr_rd, ret_addr, target_addr)?;
-                    // Map the JALR address too
-                    ctx.address_map.insert(rv_addr + 4, ctx.code.len() as u32);
-                    offset += 8; // skip both AUIPC and JALR
-                    continue;
-                }
-            }
-
-            if let Some(&target_addr) = elf.hi20_targets.get(&rv_addr) {
-                // PCREL_HI20: AUIPC for data reference.
-                // Peek ahead: if the next instruction is a paired LO12 ADDI (nop),
-                // skip it and set pending_load_imm to enable cascading fusion
-                // with the instruction after (load_ind, store_ind, ALU, branch).
-                let next_addr = rv_addr + 4;
-                if offset + 8 <= data.len()
-                    && let Some(&_) = elf.lo12_targets.get(&next_addr)
-                {
-                    let next_inst = u32::from_le_bytes([
-                        data[offset + 4],
-                        data[offset + 5],
-                        data[offset + 6],
-                        data[offset + 7],
-                    ]);
-                    let next_opcode = next_inst & 0x7f;
-                    let next_funct3 = (next_inst >> 12) & 0x7;
-                    let next_rd = ((next_inst >> 7) & 0x1f) as u8;
-                    let next_rs1 = ((next_inst >> 15) & 0x1f) as u8;
-
-                    if next_opcode == 0x13 && next_funct3 == 0 && next_rs1 == rd {
-                        // LO12 ADDI: address is already complete from HI20.
-                        // Emit load_imm into the ADDI's destination register
-                        // and set pending_load_imm for cascading fusion.
-                        let dest = if next_rd != 0 { next_rd } else { rd };
-                        let pos = ctx.code.len();
-                        // If target is a code address (function pointer), load
-                        // a jump table address instead of the raw RISC-V address.
-                        let load_val = if ctx.is_code_addr(target_addr) {
-                            let jt_idx = ctx.jump_table.len();
-                            ctx.jump_table.push(0);
-                            ctx.return_fixups.push((jt_idx, target_addr));
-                            ((jt_idx + 1) * 2) as i64
-                        } else {
-                            target_addr as i64
-                        };
-                        ctx.emit_load_imm(dest, load_val)?;
-                        ctx.pending_load_imm = Some((dest, load_val, pos));
-                        ctx.address_map.insert(next_addr, ctx.code.len() as u32);
-                        offset += 8; // skip both AUIPC and ADDI
-                        continue;
-                    }
-                }
-
-                // No paired LO12 ADDI next — emit load_imm with pending tracking.
-                // This enables fusion with the next load/store/ALU/branch via
-                // pending_load_imm even when the LO12 is a LOAD or STORE directly.
-                let pos = ctx.code.len();
-                // If target is a code address, use jump table address.
-                let load_val = if ctx.is_code_addr(target_addr) {
-                    let jt_idx = ctx.jump_table.len();
-                    ctx.jump_table.push(0);
-                    ctx.return_fixups.push((jt_idx, target_addr));
-                    ((jt_idx + 1) * 2) as i64
-                } else {
-                    target_addr as i64
-                };
-                ctx.emit_load_imm(rd, load_val)?;
-                ctx.pending_load_imm = Some((rd, load_val, pos));
-                offset += 4;
-                continue;
-            }
-        }
-
-        // Check if this instruction has a PCREL_LO12 relocation.
-        // If so, the rs1 register already contains the full resolved address
-        // (loaded by the paired AUIPC/HI20 above). Override immediate to 0
-        // and route through translate_load/translate_store to enable fusion
-        // with the pending_load_imm set by the HI20 handler above.
-        if let Some(&_data_addr) = elf.lo12_targets.get(&rv_addr) {
-            let rd = ((inst >> 7) & 0x1f) as u8;
-            let rs1 = ((inst >> 15) & 0x1f) as u8;
-            let funct3 = (inst >> 12) & 0x7;
-
-            if opcode == 0x13 && funct3 == 0 {
-                // ADDI rd, rs1, lo12 → address already loaded by HI20.
-                // This path is reached when the HI20 peek-ahead didn't consume
-                // this ADDI (e.g., non-adjacent HI20/LO12 pair).
-                if rd != rs1 && rd != 0 {
-                    let pvm_src = ctx.require_reg(rs1)?;
-                    let pvm_dst = ctx.require_reg(rd)?;
-                    ctx.emit_inst(100); // move_reg
-                    ctx.emit_data(pvm_dst | (pvm_src << 4));
-                } else {
-                    ctx.emit_inst(1); // fallthrough
-                }
-                offset += 4;
-                continue;
-            } else if opcode == 0x03 {
-                // LOAD rd, lo12(rs1) → route through translate_load with imm=0.
-                // If pending_load_imm is set (from HI20), this fuses into a
-                // direct load (load_* rd, addr) — saving one instruction.
-                ctx.translate_load(funct3, rd, rs1, 0, rv_addr)?;
-                offset += 4;
-                continue;
-            } else if opcode == 0x23 {
-                // STORE rs2, lo12(rs1) → route through translate_store with imm=0.
-                let rs2 = ((inst >> 20) & 0x1f) as u8;
-                ctx.translate_store(funct3, rs1, rs2, 0)?;
-                offset += 4;
-                continue;
-            }
-            // Fallthrough: translate normally (shouldn't happen for well-formed code)
-        }
-
-        // Normal instruction translation
-        let consumed = ctx.translate_instruction(data, offset, base_addr)?;
-        offset += consumed;
-    }
-
-    // Flush any pending LUI/AUIPC at section boundary
-    ctx.flush_pending()?;
-
-    Ok(())
-}
+#[cfg(test)]
+mod differential;

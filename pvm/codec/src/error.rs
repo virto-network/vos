@@ -7,9 +7,18 @@ pub enum DecodeError {
     #[error("invalid discriminator byte: {0}")]
     InvalidDiscriminator(u8),
 
+    #[error("invalid code: {0}")]
+    InvalidCode(u32),
+
     #[error("sequence count {count} exceeds remaining bytes {remaining}")]
     SequenceTooLong { count: u32, remaining: u32 },
 
     #[error("set elements not in strictly ascending order")]
     NotSorted,
+
+    #[error("string is not UTF-8")]
+    NotUtf8,
+
+    #[error("bytes left over past the value")]
+    LeftOver,
 }

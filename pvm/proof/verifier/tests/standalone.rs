@@ -1,11 +1,60 @@
+use stwo::core::proof::StarkProof;
+use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
-// Memory is now flat_mem in Interpreter
-use vos_pvm::PVM_REGISTER_COUNT;
+use vos_pvm_proof::pcs::PcsStack;
+use vos_pvm_proof::poseidon2::{P2MerkleChannel, P2MerkleHasher};
 
 use vos_pvm_proof::core::tracing::TracingPvm;
-use vos_pvm_proof::{SideNote, prove};
-use vos_pvm_proof_verifier::verify_standalone;
+use vos_pvm_proof::{Proof, SideNote, prove};
+use vos_pvm_proof_verifier::{CommitmentHash, verify_standalone};
+
+/// The Poseidon2-M31 Stark proof of a `format::SEGMENT` proof.
+fn stark(proof: &mut Proof) -> &mut StarkProof<P2MerkleHasher> {
+    P2MerkleChannel::stark_mut(&mut proof.stark_proof).expect("a Poseidon2-M31 proof")
+}
+
+/// [`stark`], read only.
+fn stark_ref(proof: &Proof) -> &StarkProof<P2MerkleHasher> {
+    P2MerkleChannel::stark(&proof.stark_proof).expect("a Poseidon2-M31 proof")
+}
+
+fn assert_hostile_proof_rejected_without_panic(
+    label: &str,
+    proof: Proof,
+    preprocessed_commitment: CommitmentHash,
+    side_note: &SideNote,
+) {
+    let standalone = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        verify_standalone(proof.clone(), preprocessed_commitment)
+    }));
+    assert!(standalone.is_ok(), "standalone verifier panicked: {label}");
+    assert!(
+        standalone.unwrap().is_err(),
+        "standalone verifier accepted hostile proof: {label}"
+    );
+
+    let prover_side = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        vos_pvm_proof::verify(proof, side_note)
+    }));
+    assert!(
+        prover_side.is_ok(),
+        "prover-side verifier panicked: {label}"
+    );
+    assert!(
+        prover_side.unwrap().is_err(),
+        "prover-side verifier accepted hostile proof: {label}"
+    );
+}
+
+fn mutate_pcs_config(
+    mut proof: Proof,
+    mutate: impl FnOnce(&mut stwo::core::pcs::PcsConfig),
+) -> Proof {
+    mutate(&mut proof.pcs_config);
+    stark(&mut proof).0.config = proof.pcs_config;
+    proof
+}
 
 #[test]
 fn standalone_verify_add64() {
@@ -24,7 +73,6 @@ fn standalone_verify_add64() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000,
-        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
@@ -35,10 +83,241 @@ fn standalone_verify_add64() {
 
     // Extract the preprocessed commitment from the proof itself
     // (In production, this would be pre-computed from the program bytecode)
-    let preprocessed_commitment = proof.stark_proof.commitments[0];
+    let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
 
     // Verify using standalone verifier (no SideNote needed!)
-    verify_standalone(proof, preprocessed_commitment).expect("standalone verification failed");
+    verify_standalone(proof.clone(), preprocessed_commitment)
+        .expect("standalone verification failed");
+
+    // Hostile claimed logs below the 16-lane trace floor used to reach an
+    // unchecked `log_size - LOG_N_LANES` in both verifier funnels. They are
+    // structural errors, never panics.
+    for small_log in 1..=3 {
+        let mut hostile = proof.clone();
+        hostile.log_sizes.fill(small_log);
+        assert_hostile_proof_rejected_without_panic(
+            &format!("component log {small_log}"),
+            hostile,
+            preprocessed_commitment,
+            &side_note,
+        );
+    }
+
+    // Nested hostile shapes are rejected before either verifier enters Stwo.
+    let mut hostile = proof.clone();
+    let sample = stark_ref(&hostile).sampled_values[0][0][0];
+    stark(&mut hostile).0.sampled_values[0][0].resize(
+        vos_pvm_proof::proof::MAX_PROOF_SAMPLES_PER_COLUMN + 1,
+        sample,
+    );
+    assert_hostile_proof_rejected_without_panic(
+        "oversized OODS samples",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    hostile.claimed_sums[0] =
+        stwo::core::fields::qm31::SecureField::from_u32_unchecked(u32::MAX, 0, 0, 0);
+    assert_hostile_proof_rejected_without_panic(
+        "noncanonical claimed-sum limb",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    stark(&mut hostile).0.sampled_values[0][0][0] =
+        stwo::core::fields::qm31::SecureField::from_u32_unchecked(u32::MAX, 0, 0, 0);
+    assert_hostile_proof_rejected_without_panic(
+        "noncanonical OODS-sample limb",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    stark(&mut hostile).0.queried_values[0][0][0] =
+        stwo::core::fields::m31::BaseField::from_u32_unchecked(u32::MAX);
+    assert_hostile_proof_rejected_without_panic(
+        "noncanonical queried-value limb",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    stark(&mut hostile).0.commitments.clear();
+    assert_hostile_proof_rejected_without_panic(
+        "missing commitment trees",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    stark(&mut hostile).0.queried_values[0].pop();
+    assert_hostile_proof_rejected_without_panic(
+        "missing queried-value column",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    stark(&mut hostile).0.fri_proof.inner_layers.pop();
+    assert_hostile_proof_rejected_without_panic(
+        "missing FRI layer",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    stark(&mut hostile).0.config.pow_bits ^= 1;
+    assert_hostile_proof_rejected_without_panic(
+        "outer/embedded PCS mismatch",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    for (label, hostile) in [
+        (
+            "zero FRI blowup",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.log_blowup_factor = 0;
+            }),
+        ),
+        (
+            "oversized FRI blowup",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.log_blowup_factor = 17;
+            }),
+        ),
+        (
+            "oversized FRI last layer",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.log_last_layer_degree_bound = 11;
+            }),
+        ),
+        (
+            "zero FRI fold step",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.fold_step = 0;
+            }),
+        ),
+        (
+            "unsupported FRI fold step",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.fold_step = 2;
+            }),
+        ),
+        (
+            "zero FRI queries",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.n_queries = 0;
+            }),
+        ),
+        (
+            "oversized FRI queries",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.n_queries = vos_pvm_proof::proof::MAX_FRI_QUERIES + 1;
+            }),
+        ),
+        (
+            "oversized proof-of-work bits",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.pow_bits = 32;
+            }),
+        ),
+        (
+            "oversized lifting domain",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.lifting_log_size = Some(vos_pvm_proof::proof::MAX_EXTENDED_LOG_SIZE + 1);
+            }),
+        ),
+        (
+            "proof-side recommitment amplification",
+            mutate_pcs_config(proof.clone(), |config| {
+                config.fri_config.log_blowup_factor =
+                    vos_pvm_proof::proof::MAX_RECOMMIT_LOG_BLOWUP + 1;
+            }),
+        ),
+    ] {
+        assert_hostile_proof_rejected_without_panic(
+            label,
+            hostile,
+            preprocessed_commitment,
+            &side_note,
+        );
+    }
+
+    // `None` and `Some(derived)` can describe the same effective tree height
+    // for some AIR layouts, but are distinct signed protocol configurations.
+    // Relabelling both outer and embedded config must fail cryptographically.
+    let required_lifting = u32::try_from(stark_ref(&proof).fri_proof.inner_layers.len()).unwrap()
+        + 1
+        + proof.pcs_config.fri_config.log_last_layer_degree_bound
+        + proof.pcs_config.fri_config.log_blowup_factor;
+    let hostile = mutate_pcs_config(proof.clone(), |config| {
+        config.lifting_log_size = Some(required_lifting);
+    });
+    assert_hostile_proof_rejected_without_panic(
+        "PCS lifting Option relabel",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    let mut hostile = proof.clone();
+    hostile.component_mask = 0;
+    assert_hostile_proof_rejected_without_panic(
+        "component-mask metadata relabel",
+        hostile,
+        preprocessed_commitment,
+        &side_note,
+    );
+
+    // Per-vector bounds alone used to permit multi-gigabyte Cartesian
+    // products. Keep every individual vector within its protocol ceiling but
+    // exceed the named aggregate heap budget; both owned-proof verifier
+    // funnels must reject before entering Stwo.
+    let mut aggregate = proof;
+    aggregate.pcs_config.fri_config.n_queries = vos_pvm_proof::proof::MAX_FRI_QUERIES;
+    stark(&mut aggregate).0.config = aggregate.pcs_config;
+    let secure = stark_ref(&aggregate).sampled_values[0][0][0];
+    let base = stark_ref(&aggregate).queried_values[0][0][0];
+    for tree in stark(&mut aggregate).0.sampled_values.iter_mut() {
+        for column in tree {
+            column.resize(vos_pvm_proof::proof::MAX_PROOF_SAMPLES_PER_COLUMN, secure);
+        }
+    }
+    for tree in stark(&mut aggregate).0.queried_values.iter_mut() {
+        for column in tree {
+            column.resize(vos_pvm_proof::proof::MAX_FRI_QUERIES, base);
+        }
+    }
+    stark(&mut aggregate).0.sampled_values[0].resize(
+        vos_pvm_proof::proof::MAX_PROOF_COLUMNS_PER_TREE,
+        vec![secure; vos_pvm_proof::proof::MAX_PROOF_SAMPLES_PER_COLUMN],
+    );
+    stark(&mut aggregate).0.queried_values[0].resize(
+        vos_pvm_proof::proof::MAX_PROOF_COLUMNS_PER_TREE,
+        vec![base; vos_pvm_proof::proof::MAX_FRI_QUERIES],
+    );
+    let aggregate_bytes = vos_pvm_proof::proof::proof_owned_bytes(&aggregate);
+    assert!(
+        aggregate_bytes.is_none(),
+        "aggregate hostile proof unexpectedly fit: {aggregate_bytes:?}"
+    );
+    assert_hostile_proof_rejected_without_panic(
+        "aggregate nested payload",
+        aggregate,
+        preprocessed_commitment,
+        &side_note,
+    );
 }
 
 #[test]
@@ -54,7 +333,6 @@ fn standalone_verify_rejects_wrong_commitment() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000,
-        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
@@ -64,7 +342,7 @@ fn standalone_verify_rejects_wrong_commitment() {
     let proof = prove(&mut side_note).expect("proving failed");
 
     // Use a wrong commitment
-    let wrong_commitment = vos_pvm_proof_verifier::CommitmentHash::default();
+    let wrong_commitment = vos_pvm_proof_verifier::CommitmentHash::Poseidon2M31(Default::default());
 
     let result = verify_standalone(proof, wrong_commitment);
     assert!(
@@ -73,10 +351,9 @@ fn standalone_verify_rejects_wrong_commitment() {
     );
 }
 
-// Phase 42: format_version is checked first, before any cryptographic
-// work.  A proof with a mismatched format_version (simulating a future-
-// AIR proof presented to today's verifier, or a deserialized older
-// proof that lacks the field — serde-default 0) is rejected immediately.
+// format_version is checked first, before any cryptographic
+// work: a proof under a number the registry does not admit is rejected
+// immediately.
 #[test]
 fn standalone_verify_rejects_format_version_mismatch() {
     let code = vec![Opcode::Trap as u8];
@@ -90,7 +367,6 @@ fn standalone_verify_rejects_format_version_mismatch() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000,
-        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
@@ -98,29 +374,32 @@ fn standalone_verify_rejects_format_version_mismatch() {
 
     let mut side_note = SideNote::new(steps, code, bitmask);
     let mut proof = prove(&mut side_note).expect("proving failed");
-    let preprocessed_commitment = proof.stark_proof.commitments[0];
+    let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
 
-    // Forge: simulate a proof from a future AIR shape.
-    proof.format_version = vos_pvm_proof::PROOF_FORMAT_VERSION + 1;
+    let mut explicitly_old = proof.clone();
+    explicitly_old.format_version = 18;
+    let old_error = verify_standalone(explicitly_old, preprocessed_commitment)
+        .expect_err("format-18 proof must be rejected");
+    assert!(format!("{old_error:?}").contains("proof format 18 is not registered"));
+
+    // Forge: a number the registry does not hold, as a proof of a future
+    // AIR would carry.
+    proof.format_version = 38;
 
     let err = verify_standalone(proof, preprocessed_commitment)
         .expect_err("should reject mismatched format_version");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("format version"),
+        msg.contains("proof format 38 is not registered"),
         "expected format-version error, got: {msg}"
     );
 }
 
-// Phase 49: pcs_config policy floor.  A proof generated with a
-// weaker PcsConfig (lower pow_bits / fewer FRI queries / smaller
-// blowup) than PcsPolicy::STANDARD must be rejected by the
-// default verify_standalone path before any cryptographic work.
+// A proof's parameters are its format's: one weakened below the floors,
+// its outer and embedded configs both relabelled, is refused before any
+// cryptographic work.
 #[test]
 fn standalone_verify_rejects_weak_pcs_config() {
-    use stwo::core::{fri::FriConfig, pcs::PcsConfig};
-    use vos_pvm_proof::prove_with_config;
-
     let code = vec![Opcode::Trap as u8];
     let bitmask = vec![1];
     let registers = [0u64; PVM_REGISTER_COUNT];
@@ -132,81 +411,27 @@ fn standalone_verify_rejects_weak_pcs_config() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000,
-        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
-    // Prove with a config below STANDARD policy: pow_bits = 0, only
-    // 1 FRI query.  Honest prover output but at "test-grade" security.
-    let weak_config = PcsConfig {
-        pow_bits: 0,
-        fri_config: FriConfig::new(0, 4, 1, 1),
-        lifting_log_size: None,
-    };
     let mut side_note = SideNote::new(steps, code, bitmask);
-    let proof = prove_with_config(&mut side_note, weak_config).expect("proving failed");
-    let preprocessed_commitment = proof.stark_proof.commitments[0];
+    let proof = prove(&mut side_note).expect("proving failed");
+    let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
+    let weak = mutate_pcs_config(proof, |config| config.pow_bits = 0);
 
-    let err = vos_pvm_proof_verifier::verify_standalone(proof, preprocessed_commitment)
-        .expect_err("default verify_standalone must reject weak pcs_config");
+    let err = vos_pvm_proof_verifier::verify_standalone(weak, preprocessed_commitment)
+        .expect_err("verify_standalone must refuse a weakened config");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("pow_bits") || msg.contains("n_queries"),
-        "expected pcs_config policy rejection, got: {msg}"
+        msg.contains("below format 41's floor"),
+        "expected the format's floor, got: {msg}"
     );
 }
 
-#[test]
-fn standalone_verify_accepts_weak_pcs_config_with_relaxed_policy() {
-    use stwo::core::{fri::FriConfig, pcs::PcsConfig};
-    use vos_pvm_proof::prove_with_config;
-
-    let code = vec![Opcode::Trap as u8];
-    let bitmask = vec![1];
-    let registers = [0u64; PVM_REGISTER_COUNT];
-
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        registers,
-        vec![0u8; 4 * 1024 * 1024],
-        1000,
-        25,
-    );
-    let mut tracing = TracingPvm::new(pvm);
-    tracing.run();
-    let steps = tracing.into_trace();
-
-    let weak_config = PcsConfig {
-        pow_bits: 0,
-        fri_config: FriConfig::new(0, 4, 1, 1),
-        lifting_log_size: None,
-    };
-    let mut side_note = SideNote::new(steps, code, bitmask);
-    let proof = prove_with_config(&mut side_note, weak_config).expect("proving failed");
-    let preprocessed_commitment = proof.stark_proof.commitments[0];
-
-    // Relaxed policy that allows weaker configs (e.g. for test
-    // harnesses).  The proof must verify under this policy.
-    let test_policy = vos_pvm_proof_verifier::PcsPolicy {
-        min_pow_bits: 0,
-        min_fri_queries: 1,
-        min_fri_log_blowup: 4,
-    };
-    vos_pvm_proof_verifier::verify_standalone_with_pcs_policy(
-        proof,
-        preprocessed_commitment,
-        &test_policy,
-    )
-    .expect("relaxed-policy verify must accept the weak proof");
-}
-
-// Phase 43: log_size cap test.  We don't need to forge a giant proof
-// — just call the variant with an unrealistically tight cap and check
-// the early rejection fires.
+// A log size past the protocol's cap is refused before any commitment is
+// read: a proof claiming one need not be large.
 #[test]
 fn standalone_verify_rejects_oversized_log_size() {
     let code = vec![Opcode::Trap as u8];
@@ -220,30 +445,28 @@ fn standalone_verify_rejects_oversized_log_size() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000,
-        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
     let steps = tracing.into_trace();
 
     let mut side_note = SideNote::new(steps, code, bitmask);
-    let proof = prove(&mut side_note).expect("proving failed");
-    let preprocessed_commitment = proof.stark_proof.commitments[0];
+    let mut proof = prove(&mut side_note).expect("proving failed");
+    let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
+    proof.log_sizes[0] = vos_pvm_proof_verifier::DEFAULT_MAX_LOG_SIZE + 1;
 
-    // Cap = 0: even the smallest legitimate proof has log_sizes >= LOG_N_LANES.
-    let err = vos_pvm_proof_verifier::verify_standalone_with_max_log_size(
-        proof,
-        preprocessed_commitment,
-        0,
-    )
-    .expect_err("should reject — cap is zero");
+    let err = verify_standalone(proof, preprocessed_commitment)
+        .expect_err("a log size past the cap is refused");
     let msg = format!("{err:?}");
-    assert!(msg.contains("exceeds cap"), "got: {msg}");
+    assert!(
+        msg.contains(&vos_pvm_proof::proof::Malformed::LogSize.to_string()),
+        "got: {msg}"
+    );
 }
 
 #[test]
 fn standalone_verify_rejects_zero_format_version() {
-    // Pre-Phase-42 serialized proofs (which lack the field) deserialize
+    // Serialized proofs that lack the field deserialize
     // with serde default 0 → must be rejected.  Simulate by setting the
     // field to 0 directly.
     let code = vec![Opcode::Trap as u8];
@@ -257,7 +480,6 @@ fn standalone_verify_rejects_zero_format_version() {
         registers,
         vec![0u8; 4 * 1024 * 1024],
         1000,
-        25,
     );
     let mut tracing = TracingPvm::new(pvm);
     tracing.run();
@@ -265,12 +487,45 @@ fn standalone_verify_rejects_zero_format_version() {
 
     let mut side_note = SideNote::new(steps, code, bitmask);
     let mut proof = prove(&mut side_note).expect("proving failed");
-    let preprocessed_commitment = proof.stark_proof.commitments[0];
+    let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
 
     proof.format_version = 0;
 
     let err = verify_standalone(proof, preprocessed_commitment)
         .expect_err("should reject format_version=0");
     let msg = format!("{err:?}");
-    assert!(msg.contains("format version"), "got: {msg}");
+    assert!(
+        msg.contains("proof format 0 is not registered"),
+        "got: {msg}"
+    );
+}
+
+/// A boundary timestamp at or above 2^28, where the ledgers' mod-p
+/// comparison would alias two accesses, is refused before any
+/// cryptographic work: the format-41 fixture with either boundary's
+/// timestamp at 2^30, against its own root.
+#[test]
+fn standalone_verify_refuses_a_boundary_timestamp_past_its_bound() {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../fixtures");
+    let proof: Proof = postcard::from_bytes(
+        &std::fs::read(format!("{fixtures}/segment-41.proof")).expect("the format-41 fixture"),
+    )
+    .expect("a proof");
+    let root: CommitmentHash = postcard::from_bytes(
+        &std::fs::read(format!("{fixtures}/segment-41.root")).expect("its root"),
+    )
+    .expect("a root");
+    assert!(proof.final_state.timestamp < vos_pvm_proof_verifier::TIMESTAMP_BOUND);
+    for initial in [true, false] {
+        let mut forged = proof.clone();
+        let state = if initial {
+            &mut forged.initial_state
+        } else {
+            &mut forged.final_state
+        };
+        state.timestamp = 1 << 30;
+        let error = verify_standalone(forged, root).expect_err("past the bound");
+        let message = format!("{error:?}");
+        assert!(message.contains("at or above 2^28"), "got: {message}");
+    }
 }

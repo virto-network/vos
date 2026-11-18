@@ -2,15 +2,19 @@
 name = "vos-pvm-compiler"
 version.workspace = true
 edition.workspace = true
-license = "Apache-2.0"
+license.workspace = true
 description = "RISC-V ELF to VOS PVM compiler"
 
 [dependencies]
 vos-pvm = { path = "../runtime" }
-scale = { package = "vos-pvm-codec", path = "../codec" }
+vos-pvm-program = { path = "../program" }
+# The heap a handler's or a kernel's program holds, which the SDK's
+# allocator gives it.
+vos-abi = { workspace = true }
 thiserror = "2"
 tracing = "0.1"
-tracing-test = "0.2"
+# Function names for a profiler, as source spells them.
+rustc-demangle = "0.1.24"
 
 [dev-dependencies]
 proptest = "1"

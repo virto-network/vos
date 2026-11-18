@@ -1,13 +1,10 @@
-//! SPI parser conformance against a real GP service preimage.
-//!
-//! The `gp072_*` accumulate vectors store service code as a standard-program
-//! blob (metadata prefix + GP memory layout). This test pulls the real
-//! `test-service` preimage out of a shared vector and asserts the parser
-//! recovers exactly the fields an independent byte-level decode found.
+//! SPI parser conformance against a real service program: a Gray Paper
+//! accumulate vector's service preimage, its metadata prefix stripped to
+//! the bare program the parser takes.
 
 use vos_pvm::spi::parse_standard_program;
 
-/// Extract the first service preimage blob from a gp072 accumulate input.
+/// The first service preimage blob of the accumulate vector.
 fn service_preimage() -> Vec<u8> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -26,9 +23,16 @@ fn service_preimage() -> Vec<u8> {
         .collect()
 }
 
-#[test]
-fn parses_real_service_preimage() {
+fn service_program() -> Vec<u8> {
     let blob = service_preimage();
+    let (metadata_len, consumed) = vos_pvm::spi::read_nat(&blob, 0).expect("metadata length");
+    let program_start = consumed + usize::try_from(metadata_len).expect("metadata length fits");
+    blob[program_start..].to_vec()
+}
+
+#[test]
+fn parses_canonical_program_from_real_service_preimage() {
+    let blob = service_program();
     let prog = parse_standard_program(&blob).expect("standard program parses");
 
     // Values independently decoded from the raw bytes:
@@ -52,46 +56,42 @@ fn parses_real_service_preimage() {
     assert_eq!(layout.registers[0], vos_pvm::PVM_HALT_ADDR);
 }
 
-/// The real service can be *started* under the kernel-free refine harness:
-/// it runs deterministically up to its first hostcall (`ecalli 1`), which
-/// surfaces as an undispatched `HostCall` exit for the embedder to handle.
+/// The real service can be *started* under the refine harness: it runs
+/// deterministically up to its first hostcall (`ecalli 1`), which surfaces as
+/// an undispatched `HostCall` exit for the embedder to handle.
 #[test]
-fn refine_harness_starts_real_service_preimage() {
-    let blob = service_preimage();
+fn refine_harness_starts_canonical_real_service_program() {
+    let blob = service_program();
     let inv = vos_pvm::refine::execute(&blob, &[], 10_000_000).expect("service preimage loads");
     assert_eq!(
         inv.exit,
         vos_pvm::ExitReason::HostCall(1),
         "the service's first act at the refine entry is hostcall 1"
     );
-    // ro (2) + rw+heap (3) + stack (2) pages charge init gas; the prologue
-    // consumed execution gas on top of that.
-    let init_gas = 7 * vos_pvm::GAS_PER_PAGE;
-    assert!(
-        inv.gas_used > init_gas,
-        "gas accounting: init charge plus execution (used {})",
-        inv.gas_used
-    );
-    assert_eq!(inv.output(), None, "no output without a halt");
+    assert!(inv.gas_used > 0, "the prologue consumed gas");
+    assert_eq!(inv.output_bounded(0), None, "no output without a halt");
 }
 
 /// The flat and sparse memory representations are indistinguishable on the
-/// real gp072 service: same first-hostcall exit, the same pinned gas
-/// (10 702), the same register file, and the same logical memory around
+/// real service: same first-hostcall exit, the same v0.8 ROB-metered gas
+/// (243), the same register file, and the same logical memory around
 /// every mapped region. This is the shape a 32-bit embedder (which
 /// `MemoryModel::Auto` puts on the sparse path) executes.
 #[test]
-fn refine_flat_and_sparse_agree_on_real_service_preimage() {
+fn refine_flat_and_sparse_agree_on_canonical_real_service_program() {
     use vos_pvm::refine::MemoryModel;
 
-    let blob = service_preimage();
+    let blob = service_program();
     let f = vos_pvm::refine::execute_with(&blob, &[], 10_000_000, MemoryModel::Flat).expect("flat");
     let s =
         vos_pvm::refine::execute_with(&blob, &[], 10_000_000, MemoryModel::Sparse).expect("sparse");
 
     assert_eq!(f.exit, vos_pvm::ExitReason::HostCall(1));
     assert_eq!(s.exit, f.exit, "exit agrees");
-    assert_eq!(f.gas_used, 10_702, "pinned gas for the service prologue");
+    assert_eq!(
+        f.gas_used, 243,
+        "pinned v0.8 ROB gas for the service prologue"
+    );
     assert_eq!(s.gas_used, f.gas_used, "gas agrees");
     assert_eq!(s.registers, f.registers, "registers agree");
     assert_eq!(s.memory().span(), f.memory().span(), "spans agree");

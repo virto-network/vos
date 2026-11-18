@@ -1,0 +1,40 @@
+{
+  "expected": {
+    "blocks": [
+      {
+        "gas": 61,
+        "pc": 0
+      }
+    ],
+    "first": {
+      "remaining_gas": 39,
+      "status": "panic"
+    },
+    "resume": null
+  },
+  "initial": {
+    "gas": 100,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "four_slot_instruction_waits_after_partial_decode",
+  "program": {
+    "bitmask": "0x49",
+    "code": "0x330000cb320400"
+  },
+  "rule": "gray-paper-v0.8-rob-block-gas",
+  "spec": "gray-paper-0.8.0"
+}

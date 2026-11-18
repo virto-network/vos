@@ -5,25 +5,27 @@
 //! the auxiliary witnesses (carry chains, AND nibbles, sign bits, equality
 //! witnesses), the register-memory binding witnesses (ValB/ValD/Result reg
 //! sources + indices), and the Blake2b ECALL-binding columns (φ[10/11/12/7]
-//! + Phi7Bool inversion witness).
+//! + FlagBool inversion witness).
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 
 #[derive(Debug, Copy, Clone, AirColumn)]
+#[row = "Row"]
 pub enum Column {
     #[size = 8]
-    #[mask_next_row]
     Timestamp,
     #[size = 4]
-    #[mask_next_row]
     Pc,
     #[size = 4]
     NextPc,
+    /// Exact encoded opcode byte. Its semantic decoding is authenticated by
+    /// the ProgramMemory-derived flag bytes.
     #[size = 1]
     Opcode,
     #[size = 1]
     SkipLen,
-    /// Carry chain for sequential PC addition: next_pc = pc + 1 + skip_len
+    /// Carry chain for sequential PC addition: next_pc = pc + 1 + skip_len,
+    /// bits on every row, so the sequential next pc's limbs are canonical.
     #[size = 3]
     PcCarry,
     #[size = 1]
@@ -41,7 +43,7 @@ pub enum Column {
     /// Result value (8 limbs).
     #[size = 8]
     Result,
-    /// Auxiliary carry/borrow (8 limbs). Used by add/sub.
+    /// Auxiliary carry/borrow (8 limbs), bits on every row. Used by add/sub.
     #[size = 8]
     Carry,
     /// `mask_next_row` so the terminal-row constraint can read the *next*
@@ -51,10 +53,6 @@ pub enum Column {
     #[size = 1]
     #[mask_next_row]
     IsPadding,
-    #[size = 1]
-    RegAWritten,
-    #[size = 8]
-    Gas,
     // ── Operation category flags ──
     #[size = 1]
     IsAdd,
@@ -109,7 +107,7 @@ pub enum Column {
     #[size = 1]
     IsSetLtS,
     /// Swap modifier for SetGtSImm/SetGtUImm: when 1, val_b ← imm and
-    /// val_d ← regs[rb] (so the SetLt comparison yields the GT result).
+    /// val_d ← regs\[rb\] (so the SetLt comparison yields the GT result).
     /// Not a compare-partition sub-flag; co-occurs with IsSetLtS/IsSetLtU.
     #[size = 1]
     IsSetGt,
@@ -118,7 +116,7 @@ pub enum Column {
     #[size = 1]
     IsCmovNz,
     /// CmovIzImm/CmovNzImm operand-swap modifier: val_b ← imm (the moved
-    /// value, pinned to ImmBytes), val_d ← regs[rb] (the condition).
+    /// value, pinned to ImmBytes), val_d ← regs\[rb\] (the condition).
     /// Not a compare-partition sub-flag; co-occurs with IsCmovIz/IsCmovNz.
     #[size = 1]
     IsCmovImm,
@@ -145,11 +143,11 @@ pub enum Column {
     /// Signed less-than flag: 1 if val_b < val_d (signed).
     #[size = 1]
     CmpLtSFlag,
-    /// 1 iff val_b == val_d (all bytes equal). Used for Le/Gt branches.
-    /// Constrained one-directionally: `eq_flag=1 ⇒ val_b[i] = val_d[i]` for
-    /// every byte i, gated on `is_cmp_or_branch`.  The converse is benign in
-    /// PVM semantics — the prover would have to produce the wrong next_pc to
-    /// undermark eq_flag, which is bound by ProgramMemoryChip.
+    /// 1 iff val_b == val_d (all bytes equal), on every compare and branch
+    /// row: `eq_flag=1 ⇒ val_b[i] = val_d[i]` byte by byte, and
+    /// `eq_flag = 1 − EqDiffSquaresTimesInvH`, 1 when they are equal. The
+    /// equality branches take it as their condition, the Le/Gt ones add it
+    /// to their less-than.
     #[size = 1]
     EqFlag,
     // BranchEq / BranchNe constraints read `val_b[i] - val_d[i]` directly:
@@ -158,9 +156,8 @@ pub enum Column {
     // ── Shift auxiliary ──
     #[size = 1]
     ShiftAmount,
-    #[size = 1]
-    ShiftOp,
-    /// 1 when is_shift AND shift_op ∈ {0,1} (left shift or logical right shift)
+    /// 1 on every shift and rotate row (`IsShift`, which a constraint
+    /// equates it with)
     #[size = 1]
     IsShiftConstrained,
     /// Raw u64 of `regs_before[reg_a_or_b]` whenever ValBIsReg=1.
@@ -175,17 +172,18 @@ pub enum Column {
     /// to that product via a validity constraint below.
     #[size = 1]
     IsTruncated,
-    /// Raw u64 of `regs_before[reg_b]` whenever ValDIsReg=1.
-    /// For non-shift non-32-bit ops ValD == RegValD (constrained below); for
+    /// ValD's source: `regs_before[reg_b]` when ValDIsReg=1, the
+    /// instruction's immediate otherwise (pinned to ImmBytes).  For
+    /// non-shift non-32-bit ops ValD == RegValD (constrained below); for
     /// shifts ValD gets rewritten to `2^shift_amount` but RegValD keeps the
-    /// raw register value so the ledger producer can authenticate it.  Zero
-    /// when ValDIsReg=0.
+    /// raw shift operand so the identity below binds the amount to it.
     #[size = 8]
     RegValD,
-    /// Quotient in `RegValD = ShiftAmount + modulus · q` for
-    /// shift ops.  modulus = 32 for 32-bit shifts, 64 otherwise.  Ties
-    /// the prover-chosen ShiftAmount to the authenticated RegValD.
-    #[size = 8]
+    /// The bits of `k` in `RegValD[0] = ShiftAmount + 32·k` on shift rows:
+    /// as `modulus` divides 256, the amount is the low byte's residue, and
+    /// every term is small, so the identity holds over the integers.  On a
+    /// 64-bit shift `k` is even, making the modulus 64.
+    #[size = 3]
     ShiftQuotient,
     // ── Control flow ──
     // IsBranch is the 10-sub-flag sum (IsBrEq + IsBrNe + IsBrLtU + IsBrGeU
@@ -302,92 +300,74 @@ pub enum Column {
     /// Blake2bChip forces this to be set correctly for every blake2b call.
     #[size = 1]
     IsBlakeEcall,
-    // ── Blake2b ECALL slot columns ──
-    //
-    // Naming note: these column names ("Phi10", "Phi11", "Phi12", "Phi7")
-    // do NOT match the PVM register each slot holds — each slot's SOURCE
-    // is a different register than its name implies.  See
-    // `chips/cpu/trace_fill.rs`'s Blake2b block and
-    // `chips/cpu/{mod,interaction}.rs::ECALL_REG_IDXS` for the canonical
-    // slot ↔ register mapping.
-    //
-    /// h_ptr slot (sourced from φ[7]; low 4 bytes flow into the
+    // ── The BLAKE2b call's slots, each the register it reads
+    // (`tuples::BLAKE2B_CALL_REGS`) ──
+    /// h_ptr slot (sourced from φ\[7\]; low 4 bytes flow into the
     /// Blake2bCall tuple as h_ptr).  Full u64 witnessed so the upper
-    /// 32 bits can hold whatever regs_before[7] held.
+    /// 32 bits can hold whatever regs_before\[7\] held.
     #[size = 8]
-    Phi10,
-    /// m_ptr slot (sourced from φ[8]).  Low 4 bytes flow into the
+    HPtr,
+    /// m_ptr slot (sourced from φ\[8\]).  Low 4 bytes flow into the
     /// Blake2bCall tuple as m_ptr.
     #[size = 8]
-    Phi11,
-    /// t_low slot (sourced from φ[9]).  Full 8 bytes flow into the
+    MPtr,
+    /// t_low slot (sourced from φ\[9\]).  Full 8 bytes flow into the
     /// Blake2bCall tuple as T.
     #[size = 8]
-    Phi12,
-    /// f_flag slot (sourced from φ[10] = a3).  Full u64 of regs_before[10].
-    /// Phi7Bool below is the boolean form `(regs_before[10] != 0)`,
+    TLow,
+    /// f_flag slot (sourced from φ\[10\] = a3).  Full u64 of regs_before\[10\].
+    /// FlagBool below is the boolean form `(regs_before[10] != 0)`,
     /// which is what flows into the Blake2bCall tuple as F.
     #[size = 8]
-    Phi7,
-    /// Inversion witness for the f_flag slot: if Phi7 (as field
-    /// element) != 0, Phi7Inv = 1 / Phi7_combined; else 0.  Used to
-    /// constrain Phi7Bool = (Phi7 != 0) in-circuit.
-    #[size = 8]
-    Phi7Inv,
-    /// Boolean form of the f_flag slot: 1 if regs_before[10] != 0.
+    Flag,
+    /// Inversion witness for the f_flag slot: the inverse of the sum of
+    /// Flag's bytes, or 0 when it is 0. The sum, at most 2040, is zero
+    /// exactly when the register is, so it constrains FlagBool =
+    /// (Flag != 0) in-circuit as the register's value, not its field
+    /// reduction.
+    #[size = 1]
+    FlagInv,
+    /// Boolean form of the f_flag slot: 1 if regs_before\[10\] != 0.
     /// The prover fills this and the lookup balance keeps it tied to
     /// the Blake2bChip.F column at the matching compression.
     #[size = 1]
-    Phi7Bool,
-    // ── Ristretto ECALL binding ──
-    //
-    // One boolean per ristretto-family ECALL id (Ecalli with imm = id),
-    // prover-witnessed; logup balance with RistrettoEcallChip (RELATION A)
-    // and the register-file ledger forces each to be set correctly for every
-    // genuine ristretto ECALL step.  All five ids read the operand pointers
-    // from φ[7,8,9] (reduce_wide: φ[7,8] only) — already snapshotted in the
-    // Phi10/Phi11/Phi12 slots above (= regs_before[7,8,9]), so no new ptr
-    // columns are needed; the per-id RELATION-A producer arranges those
-    // slots into trace-layout order (see chips/cpu/mod.rs).
-    /// 1 iff Ecalli with imm == ECALL_RISTRETTO_SCALAR_MULT (110).
-    #[size = 1]
-    Is110Ecall,
-    /// 1 iff Ecalli with imm == ECALL_RISTRETTO_POINT_ADD (111).
-    #[size = 1]
-    Is111Ecall,
-    /// 1 iff Ecalli with imm == ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE (112).
-    #[size = 1]
-    Is112Ecall,
-    /// 1 iff Ecalli with imm == ECALL_SCALAR_MUL_MOD_L (113).
-    #[size = 1]
-    Is113Ecall,
-    /// 1 iff Ecalli with imm == ECALL_SCALAR_ADD_MOD_L (114).
-    #[size = 1]
-    Is114Ecall,
+    FlagBool,
     // ── Register-memory binding ──
     /// 1 iff ValB was sourced from a register read at this step.  See
     /// `val_b_read_reg` for the per-category mapping.  Gates the ValB
     /// register-memory producer emission.
     #[size = 1]
     ValBIsReg,
-    /// Register index that ValB was read from when ValBIsReg=1.
+    /// Register index ValB reads when ValBIsReg=1: RegA when ValBFromA,
+    /// otherwise RegB, on every row.
     #[size = 1]
     ValBRegIdx,
+    /// 1 iff ValB's register is RegA rather than RegB, as the instruction
+    /// fixes it (flag byte 6).
+    #[size = 1]
+    ValBFromA,
     /// 1 iff ValD was sourced from a register read.
     #[size = 1]
     ValDIsReg,
-    /// Register index that ValD was read from when ValDIsReg=1.
+    /// Register index ValD reads when ValDIsReg=1: RegB on every row.
     #[size = 1]
     ValDRegIdx,
-    /// 1 iff Result was written to a register at this step (tracer's
-    /// step.reg_write is Some).  Gates the Result register-memory producer.
+    /// 1 iff Result is written to a register at this step: whenever the
+    /// instruction writes one (flag byte 6), except a conditional move that
+    /// does not move, and a witness-input call's count.  Gates the Result
+    /// register-memory producer.
     #[size = 1]
     ResultIsReg,
-    /// Register index that Result was written to when ResultIsReg=1.
+    /// Register index Result is written to when ResultIsReg=1: RegD when
+    /// ResultToD, otherwise RegA, or 7 on a witness-input call.
     #[size = 1]
     ResultRegIdx,
+    /// 1 iff the result's register is RegD rather than RegA, as the
+    /// instruction fixes it (flag byte 6).
+    #[size = 1]
+    ResultToD,
     // ── BitManip permutation/zero-extend ──
-    /// 1 iff this step is `ReverseBytes` (result[i] = val_d[7-i]).
+    /// 1 iff this step is `ReverseBytes` (result\[i\] = val_d[7-i]).
     #[size = 1]
     IsReverseBytes,
     /// 1 iff this step is `ZeroExtend16` (result[0..1] = val_d[0..1]; result[2..7] = 0).
@@ -438,10 +418,12 @@ pub enum Column {
     /// address. See [`Self::IsHaltJumpInd`].
     #[size = 1]
     IsHaltLoadImmJumpInd,
-    /// 4 little-endian bytes of `step.imm_y`
-    /// (the second immediate, used for LoadImmJumpInd's jump offset).
-    /// Bound to canonical bytecode decoding via the prog_mem tuple.
-    #[size = 4]
+    /// The low 5 little-endian bytes of `step.imm_y`, the second
+    /// immediate, sign-extended from at most 4 bytes, so byte 4 is each of
+    /// its high bytes: LoadImmJumpInd's jump offset and an immediate
+    /// store's value. Bound to canonical bytecode decoding via the prog_mem
+    /// tuple.
+    #[size = 5]
     ImmYBytes,
     /// Virtual jump address for LoadImmJumpInd
     /// (low 32 bits of `val_d + imm_y`), 4 little-endian bytes.  Pinned
@@ -463,7 +445,7 @@ pub enum Column {
     IsMulUpperSU,
     #[size = 1]
     IsMulUpperSS,
-    /// Sign bit (bit 7) of the sign-source byte (val_d[0] for SE8, val_d[1] for SE16).
+    /// Sign bit (bit 7) of the sign-source byte (val_d\[0\] for SE8, val_d\[1\] for SE16).
     /// Pinned by a nibble-AND lookup against (SignExtSrcHiNib, 8, 8·SignExtBit).
     #[size = 1]
     SignExtBit,
@@ -482,6 +464,20 @@ pub enum Column {
     /// RemS32 / RemS64.  Drives DivRemChip's signed-correction chain.
     #[size = 1]
     IsDivS,
+    /// 1 iff this step's opcode is an arithmetic right shift (SharR32 /
+    /// SharR64 and their immediate forms).  Flag byte 0's bit 3 commits
+    /// `IsSharR + IsShloR`, a right shift, and `IsSharR · IsMul = 0` tells
+    /// it from a logical one; flows in the DivRem tuple, where it selects
+    /// floor division.
+    #[size = 1]
+    IsSharR,
+    /// 1 iff this step's opcode is a logical right shift (ShloR32 /
+    /// ShloR64 and their immediate forms), a multiplication by
+    /// `2^ShiftAmountCompl` whose high word MulChip takes, its low word
+    /// when `ShiftZero` (the amount is 0). `IsShloR · (1 - IsMul) = 0`
+    /// tells it from an arithmetic one in flag byte 0's bit 3.
+    #[size = 1]
+    IsShloR,
     /// Bit 7 of `div_quotient[7]` (sign of quotient on 64-bit
     /// signed div/rem).  Prover-witnessed.  Pinned via a nibble lookup;
     /// flowed to DivRemChip via the lookup tuple.
@@ -541,9 +537,9 @@ pub enum Column {
     // sign bits, and the constraint `result[i] = 0xFF · SignBitResult`
     // for `i ∈ 4..8` holds on 32-bit ALU rows.
     /// Bit 7 of `result[3]`.  Pinned via the (HiNib, 8, 8·SignBitResult)
-    /// lookup; equals 0 on rows where result[3] < 0x80, equals 1 on
+    /// lookup; equals 0 on rows where result\[3\] < 0x80, equals 1 on
     /// 32-bit ALU rows whose signed result is negative.  On non-real
-    /// rows (padding) result[3] = 0 so SignBitResult = 0.
+    /// rows (padding) result\[3\] = 0 so SignBitResult = 0.
     #[size = 1]
     SignBitResult,
     /// High nibble of `result[3]`, paired with the (lo, 0xF, lo)
@@ -617,7 +613,7 @@ pub enum Column {
     /// Per-byte carry chain for the MemAddr indirect-
     /// addressing add `MemAddr = (val_b + ImmBytes) mod 2^32`.
     /// Carry-out at byte 3 is the 32-bit overflow, discarded.
-    /// Boolean-constrained (val_b[i] + ImmBytes[i] + carry_in ≤ 511,
+    /// Boolean-constrained (val_b\[i\] + ImmBytes\[i\] + carry_in ≤ 511,
     /// carry_out ≤ 1).
     #[size = 4]
     MemAddrCarry,
@@ -637,7 +633,7 @@ pub enum Column {
     /// 1 iff this opcode is `StoreInd[U][8/16/32/64]`
     /// (TwoRegOneImm — *register-source* indirect store).  For
     /// these the value written to memory is `regs[ra]`, which val_b
-    /// doesn't carry on TwoRegOneImm rows (val_b holds regs[rb]
+    /// doesn't carry on TwoRegOneImm rows (val_b holds regs\[rb\]
     /// = the base).  Drives the `MemValue = RegValA` per-byte
     /// binding plus the producer emission to the register-memory
     /// ledger.
@@ -655,19 +651,19 @@ pub enum Column {
     // ValDIsZero is pinned in both directions (`val_d_is_zero=1 ⇒ val_d=0`
     // and `val_d=0 ⇒ val_d_is_zero=1`), and DivByZero likewise, via
     // byte-wise inversion witnesses + cumulative OR.
-    /// Per-byte inverse witness.  When `val_d[i] ≠ 0`, ByteInv[i]
+    /// Per-byte inverse witness.  When `val_d[i] ≠ 0`, ByteInv\[i\]
     /// must equal `1/val_d[i]` (in the field) so that
     /// `val_d[i] · ByteInv[i] = 1` (the byte indicator).  When
-    /// `val_d[i] = 0`, ByteInv[i] is unconstrained (the indicator
+    /// `val_d[i] = 0`, ByteInv\[i\] is unconstrained (the indicator
     /// degenerates to 0).  Constrained by
     ///   `val_d[i] · (val_d[i] · ByteInv[i] − 1) = 0`
-    /// which is satisfied iff val_d[i]=0 OR (ByteInv[i] is the inverse).
+    /// which is satisfied iff val_d\[i\]=0 OR (ByteInv\[i\] is the inverse).
     #[size = 8]
     ValDByteInv,
     /// Cumulative OR of byte-indicators.  Recurrence (degree 3):
-    ///   PartialNZ[0] = val_d[0] · ByteInv[0]
-    ///   PartialNZ[i] = PartialNZ[i-1] + ByteIndicator[i]
-    ///                  − PartialNZ[i-1] · ByteIndicator[i]
+    ///   PartialNZ\[0\] = val_d\[0\] · ByteInv\[0\]
+    ///   PartialNZ\[i\] = PartialNZ[i-1] + ByteIndicator\[i\]
+    ///                  − PartialNZ[i-1] · ByteIndicator\[i\]
     /// where `ByteIndicator[i] = val_d[i] · ByteInv[i] ∈ {0, 1}`.
     /// `PartialNZ[7] = 1 ↔ val_d ≠ 0`.  ValDIsZero is then pinned
     /// to `1 − PartialNZ[7]`.
@@ -695,7 +691,7 @@ pub enum Column {
     #[size = 8]
     ValRByteInv,
     /// Cumulative OR of div_remainder's byte-indicators.  Same
-    /// recurrence as ValDPartialNZ.  PartialNZ[7] = 1
+    /// recurrence as ValDPartialNZ.  PartialNZ\[7\] = 1
     /// ↔ div_remainder ≠ 0.
     #[size = 8]
     ValRPartialNZ,
@@ -737,13 +733,13 @@ pub enum Column {
     #[size = 1]
     IsTzb,
     /// Per-byte leading-zeros witnesses for the 8 bytes of `val_d`.
-    /// `BitOpLzByte[i] = val_d[i].leading_zeros()` (8 if val_d[i] = 0)
+    /// `BitOpLzByte[i] = val_d[i].leading_zeros()` (8 if val_d\[i\] = 0)
     /// enforced via the BitcountChip lookup.  Used for both LZ32 and LZ64
     /// rows; only the relevant prefix participates in the result formula.
     #[size = 8]
     BitOpLzByte,
     /// Per-byte trailing-zeros witnesses for the 8 bytes of `val_d`.
-    /// `BitOpTzByte[i] = val_d[i].trailing_zeros()` (8 if val_d[i] = 0).
+    /// `BitOpTzByte[i] = val_d[i].trailing_zeros()` (8 if val_d\[i\] = 0).
     #[size = 8]
     BitOpTzByte,
     /// Cumulative-OR of byte_indicator[i..7] (MSB-direction
@@ -774,18 +770,26 @@ pub enum Column {
     #[size = 1]
     IsRotateR64,
     /// Complementary shift amount = `(64 − n) mod 64` where
-    /// `n = reg_val_d mod 64`.  Used as the PowerOfTwo lookup key on
-    /// RotR64 rows, so val_d gets pinned to `2^((64 − n) mod 64)`.
-    /// Range-bounded to [0, 63] by the lookup table size.
+    /// `n = reg_val_d mod 64` (32 for a 32-bit op).  Used as the
+    /// PowerOfTwo lookup key on rotate-right and logical right shift rows,
+    /// so val_d gets pinned to `2^((64 − n) mod 64)`.  Range-bounded to
+    /// [0, 63] by the lookup table size.
     #[size = 1]
     ShiftAmountCompl,
-    /// Integer quotient in
-    /// `reg_val_d + ShiftAmountCompl = 64·ShiftQuotientCompl`.  Range-
-    /// bounded by the 8-byte decomposition + Range256 byte checks.
-    /// For the modulus-32 variant (RotR32) the constraint reads
-    /// `reg_val_d + ShiftAmountCompl = 32·ShiftQuotientCompl`.
-    #[size = 8]
+    /// The bits of `k` in `RegValD[0] + ShiftAmountCompl = 32·k` on
+    /// rotate-right rows, `k` even on a 64-bit rotate: the complement is
+    /// the negated low byte's residue, over the integers as for
+    /// `ShiftQuotient`.
+    #[size = 4]
     ShiftQuotientCompl,
+    /// 1 iff `ShiftAmountCompl` is 0, on every row: `1 - ShiftAmountCompl ·
+    /// ShiftComplInv`, and `ShiftZero · ShiftAmountCompl = 0`. A logical
+    /// right shift by 0 takes the product's low word, its operand.
+    #[size = 1]
+    ShiftZero,
+    /// The M31 inverse of `ShiftAmountCompl`, or 0 when it is 0.
+    #[size = 1]
+    ShiftComplInv,
     // ── 32-bit rotate flags ────────────────────────────────────
     /// 1 iff this opcode is `RotL32`.  Pinned by ProgramMemoryChip's
     /// preprocessed table.  Drives the 32-bit mul-schoolbook re-route +
@@ -798,26 +802,25 @@ pub enum Column {
     /// complementary shift identity and PowerOfTwo lookup.
     #[size = 1]
     IsRotateR32,
-    /// 1 iff this opcode is `RotR64ImmAlt` or
-    /// `RotR32ImmAlt`.  These are the swapped-source variants
-    /// where the immediate is the rotated value and `regs[rb]`
-    /// is the shift amount.  Drives the `val_b = ImmBytes`
+    /// 1 iff this opcode is an `ImmAlt` shift or rotate (`ShloL`,
+    /// `ShloR`, `SharR` and `RotR`, 32- and 64-bit).  These are the
+    /// swapped-source variants where the immediate is the shifted value
+    /// and `regs[rb]` is the shift amount.  Drives the `val_b = ImmBytes`
     /// constraint pinning val_b to the canonical immediate
     /// (since val_b is not a register read for these rows
     /// — the standard val_b ↔ reg_val_b cross-constraint is
     /// inactive when val_b_is_reg=0).
     #[size = 1]
-    IsRotateRImmAlt,
-    /// 6 packed flag bytes mirroring the canonical
-    /// classify_opcode flag bag.  Each byte holds 8 of the 48
-    /// individual flag bits (bit i = flag[8*k + i]).  The byte-to-bits
+    IsImmAlt,
+    /// The first 6 packed flag bytes of the canonical classify_opcode
+    /// flag bag.  Each byte holds 8 individual flag bits
+    /// (bit i = flag[8*k + i]).  The byte-to-bits
     /// lookup per row pins these bits to the matching CpuChip flag
-    /// columns (or sum-of-sub-flags expressions for the 5 folded
-    /// category slots: is_mul_upper, is_bitwise, is_compare,
-    /// is_branch, is_store).  ProgramMemoryChip's preprocessed
+    /// columns (or sum-of-sub-flags expressions for the 4 folded
+    /// category slots: is_bitwise, is_compare, is_branch, is_store).
+    /// ProgramMemoryChip's preprocessed
     /// FlagByte0..5 columns hold the canonical values; the prog_mem
     /// lookup balance pins each FlagByteI on CpuChip to canonical.
-    /// Together these collapse the 48-flag prog_mem region to 6 bytes.
     /// Layout per byte is documented in `lookups/relations.rs` next
     /// to `PROG_MEMORY_N_FLAG_BYTES`.
     #[size = 1]
@@ -832,8 +835,21 @@ pub enum Column {
     FlagByte4,
     #[size = 1]
     FlagByte5,
+    /// The four flag bytes CpuChip recomposes from its own columns, bound
+    /// to ProgramMemory's canonical bytes by the instruction tuple: the
+    /// register accesses and operand modifiers (6), the compare
+    /// sub-operations (7), the branch conditions (8, 9) and the bitwise
+    /// sub-operations (9).  Layout in `lookups/relations.rs`.
+    #[size = 1]
+    FlagByte6,
+    #[size = 1]
+    FlagByte7,
+    #[size = 1]
+    FlagByte8,
+    #[size = 1]
+    FlagByte9,
 
-    // ── Stwo-v2.x degree-flatten helpers ──
+    // ── Degree-flatten helpers ──
     //
     // CpuChip's natural form has dozens of `is_real · is_op · is_width
     // · …` selector chains gated against linear bodies; with all
@@ -887,8 +903,12 @@ pub enum Column {
     /// `IsCmovNz · (1 - ValDIsZero)` — the if-not-zero CMOV path.
     #[size = 1]
     IsCmovNzNotVdzH,
-    /// MinU/MaxU result-binding body helpers: `CmpLtFlag · ValB[i]` and
-    /// `CmpLtFlag · ValD[i]`.  Per-byte (size 8 each).
+    /// The less-than a min or max selects by: `CmpLtSFlag` on MinS/MaxS
+    /// rows, `CmpLtFlag` on every other.
+    #[size = 1]
+    MinMaxLtFlag,
+    /// Min/Max result-binding body helpers: `MinMaxLtFlag · ValB[i]` and
+    /// `MinMaxLtFlag · ValD[i]`.  Per-byte (size 8 each).
     #[size = 8]
     CmpLtValBH,
     #[size = 8]
@@ -915,7 +935,7 @@ pub enum Column {
 
     // ValDIsZero / PartialNZ recurrence + DivByZero result binding.
     /// `ValD[i] · ValDByteInv[i]` — per-byte ValD nonzero indicator
-    /// (1 when ValD[i] != 0, else 0).  Lifts the deg-2 product into a
+    /// (1 when ValD\[i\] != 0, else 0).  Lifts the deg-2 product into a
     /// deg-1 column for the recurrence.
     #[size = 8]
     ValDByteIndicatorH,
@@ -924,11 +944,12 @@ pub enum Column {
     /// `is_real`.
     #[size = 8]
     ValDByteIndMinus1H,
-    /// `ValDPartialNZ[i-1] · ValDByteIndicatorH[i]` for i = 1..8 — used
-    /// in the OR-recurrence `PartialNZ[i] = PartialNZ[i-1] + Ind[i] -
-    /// PartialNZ[i-1]·Ind[i]`.  Index 0 is unused (PartialNZ[0] is set
-    /// directly to ValDByteIndicatorH[0]).
-    #[size = 8]
+    /// `ValDPartialNZ[i-1] · ValDByteIndicatorH[i]` at limb `i - 1` for
+    /// i = 1..8 — used in the OR-recurrence
+    /// `PartialNZ[i] = PartialNZ[i-1] + Ind[i] - PartialNZ[i-1]·Ind[i]`.
+    /// PartialNZ\[0\] is set directly to ValDByteIndicatorH\[0\], so no
+    /// limb serves i = 0.
+    #[size = 7]
     PartNZTimesIndH,
     /// `IsDivRem · ValDIsZero` — pins DivByZero on divrem rows.
     #[size = 1]
@@ -942,28 +963,33 @@ pub enum Column {
     DbzActiveQuotH,
     #[size = 1]
     DbzActiveRemH,
+    /// `DbzActiveRemH · (1 - Is32Bit)` — a 64-bit remainder by zero, whose
+    /// result's high word is the dividend's (a 32-bit one's is the
+    /// sign extension of its low word).
+    #[size = 1]
+    DbzActiveRem64H,
 
     // BitManip MSB recurrences.  (sign_ext_bit is enforced boolean
     // unconditionally, so no separate helper is needed.)
     /// `ValDPartialNZMsb[i+1] · ValDByteIndicatorH[i]` for the MSB-direction
-    /// recurrence — i ∈ 0..7 (index 7 unused; default fill = 0).
-    #[size = 8]
+    /// recurrence — i ∈ 0..7.
+    #[size = 7]
     PartNZMsbTimesIndH,
-    /// Same for the low-4-byte MSB recurrence — i ∈ 0..3 (index 3 unused).
-    #[size = 4]
+    /// Same for the low-4-byte MSB recurrence — i ∈ 0..3.
+    #[size = 3]
     PartNZMsbLoTimesIndH,
 
     // TZ / LZ result binding.
-    /// Sum_{i=0..4} (PartialNZ[i] - PartialNZ[i-1]) · (8i + TzByte[i]).
+    /// Sum_{i=0..4} (PartialNZ\[i\] - PartialNZ[i-1]) · (8i + TzByte\[i\]).
     #[size = 1]
     TzLo4H,
-    /// Sum_{i=4..8} (PartialNZ[i] - PartialNZ[i-1]) · (8i + TzByte[i]).
+    /// Sum_{i=4..8} (PartialNZ\[i\] - PartialNZ[i-1]) · (8i + TzByte\[i\]).
     #[size = 1]
     TzHi4H,
-    /// Sum_{i=0..8} (PartialNZMsb[i] - PartialNZMsb[i+1]) · (8(7-i) + LzByte[i]).
+    /// Sum_{i=0..8} (PartialNZMsb\[i\] - PartialNZMsb[i+1]) · (8(7-i) + LzByte\[i\]).
     #[size = 1]
     Lz64H,
-    /// Sum_{i=0..4} (PartialNZMsbLo[i] - PartialNZMsbLo[i+1]) · (8(3-i) + LzByte[i]).
+    /// Sum_{i=0..4} (PartialNZMsbLo\[i\] - PartialNZMsbLo[i+1]) · (8(3-i) + LzByte\[i\]).
     #[size = 1]
     Lz32H,
     /// `IsTzb · Is64Bit`, `IsTzb · Is32Bit`, mirror for IsLzb.
@@ -977,12 +1003,17 @@ pub enum Column {
     IsLzb32H,
 
     // Branch conditions + sequential PC.
-    /// `IsBrEq · BranchTaken` — `val_b == val_d` constraint gate.
+    /// `Σ (ValB[i] − ValD[i])²`, below 2^20 for byte operands, so zero
+    /// exactly when they are equal.
     #[size = 1]
-    IsBrEqTakenH,
-    /// `IsBrNe · (1 - BranchTaken)` — `val_b == val_d` (when not taken) gate.
+    EqDiffSquaresH,
+    /// The inverse of `EqDiffSquaresH`, or 0 when it is 0.
     #[size = 1]
-    IsBrNeNotTakenH,
+    EqDiffSquaresInv,
+    /// `EqDiffSquaresH · EqDiffSquaresInv`: 1 exactly when the operands
+    /// differ, which pins `EqFlag` to 0 then and to 1 when they are equal.
+    #[size = 1]
+    EqDiffSquaresTimesInvH,
     /// `IsCmpOrBranch · EqFlag` — gate for the val_b/val_d byte-equal pinning.
     #[size = 1]
     IsCmpOrBranchEqH,
@@ -991,17 +1022,9 @@ pub enum Column {
     #[size = 1]
     IsBranchTakenH,
 
-    // Control flow next_pc + memory monotonicity.
-    // (BranchTaken and MemByteActive booleans are enforced unconditionally
-    // as `X·(1-X)=0`, so no separate helpers are needed.)
-    /// `MemByteActive[i+1] · (1 - MemByteActive[i])` per i ∈ 0..7
-    /// (index 7 unused, default fill = 0).
-    #[size = 8]
-    MemByteActiveMonoH,
-
     // Register-memory binding selector helpers.  Many cross-constraints
     // chain 3-4 selector flags before a linear body.  (The IsTruncated /
-    // ValBIsReg / ValDIsReg / ResultIsReg / Phi7Bool / IsBlakeEcall
+    // ValBIsReg / ValDIsReg / ResultIsReg / FlagBool / IsBlakeEcall
     // booleans are enforced unconditionally as `X·(1-X)=0`, so no separate
     // helpers are needed.)
     /// `(1 - IsPadding) · Is32Bit` — used in the IsTruncated identity binding.
@@ -1016,11 +1039,12 @@ pub enum Column {
     /// `ValBIsRegH · IsTruncated` — truncated ValB upper-byte gate.
     #[size = 1]
     ValBIsRegTruncH,
-    /// `(1 - IsPadding) · ValDIsReg` — gate root for ValD cross-constraints.
+    /// `(1 - IsPadding) · (1 - ValDIsReg)` — the gate pinning RegValD to
+    /// the immediate.
     #[size = 1]
-    ValDIsRegH,
-    /// `ValDIsRegH · (1 - IsShiftConstrained)` — non-shift ValD gate
-    /// (the `non_shift_gate`).
+    ValDIsImmH,
+    /// `(1 - IsPadding) · (1 - IsShiftConstrained)` — non-shift ValD gate
+    /// (the `non_shift_gate`); every real row's ValD has a source.
     #[size = 1]
     NonShiftGateH,
     /// `NonShiftGateH · (1 - IsTruncated)` — non-shift, non-truncated.
@@ -1029,30 +1053,31 @@ pub enum Column {
     /// `NonShiftGateH · IsTruncated` — non-shift, truncated.
     #[size = 1]
     NonShiftGateTruncH,
-    /// `ValDIsRegH · IsShiftConstrained` — shift-amount identity gate.
+    /// `(1 - IsPadding) · IsShiftConstrained` — shift-amount identity gate.
     #[size = 1]
-    ValDIsRegShiftCH,
-    /// `(1 - IsPadding) · (IsRotateR64 + IsRotateR32)` — rotate-R identity gate.
+    RealShiftCH,
+    /// `(1 - IsPadding) · (IsRotateR64 + IsRotateR32 + IsShloR)` — the
+    /// complementary shift-amount identity's gate.
     #[size = 1]
-    IsRotateRGateH,
-    /// `(1 - IsPadding) · (1 - Phi7Bool)` — gate for `Phi7=0` constraint.
+    ShiftComplGateH,
+    /// `(1 - IsPadding) · (1 - FlagBool)` — gate for `Flag=0` constraint.
     #[size = 1]
-    RealNotPhi7BoolH,
-    /// `(1 - IsPadding) · Phi7Bool` — gate for `Phi7·Phi7Inv=1` constraint.
+    RealNotFlagBoolH,
+    /// `(1 - IsPadding) · FlagBool` — gate for `Flag·FlagInv=1` constraint.
     #[size = 1]
-    RealPhi7BoolH,
-    /// `Phi7Field · Phi7InvField` — body helper for the Phi7-nonzero proof.
+    RealFlagBoolH,
+    /// `(Σ Flag bytes) · FlagInv` — body helper for the Flag-nonzero proof.
     #[size = 1]
-    Phi7TimesInvH,
+    FlagTimesInvH,
 
     // Deg-3 selector helpers for RotR ImmAlt val_b pinning and 32-bit
     // shift val_d-high-bytes-zero.
-    /// `IsRotateRImmAlt · (1 - IsTruncated)` — non-truncated ImmAlt gate.
+    /// `IsImmAlt · (1 - IsTruncated)` — non-truncated ImmAlt gate.
     #[size = 1]
-    IsRotRImmAltNotTruncH,
-    /// `IsRotateRImmAlt · IsTruncated` — truncated ImmAlt gate.
+    IsImmAltNotTruncH,
+    /// `IsImmAlt · IsTruncated` — truncated ImmAlt gate.
     #[size = 1]
-    IsRotRImmAltTruncH,
+    IsImmAltTruncH,
     /// `Is32Bit · IsShiftConstrained` — 32-bit shift gate.
     #[size = 1]
     Is32ShiftCH,
@@ -1076,8 +1101,9 @@ pub enum Column {
     /// `DivRemainder[i] · (ValRByteIndicatorH - 1)` — inv pinning.
     #[size = 8]
     ValRByteIndMinus1H,
-    /// `ValRPartialNZ[i-1] · ValRByteIndicatorH[i]` — OR-recurrence.
-    #[size = 8]
+    /// `ValRPartialNZ[i-1] · ValRByteIndicatorH[i]` at limb `i - 1` for
+    /// i = 1..8 — OR-recurrence.
+    #[size = 7]
     ValRPartNZTimesIndH,
     /// `IsDivS · (1 - DivByZero) · ValRPartialNZ[7]` — sign-of-r gate.
     #[size = 1]
@@ -1085,10 +1111,71 @@ pub enum Column {
     /// `IsDivS · (1 - DivByZero)` — root helper for DivSActivePartialH.
     #[size = 1]
     IsDivSNotDbzH,
-    /// `IsShiftConstrained · (1 - IsRotateR64 - IsRotateR32)` —
-    /// PowerOfTwo lookup multiplicity for the classic shift case.
+    /// `IsShiftConstrained · (1 - IsRotateR64 - IsRotateR32 - IsShloR)` —
+    /// PowerOfTwo lookup multiplicity for the shifts by `ShiftAmount`.
     #[size = 1]
-    IsShiftCNotRotrH,
+    ShiftAmountPow2H,
+
+    /// Boolean disposition of a host-call row. One only when an ECALLI was
+    /// handled and acknowledged by the embedder; zero for unhandled calls.
+    #[size = 1]
+    HostCallAcknowledged,
+
+    /// `IsLoad + IsStore`: scalar-memory instructions, all subject to the
+    /// protected-zone rule.
+    #[size = 1]
+    IsStandardMemH,
+    /// Carry into the most-significant address byte for the final active byte:
+    /// `carry3[width - 1]`, selected by the authenticated width flags.
+    #[size = 1]
+    MemLastAddrCarryH,
+    /// `canonical_high_word · (256 - addr[3] - last_carry)`, where the
+    /// high word is derived from the authenticated byte-0 memory lookup.
+    /// Nonzero exactly when the base is at least 0x10000 and the final active
+    /// byte does not wrap through 2^32.
+    #[size = 1]
+    MemRangeProductH,
+    /// M31 inverse of `MemRangeProductH` when nonzero, otherwise zero.
+    #[size = 1]
+    MemRangeInv,
+    /// `MemRangeProductH · MemRangeInv`, lifted so the Standard-memory
+    /// validity gate remains within CpuChip's degree-two bound.
+    #[size = 1]
+    MemRangeTimesInvH,
+
+    /// ProgramMemory-authenticated exact precompile dispatch identifier
+    /// (100, 101 or 102), or zero for any other instruction. A
+    /// continued host-call row must select exactly the matching precompile
+    /// call relation.
+    #[size = 1]
+    HostCallPrecompileDispatch,
+
+    // ── Witness-input binding ──
+    /// 1 iff an acknowledged `Ecalli` of the witness input (dispatch 101).
+    /// Its row reads φ7, the destination (`HPtr`), and φ8, the capacity
+    /// (`MPtr`); writes the count to φ7 (`Result`, `ResultRegIdx` 7), a
+    /// value below 2^24 at most φ8 (a CompareLookup tuple); and, when the
+    /// count is not zero, hands `(ts, destination, count)` to
+    /// `WitnessInputChip`, which writes exactly that range.
+    #[size = 1]
+    IsWitnessEcall,
+    /// 1 iff the witness-input call wrote bytes: its count is not zero.
+    #[size = 1]
+    WitnessNonEmpty,
+    /// M31 inverse of the witness-input count when it is not zero.
+    #[size = 1]
+    WitnessCountInv,
+    /// `count · WitnessCountInv`, lifted so the non-zero test stays within
+    /// CpuChip's degree-two bound.
+    #[size = 1]
+    WitnessCountTimesInvH,
+
+    // ── Poseidon2 binding ──
+    /// 1 iff an acknowledged `Ecalli` of the Poseidon2 call (dispatch 102).
+    /// Its row reads φ7 and φ8, the input and output pointers (`HPtr`,
+    /// `MPtr`), below 2^32, and hands `(ts, φ7, φ8)` to `Poseidon2Chip`.
+    #[size = 1]
+    IsP2Ecall,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]

@@ -41,27 +41,24 @@
 //!   (init_pc, init_ts) / (final_pc, final_ts) columns are pinned to the
 //!   trace by CpuChip's `#[mask_next_row]` program-execution chaining +
 //!   telescoping. So pc/timestamp are genuine bound public inputs.
-//! - **registers: fully bound (v6).** The
+//! - **registers: fully bound.** The
 //!   `RegisterMemory{Boundary,Closing}Chip` register columns are pinned
-//!   to the trace by `RegisterMemoryChip` read-consistency, which is now
+//!   to the trace by `RegisterMemoryChip` read-consistency, which is
 //!   sound against a from-scratch prover: a cross-row `#[mask_next_row]`
 //!   `prev_value` binding, a range-checked `(reg, ts)` sortedness gadget,
 //!   and an `is_write` tuple limb together force the closing read's value
 //!   — and hence the actor io-hash in `final_state.registers[9..13]` —
 //!   to equal the trace's actual final register state. Combined with the
 //!   metadata→column binding here, registers are a fully bound public
-//!   input (gate: `tests/ledger_readconsistency_gate.rs`).
-//!   `memory_commitment` has no committed column and stays OUTSIDE this
-//!   binding entirely.
+//!   input (gate: `tests/gates/ledger_readconsistency_gate.rs`).
 //!
 //! A consequence of the closing-chip equality: a proof over an EMPTY
-//! trace (no steps, all-zero boundary metadata) is now rejected — the
+//! trace (no steps, all-zero boundary metadata) is rejected — the
 //! closing chip emits no tuples (claimed sum 0) while the expected sum
-//! over thirteen (r, 0, 0) tuples is non-zero. (Empty proofs previously
-//! verified: the boundary chip's thirteen (r, 0, 0) seeds were exactly
-//! cancelled by the ledger's ts=0 initial-write rows, so the relation
-//! balanced with no closing emissions; the closing-chip equality is what
-//! now rejects them. Empty traces assert nothing useful anyway.)
+//! over thirteen (r, 0, 0) tuples is non-zero. Without that equality the
+//! boundary chip's thirteen (r, 0, 0) seeds would cancel against the
+//! ledger's ts=0 initial-write rows, and the relation balance with no
+//! closing emissions.
 
 use alloc::vec::Vec;
 
@@ -77,6 +74,37 @@ use crate::lookups::{
 };
 use crate::proof::SegmentState;
 
+/// The bytes of the boundary states the lossless formats absorb, one M31 a
+/// byte (`proving.md` A.3): the 13 registers in, the 13 out, pc and ts in, pc
+/// and ts out, the memory roots in and out. A register or ts is its 8
+/// little-endian bytes and pc its 4, the byte limbs the boundary chips'
+/// tuples carry, so the transcript binds exactly the tuples the public logup
+/// terms below recompute.
+pub const BOUNDARY_STATE_BYTES: usize = 13 * 8 * 2 + (4 + 8) * 2 + 32 * 2;
+
+/// The boundary states as [`BOUNDARY_STATE_BYTES`] bytes, in that order.
+pub fn boundary_state_bytes(
+    initial: &SegmentState,
+    final_state: &SegmentState,
+) -> [u8; BOUNDARY_STATE_BYTES] {
+    let mut bytes = [0u8; BOUNDARY_STATE_BYTES];
+    let mut at = 0;
+    let mut put = |part: &[u8]| {
+        bytes[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    };
+    for register in initial.registers.iter().chain(&final_state.registers) {
+        put(&register.to_le_bytes());
+    }
+    for state in [initial, final_state] {
+        put(&state.pc.to_le_bytes());
+        put(&state.timestamp.to_le_bytes());
+    }
+    put(&initial.memory_root);
+    put(&final_state.memory_root);
+    bytes
+}
+
 /// Positions of the three boundary-binding chips within a proof's
 /// ACTIVE component order (the order `claimed_sums` is indexed by).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +112,7 @@ pub struct BoundaryChipPositions {
     pub register_boundary: usize,
     pub register_closing: usize,
     pub program_boundary: usize,
-    /// Position of `MemoryRootBoundaryChip` (format v7), which
+    /// Position of `MemoryRootBoundaryChip`, which
     /// consumes the single root `MerkleNode` `(0, 0, initial_root, final_root)`.
     pub memory_root_boundary: usize,
 }

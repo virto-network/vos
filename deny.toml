@@ -1,61 +1,54 @@
-# cargo-deny configuration. Run with:
-#
-#     cargo install cargo-deny
-#     cargo deny check
-#
-# The four sub-checks (advisories / licenses / bans / sources) all run
-# by default. Wire `cargo deny check` into CI before any release that
-# leaves the trusted-internal-network bucket — without it, RustSec
-# advisories on hyper / quinn / rustls / ring won't get caught.
+# `just deny`: the workspace's dependency graph, every feature on, held to
+# an allowlist of licences compatible with the AGPL-3.0-or-later the
+# workspace ships under, to the RustSec advisory database, and to the
+# sources named here.
 
 [graph]
-# Check every feature combination so feature-gated deps (e.g. our
-# `http3` stack) are scanned too. Slower than the default, worth it.
 all-features = true
 
 [advisories]
 version = 2
-# Hard-fail on any RustSec advisory by default; manage exceptions
-# with `ignore = ["RUSTSEC-XXXX-YYYY"]` when there's a documented
-# reason and a tracking ticket.
-ignore = []
+yanked = "warn"
+# Each advisory left open, with what holds it: none has an upgrade the
+# crate that pulls it accepts. Reviewed 2026-11-17.
+ignore = [
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained: heapless 0.7 under postcard 1; no code path on a target without atomics." },
+]
 
 [licenses]
 version = 2
-# Permissive set common to the Rust ecosystem. Add to this list only
-# after legal review — every entry is a license the project ships.
+# The permissive licences the dependencies carry.
 allow = [
-    "MIT",
+    "AGPL-3.0-or-later",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-1-Clause",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "ISC",
-    "Unicode-DFS-2016",
-    "Unicode-3.0",
-    "CC0-1.0",
-    "MPL-2.0",
     "Zlib",
-    "OpenSSL",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
 ]
-# Confidence floor for license auto-detection. 0.8 is the cargo-deny
-# default; raising it would flag crates with non-canonical license
-# text that we'd otherwise have to whitelist explicitly.
-confidence-threshold = 0.8
+# The five crates the verifier kit vendors into a chain's runtime, under the
+# GPL-3.0-or-later (`pvm/README.md`); no other crate takes it.
+exceptions = [
+    { name = "vos-anchor", allow = ["GPL-3.0-or-later"] },
+    { name = "vos-statement", allow = ["GPL-3.0-or-later"] },
+    { name = "vos-pvm-final-verifier", allow = ["GPL-3.0-or-later"] },
+    { name = "vos-pvm-recair-air", allow = ["GPL-3.0-or-later"] },
+    { name = "vos-pvm-poseidon2", allow = ["GPL-3.0-or-later"] },
+]
 
 [bans]
-# Multiple versions of the same crate in the dep tree are common in
-# Rust and rarely a real problem, but worth a heads-up at audit time.
 multiple-versions = "warn"
-# Wildcard versions in `[dependencies]` are a CI hazard — they let an
-# upstream patch bump silently land in the lock file with the next
-# `cargo update`.
-wildcards = "deny"
-# Allow our own `path = ".."` workspace deps to use wildcards.
-allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Runtime and compiler dependencies are workspace-owned.
-allow-git = []
+# The fork the workspace pins: the Stwo prover.
+allow-git = [
+    "https://github.com/olanod/stwo",
+]

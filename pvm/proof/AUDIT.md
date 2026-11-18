@@ -1,0 +1,217 @@
+# Reading map for an audit
+
+Where the code is that decides what a verifier accepts, path by path, in
+the crates under `pvm/proof`. [SECURITY.md](SECURITY.md) says what a
+verified proof proves and what the audit covers; this page says which
+files and functions to read for it. Paths below are relative to
+`pvm/proof/`; `src/` is `vos-pvm-proof`'s.
+
+## The rule in `vos-pvm-proof`
+
+**An item not behind the `prover` feature is verifier-side:** compiled
+into the verifier build, though not every such item is read on a
+verifier's path (a few constants of a chip's layout are the prover's
+alone). The crate's `--no-default-features` build, which also leaves out
+the `abi` feature's checks against the actor ABI's records, compiles
+exactly those items, and `just check-no-std` builds it for
+`thumbv7em-none-eabihf` and `wasm32-unknown-unknown` through
+`vos-pvm-proof-verifier`, so check code that called into prover code
+would fail to compile there.
+
+Prover code sits in child modules, each declared on one line at the edge
+of its parent, `#[cfg(feature = "prover")] mod fill;`, with a gated
+`pub use` when the parent re-exports one of its items under the parent's
+path. A child sees its parent's private items, so no public path or
+visibility outside the parent depends on where an item sits:
+
+| parent | its prover half |
+|---|---|
+| a chip, `src/chips/<chip>.rs` or `<chip>/mod.rs`: columns, `BuiltInComponent::add_constraints` | `src/chips/<chip>/fill.rs`: `impl BuiltInProverComponent`, the helpers and constants only it reads; for a chip whose preprocessed columns read the program, `<chip>/pin.rs`: those columns |
+| `src/chips/blake2b/address.rs` | `address/trace.rs` |
+| `src/chips/cpu/cut.rs`: `CpuColumns`, `ProgramCpuChip`'s AIR | `cut/pin.rs` (the columns a code keeps), `cut/fill.rs` (the cut trace) |
+| `src/device.rs`: the device chip set, its order | `device/pin.rs` (`device_chips_of_code`), `device/run.rs` (`DeviceLayout`, `DeviceRun`) |
+| `src/page_merkle.rs`: the page-hash constants and chaining | `page_merkle/host.rs`: the host's tree, roots and multiproofs |
+| `src/core/step.rs`, `src/memory_layout.rs`, `src/sparse_memory.rs` | `step/trace.rs`, `memory_layout/host.rs`, `sparse_memory/host.rs` |
+| `src/framework/traits/{builtin,erased}.rs`: the verifier's chip traits | `builtin/prover.rs`, `erased/prover.rs`: `BuiltInProverComponent`, `MachineProverComponent` |
+| `src/poseidon2/mod.rs`: the hasher and the channel | `poseidon2/simd_backend.rs`: the prover's backends |
+| `src/masked/mod.rs`: the masked device set | `masked/trace.rs` |
+| `src/lib.rs`: the chip table (`chips!`) | `src/prove/active.rs`: which chips a trace activates |
+
+Whole modules behind `prover`: `side_note`, `kernel`, `prove`, `verify`
+(which takes a `SideNote`; the side-note-free verifier is
+`vos-pvm-proof-verifier`), `segment`'s bounds, cursor and windows, the tracer
+(`core/tracing.rs`), the trace builders and the CPU's `classify`,
+`reg_access`, `trace_fill/` and `interaction/`. Two type aliases have a
+twin per configuration, side by side in `src/lib.rs`: `DynChip`, the chip
+tables' trait object, and `DynComponent`, Stwo's component the masked set
+holds; each is the verifier's trait without `prover` and the prover's
+subtrait with it, which verification upcasts. The tables themselves are
+written once.
+
+**The `prover` feature is not the trust boundary.** No production binary
+builds the verifier-only configuration: `vos-node` and `vos-light` link
+`vos-pvm-proof` with `prover` through `vos-pvm-recair`. That build serves
+the reference verifier and the compile check above. The code that fixes
+what a verifier holds a proof to (the pin code below) is behind `prover`,
+and two of the four production verifiers are not in `src/` at all.
+
+## Three kinds of code
+
+| kind | does | trusted for | in `vos-pvm-proof` |
+|---|---|---|---|
+| **check** | runs on every proof: constraints, transcript, PCS | soundness | ungated |
+| **pin** | runs once a program: computes what the verifier holds a proof to | soundness | behind `prover`, but for the program id's derivation |
+| **fill** | runs once a proof: tracer, trace fill, interaction trace, masks | completeness and zero-knowledge, not soundness | behind `prover` |
+
+Pin code stays behind `prover`, among the fill code it shares a trait
+with, but for one file: `src/program_id.rs` is ungated, shared by check and
+pin (`KernelEntry::of` derives a kernel's entry state from its blob,
+`KernelProgram::id` its id, both run by `verify_kernel_chain` and the
+leaf). Read it as trusted:
+
+- `src/chips/cpu/cut/pin.rs`: `FAMILIES`, `CpuColumns::always`,
+  `CpuColumns::of_code`: which CPU columns a device program keeps, hence
+  which of the CPU's constraints its verifier drops.
+- `src/device/pin.rs`: `device_chips_of_code`, a device program's chip set,
+  with `src/prove/active.rs`: `opcode_component_mask`, the chips an opcode
+  activates.
+- `src/prove/preprocessed.rs`: `preprocessed_root`, the root of a chip
+  set's preprocessed columns, through the blanket
+  `MachineProverComponent::generate_preprocessed_trace`
+  (`src/framework/traits/erased/prover.rs`).
+- `BuiltInProverComponent::generate_preprocessed_trace`, a method of the
+  fill trait; every one feeds the preprocessed root a verifier holds. Six
+  read the program, each in its chip's `pin.rs` (`preprocessed_trace`,
+  which the fill trait's method calls), beside the helpers they share
+  with the fill: `src/chips/program_memory/pin.rs` (the code table every
+  step is bound to), `jump_table/pin.rs`, `memory_page/pin.rs` (the
+  regions and their permissions), `device_boundary/pin.rs`
+  (`DeviceBoundaryChip`'s entry), `word_memory/data/pin.rs` (the program's
+  data) and `word_memory/boundary/pin.rs`. The others are fixed tables,
+  their columns in their `fill.rs`:
+  `bitwise_lookup`, `bitwise_and_byte`, `byte_to_bits`, `popcount`,
+  `bitcount`, `power_of_two`, `range_multiplicity`, `blake2b`,
+  `blake2b/boundary`, `word_memory` and `device_boundary` (`DeviceIoChip`).
+- `src/masked/trace.rs`: `device_preprocessed`; `src/kernel.rs`:
+  `kernel_side_note`; `src/prove/shaped.rs`: `program_commitment_for_shape`;
+  `recair/src/leaf/program.rs`: `kernel_program`, a kernel's program from
+  its install record.
+- `device/src/prove.rs`: `Program::from_kernel`, `Program::sized_for`,
+  `Program::from_release` and `Program::verifier`; `device/src/verify.rs`:
+  `DeviceProgramId::of`. A node gets a device program's `Verifier` by
+  building its prover: `DeviceProver::install` commits the preprocessed
+  tree (`device/src/masked/prove.rs`), and `.verifier()` keeps the
+  program, its masked format and its id (on the node side, the host's
+  `device_program` at install and its credentialed ingress). Ingress needs
+  the prover's backend at install, whatever the layout.
+- The format registry, one copy: its plain data (each format's number,
+  kind, channel, parameters, masking, floors and status, `admitted`) in
+  `recair-air/src/format.rs`, `no_std`; `src/format.rs` re-exports it and
+  adds each format's reference shape and its counts (`COUNTS`), which
+  `security.rs` takes. The final verifier's `masked::CONFIG` is the
+  registry's `MASKED_WRAP.pcs_config()`.
+
+## The four production paths
+
+| path | who checks it | entry | code that decides what is checked | what pins it |
+|---|---|---|---|---|
+| **39**, the masked wrap | a venue: natively, in wasm32, or as a PVM guest (the JAM statements service, below) | `statement/src/lib.rs`: `admit`, then `Admitted::verify` → `final-verifier/src/lib.rs`: `verify` (`decode`, `Decoded::verify`) → `final-verifier/src/masked.rs`: `verify` → `final-verifier/src/masking.rs`: `verify_masked` | `statement/src/lib.rs` (the statement, its decode, `admit`, `judge`); `anchor/src/codec.rs` (the statement's decoder of untrusted bytes, `Reader`), `anchor/src/lib.rs` (`blake2b_256`, the io-hash's and the statement id's hash), `anchor/src/venue.rs` (the venue rules); `final-verifier/src/{lib,masked,masking,layout,constants}.rs` (`masking.rs` the masked verifier any masked format runs, `masked.rs` format 39's decode and parameters); `recair-air/src/` (`gate.rs`, `p2.rs`, `h8.rs`, `qm31.rs`, `format.rs`, `masking/`, `wrap.rs`; the masked transcript is `masking.rs`'s own `replay`, not `transcript.rs`); `vos-pvm-poseidon2` (`poseidon2/src/`) without `packed`; Stwo's verifier core | `PREPROCESSED_ROOT_39` (`final-verifier/src/constants.rs`, the wrap circuit, the one copy: `src/constants.rs` re-exports it), `MASKED_WRAP` (`final-verifier/src/masked.rs`, the masked format `verify` holds a proof to) and the statement's program id |
+| **32**, leaves and folds | the fold and wrap circuits, in-AIR; natively only `recair/src/prove.rs`: `verify`, in tests and the prover's own check | none outside the circuits | `recair-air/src/` without `masking/` (`transcript.rs`: `replay_prefix`, 32's transcript up to the interaction root, which `recair/src/prove.rs` and the fold's child verifier, `recair/src/fold/child.rs`, replay); the circuit builders in `recair/src/`: `fold/`, `wrap.rs`, `verifier/`, `context/`, `circuit.rs`, `gadgets.rs`, `value.rs` | `H_FOLD` (`src/constants.rs`), a constant of the wrap circuit |
+| **41**, a node's segment | a leaf circuit, in-AIR; no native verifier runs in production | `src/standalone.rs`: `verify_standalone` (the one copy of the checks; the prover-side `verify` runs them at the root it commits again), and `verifier/src/lib.rs`: `verify_kernel_segment`, `verify_kernel_chain`, the reference a leaf is tested against | the node chip set and the AIR plumbing (below); `src/{proof,format,pcs,security,shape,program_id,boundary_binding}.rs` (`src/proof/preflight.rs` the hostile-input preflight of every nested length, `src/proof/transcript.rs` the interaction PoW and the format's security check, `src/proof/malformed.rs` the refusals before the STARK), `recair-air/src/format.rs`; `recair/src/compile/` (constraints to gates), `recair/src/leaf/`, `recair/src/verifier/{segment,shape,logup}.rs` | the program id: `src/program_id.rs` (`KernelProgram`, `LeafCircuits`; `ProgramId`, `final-verifier/src/lib.rs`'s, re-exported), each class's shape, preprocessed root and entry state |
+| **47**, a device proof | a node's ingress, natively | `device/src/verify.rs`: `Verifier::verify` → `device/src/masked/verify.rs`: `verify_device_in` → `final-verifier/src/masking.rs`: `verify_masked` | `final-verifier/src/masking.rs`; `recair-air/src/masking/`; `src/masked/mod.rs`; `src/device.rs`; the device chip set and the plumbing (below); `recair-air/src/format.rs`, `src/format.rs`; `device/src/verify.rs` (`precheck`, `decode`, `Verifier::verify`) and `device/src/masked/verify.rs` (`device_floors`, `device_format`, `verify_device_in`), beside their parents' shared types (`device/src/lib.rs`, `device/src/masked.rs`: `DeviceProgram`, `DeviceProof`, the formats; `device/src/error.rs`: `Refusal`) and `final-verifier/src/masking.rs`'s `verifier_format`, `mask_rows` and `reveals` (what a format pins of a component set) and `MaskedProof`; the crate has no `prover` feature, and its prove halves are `device/src/prove.rs` and `device/src/masked/prove.rs`, which the verify files do not import, nor anything of `vos-pvm-recair` | `device/src/verify.rs`: `DeviceProgramId::of` (the format, the chips, the CPU cut, the log sizes, the preprocessed root) |
+
+The masking's zero-knowledge rests on prover code: `recair/src/masked/`,
+`device/src/masked/prove.rs` and `src/masked/trace.rs`.
+
+**A masked claim's checks are all mandatory.** `masking::Claim` carries
+the circuit's root, the public terms' logup sum and the check of the sums
+the public values fix (`bound_sums`, the device's io-hash binding) as
+plain fields, never optional: every caller of `verify_masked` checks the
+preprocessed root against the root it pins, the claimed sums against the
+public terms, and the fixed sums against the public values (a set with
+none, the wrap, passes a check that holds).
+
+### The JAM statements service
+
+`statement/service/src/` is the one venue implemented under `pvm/`
+(`statement-service.elf`), and splits the 39 path's check in two:
+
+- **Refine** (`refine.rs`) reads no state. A statement: its size and roots
+  bounded, decoded, then `admit` under `Stateless`, a venue that answers
+  every root anchored and no statement seen (`refine.rs`'s `Stateless`), so
+  refine checks the format, the program against the deployment's pins
+  (`config.rs`), the space rule, the io-hash and the id, then the proof
+  (its first extrinsic, at most `MAX_PROOF_BYTES`). A registration's checks
+  that read no state (`vos_anchor::venue::registration`) and an anchor's
+  and a control's ed25519 signatures (`verify_strict`). Its output is a
+  verdict (`verdict.rs`): the code and, for a statement, its space, roots
+  and id.
+- **Accumulate** (`accumulate.rs`) holds the state (`state.rs`): it
+  applies the venue rules at the slot's time to a registration and an
+  anchor, and records a statement only if refine's code is 0, every root
+  it names is anchored (`anchored`, the rules' `anchored` over the
+  service's snapshot) and its id unseen (`submit`), then writes its `Seen`
+  entry. It trusts refine's verdict as JAM trusts a guaranteed work
+  report: the proof is not verified again.
+- The items and their encodings are `item.rs`; the deployment's constants
+  (the genesis, the pinned programs) `config.rs`.
+- **The program's entries and runtime:**
+  `statement/service/src/bin/statement-service.rs` holds refine's and
+  accumulate's entries, which read their arguments and fetch the proof
+  extrinsic, and includes by path the venue guests' runtime,
+  `statement/src/bin/guest/runtime.rs` with `statement/src/bin/guest/heap.rs`:
+  the guest's own stack and the switch onto it, the allocator, the host
+  calls and their convention, the panic handler and the single-core atomic
+  libcalls. The service's `unsafe` code is in these three files.
+
+### Test seams
+
+Public items a production build never compiles, each behind a feature
+`just check-no-leaks` keeps off every production edge; of them, `just
+check-kit` refuses `other-pins` and `model-judge` in the kit's build,
+whose crates hold none of the others: `vos-pvm-proof`'s `chip-isolated`
+(`prove_with_explicit_components`, `verify_with_explicit_components`,
+`harness`, whose proofs carry `component_mask = 0`, which
+`verify_standalone` refuses; `prove_with_boundary_override`, a prover of
+forged boundary states for the boundary-binding gate; and
+`record_canonical_transcript`, the recursion seams' recorded transcript); `vos-pvm-recair`'s `seeded-masks` (seeded
+randomness, the forced prove); `vos-pvm-final-verifier`'s `other-pins`
+(`masked::verify_with`, the wrap under other pins); `vos-pvm-device`'s
+`test-device-format`; and `vos-statement`'s `model-judge` (`model`, a
+judge whose pinned program and venue state its input bytes carry, for the
+harnesses and the conformance vectors, `statement/src/model.rs`; the
+development tools link it, the node, `vos` and the JAM statements
+service's program never). Two of `blobs.lock`'s blobs link it on purpose,
+as the harnesses' programs, and are deployed nowhere: `final-verify.elf`
+(`statement/src/bin/final-verify.rs` on `statement/src/bin/guest/mod.rs`,
+the JAM-only host's) and the final verifier's Wasm blob
+(`final-verifier/wasm/blob/`). `vos-pvm-device`'s `masked` module takes a `Format`
+itself, the gates' layer; production enters through `Program` and
+`Verifier` alone.
+
+The kit's vendored manifests keep `other-pins` and `model-judge`: they add
+functions and change none, and `check-kit` refuses them in VOS's build of
+the kit, not in a consumer's. A chain that vendors the kit enables neither
+in its own build.
+
+### The chip sets
+
+Each chip's check code is its parent file (or directory, its prover
+modules aside); `src/lib.rs` holds both tables, the node's (`chips!`) and
+the device's own chips over it (`device_chips!`), and `src/device.rs`
+(`DEVICE_ORDER`, `device_chip`) the device set's order and indices.
+
+| chips | node segment (41) | device (47) |
+|---|---|---|
+| `src/chips/cpu/` (`columns.rs`, `constraints/`, `tuples.rs`), `blake2b/` (`mod.rs`, `address.rs`, `call.rs`, `columns.rs`, `compression/{mod,constraints}.rs`, `consts.rs`, `sw.rs`), `poseidon2.rs`, `register_memory.rs`, `program_memory.rs`, `jump_table.rs`, `witness_input.rs`, `range_multiplicity.rs`, `bitwise_lookup.rs`, `power_of_two.rs`, `popcount.rs`, `bitcount.rs`, `byte_to_bits.rs`, `mul.rs`, `bitwise.rs`, `compare.rs`, `divrem/{mod,constraints}.rs`, `bitwise_and_byte.rs` | yes | yes |
+| `memory.rs` (the byte ledger), `blake2b/boundary.rs`, `memory_page.rs`, `memory_merkle.rs`, `memory_root_boundary.rs` (the page tree), `register_memory_boundary.rs`, `register_memory_closing.rs`, `program_boundary.rs` | yes | no |
+| `cpu/cut.rs` (`ProgramCpuChip`, the CPU with its cut columns zero), `word_memory/mod.rs` (`WordMemoryChip`, in the byte ledger's place), `word_memory/boundary.rs`, `word_memory/data.rs`, `device_boundary.rs` (`DeviceBoundaryChip`, `DeviceIoChip`) | no | yes |
+
+The AIR plumbing both sets share: `src/framework/` (`eval.rs`,
+`traits/builtin.rs`, `traits/erased.rs`), `src/lookups/` (the relations),
+`src/trace/eval.rs`, `src/air_column/`, `src/framework_access.rs` and
+`src/chips/ordering.rs` (the ledgers' ordering delta); and the column
+derives the constraints index by, `derive/src/` (`vos-pvm-proof-derive`:
+`derive_impl.rs` writes each column enum's sizes, offsets, column count,
+`mask_next_row` and preprocessed impl for `#[derive(AirColumn)]` and
+`#[derive(PreprocessedAirColumn)]`).

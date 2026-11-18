@@ -13,16 +13,20 @@ constraint of degree
 (roughly: degree shoots up because the two fractions share a denominator
 product).
 
-CpuChip declares `LOG_CONSTRAINT_DEGREE_BOUND = 2` — so paired-batch
-constraints must stay ≤ degree 4.
+CpuChip declares `LOG_CONSTRAINT_DEGREE_BOUND = 1`: its constraints are
+evaluated on a domain twice the trace's, and a constraint of degree `d` has a
+quotient of degree about `(d − 1)·N` over a trace of `N` rows, which fits for
+`d ≤ 3`. So paired-batch constraints must stay ≤ degree 3, which a pair of
+degree-1 tuples with degree-1 multiplicities meets exactly. (MemoryChip's
+permission rules, of degree 3 in its body, use the same headroom.)
 
 **Rule.** Tuples passed to `add_to_relation` should be **degree ≤ 1** in the
 fundamental columns.  Multiplicities should be **degree ≤ 1** too.  A tuple
 expression like `is_op_a * val_d[0]` is degree 2 and will blow the bound when
 paired.  If you need a derived value, materialise it as a column.
 
-**Subtlety: pair parity matters at the chip level.**  CpuChip's
-`add_constraints` must emit an EVEN number of `add_to_relation` calls.  The
+**Subtlety: pair parity matters at the chip level.**  CpuChip's emissions
+pair in emission order on both sides, an odd last one alone.  The
 prover-side `LogupTraceBuilder::add_to_relation_with` /
 `add_to_relation_computed` always pair adjacent emissions into shared
 interaction-trace columns; `finalize_logup_in_pairs` on the verifier side
@@ -31,9 +35,8 @@ matches that column structure 1:1.  Switching the verifier side to plain
 mismatch and stwo panics with `Option::unwrap() on a None value` in
 `pcs/utils.rs`.
 
-So if you add a single new emission, you **must** add a partner alongside —
-or defer until another commit adds its own and ship them together.  Two
-common patterns:
+So a single emission added in the middle shifts every later pair (§2);
+at the end it closes alone.  Two common patterns for even blocks:
 
 - **Pair within a feature.**  The SignExtend block emits 4 lookups in a
   trailing block; pair count even, no parity flip elsewhere.
@@ -50,18 +53,21 @@ stay within the degree bound.
 
 The dangerous variant is inserting **one** emission, or inserting in a
 position that splits an existing pair: `(A,B), (C,D)` → `(A,B), (X,C), (D,…)`.
-Now `(X,C)` and `(D,next)` are new pair shapes, and a tuple combination
-that was fine before may now exceed the degree bound — even though every
+Then `(X,C)` and `(D,next)` are new pair shapes, and a tuple combination
+that was within the degree bound may exceed it — even though every
 emission individually is degree-bounded.
 
 **Rule.** Add new emissions at the **end** of `add_constraints` (and
-`generate_interaction_trace`), in **even-count blocks**, so they pair within
-themselves and never reshuffle pre-existing pair shapes.
+`generate_interaction_trace`), so they never reshuffle pre-existing pair
+shapes. An odd tail closes in a column of its own on both sides (the
+Poseidon2 call's three fractions end the CPU's): every pair, the tail's
+included, must stay at degree ≤ 3, which the masked degree audits
+(`vos-pvm-recair`'s `circuit` tests) check on the built chip.
 
 This is what the SignExtend constraints require: the 4 nibble-AND lookups
 sit in a final block right before `finalize_logup_in_pairs` rather than
 inline near the related ground constraints.  See the "Sign-extend nibble
-lookups" block near the end of `add_constraints` in `mod.rs` for the
+lookups" block, `constraints::bitmanip::sign_extend_nibbles`, for the
 canonical example.
 
 ## 3. Verifier-side and prover-side emissions must match exactly
@@ -75,10 +81,10 @@ Every `eval.add_to_relation(RelationEntry::new(rel, mult, &[tuple]))` in
   - the same tuple values per row,
   - the same emission **order** (so pairing matches).
 
-Mismatches usually surface as `ConstraintsNotSatisfied` with the
-`debug_claimed_sums` totals balancing — confusing.  Use that helper to
-distinguish "logup imbalance" (totals nonzero) from "structural mismatch"
-(totals zero but constraints fail).
+Mismatches usually surface as `ConstraintsNotSatisfied` while the claimed
+sums still balance — confusing. `debug_assert_constraints_explicit`
+(`debug-internals`) names the first failing row and constraint; a "claimed
+logup sum is not zero" refusal is a lookup imbalance instead.
 
 ## 4. Multiplicity registration on producer chips
 
@@ -97,7 +103,7 @@ the canonical paired structure.
 
 Adding a constraint without a matching negative test (a deliberately-wrong
 trace that the verifier must reject) leaves you with no proof the constraint
-fires.  See `tests/bitmanip.rs` for the pattern: build an honest trace,
+fires.  See `tests/isa/bitmanip.rs` for the pattern: build an honest trace,
 mutate one column, assert `prove + verify` panics with
 `ConstraintsNotSatisfied`.
 
@@ -120,8 +126,5 @@ discovered the hard way:
     pair structure should pass `prove_fibonacci_actor` (a few hundred
     steps) before claiming the change is safe at scale.
 
-Minimum sweep: `cargo test -p vos-pvm-proof --test add64_e2e --test memory --test
-control_flow --test bitmanip --test alu_negative --test
-control_flow_negative --test memory_negative --test program_identity
---test prove_vos_actor`.  ~6 minutes; catches all known regression
-classes.
+Minimum sweep: `cargo test -p vos-pvm-proof --features debug-internals --test
+isa --test gates`; catches all known regression classes.

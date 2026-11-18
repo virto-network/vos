@@ -82,6 +82,17 @@ impl ComponentTrace {
         std::array::from_fn(|i| (&self.original_trace[i + offset]).into())
     }
 
+    /// The finalized parts of `col`, its size read at run time.
+    pub fn original_columns<C: AirColumn>(
+        &self,
+        col: C,
+    ) -> impl Iterator<Item = FinalizedColumn<'_>> {
+        let offset = col.offset();
+        self.original_trace[offset..offset + col.size()]
+            .iter()
+            .map(Into::into)
+    }
+
     pub fn preprocessed_base_column<'a, const N: usize, P: PreprocessedAirColumn>(
         &'a self,
         col: P,

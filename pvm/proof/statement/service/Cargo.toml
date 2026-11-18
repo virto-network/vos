@@ -1,0 +1,44 @@
+[package]
+name = "vos-statement-service"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The JAM statements service: a venue on JAM, as a service whose refine checks registrations', migrations' and anchors' signatures and judges statements against their final proofs, and whose accumulate keeps the spaces, their anchors and the statements accepted. no_std; its program for the PVM target."
+
+[features]
+# The service as a JAM program (`src/bin/statement-service.rs`), for the
+# PVM target only: no_main, the venue guests' runtime.
+pvm-guest = []
+# The guests' heap peak, which the runtime this program shares names
+# (`vos-statement`'s `heap-peak`); the service reports no high-water mark
+# and never enables it.
+heap-peak = []
+
+[[bin]]
+name = "statement-service"
+required-features = ["pvm-guest"]
+test = false
+bench = false
+
+[dependencies]
+# The statement, its venue checks and the final verifier (format 39); the
+# space's types, re-exported.
+vos-statement = { workspace = true }
+# The anchors', registrations' and controls' signatures, verified at
+# refine.
+ed25519-dalek = { version = "2", default-features = false }
+# The Gray Paper's naturals, and the refine arguments and accumulate inputs
+# a JAM node gives, in their one encoding.
+vos-pvm-program = { workspace = true }
+vos-abi = { workspace = true }
+
+[dev-dependencies]
+# The golden fixtures, judged by the service as by every venue.
+vos-statement = { workspace = true, features = ["fixtures"] }
+# The venue rules' suite, run over the service's refine and accumulate.
+vos-anchor = { workspace = true, features = ["suite"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# The JAM-only host the service runs on, refine and accumulate, and its
+# linker.
+vos-pvm = { workspace = true }
+vos-pvm-compiler = { workspace = true }

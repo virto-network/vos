@@ -1,0 +1,23 @@
+vos-pvm-proof and vos-pvm-proof-derive
+Licensed under the GNU Affero General Public License, version 3 or later.
+
+These crates adapt code from the Nexus zkVM, by Nexus Laboratories, Ltd.,
+under the Apache License, Version 2.0 (`../LICENSE-APACHE-2.0`).
+The adapted files were modified (Apache-2.0 §4(b)): retargeted at the PVM
+instruction set, and changed since throughout. They include the column and
+trace framework and the first chips:
+
+- src/air_column/ and derive/ (the `AirColumn` derive);
+- src/trace/ (builder.rs, component.rs, eval.rs, utils.rs,
+  virtual_column.rs, utils_external.rs);
+- src/framework/ (eval.rs, traits/);
+- src/lookups/ (mod.rs, logup_trace_builder.rs, macros.rs, range_check.rs,
+  relations.rs);
+- src/chips/cpu/ (descended from the ported CPU chip) and
+  src/chips/range_multiplicity.rs;
+- src/side_note.rs, src/prove.rs and src/verify.rs.
+
+src/trace/utils_external.rs is adapted from Stwo's
+`coset_order_to_circle_domain_order`, Copyright 2024 StarkWare Industries
+Ltd. / Nexus Laboratories, Ltd., licensed under the Apache License,
+Version 2.0, as its header states.
