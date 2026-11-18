@@ -10,12 +10,17 @@ use crate::PVM_PAGE_SIZE;
 pub const CODE_WINDOW_SIZE: usize = 1 << 32;
 /// One permission byte per 4 KiB guest page.
 pub const CODE_WINDOW_PERMS_SIZE: usize = CODE_WINDOW_SIZE / PVM_PAGE_SIZE as usize;
-/// Writable page containing the native JIT context immediately before RAM.
+/// Writable page holding the native JIT context.
 pub const CODE_WINDOW_CTX_SIZE: usize = 4096;
-/// Metadata prefix before guest memory.
-pub const CODE_WINDOW_HEADER_SIZE: usize = CODE_WINDOW_PERMS_SIZE + CODE_WINDOW_CTX_SIZE;
-/// Inaccessible native page after the 32-bit guest address space.
-pub const CODE_WINDOW_GUARD_SIZE: usize = 4096;
+/// Inaccessible span between the context and guest address 0, so that an
+/// access a little below the guest window faults instead of reaching the
+/// context's pointers.
+pub const CODE_WINDOW_LOW_GUARD_SIZE: usize = 16 << 20;
+/// Metadata prefix before guest memory, its low guard included.
+pub const CODE_WINDOW_HEADER_SIZE: usize =
+    CODE_WINDOW_PERMS_SIZE + CODE_WINDOW_CTX_SIZE + CODE_WINDOW_LOW_GUARD_SIZE;
+/// Inaccessible span after the 32-bit guest address space.
+pub const CODE_WINDOW_GUARD_SIZE: usize = 16 << 20;
 
 /// A memfd-backed pool of guest pages.
 pub struct BackingStore {
@@ -83,26 +88,27 @@ impl Drop for BackingStore {
 
 /// The JIT's virtual address space window.
 ///
-/// A full 4GB mmap region with a permission-table and CTX prefix plus an
-/// inaccessible trailing guard page.
+/// One reservation: the permission table and the context, then guest
+/// memory between two inaccessible guards.
 ///
 /// Layout:
 /// ```text
-/// [permissions (1MiB)] [CTX (4KiB)] [guest memory] [guard]
-/// ^                     ^           ^
-/// perms()               ctx_ptr()   base()  ← R15 in JIT code
+/// [permissions (1MiB)] [CTX (4KiB)] [low guard] [guest memory (4GiB)] [guard]
+/// ^                     ^                        ^
+/// perms()               ctx_ptr()                base()  ← R15 in JIT code
 /// ```
 pub struct CodeWindow {
-    /// Base of the entire mmap'd region (CTX page).
+    /// Base of the entire mmap'd region (the permission table).
     region: *mut u8,
-    /// Total region size including metadata and the trailing guard.
+    /// Total region size including metadata and both guards.
     region_size: usize,
-    /// Guest memory base (region + CTX_PAGE). This is R15 in JIT code.
+    /// Guest memory base (region + header). This is R15 in JIT code.
     base: *mut u8,
 }
 
 impl CodeWindow {
-    /// Allocate a new 4GB window with CTX page.
+    /// Reserve a new window: the permission table and context writable,
+    /// everything else inaccessible until guest memory is mapped.
     pub fn new() -> Option<Self> {
         let region_size = CODE_WINDOW_HEADER_SIZE + CODE_WINDOW_SIZE + CODE_WINDOW_GUARD_SIZE;
         // SAFETY: MAP_ANONYMOUS | MAP_NORESERVE allocates virtual address space only.
@@ -121,13 +127,11 @@ impl CodeWindow {
         }
         let region = region as *mut u8;
 
-        // Make the permission table and CTX page writable. Guest RAM and the
-        // trailing guard remain PROT_NONE until guest memory is mapped.
-        // SAFETY: the header lies wholly within the fresh mapping.
+        // SAFETY: the table and context lie wholly within the fresh mapping.
         unsafe {
             if libc::mprotect(
                 region as *mut libc::c_void,
-                CODE_WINDOW_HEADER_SIZE,
+                CODE_WINDOW_PERMS_SIZE + CODE_WINDOW_CTX_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
             ) != 0
             {
@@ -151,10 +155,10 @@ impl CodeWindow {
         self.base
     }
 
-    /// Pointer to the JitContext page (base - CTX_PAGE).
+    /// Pointer to the JitContext page, below the low guard.
     pub fn ctx_ptr(&self) -> *mut u8 {
-        // SAFETY: base follows the complete header and the CTX is its final page.
-        unsafe { self.base.sub(CODE_WINDOW_CTX_SIZE) }
+        // SAFETY: the context page directly follows the permission table.
+        unsafe { self.region.add(CODE_WINDOW_PERMS_SIZE) }
     }
 
     /// Pointer to the page-permission table (one byte per guest page).
@@ -196,9 +200,49 @@ mod tests {
         );
     }
 
+    /// Whether `address` can be read, asked of the kernel: a write from
+    /// it into a pipe fails with `EFAULT` where it is inaccessible.
+    fn readable(address: *const u8) -> bool {
+        let mut pipe = [0; 2];
+        // SAFETY: pipe fills a valid two-descriptor array; write reads one
+        // byte at `address` in the kernel, which never faults the process.
+        unsafe {
+            assert_eq!(libc::pipe(pipe.as_mut_ptr()), 0);
+            let wrote = libc::write(pipe[1], address.cast(), 1);
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+            wrote == 1
+        }
+    }
+
+    /// The pages on both sides of the guest window are inaccessible, and
+    /// the context, which redirects control, is past the low guard.
     #[test]
-    fn test_code_window_create() {
+    fn the_guest_window_is_guarded_on_both_sides() {
         let window = CodeWindow::new().expect("CodeWindow::new failed");
-        assert!(!window.base().is_null());
+        let base = window.base() as usize;
+        let ctx = window.ctx_ptr() as usize;
+        assert!(readable(window.ctx_ptr()));
+        assert!(readable(window.perms()));
+        assert!(base - (ctx + CODE_WINDOW_CTX_SIZE) >= CODE_WINDOW_LOW_GUARD_SIZE);
+        let table = window.perms() as usize;
+        assert!(
+            ctx >= table + CODE_WINDOW_PERMS_SIZE,
+            "the table is below the context"
+        );
+        for address in [
+            ctx + CODE_WINDOW_CTX_SIZE,
+            base - CODE_WINDOW_LOW_GUARD_SIZE,
+            base - 1,
+            base,
+            base + CODE_WINDOW_SIZE,
+            base + CODE_WINDOW_SIZE + CODE_WINDOW_GUARD_SIZE - 1,
+        ] {
+            assert!(
+                !readable(address as *const u8),
+                "{:#x} past base",
+                address.wrapping_sub(base)
+            );
+        }
     }
 }

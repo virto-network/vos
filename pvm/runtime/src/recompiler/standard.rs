@@ -56,26 +56,42 @@ pub(crate) fn run_standard(
     .is_none()
     {
         signal::ensure_installed();
+        let code_start = compiled.native_code.ptr as usize;
         let mut state = signal::SignalState {
-            code_start: compiled.native_code.ptr as usize,
-            code_end: compiled.native_code.ptr as usize + compiled.native_code.len,
-            exit_label_addr: compiled.native_code.ptr as usize
-                + compiled.exit_label_offset as usize,
+            code_start,
+            code_end: code_start + compiled.native_code.len,
+            exit_label_addr: code_start + compiled.exit_label_offset as usize,
+            abort_label_addr: code_start + compiled.abort_label_offset as usize,
+            window_base: flat_buf as usize,
             ctx_ptr: context_pointer,
             trap_table_ptr: compiled.trap_table.as_ptr(),
             trap_table_len: compiled.trap_table.len(),
             fault_resume_offsets_ptr: compiled.fault_resume_offsets.as_ptr(),
             fault_resume_offsets_len: compiled.fault_resume_offsets.len(),
             activation,
+            entry_rsp: 0,
+            backend_fault: Default::default(),
         };
+        // The handler and native code reach the state only through this
+        // pointer while native code runs.
+        let state_pointer = &raw mut state;
+        // SAFETY: a field of the live state, through its one pointer.
+        let entry_rsp = unsafe { &raw mut (*state_pointer).entry_rsp };
         // Preserve a prior owner even when embedders nest native execution.
-        let previous = signal::SIGNAL_STATE.with(|cell| cell.replace(&mut state));
+        let previous = signal::SIGNAL_STATE.with(|cell| cell.replace(state_pointer));
         // SAFETY: code is immutable executable preparation; context and guest
         // mapping follow the existing recompiler ABI and signal-state lifetime.
         unsafe {
-            compiled.native_code.entry()(context_pointer);
+            compiled.native_code.entry()(context_pointer, entry_rsp);
         }
         signal::SIGNAL_STATE.with(|cell| cell.set(previous));
+        if state.backend_faulted() {
+            // The machine's state is not meaningful: its memory reports
+            // every page from now on, and it is never run again.
+            // SAFETY: the activation belongs to the window, live here.
+            unsafe { (*activation).fail() };
+            return Err("native code faulted outside a guest access".into());
+        }
     }
     vm.registers = context.regs;
     vm.gas = context.gas;

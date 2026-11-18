@@ -74,6 +74,11 @@ pub(crate) enum Activated {
 }
 
 impl Activation {
+    /// Fail tracking for good: the window's state is no longer trusted.
+    pub(crate) fn fail(&self) {
+        self.failed.store(true, Ordering::Relaxed);
+    }
+
     fn is_active(&self, slot: usize) -> bool {
         self.active[slot].load(Ordering::Relaxed)
     }

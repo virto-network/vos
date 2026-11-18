@@ -168,8 +168,10 @@ impl NativeCode {
         })
     }
 
-    /// Get the function pointer for the compiled code entry.
-    pub fn entry(&self) -> unsafe extern "sysv64" fn(*mut JitContext) {
+    /// Get the function pointer for the compiled code entry: the context,
+    /// and where the entry records its frame for the fault handler
+    /// ([`signal::SignalState::entry_rsp`]).
+    pub fn entry(&self) -> unsafe extern "sysv64" fn(*mut JitContext, *mut u64) {
         // SAFETY: ptr contains valid x86-64 machine code from the assembler, and was
         // mprotected to PROT_READ|PROT_EXEC. Transmute to fn pointer is valid.
         unsafe { std::mem::transmute(self.ptr) }
@@ -196,6 +198,8 @@ pub struct CompiledCode {
     pub block_gas_costs: Vec<u32>,
     pub trap_table: Vec<(u32, u32)>,
     pub exit_label_offset: u32,
+    /// The epilogue alone, where the fault handler aborts native code.
+    pub abort_label_offset: u32,
     /// What the dispatch table holds for a PC with no entry of its own.
     pub panic_offset: i32,
     /// Strict basic-block starts ({0} ∪ post-terminator), one byte per code
@@ -293,6 +297,16 @@ pub fn compile_code(
     bitmask: &[u8],
     jump_table: &[u32],
 ) -> Result<CompiledCode, String> {
+    compile_with(code, bitmask, jump_table, |_| {})
+}
+
+/// [`compile_code`], with `configure` applied to the compiler first.
+fn compile_with(
+    code: &[u8],
+    bitmask: &[u8],
+    jump_table: &[u32],
+    configure: impl FnOnce(&mut Compiler),
+) -> Result<CompiledCode, String> {
     code_fits(code)?;
     let helpers = HelperFns {
         mem_read_u8: mem_read_u8 as *const () as u64,
@@ -312,7 +326,8 @@ pub fn compile_code(
         .map(u8::from)
         .collect();
 
-    let compiler = Compiler::new(&block_starts, jump_table, helpers, code.len(), true);
+    let mut compiler = Compiler::new(&block_starts, jump_table, helpers, code.len(), true);
+    configure(&mut compiler);
     let result = compiler.compile(code, bitmask)?;
     let dispatch_table = result.dispatch_table;
 
@@ -343,6 +358,7 @@ pub fn compile_code(
         block_gas_costs: result.block_gas_costs,
         trap_table: result.trap_table,
         exit_label_offset: result.exit_label_offset,
+        abort_label_offset: result.abort_label_offset,
         panic_offset: result.panic_offset,
         block_starts,
     })
@@ -353,17 +369,6 @@ pub fn compile_code(
 unsafe impl Send for NativeCode {}
 unsafe impl Sync for NativeCode {}
 
-/// Flat memory backing buffer for inline JIT memory access.
-///
-/// Contiguous mmap layout (R15 = guest memory base = region + HEADER_SIZE):
-///   [perm table, 1MB] [JitContext page, 4KB] [guest memory, 4GB] [guard, 4KB]
-///   ^                  ^                      ^
-///   region             ctx_ptr                 R15 (buf)
-///
-/// R15-relative offsets:
-///   perms:  R15 - CTX_PAGE - NUM_PAGES  = R15 - PERMS_OFFSET
-///   ctx:    R15 - CTX_PAGE              = R15 - CTX_OFFSET
-///   guest:  R15 + 0 .. R15 + 4GB
 /// Memory layout offsets for direct flat-buffer writes (standalone recompiler path).
 pub struct DataLayout {
     pub mem_size: u32,
@@ -375,53 +380,42 @@ pub struct DataLayout {
     pub rw_data: Vec<u8>,
 }
 
+/// Flat memory for inline JIT memory access: a
+/// [`crate::backing::CodeWindow`] whose guest span is private anonymous
+/// memory, readable and writable until permissions are installed.
 struct FlatMemory {
-    /// Base of the entire mmap'd region.
-    region: *mut u8,
-    /// Total mmap size.
-    region_size: usize,
-    /// Pointer to the guest memory base (= region + HEADER_SIZE).
+    window: crate::backing::CodeWindow,
+    /// Guest memory base (R15).
     buf: *mut u8,
-    /// Pointer to the permission table (= region).
+    /// Permission table, one byte per guest page.
     perms: *mut u8,
 }
 
-const FLAT_BUF_SIZE: usize = crate::backing::CODE_WINDOW_SIZE;
 const NUM_PAGES: usize = crate::backing::CODE_WINDOW_PERMS_SIZE;
-const CTX_PAGE: usize = crate::backing::CODE_WINDOW_CTX_SIZE;
-const HEADER_SIZE: usize = crate::backing::CODE_WINDOW_HEADER_SIZE;
-const TRAILING_GUARD_SIZE: usize = crate::backing::CODE_WINDOW_GUARD_SIZE;
 
 impl FlatMemory {
     /// Create a flat memory from a data layout.
     fn new(layout: &DataLayout) -> Option<Self> {
-        let region_size = HEADER_SIZE + FLAT_BUF_SIZE + TRAILING_GUARD_SIZE;
-        // SAFETY: mmap with MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE allocates virtual pages.
-        // MAP_FAILED checked below.
-        let region = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                region_size,
+        let window = crate::backing::CodeWindow::new()?;
+        let buf = window.base();
+        let perms = window.perms();
+        // SAFETY: the guest span is this window's own reservation.
+        if unsafe {
+            libc::mprotect(
+                buf.cast(),
+                crate::backing::CODE_WINDOW_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
-                -1,
-                0,
             )
-        };
-        if region == libc::MAP_FAILED {
+        } != 0
+        {
             return None;
         }
-        let region = region as *mut u8;
-        let perms = region;
-        // SAFETY: HEADER_SIZE < region_size, so region + HEADER_SIZE is within the mmap.
-        let buf = unsafe { region.add(HEADER_SIZE) };
 
-        // Set all pages in [0, mem_size) as read-write in the permission table.
-        // Reserved for future software bounds checking path
-        // AND for write_bytes/read_bytes which always check the permission table.
+        // Set all pages in [0, mem_size) as read-write in the permission
+        // table, which write_bytes/read_bytes check.
         {
             let num_pages = layout.mem_size.div_ceil(4096) as usize;
-            // SAFETY: perms points to the start of the mmap region; num_pages is clamped to NUM_PAGES.
+            // SAFETY: the table holds NUM_PAGES bytes; num_pages is clamped to it.
             unsafe {
                 std::ptr::write_bytes(perms, 2u8, num_pages.min(NUM_PAGES));
             }
@@ -429,64 +423,21 @@ impl FlatMemory {
         // SAFETY: buf points to guest memory base within the mmap. Data layout offsets and
         // lengths are validated by parse_program_blob to fit within the allocated region.
         unsafe {
-            if !layout.arg_data.is_empty() {
-                std::ptr::copy_nonoverlapping(
-                    layout.arg_data.as_ptr(),
-                    buf.add(layout.arg_start as usize),
-                    layout.arg_data.len(),
-                );
-            }
-            if !layout.ro_data.is_empty() {
-                std::ptr::copy_nonoverlapping(
-                    layout.ro_data.as_ptr(),
-                    buf.add(layout.ro_start as usize),
-                    layout.ro_data.len(),
-                );
-            }
-            if !layout.rw_data.is_empty() {
-                std::ptr::copy_nonoverlapping(
-                    layout.rw_data.as_ptr(),
-                    buf.add(layout.rw_start as usize),
-                    layout.rw_data.len(),
-                );
-            }
-
-            // A generated scalar access must never reach this page: the
-            // cyclic-wide slow path classifies it before issuing a native
-            // load/store. Keep a hardware guard as defense in depth so an
-            // omitted emitter cannot access an adjacent host mapping.
-            if libc::mprotect(
-                buf.add(FLAT_BUF_SIZE) as *mut libc::c_void,
-                TRAILING_GUARD_SIZE,
-                libc::PROT_NONE,
-            ) != 0
-            {
-                libc::munmap(region as *mut libc::c_void, region_size);
-                return None;
+            for (start, data) in [
+                (layout.arg_start, &layout.arg_data),
+                (layout.ro_start, &layout.ro_data),
+                (layout.rw_start, &layout.rw_data),
+            ] {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), buf.add(start as usize), data.len());
             }
         }
 
-        Some(Self {
-            region,
-            region_size,
-            buf,
-            perms,
-        })
+        Some(Self { window, buf, perms })
     }
 
-    /// Get the pointer where JitContext should be placed (buf - CTX_PAGE).
+    /// Get the pointer where JitContext should be placed.
     fn ctx_ptr(&self) -> *mut u8 {
-        // SAFETY: buf = region + HEADER_SIZE and HEADER_SIZE >= CTX_PAGE, so sub is in-bounds.
-        unsafe { self.buf.sub(CTX_PAGE) }
-    }
-}
-
-impl Drop for FlatMemory {
-    fn drop(&mut self) {
-        // SAFETY: region and region_size correspond to a valid mmap allocation from new().
-        unsafe {
-            libc::munmap(self.region as *mut libc::c_void, self.region_size);
-        }
+        self.window.ctx_ptr()
     }
 }
 
@@ -721,9 +672,9 @@ impl RecompiledPvm {
         let flat_memory = FlatMemory::new(&layout).ok_or("failed to mmap flat memory region")?;
         let _t_flat = _t1.elapsed();
 
-        // Place JitContext inside the flat memory region (at buf - CTX_PAGE)
+        // Place JitContext in the window's context page
         let ctx_raw = flat_memory.ctx_ptr() as *mut JitContext;
-        // SAFETY: ctx_raw points to a properly aligned CTX_PAGE region within the mmap.
+        // SAFETY: ctx_raw points to the window's aligned, writable context page.
         // Writing the JitContext initializes the memory that JIT code will access via R15.
         unsafe {
             ctx_raw.write(JitContext {
@@ -843,12 +794,17 @@ impl RecompiledPvm {
                 code_end: native_code.ptr as usize + native_code.len,
                 exit_label_addr: native_code.ptr as usize
                     + compile_result.exit_label_offset as usize,
+                abort_label_addr: native_code.ptr as usize
+                    + compile_result.abort_label_offset as usize,
+                window_base: flat_memory.buf as usize,
                 ctx_ptr: ctx_raw,
                 trap_table_ptr: trap_table.as_ptr(),
                 trap_table_len: trap_table.len(),
                 fault_resume_offsets_ptr: fault_resume_offsets.as_ptr(),
                 fault_resume_offsets_len: fault_resume_offsets.len(),
                 activation: std::ptr::null(),
+                entry_rsp: 0,
+                backend_fault: Default::default(),
             });
             Some(ss)
         };
@@ -940,19 +896,29 @@ impl RecompiledPvm {
             self.ctx_mut().exit_reason = 0xDEAD;
         }
 
-        // Execute native code — set up signal state for SIGSEGV handler
-        if let Some(ref mut ss) = self.signal_state {
-            signal::SIGNAL_STATE.with(|cell| cell.set(&mut **ss as *mut _));
-        }
-
+        // Execute native code — set up signal state for SIGSEGV handler,
+        // which with native code reaches it only through this pointer.
+        let state: *mut signal::SignalState = &raw mut **self
+            .signal_state
+            .as_mut()
+            .expect("a recompiled machine has signal state");
+        signal::SIGNAL_STATE.with(|cell| cell.set(state));
         let entry = self.native_code.entry();
         // SAFETY: entry points to valid JIT-compiled x86-64 code; self.ctx is a valid
-        // JitContext pointer. The native code follows the sysv64 calling convention.
+        // JitContext pointer. The native code follows the sysv64 calling convention;
+        // the state outlives the run.
         unsafe {
-            entry(self.ctx);
+            entry(self.ctx, &raw mut (*state).entry_rsp);
         }
 
         signal::SIGNAL_STATE.with(|cell| cell.set(std::ptr::null_mut()));
+        assert!(
+            !self
+                .signal_state
+                .as_ref()
+                .is_some_and(|state| state.backend_faulted()),
+            "native code faulted outside a guest access"
+        );
 
         if self.debug {
             tracing::debug!(
@@ -1365,6 +1331,49 @@ mod tests {
             bitmask,
         };
         assert!(crate::spi::validate_code_blob(&blob, 0));
+    }
+
+    /// One slice of `unlikely; trap` on the production native path, with
+    /// `wild` planted at the `unlikely`; guest page 0 is unmapped.
+    fn run_wild(
+        wild: Option<codegen::Wild>,
+    ) -> (Result<Option<ExitReason>, String>, crate::Interpreter) {
+        let (code, bitmask) = ([2u8, 0], [1u8, 1]);
+        let compiled = compile_with(&code, &bitmask, &[], |compiler| compiler.wild = wild).unwrap();
+        let mut memory = crate::interpreter::Memory::native(16 * 4096).unwrap();
+        memory.set_page_range(0, 16, crate::interpreter::PERM_NONE);
+        let program = crate::Interpreter::predecode(&code, &bitmask, &[]);
+        let mut machine = crate::Interpreter::from_predecoded(&program, [7; 13], memory, 1_000);
+        let outcome = run_standard(&compiled, &mut machine);
+        (outcome, machine)
+    }
+
+    /// A fault in compiled code is the guest's only at a guest access's own
+    /// instruction and inside its window. A wrong access anywhere else (no
+    /// trap site, below the window, a push outstanding) is a backend
+    /// failure: no guest exit, the machine's state untouched and its memory
+    /// marked failed so it is never reused, and the thread unharmed.
+    #[test]
+    fn a_fault_outside_a_guest_access_is_a_backend_failure() {
+        let (control, machine) = run_wild(None);
+        assert_eq!(control, Ok(Some(ExitReason::Panic)));
+        assert!(!machine.memory().tracking_failed());
+        for wild in [
+            codegen::Wild::Untrapped,
+            codegen::Wild::TrappedBelow,
+            codegen::Wild::UntrappedInside,
+            codegen::Wild::Pushed,
+        ] {
+            let (outcome, machine) = run_wild(Some(wild));
+            assert!(outcome.is_err(), "{wild:?}: {outcome:?}");
+            assert!(machine.memory().tracking_failed(), "{wild:?}");
+            assert_eq!(
+                machine.registers, [7; 13],
+                "{wild:?}: no guest state leaves"
+            );
+            // The frame was restored: native code runs again on this thread.
+            assert_eq!(run_wild(None).0, Ok(Some(ExitReason::Panic)), "{wild:?}");
+        }
     }
 
     #[test]

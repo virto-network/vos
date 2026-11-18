@@ -5,6 +5,13 @@
 //! trigger SIGSEGV, which this handler intercepts and redirects to the
 //! existing exit sequence via ucontext modification (no longjmp).
 //!
+//! A fault is the guest's only when its instruction is exactly a guest
+//! access's (a trap-table entry) and its address lies in the guest window,
+//! `[base, base + 2^32)`. Any other fault in compiled code is a backend
+//! failure: the handler restores the stack pointer the entry recorded and
+//! returns through the epilogue alone, with no guest-visible exit, and the
+//! machine is never run again.
+//!
 //! A write to a guest-writable page of a slot that does not track writes
 //! yet is not a guest fault: the handler starts tracking the slot and
 //! returns, so the store retries (`Activation`).
@@ -12,9 +19,7 @@
 //! It assumes it stays the process's SIGSEGV handler once installed (no
 //! later `sigaction` replaces it while compiled code runs), and that any
 //! handler installed before it is one it may chain to for a fault outside
-//! compiled code. Every fault whose instruction pointer lies in compiled
-//! code is taken as the guest's: a host bug faulting there is reported as
-//! a guest page fault, not as a crash.
+//! compiled code.
 
 use std::cell::Cell;
 use std::ptr::null_mut;
@@ -24,7 +29,8 @@ use super::JitContext;
 use super::codegen::{EXIT_PAGE_FAULT, EXIT_TRACKING_FAILED};
 use super::memory::{Activated, Activation};
 
-/// Per-thread state accessible from the signal handler.
+/// Per-thread state accessible from the signal handler. It lives on the
+/// host's stack, away from every mapping native code addresses.
 #[repr(C)]
 pub struct SignalState {
     /// Start of native code region (absolute address).
@@ -33,6 +39,11 @@ pub struct SignalState {
     pub code_end: usize,
     /// Absolute address of exit_label in native code.
     pub exit_label_addr: usize,
+    /// Absolute address of the epilogue alone, where a backend failure
+    /// returns.
+    pub abort_label_addr: usize,
+    /// The guest window's base: guest address 0.
+    pub window_base: usize,
     /// Pointer to JitContext (for writing exit_reason/exit_arg/pc).
     pub ctx_ptr: *mut JitContext,
     /// Trap table: sorted by native_offset. (native_offset, pvm_pc).
@@ -46,6 +57,18 @@ pub struct SignalState {
     /// Write-tracking activation for the guest window, or null when the
     /// window does not track writes.
     pub(crate) activation: *const Activation,
+    /// The stack pointer after the entry's prologue, which native code
+    /// writes here (its second argument) as it starts.
+    pub entry_rsp: u64,
+    /// Set by the handler when native code faulted outside a guest access.
+    pub backend_fault: Cell<bool>,
+}
+
+impl SignalState {
+    /// Whether the handler aborted the last run as a backend failure.
+    pub fn backend_faulted(&self) -> bool {
+        self.backend_fault.get()
+    }
 }
 
 // SAFETY: SignalState is only accessed by the owning thread (set before JIT call,
@@ -189,13 +212,35 @@ unsafe extern "C" fn sigsegv_handler(
             return;
         }
 
+        // The guest's fault only at a guest access's own instruction, on
+        // an address in its window; anything else is the backend's.
+        let fault_host = (*_siginfo).si_addr() as usize;
+        let fault_offset = fault_host.wrapping_sub(state.window_base);
+        let native_offset = (pc - state.code_start) as u32;
+        let trap_table = std::slice::from_raw_parts(state.trap_table_ptr, state.trap_table_len);
+        let attributed = trap_table
+            .binary_search_by_key(&native_offset, |&(off, _)| off)
+            .ok()
+            .filter(|_| fault_offset < 1 << 32);
+        let Some(entry) = attributed else {
+            // A second fault while aborting, or one before the entry
+            // recorded its frame, has no frame to return through.
+            if state.backend_fault.get() || state.entry_rsp == 0 {
+                delegate_to_previous(signum, _siginfo, ucontext);
+                return;
+            }
+            state.backend_fault.set(true);
+            cx.uc_mcontext.gregs[libc::REG_RSP as usize] = state.entry_rsp as i64;
+            cx.uc_mcontext.gregs[libc::REG_RIP as usize] = state.abort_label_addr as i64;
+            return;
+        };
+        let pvm_pc = trap_table[entry].1;
+
         // A write may be the first into a slot that does not track writes
         // yet. The x86 page-fault error code's bit 1 marks a write.
         let ctx = &mut *state.ctx_ptr;
-        let fault_host = (*_siginfo).si_addr() as usize;
-        let fault_offset = fault_host.wrapping_sub(ctx.flat_buf as usize);
         let write = cx.uc_mcontext.gregs[libc::REG_ERR as usize] & 2 != 0;
-        if write && !state.activation.is_null() && fault_offset < 1 << 32 {
+        if write && !state.activation.is_null() {
             // Starting tracking makes system calls; keep the interrupted
             // code's errno.
             let errno = *libc::__errno_location();
@@ -214,21 +259,6 @@ unsafe extern "C" fn sigsegv_handler(
                 Activated::NotTracking => {}
             }
         }
-
-        // Binary search the trap table for this native offset.
-        // If the faulting PC is in JIT code, always handle it as a guest fault —
-        // never delegate to the previous handler (which would crash the host process).
-        let native_offset = (pc - state.code_start) as u32;
-        let trap_table = std::slice::from_raw_parts(state.trap_table_ptr, state.trap_table_len);
-        let pvm_pc = match trap_table.binary_search_by_key(&native_offset, |&(off, _)| off) {
-            Ok(idx) => trap_table[idx].1,
-            Err(idx) => {
-                // PC is in JIT code but not at a registered trap site.
-                // Use the nearest preceding trap entry's PVM PC as a best-effort
-                // location, or 0 if no preceding entry exists.
-                if idx > 0 { trap_table[idx - 1].1 } else { 0 }
-            }
-        };
 
         // Guest fault address = faulting host address (si_addr) relative to
         // the guest memory base, masked to the page base. si_addr identifies

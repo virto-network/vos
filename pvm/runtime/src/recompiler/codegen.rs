@@ -53,13 +53,14 @@ const CTX: Reg = Reg::R15;
 ///
 /// Memory layout (contiguous mmap):
 ///   R15 - PERMS_OFFSET .. R15 - CTX_OFFSET:  permission table (1MB)
-///   R15 - CTX_OFFSET   .. R15:               JitContext (~208 bytes, padded to page)
+///   R15 - CTX_OFFSET   ..:                   JitContext (~208 bytes, padded to page)
+///   the low guard, inaccessible
 ///   R15                .. R15 + 4GB:          guest memory (flat buffer)
 ///
 /// CTX_OFFSET is the page-aligned distance from R15 to JitContext start.
-pub const CTX_OFFSET: i32 = 4096; // JitContext at R15 - 4096
-pub const PERMS_OFFSET: i32 = CTX_OFFSET + (1 << 20); // perms at R15 - 1052672
-const _: () = assert!(CTX_OFFSET as usize == crate::backing::CODE_WINDOW_CTX_SIZE);
+pub const CTX_OFFSET: i32 =
+    (crate::backing::CODE_WINDOW_CTX_SIZE + crate::backing::CODE_WINDOW_LOW_GUARD_SIZE) as i32;
+pub const PERMS_OFFSET: i32 = CTX_OFFSET + crate::backing::CODE_WINDOW_PERMS_SIZE as i32;
 const _: () = assert!(PERMS_OFFSET as usize == crate::backing::CODE_WINDOW_HEADER_SIZE);
 
 use super::JitContext;
@@ -106,6 +107,9 @@ pub struct CompileResult {
     pub block_gas_costs: Vec<u32>,
     pub trap_table: Vec<(u32, u32)>,
     pub exit_label_offset: u32,
+    /// Where the fault handler aborts native code: the epilogue alone,
+    /// entered with the entry's stack pointer restored.
+    pub abort_label_offset: u32,
     /// The panic stub's offset: what the dispatch table holds for every PC
     /// that is neither a gas-block start nor a resume point.
     pub panic_offset: i32,
@@ -150,6 +154,8 @@ pub struct Compiler {
     block_gas_costs: Vec<u32>,
     /// Label for the exit sequence.
     exit_label: Label,
+    /// The epilogue past the register stores ([`CompileResult::abort_label_offset`]).
+    abort_label: Label,
     /// Label for the shared out-of-gas exit (sets EXIT_OOG + jumps to exit).
     oog_label: Label,
     /// Label for panic exit.
@@ -167,6 +173,25 @@ pub struct Compiler {
     block_starts_len: usize,
     /// Trap table for signal-based bounds checking: (native_offset, pvm_pc).
     trap_entries: Vec<(u32, u32)>,
+    /// A wrong access planted at every `unlikely`, as a code-generation
+    /// bug would emit it.
+    #[cfg(test)]
+    pub(crate) wild: Option<Wild>,
+}
+
+/// A wrong native access, for showing the fault handler takes it as the
+/// backend's failure.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Wild {
+    /// A load below the guest window, at no trap site.
+    Untrapped,
+    /// A load below the guest window, at a trap site.
+    TrappedBelow,
+    /// A load of guest address 0, inside the window, at no trap site.
+    UntrappedInside,
+    /// As `Untrapped`, with a push outstanding.
+    Pushed,
 }
 
 impl Compiler {
@@ -191,6 +216,7 @@ impl Compiler {
         // Reserve label 0 so label IDs start from 1 (for consistency with fixed labels).
         let _reserved = asm.new_label(); // Label(0)
         let exit_label = asm.new_label();
+        let abort_label = asm.new_label();
         let oog_label = asm.new_label();
         let panic_label = asm.new_label();
         let oog_pc_label = asm.new_label();
@@ -209,6 +235,7 @@ impl Compiler {
             block_gas_costs: vec![0; code_len + 1],
             asm,
             exit_label,
+            abort_label,
             oog_label,
             panic_label,
             oog_pc_label,
@@ -217,6 +244,8 @@ impl Compiler {
             block_starts_ptr: block_starts.as_ptr(),
             block_starts_len: block_starts.len(),
             trap_entries: Vec::with_capacity(2048),
+            #[cfg(test)]
+            wild: None,
         }
     }
 
@@ -641,6 +670,7 @@ impl Compiler {
         }
 
         let exit_label_offset = self.asm.label_offset(self.exit_label).unwrap_or(0) as u32;
+        let abort_label_offset = self.asm.label_offset(self.abort_label).unwrap_or(0) as u32;
         let trap_table = self.trap_entries;
 
         // A mapped buffer becomes executable in place; its failure is the
@@ -660,6 +690,7 @@ impl Compiler {
             block_gas_costs: self.block_gas_costs,
             trap_table,
             exit_label_offset,
+            abort_label_offset,
             panic_offset,
             mmap_ptr,
             mmap_len,
@@ -945,6 +976,10 @@ impl Compiler {
             Opcode::Fallthrough | Opcode::Unlikely => {
                 // Just fall through to next instruction.
                 // Note: gas is already charged at basic block start above.
+                #[cfg(test)]
+                if let Some(wild) = self.wild {
+                    self.emit_wild(wild, pc);
+                }
             }
 
             // === A.5.2: One immediate ===
@@ -2627,6 +2662,24 @@ impl Compiler {
         }
     }
 
+    #[cfg(test)]
+    fn emit_wild(&mut self, wild: Wild, pc: u32) {
+        let below = -(crate::backing::CODE_WINDOW_LOW_GUARD_SIZE as i32) / 2;
+        match wild {
+            Wild::Untrapped => self.asm.mov_load64(SCRATCH, CTX, below),
+            Wild::TrappedBelow => {
+                self.trap_entries.push((self.asm.offset() as u32, pc));
+                self.asm.mov_load64(SCRATCH, CTX, below);
+            }
+            Wild::UntrappedInside => self.asm.mov_load64(SCRATCH, CTX, 0),
+            Wild::Pushed => {
+                self.asm.push(Reg::RAX);
+                self.asm.mov_load64(SCRATCH, CTX, below);
+                self.asm.pop(Reg::RAX);
+            }
+        }
+    }
+
     /// Emit an exit sequence that sets exit_reason and exit_arg.
     fn emit_exit(&mut self, reason: u32, arg: u64) {
         if matches!(reason, EXIT_HALT | EXIT_PANIC) {
@@ -2664,6 +2717,10 @@ impl Compiler {
         // displacement = 56 + 64 = 120, RSP mod 16 = 8. Push extra 8 bytes for
         // alignment so that save_caller_saved leaves RSP mod 16 = 0 for CALL.
         self.asm.push(SCRATCH); // alignment padding
+
+        // RSI = where the host keeps this frame: the fault handler returns
+        // through it when native code faults outside a guest access.
+        self.asm.mov_store64(Reg::RSI, 0, Reg::RSP);
 
         // RDI = JitContext pointer. R15 = guest memory base = RDI + CTX_OFFSET.
         self.asm.lea(CTX, Reg::RDI, CTX_OFFSET);
@@ -2751,6 +2808,7 @@ impl Compiler {
         }
 
         // Restore callee-saved (+ alignment padding)
+        self.asm.bind_label(self.abort_label);
         self.asm.pop(SCRATCH); // alignment padding
         self.asm.pop(Reg::R15);
         self.asm.pop(Reg::R14);
