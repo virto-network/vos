@@ -164,7 +164,7 @@ pub enum MachineObservation<'a> {
 }
 
 impl Machine {
-    /// Construct the full Gray Paper Ψ boundary from a canonical compact PVM
+    /// Construct the full Gray Paper Ψ boundary from a compact PVM
     /// blob and an explicit architectural state.
     ///
     /// A failed `deblob(blob, initial_pc)` is represented as an immediate
@@ -594,7 +594,7 @@ pub(crate) fn window(len: usize, offset: u64, max: u64) -> core::ops::Range<usiz
 /// selecting the memory representation automatically
 /// ([`MemoryModel::Auto`]).
 ///
-/// Parses the canonical bare `spi_blob`, builds the GP memory image and
+/// Parses the bare `spi_blob`, builds the GP memory image and
 /// register file for `args`, charges the standard per-page init gas, and runs
 /// the interpreter from instruction counter 0 (the refine entry) until it
 /// exits. Metadata-prefixed predecessor blobs are rejected. No hostcalls are

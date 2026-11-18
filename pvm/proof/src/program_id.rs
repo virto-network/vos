@@ -174,13 +174,16 @@ pub const HALT_PC: u32 = vos_pvm_program::HALT_ADDRESS as u32;
 impl KernelEntry {
     /// The entry of `blob`, the kernel `program` pins: refused when `blob`
     /// is not the program it names, by its hash and its image root, or not
-    /// a standard program.
+    /// a standard program in its one encoding.
     pub fn of(program: &KernelProgram, blob: &[u8]) -> Result<Self, KernelError> {
         if vos_pvm_precompiles::blake2b_256(blob) != program.program {
             return Err(KernelError::Blob);
         }
         let standard =
             vos_pvm_program::parse_standard_program(blob).ok_or(KernelError::NotStandard)?;
+        if vos_pvm_program::build_standard_program(&standard).as_deref() != Some(blob) {
+            return Err(KernelError::NotCanonical);
+        }
         if standard.image_root() != Some(program.image_root) {
             return Err(KernelError::ImageRoot);
         }
@@ -200,6 +203,10 @@ pub enum KernelError {
     Blob,
     /// The blob is not a standard program.
     NotStandard,
+    /// The blob is a standard program in other bytes than its one encoding
+    /// (`vos_pvm_program::parse_canonical_standard_program`): a kernel's
+    /// identity is its blob's hash, so one program has one blob.
+    NotCanonical,
     /// The blob's image root is not the kernel's.
     ImageRoot,
     /// The kernel's layout does not fit.
@@ -225,6 +232,7 @@ impl KernelError {
         match self {
             Self::Blob => "the blob is not the kernel's program",
             Self::NotStandard => "the kernel is not a standard program",
+            Self::NotCanonical => "the kernel is not its program's one encoding",
             Self::ImageRoot => "the blob's image root is not the kernel's",
             Self::Layout => "the kernel's layout does not fit",
             Self::Shape(error) => error.reason(),
@@ -373,6 +381,33 @@ mod tests {
             ],
             image_root: core::array::from_fn(|i| 0xa0 + i as u8),
             leaf_circuits: LeafCircuits::None,
+        }
+    }
+
+    /// A kernel's blob is its program's one encoding: the same program
+    /// with its jump table one byte wider, which the Gray Paper reader
+    /// takes, is refused by its own rule, and the canonical blob is not.
+    #[test]
+    fn a_kernel_blob_in_other_bytes_is_refused() {
+        // No data, a one-entry table naming 0, one trap: the header, the
+        // code's length, then the compact code at width `width`.
+        let blob = |width: u8| {
+            let mut blob = vec![0u8; 11];
+            let mut code = vec![1, width, 1];
+            code.extend(core::iter::repeat_n(0, usize::from(width)));
+            code.extend_from_slice(&[0, 1]);
+            blob.extend_from_slice(&(code.len() as u32).to_le_bytes());
+            blob.extend_from_slice(&code);
+            blob
+        };
+        for (width, expected) in [(1, Ok(())), (2, Err(KernelError::NotCanonical))] {
+            let blob = blob(width);
+            let mut program = program();
+            program.program = vos_pvm_precompiles::blake2b_256(&blob);
+            program.image_root = vos_pvm_program::parse_standard_program(&blob)
+                .and_then(|standard| standard.image_root())
+                .expect("a standard program");
+            assert_eq!(KernelEntry::of(&program, &blob).map(|_| ()), expected);
         }
     }
 

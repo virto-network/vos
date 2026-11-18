@@ -40,8 +40,10 @@ pub fn kernel_program(
     format: &'static Format,
 ) -> Result<(KernelProgram, KernelEntry), KernelError> {
     let shape = KernelShape::try_from(&record.shape).map_err(KernelError::Shape)?;
-    let side_note =
-        vos_pvm_proof::kernel::kernel_side_note(blob).map_err(|_| KernelError::NotStandard)?;
+    let side_note = vos_pvm_proof::kernel::kernel_side_note(blob).map_err(|error| match error {
+        vos_pvm_proof::kernel::KernelTraceError::NotCanonical => KernelError::NotCanonical,
+        _ => KernelError::NotStandard,
+    })?;
     let preprocessed_roots = (0..shape.classes.len())
         .map(|class| {
             let segment = shape.segment(class).expect("a class");

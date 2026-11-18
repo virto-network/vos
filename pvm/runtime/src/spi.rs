@@ -85,7 +85,7 @@ pub fn validate_code_blob(program: &CodeBlob, initial_pc: u64) -> bool {
 
 /// Full Gray Paper `deblob(program, initial_pc)` boundary.
 ///
-/// This combines canonical compact decoding, whole-program validation and
+/// This combines the compact decoding, whole-program validation and
 /// initial-instruction validation. Callers implementing full Ψ must turn a
 /// `None` result into a no-charge panic over the unchanged input state;
 /// callers implementing Ω_M retain its specified `HUH` mapping.

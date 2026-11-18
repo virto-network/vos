@@ -196,7 +196,7 @@ pub struct InnerMachineIdentity {
 
 /// Immutable dictionary view used by nested proof boundary tracers.
 /// `machine` is absent until the lazily-created inner interpreter is first
-/// needed; the canonical compact `program` and entry counter remain available
+/// needed; the compact `program` and entry counter remain available
 /// in either state.
 pub struct InnerMachineView<'a> {
     pub identity: InnerMachineIdentity,
@@ -344,7 +344,7 @@ impl InnerMachines {
             })
     }
 
-    /// Create a machine from one canonical compact code blob.
+    /// Create a machine from a compact code blob.
     ///
     /// The lowest unused natural-number index is returned.
     pub fn create(&mut self, program_blob: &[u8], initial_pc: u32) -> Result<u32, InnerError> {

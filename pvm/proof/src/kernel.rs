@@ -48,6 +48,10 @@ pub struct KernelTrace {
 pub enum KernelTraceError {
     /// The blob is not a standard program, or its layout does not fit.
     Program,
+    /// The blob is a standard program in other bytes than its one encoding
+    /// (`vos_pvm_program::parse_canonical_standard_program`): a kernel's
+    /// identity is its blob's hash, so an installed kernel has one blob.
+    NotCanonical,
     /// A jump-table entry, a static jump's or a branch's target is no basic
     /// block start (`vos_pvm::interpreter::bad_transfer`): the machine
     /// panics at that transfer, and the pin, which knows instruction starts
@@ -128,10 +132,15 @@ fn load(
 
 /// Kernel `blob`'s program as a proof sees it before any run: its code,
 /// jump table, initial memory and layout, and no step. What its
-/// preprocessed roots are computed from. Refused if any of its control
-/// transfers lands on no basic block start ([`KernelTraceError::Transfer`]).
+/// preprocessed roots are computed from. Refused if `blob` is not its
+/// program's one encoding ([`KernelTraceError::NotCanonical`]), or if any
+/// of its control transfers lands on no basic block start
+/// ([`KernelTraceError::Transfer`]).
 pub fn kernel_side_note(blob: &[u8]) -> Result<SideNote, KernelTraceError> {
     let (machine, image, permissions) = load(blob, &[], 0, |_| {})?;
+    if vos_pvm_program::parse_canonical_standard_program(blob).is_none() {
+        return Err(KernelTraceError::NotCanonical);
+    }
     let side_note = TracingPvm::new(machine)
         .into_side_note()
         .with_sparse_memory(image)
@@ -320,5 +329,33 @@ mod tests {
             Some(KernelTraceError::Transfer)
         );
         assert!(kernel_side_note(&blob(true)).is_ok());
+    }
+
+    /// An installed kernel is its program's one encoding: the same program
+    /// with its jump table a byte wider, which the Gray Paper reader takes,
+    /// is refused by its own rule.
+    #[test]
+    fn a_kernel_in_other_bytes_is_refused() {
+        let mut asm = Assembler::new();
+        asm.set_stack_pages(1);
+        asm.load_imm(Reg::T0, 2).jump_ind(Reg::T0, 0);
+        let canonical = with_table(&asm, &[0]);
+        assert!(kernel_side_note(&canonical).is_ok());
+        // The compact code follows the header, the data (none) and its
+        // four-byte length: `E(1) ⌢ E_1(1) ⌢ ...`; widen the table to 2.
+        let at = vos_pvm_program::StandardHeader::LEN + 4;
+        assert_eq!(&canonical[at..at + 2], &[1, 1]);
+        let mut wide = canonical[..at].to_vec();
+        wide.extend_from_slice(&[1, 2]);
+        wide.extend_from_slice(&canonical[at + 2..at + 4]);
+        wide.push(0);
+        wide.extend_from_slice(&canonical[at + 4..]);
+        let length = (wide.len() - at) as u32;
+        wide[at - 4..at].copy_from_slice(&length.to_le_bytes());
+        assert!(vos_pvm::spi::parse_standard_program(&wide).is_some());
+        assert_eq!(
+            kernel_side_note(&wide).err(),
+            Some(KernelTraceError::NotCanonical)
+        );
     }
 }
