@@ -60,6 +60,9 @@ pub enum RefineError {
     /// The requested backend is unavailable, cannot be prepared, or its host
     /// memory setup failed. This is not a guest exit or an interpreter retry.
     Backend,
+    /// A run that serves state reads was given no state reader
+    /// ([`crate::refine_host::RefineContext::try_run_jam_with_state_stand_in`]).
+    NoStateReader,
 }
 
 impl core::fmt::Display for RefineError {
@@ -68,6 +71,7 @@ impl core::fmt::Display for RefineError {
             Self::InvalidBlob => f.write_str("blob is not a GP standard program"),
             Self::LayoutOverflow => f.write_str("memory layout exceeds the address space"),
             Self::Backend => f.write_str("standard execution backend failed"),
+            Self::NoStateReader => f.write_str("no state reader for a run that serves state"),
         }
     }
 }
