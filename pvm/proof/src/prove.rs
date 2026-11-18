@@ -62,6 +62,10 @@ pub enum SegmentError {
     /// The shape names a chip outside the segment AIR, has a log size more
     /// or fewer than its chips, or lacks the class named.
     MalformedShape,
+    /// The program's code jumps or branches statically to the halt
+    /// address: the machine panics there, where a proof would end the run
+    /// as a halt.
+    Transfer,
     /// The run is longer than [`MAX_RUN_STEPS`]: its ledgers' ordering
     /// deltas would pass their bits. Refused before any trace.
     RunLength,
@@ -101,6 +105,9 @@ impl core::fmt::Display for SegmentError {
                 overflow: false,
             } => write!(formatter, "chip {chip} is another size than its shape"),
             Self::MalformedShape => formatter.write_str("the shape is not one of the segment AIR"),
+            Self::Transfer => {
+                formatter.write_str("the code jumps statically to the halt address")
+            }
             Self::RunLength => formatter.write_str("the run is longer than a proof's ledgers order"),
             Self::Segments => formatter.write_str("the run takes more segments than its gas buys"),
         }
@@ -118,6 +125,15 @@ impl std::error::Error for SegmentError {}
 /// A longer run, or a segment ending past it, is refused
 /// ([`SegmentError::RunLength`]) before any trace.
 pub const MAX_RUN_STEPS: usize = (1 << 27) - 1;
+
+/// Whether `side_note`'s code holds no static transfer to the halt address
+/// ([`SegmentError::Transfer`]), which its pin cannot take.
+pub(crate) fn check_transfers(side_note: &SideNote) -> Result<(), SegmentError> {
+    if crate::chips::program_memory::jumps_to_halt(&side_note.code, &side_note.bitmask) {
+        return Err(SegmentError::Transfer);
+    }
+    Ok(())
+}
 
 /// Whether `side_note`'s last step is within [`MAX_RUN_STEPS`] of the run's
 /// start: its ledgers' closing reads order within their bits.
@@ -776,6 +792,7 @@ where
 /// registers filled, and its memory pages' Merkle payload built.
 fn prepare(side_note: &mut SideNote) -> Result<(), SegmentError> {
     check_run_length(side_note)?;
+    check_transfers(side_note)?;
     validate_memory_witnesses(side_note)?;
     // RegisterMemoryBoundaryChip needs `initial_regs` populated.
     backfill_initial_regs(side_note);
@@ -842,4 +859,32 @@ where
     }
     tree_builder.commit(channel);
     columns
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vos_pvm::instruction::Opcode;
+
+    /// A code whose jump lands on the halt address, which the program
+    /// memory's pin cannot take, is refused before any trace or pin; one
+    /// jumping elsewhere is not refused for it.
+    #[test]
+    fn a_static_jump_to_the_halt_address_is_refused() {
+        let jump = |target: u32| {
+            let mut code = vec![Opcode::Jump as u8];
+            code.extend_from_slice(&target.to_le_bytes());
+            code.push(Opcode::Trap as u8);
+            SideNote::new(Vec::new(), code, vec![1, 0, 0, 0, 0, 1])
+        };
+        let mut halt = jump(vos_pvm::PVM_HALT_ADDR as u32);
+        assert!(matches!(check_transfers(&halt), Err(SegmentError::Transfer)));
+        assert!(matches!(prove(&mut halt), Err(SegmentError::Transfer)));
+        let shape = crate::shape::ProofShape {
+            components: crate::chip_idx::ALWAYS,
+            log_sizes: vec![16; crate::chip_idx::ALWAYS.count_ones() as usize],
+        };
+        assert!(program_commitment_for_shape(&halt, &shape, &crate::format::SEGMENT).is_none());
+        assert!(check_transfers(&jump(5)).is_ok());
+    }
 }

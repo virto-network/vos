@@ -101,6 +101,26 @@ pub(crate) fn pack_flags(
     out
 }
 
+/// The static target of the instruction at `pc` (an instruction start), its
+/// branch or jump offset resolved; 0 for one without.
+fn static_target(code: &[u8], bitmask: &[u8], pc: usize) -> u32 {
+    use vos_pvm::instruction::Opcode;
+    let opcode = Opcode::from_byte(code[pc]).unwrap_or(Opcode::Trap);
+    let skip_len = vos_pvm::skip(bitmask, pc);
+    let decoded_args = vos_pvm::args::decode_args(code, pc, skip_len, opcode.category());
+    crate::core::tracing::decode_branch_target(&decoded_args)
+}
+
+/// Whether an instruction of `code` jumps or branches statically to the
+/// halt address: the machine panics there, where its pin would end a
+/// segment as a halt. A proof of such a program is refused before its pin
+/// is computed (`SegmentError::Transfer`).
+pub(crate) fn jumps_to_halt(code: &[u8], bitmask: &[u8]) -> bool {
+    (0..code.len())
+        .filter(|&pc| bitmask.get(pc) == Some(&1))
+        .any(|pc| u64::from(static_target(code, bitmask, pc)) == vos_pvm::PVM_HALT_ADDR)
+}
+
 /// Decode the instruction at `pc` (an instruction start) into
 /// the canonical tuple consumed by CpuChip.  Mirrors the tracer's per-step
 /// decoding plus classify_opcode's flag derivation, so the preprocessed
@@ -118,16 +138,16 @@ fn decode_at(code: &[u8], bitmask: &[u8], pc: usize) -> Decoded {
     let (ra, rb, rd) = crate::core::tracing::decode_reg_indices(opcode, &decoded_args);
     let imm = crate::core::tracing::decode_immediate(&decoded_args);
     let imm_y = crate::core::tracing::decode_imm_y(&decoded_args);
-    let branch_target_canon = crate::core::tracing::decode_branch_target(&decoded_args);
+    let branch_target_canon = static_target(code, bitmask, pc);
     // Only the halt selector of a dynamic jump continues at the halt
     // address; a static jump there would end a segment at it, as a halt
-    // does, where the machine panics. The pin's program is refused when a
-    // static target is no basic block start (`kernel::kernel_side_note`,
-    // as `derive`), so a pinned program never fails this.
+    // does, where the machine panics. Every path to the pin refuses such a
+    // program first ([`jumps_to_halt`]), so a pinned program never fails
+    // this.
     assert_ne!(
         u64::from(branch_target_canon),
         vos_pvm::PVM_HALT_ADDR,
-        "the instruction at {pc:#x} jumps statically to the halt address"
+        "an instruction jumps statically to the halt address"
     );
     let f = crate::chips::cpu::classify_opcode_for_program_memory(opcode);
     let host_call_precompile_dispatch = if matches!(opcode, Opcode::Ecalli) {

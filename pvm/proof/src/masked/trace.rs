@@ -20,7 +20,7 @@ use crate::chip_idx;
 use crate::framework::MachineProverComponent;
 use crate::lookups::AllLookupElements;
 use crate::prove::{
-    SegmentError, check_run_length, generate_component_traces,
+    SegmentError, check_run_length, check_transfers, generate_component_traces,
     prepare_side_note_for_verification, steps_fit, validate_memory_witnesses,
 };
 use crate::side_note::SideNote;
@@ -101,6 +101,7 @@ pub fn masked_device_trace(
         return Err(SegmentError::MalformedShape);
     }
     check_run_length(side_note)?;
+    check_transfers(side_note)?;
     validate_memory_witnesses(side_note)?;
     prepare_side_note_for_verification(side_note);
     side_note.device = Some(alloc::sync::Arc::new(crate::device::DeviceRun::of(
@@ -185,6 +186,7 @@ pub fn device_preprocessed(
     if chips.len() != log_sizes.len() {
         return Err(SegmentError::MalformedShape);
     }
+    check_transfers(code)?;
     let mut side_note = SideNote::new(Vec::new(), code.code.to_vec(), code.bitmask.to_vec())
         .with_jump_table(code.jump_table.to_vec());
     side_note.device = Some(alloc::sync::Arc::new(crate::device::DeviceRun::empty(

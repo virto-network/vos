@@ -59,8 +59,9 @@ pub fn prove_shaped(
 /// root every segment of the class commits, whatever its run, which a
 /// kernel's program id pins. `None` on a format the registry does not admit,
 /// a malformed or empty shape, one whose code or jump table is larger than
-/// its chip's log size holds, or one whose proofs would count below the
-/// format's security floor (refused before any column is generated).
+/// its chip's log size holds, a code jumping statically to the halt
+/// address, or one whose proofs would count below the format's security
+/// floor (refused before any column is generated).
 pub fn program_commitment_for_shape(
     side_note: &SideNote,
     shape: &ProofShape,
@@ -91,6 +92,7 @@ pub fn program_commitment_for_shape(
     {
         return None;
     }
+    super::check_transfers(side_note).ok()?;
     let config = Target::of(format).ok()?.format.pcs_config();
     let layout = crate::sample_layout(shape.components, &shape.log_sizes, &config);
     crate::proof::check_format_security(format, &config, &layout.security_shape).ok()?;
