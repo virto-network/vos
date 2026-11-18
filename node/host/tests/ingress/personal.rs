@@ -481,8 +481,19 @@ fn a_removed_device_keeps_its_session_and_the_agent_refuses_it() {
         .unwrap();
     assert_eq!(pushed.position, 1);
     personal.pass(60_000);
+    let (call, answer) = personal.call(&mut admin, "remove", 1u32.encode());
+    let removal: Recorded = outcome(answer).unwrap();
+    // Its evidence posted: an operation without it matures for no device.
+    let message = call.message(&personal.identity);
     personal
-        .answer::<Recorded>(&mut admin, "remove", 1u32)
+        .answer::<Recorded>(
+            &mut sync,
+            "evidence",
+            (
+                (removal.index, message),
+                (call.signature, Attached::default()),
+            ),
+        )
         .unwrap();
     personal.pass(2 * 60_000);
     personal.answer::<Recorded>(&mut sync, "alive", ()).unwrap();
