@@ -100,7 +100,8 @@ impl std::error::Error for SegmentError {}
 
 /// Cap rayon's global thread pool at a sensible default for our
 /// workload, unless the user has explicitly set `RAYON_NUM_THREADS`
-/// or initialised their own pool.  Idempotent — safe to call many
+/// or initialised their own pool, and give its workers
+/// 16 MiB of stack.  Idempotent — safe to call many
 /// times; only the first effective call wins (we use a `OnceLock`
 /// guard around `ThreadPoolBuilder::build_global`).
 ///
@@ -113,22 +114,32 @@ pub fn install_thread_pool() -> usize {
     use std::sync::OnceLock;
     static INSTALLED: OnceLock<usize> = OnceLock::new();
     *INSTALLED.get_or_init(|| {
-        // Honour explicit RAYON_NUM_THREADS — user knows best.
-        if std::env::var_os("RAYON_NUM_THREADS").is_some() {
-            return rayon::current_num_threads();
-        }
-        let logical = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        let target = logical.min(10);
-        // build_global panics if a pool already exists; ignore that
+        // Honour explicit RAYON_NUM_THREADS — user knows best: zero
+        // threads is the builder's own reading of it.
+        let threads = if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+            0
+        } else {
+            let logical = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            logical.min(10)
+        };
+        // build_global fails if a pool already exists; ignore that
         // case (e.g., test harness, downstream lib that set its own).
         let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(target)
+            .num_threads(threads)
+            .stack_size(WORKER_STACK)
             .build_global();
         rayon::current_num_threads()
     })
 }
+
+/// A prover worker's stack: 16 MiB, as a worker blocked in a `join` runs
+/// the tasks it steals on its own stack, so its depth grows with the
+/// nesting; at the platform's default 2 MiB a release prover's worker can
+/// overflow it. Reserved, not committed: a worker touches only the pages
+/// it uses.
+const WORKER_STACK: usize = 16 << 20;
 
 /// What the prover produces: an admitted format, at its parameters.
 #[derive(Clone, Copy)]
