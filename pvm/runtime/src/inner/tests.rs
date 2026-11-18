@@ -552,3 +552,20 @@ fn pins_host_call_ids_and_gas_schedule() {
     assert_eq!(gas::memory(112, 1024), 112);
     assert_eq!(gas::memory(112, 1025), 113);
 }
+
+/// An inner machine's code past the interpreter's preparation bound is a
+/// valid program the host refuses as its resource: `Backend`, never the
+/// guest's `HUH`, while `deblob` accepts it.
+#[test]
+fn code_past_the_interpreters_bound_is_a_backend_refusal() {
+    let code = vec![0; crate::backend::MAX_INTERPRETED_CODE + 1];
+    let mut packed = vec![0xffu8; code.len().div_ceil(8)];
+    *packed.last_mut().unwrap() = 0x01;
+    let mut blob = vec![0, 1];
+    vos_pvm_program::encode_nat(code.len() as u64, &mut blob);
+    blob.extend_from_slice(&code);
+    blob.extend_from_slice(&packed);
+    assert!(crate::spi::deblob(&blob, 0).is_some());
+    let mut machines = InnerMachines::new();
+    assert_eq!(machines.create(&blob, 0), Err(InnerError::Backend));
+}

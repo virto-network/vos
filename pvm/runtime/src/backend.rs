@@ -135,15 +135,30 @@ enum ResolvedBackend {
     Recompiler,
 }
 
-/// Compile PVM code into a `CompiledProgram` using the selected backend:
-/// refused on either past [`crate::spi::MAX_CODE`] bytes.
+/// The most code bytes the interpreter prepares: its tables hold several
+/// bytes for each code byte, and a guest sizes an inner machine's code, so
+/// a host bounds them. It holds every service's code
+/// ([`crate::spi::MAX_SERVICE_CODE`]); past it a program is valid but
+/// refused as this host's resource, a backend error and never a guest
+/// outcome.
+pub const MAX_INTERPRETED_CODE: usize = 4 << 20;
+
+/// Compile PVM code into a `CompiledProgram` using the selected backend.
+/// Each backend bounds the code it prepares as its own resource, past any
+/// rule of the program: the interpreter at [`MAX_INTERPRETED_CODE`], the
+/// recompiler at its native bound (`recompiler::MAX_CODE`).
 pub fn compile(
     code: &[u8],
     bitmask: &[u8],
     jump_table: &[u32],
     backend: PvmBackend,
 ) -> Result<CompiledProgram, alloc::string::String> {
-    crate::spi::code_fits(code)?;
+    if code.len() > MAX_INTERPRETED_CODE {
+        return Err(alloc::format!(
+            "{} bytes of code, past the interpreter's {MAX_INTERPRETED_CODE}",
+            code.len()
+        ));
+    }
     match resolve_backend(backend)? {
         ResolvedBackend::Interpreter => Ok(CompiledProgram::Interpreter(
             crate::interpreter::Interpreter::predecode(code, bitmask, jump_table),

@@ -79,6 +79,10 @@ impl CodeHash {
 pub enum PoolError {
     /// Not a valid standard program, or its layout does not fit.
     InvalidProgram,
+    /// A service's code past the Gray Paper's service-code bound
+    /// ([`crate::spi::MAX_SERVICE_CODE`]): refine and accumulate of it fail
+    /// as `BIG`.
+    ServiceTooBig,
     /// The execution backend failed.
     Backend,
 }
@@ -596,13 +600,17 @@ impl OuterMachines {
         Self::with_idle_limit(blob, backend, DEFAULT_IDLE_OUTER)
     }
 
-    /// Outer machines of `blob` on `backend`, keeping at most `idle_limit`
-    /// idle.
+    /// Outer machines of `blob`, a service's code, on `backend`, keeping at
+    /// most `idle_limit` idle: refused past the service-code bound
+    /// ([`PoolError::ServiceTooBig`]) before it is parsed.
     pub fn with_idle_limit(
         blob: &[u8],
         backend: PvmBackend,
         idle_limit: usize,
     ) -> Result<Self, PoolError> {
+        if !crate::spi::service_fits(blob) {
+            return Err(PoolError::ServiceTooBig);
+        }
         let standard = crate::spi::parse_standard_program(blob).ok_or(PoolError::InvalidProgram)?;
         let program = Arc::new(PoolProgram::new(blob)?);
         let execution = program.prepared(backend)?;
@@ -621,7 +629,9 @@ impl OuterMachines {
     }
 
     /// A machine laid out for `args`, starting at instruction counter
-    /// `entry` with `gas`: 0 is refine, 5 accumulate.
+    /// `entry` with `gas`: 0 is refine, 5 accumulate. An `entry` that is no
+    /// instruction start ends the run at once, uncharged
+    /// ([`Machine::load_prepared_at`]).
     pub fn load(&self, entry: u32, args: &[u8], gas: Gas) -> Result<Machine, RefineError> {
         let layout = self
             .standard
@@ -650,8 +660,9 @@ impl OuterMachines {
         memory.take_dirty_pages();
         vm.registers = layout.registers;
         vm.gas = gas;
-        vm.set_pc(entry);
-        Ok(Machine::lent(vm, execution, gas, ticket))
+        let mut machine = Machine::lent(vm, execution, gas, ticket);
+        machine.enter_at(&self.standard.code, entry);
+        Ok(machine)
     }
 
     /// Reset the machine `invocation` finished on and keep it idle, or drop

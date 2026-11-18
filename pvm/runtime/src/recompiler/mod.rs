@@ -266,15 +266,33 @@ pub(crate) fn prepare_external_entry(
     None
 }
 
+/// The most code bytes the recompiler compiles: its native code and tables
+/// stay bounded by the code's length, and its offsets fit an `i32` (at most
+/// `asm::INSTRUCTION` native bytes for each code byte). A resource bound of
+/// this backend, not a rule of the program: the interpreter runs longer
+/// code, and a refusal here is the backend's, never a guest outcome.
+pub const MAX_CODE: usize = 2 << 20;
+
+/// `code` refused past [`MAX_CODE`] bytes: a compile's guard.
+fn code_fits(code: &[u8]) -> Result<(), String> {
+    if code.len() > MAX_CODE {
+        return Err(format!(
+            "{} bytes of code, past the recompiler's {MAX_CODE}",
+            code.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Compile PVM code to native x86-64 without creating an execution context.
 /// Returns the compiled artifacts that can be stored in a CodeCap. Refused
-/// past [`crate::spi::MAX_CODE`] bytes of code.
+/// past [`MAX_CODE`] bytes of code.
 pub fn compile_code(
     code: &[u8],
     bitmask: &[u8],
     jump_table: &[u32],
 ) -> Result<CompiledCode, String> {
-    crate::spi::code_fits(code)?;
+    code_fits(code)?;
     let helpers = HelperFns {
         mem_read_u8: mem_read_u8 as *const () as u64,
         mem_read_u16: mem_read_u16 as *const () as u64,
@@ -689,7 +707,7 @@ impl RecompiledPvm {
         gas: Gas,
         data_layout: Option<DataLayout>,
     ) -> Result<Self, String> {
-        crate::spi::code_fits(code)?;
+        code_fits(code)?;
         let debug = debug_from_environment();
 
         // Gas blocks and validation are now computed inline during the compile loop.
@@ -1322,25 +1340,38 @@ mod tests {
         }
     }
 
-    /// Code past [`crate::spi::MAX_CODE`] bytes is refused before any work,
-    /// on both backends and by validation.
+    /// Code past [`MAX_CODE`] bytes is the recompiler's refusal before any
+    /// work, its own resource bound: the interpreter prepares the same
+    /// code, and a validation accepts it.
     #[test]
-    fn code_past_its_cap_is_refused_on_both_backends() {
-        let code = vec![0; crate::spi::MAX_CODE + 1];
+    fn code_past_the_native_bound_is_the_recompilers_refusal_alone() {
+        let code = vec![0; MAX_CODE + 1];
         let bitmask = vec![1; code.len()];
-        for backend in [
-            crate::backend::PvmBackend::ForceInterpreter,
-            crate::backend::PvmBackend::ForceRecompiler,
-        ] {
-            assert!(crate::backend::compile(&code, &bitmask, &[], backend).is_err());
-        }
         assert!(compile_code(&code, &bitmask, &[]).is_err());
+        assert!(
+            crate::backend::compile(
+                &code,
+                &bitmask,
+                &[],
+                crate::backend::PvmBackend::ForceRecompiler
+            )
+            .is_err()
+        );
+        assert!(
+            crate::backend::compile(
+                &code,
+                &bitmask,
+                &[],
+                crate::backend::PvmBackend::ForceInterpreter
+            )
+            .is_ok()
+        );
         let blob = crate::spi::CodeBlob {
             jump_table: Vec::new(),
             code,
             bitmask,
         };
-        assert!(!crate::spi::validate_code_blob(&blob, 0));
+        assert!(crate::spi::validate_code_blob(&blob, 0));
     }
 
     #[test]

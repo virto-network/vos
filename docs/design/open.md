@@ -194,6 +194,19 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   verifier, `derive` and the security tool's counts. Engage before any
   value rides on VOS.
 
+## Execution
+
+- **Host bounds past the Gray Paper's reader** (`vos_pvm_program`,
+  `vos_pvm::backend`): a zero-width jump table holds at most as many
+  entries as its blob has bytes, and the interpreter prepares at most
+  `MAX_INTERPRETED_CODE` (4 MiB) of code, a backend refusal past it; both
+  are valid programs only an inner machine's `machine` call can name.
+  A fallible predecode with a table of implicit zeros lifts both.
+- **Service admission in the node** (`vos_pvm::spi::service_fits`, `W_C`):
+  `OuterMachines` refuses a service's code past 4,000,000 bytes; the node
+  side's install, and its refine and accumulate answering `BIG`, call it
+  when they land.
+
 ## Venues
 
 - **Anchoring limits** (`proving.md` §7): a single founding key can squat a

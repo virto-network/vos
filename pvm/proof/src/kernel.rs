@@ -52,6 +52,11 @@ pub enum KernelTraceError {
     /// (`vos_pvm_program::parse_canonical_standard_program`): a kernel's
     /// identity is its blob's hash, so an installed kernel has one blob.
     NotCanonical,
+    /// The program's code is longer than a proof's program memory holds,
+    /// one row a code byte up to [`crate::proof::MAX_PROOF_LOG_SIZE`]'s
+    /// rows: a valid program the prover cannot take, refused before it
+    /// runs.
+    Code,
     /// A jump-table entry, a static jump's or a branch's target is no basic
     /// block start (`vos_pvm::interpreter::bad_transfer`): the machine
     /// panics at that transfer, and the pin, which knows instruction starts
@@ -62,8 +67,12 @@ pub enum KernelTraceError {
     Input,
     /// The run stopped otherwise than by its halt.
     Exit,
-    /// Its output is not readable where φ7 and φ8 name it.
+    /// A kernel's nonempty output is not readable where φ7 and φ8 name it:
+    /// the kernel contract, stricter than Gray Paper Ψ_M, which reads such
+    /// an output as the empty string, as [`trace_program`] does.
     Output,
+    /// The host could not allocate the output.
+    Allocation,
     /// It read fewer bytes than the input holds: it is not the run the
     /// input was recorded from.
     Unread,
@@ -86,6 +95,9 @@ fn load(
     KernelTraceError,
 > {
     let program = vos_pvm::spi::parse_standard_program(blob).ok_or(KernelTraceError::Program)?;
+    if program.code.code.len() > 1 << crate::proof::MAX_PROOF_LOG_SIZE {
+        return Err(KernelTraceError::Code);
+    }
     let layout = program.layout(arguments).ok_or(KernelTraceError::Program)?;
     let mut memory = Memory::sparse(1 << 32);
     let pages = memory.pages();
@@ -159,9 +171,11 @@ pub fn kernel_side_note(blob: &[u8]) -> Result<SideNote, KernelTraceError> {
 
 /// Run kernel `blob` with `gas` on `input`, its witness input, as the
 /// agent runs it: the standard layout with no arguments, φ0 the halt
-/// address, φ1 the stack's top, φ7 the argument window and φ8 0.
+/// address, φ1 the stack's top, φ7 the argument window and φ8 0. Its halt
+/// is held to the kernel contract: a nonempty output is readable
+/// ([`KernelTraceError::Output`]); an empty one is empty whatever φ7.
 pub fn trace_kernel(blob: &[u8], input: &[u8], gas: u64) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, &[], input, gas, |_| {})
+    trace(blob, &[], input, gas, Contract::Kernel, |_| {})
 }
 
 /// [`trace_kernel`] with the machine's memory changed by `forge` before
@@ -175,18 +189,20 @@ pub fn trace_forged_kernel(
     gas: u64,
     forge: impl FnOnce(&mut Memory),
 ) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, &[], input, gas, forge)
+    trace(blob, &[], input, gas, Contract::Kernel, forge)
 }
 
 /// Run standard program `blob` with `gas` on `arguments`, mapped read-only
 /// in its argument window, with no witness input: φ7 the window and φ8
-/// its length.
+/// its length. Its output is Gray Paper Ψ_M's
+/// (`vos_pvm::refine::halt_output`): empty for a zero length whatever φ7,
+/// and for a range any byte of which is unreadable.
 pub fn trace_program(
     blob: &[u8],
     arguments: &[u8],
     gas: u64,
 ) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, arguments, &[], gas, |_| {})
+    trace(blob, arguments, &[], gas, Contract::Gray, |_| {})
 }
 
 /// [`trace_kernel`] run to whatever exit it reaches, a trap included: its
@@ -230,11 +246,23 @@ fn start(
     Ok((tracer, image, permissions))
 }
 
+/// Whose output rule a trace's halt is held to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Contract {
+    /// Gray Paper Ψ_M's: an output any byte of which is unreadable is the
+    /// empty string.
+    Gray,
+    /// A kernel's: a nonempty output is readable, or the trace is refused
+    /// ([`KernelTraceError::Output`]).
+    Kernel,
+}
+
 fn trace(
     blob: &[u8],
     arguments: &[u8],
     input: &[u8],
     gas: u64,
+    contract: Contract,
     forge: impl FnOnce(&mut Memory),
 ) -> Result<KernelTrace, KernelTraceError> {
     let (mut tracer, image, permissions) = start(blob, arguments, input, gas, forge)?;
@@ -248,15 +276,11 @@ fn trace(
         return Err(KernelTraceError::Unread);
     }
     let registers = tracer.pvm.registers;
-    let length = usize::try_from(registers[8]).map_err(|_| KernelTraceError::Output)?;
-    let address = u32::try_from(registers[7]).map_err(|_| KernelTraceError::Output)?;
-    // Checked before anything is allocated for it: a halt may name any
-    // length.
-    if !tracer.pvm.memory().is_readable(address, length) {
-        return Err(KernelTraceError::Output);
-    }
-    let mut output = alloc::vec![0u8; length];
-    if !tracer.pvm.memory().read_bytes_checked(address, &mut output) {
+    // Readability is checked before anything is allocated for it: a halt
+    // may name any length.
+    let output = vos_pvm::refine::halt_output(tracer.pvm.memory(), &registers, usize::MAX)
+        .map_err(|_| KernelTraceError::Allocation)?;
+    if output.is_empty() && registers[8] != 0 && contract == Contract::Kernel {
         return Err(KernelTraceError::Output);
     }
     let mut io_hash = [0u8; 32];
@@ -281,7 +305,7 @@ fn trace(
 mod tests {
     use vos_pvm_compiler::assembler::{Assembler, Reg};
 
-    use super::{KernelTraceError, kernel_side_note};
+    use super::{KernelTraceError, kernel_side_note, trace_kernel, trace_program};
 
     /// `asm`'s program with jump table `table`.
     fn with_table(asm: &Assembler, table: &[u32]) -> Vec<u8> {
@@ -331,6 +355,47 @@ mod tests {
         assert!(kernel_side_note(&blob(true)).is_ok());
     }
 
+    /// A program that halts with φ7 `address` and φ8 `len`.
+    fn halting_with(address: u64, len: u64) -> Vec<u8> {
+        let mut asm = Assembler::new();
+        asm.set_stack_pages(1);
+        asm.load_imm_64(Reg::A0, address)
+            .load_imm_64(Reg::A1, len)
+            .jump_ind(Reg::RA, 0);
+        asm.build()
+    }
+
+    /// An empty output is empty whatever its pointer, on either tracer.
+    #[test]
+    fn an_empty_halt_output_is_empty_whatever_its_pointer() {
+        for address in [0, 0x1234, u64::from(u32::MAX), u64::MAX] {
+            let blob = halting_with(address, 0);
+            for arguments in [&[][..], &[1, 2, 3]] {
+                let trace = trace_program(&blob, arguments, 1_000).expect("halts");
+                assert!(trace.output.is_empty(), "{address:#x}");
+            }
+            let trace = trace_kernel(&blob, &[], 1_000).expect("halts");
+            assert!(trace.output.is_empty(), "{address:#x}");
+        }
+    }
+
+    /// A nonempty output any byte of which is unreadable: Ψ_M's empty
+    /// string on the generic tracer, the kernel contract's refusal on a
+    /// kernel's.
+    #[test]
+    fn an_unreadable_output_is_empty_but_breaks_the_kernel_contract() {
+        for (address, len) in [(0, 1), (u64::MAX, 1), (0x1_0000, u64::MAX)] {
+            let blob = halting_with(address, len);
+            let trace = trace_program(&blob, &[], 1_000).expect("halts");
+            assert!(trace.output.is_empty(), "{address:#x}+{len}");
+            assert_eq!(
+                trace_kernel(&blob, &[], 1_000).err(),
+                Some(KernelTraceError::Output),
+                "{address:#x}+{len}"
+            );
+        }
+    }
+
     /// An installed kernel is its program's one encoding: the same program
     /// with its jump table a byte wider, which the Gray Paper reader takes,
     /// is refused by its own rule.
@@ -356,6 +421,30 @@ mod tests {
         assert_eq!(
             kernel_side_note(&wide).err(),
             Some(KernelTraceError::NotCanonical)
+        );
+    }
+
+    /// Code past what a proof's program memory holds is the prover's own
+    /// refusal, before any run.
+    #[test]
+    fn code_past_the_program_memory_is_refused() {
+        let len = (1usize << crate::proof::MAX_PROOF_LOG_SIZE) + 1;
+        let program = vos_pvm_program::StandardProgram {
+            ro_data: Vec::new(),
+            rw_data: Vec::new(),
+            heap_pages: 0,
+            stack_size: 4096,
+            code: vos_pvm_program::CodeBlob {
+                jump_table: Vec::new(),
+                code: vec![0; len],
+                bitmask: vec![1; len],
+            },
+        };
+        let blob = vos_pvm_program::build_standard_program(&program).unwrap();
+        assert!(vos_pvm::spi::parse_standard_program(&blob).is_some());
+        assert_eq!(
+            super::trace_program(&blob, &[], 10).err(),
+            Some(KernelTraceError::Code)
         );
     }
 }
