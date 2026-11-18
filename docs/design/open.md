@@ -139,8 +139,16 @@ The scale results are in `core-model.md` §14, "The scale test".
   be given a short or empty read and more bytes later; a constraint
   across calls (a zero read final) needs a new segment format. Until
   then a kernel frames its input by content (`pvm/proof/SECURITY.md`,
-  "Three boundaries"), and the stock kernels' reads are to be audited
-  against that.
+  "Three boundaries"). Every derived kernel reads its input through
+  `derive`'s prologue, which reads on through short reads, ends at a zero
+  read and traps past its room, then calls the entry on the bytes read;
+  every entry `#[messages]` generates decodes those bytes by content (the
+  message's encoding, an in-place argument's size, `served`'s rows decoded
+  whole) and traps on a frame cut short, so a proved run's result is the
+  live run's on the bytes it read, however they were split [audited,
+  2026-11-18: the window, balance and predicate kernels, the credential
+  actor's `auth` and `owner`, the test actors' device kernels; none reads
+  the witness otherwise].
 - **The leaf's timestamp bytes:** the leaf range-checks the io-hash's 32
   boundary bytes alone, and rests on the fold chain for the rest; a leaf
   alone accepts a `ts_in` whose first limb is `p − 1`. Range-check
@@ -360,10 +368,6 @@ The scale results are in `core-model.md` §14, "The scale test".
   instruction four bytes on. It cannot see the arithmetic: only a
   `jalr`'s own displacement past ±1 is refused, and a source that offsets
   a code pointer otherwise runs differently.
-- **Service admission in the node** (`vos_pvm::spi::service_fits`, `W_C`):
-  `OuterMachines` refuses a service's code past 4,000,000 bytes; the node
-  side's install, and its refine and accumulate answering `BIG`, call it
-  when they land.
 - **The JAM-only host's package** (`JamRefine`): `fetch` kinds 7 and 10
   serve the encoded package and context as the caller gives them; the
   fixture encodes no work package, so nothing holds them to its items.
