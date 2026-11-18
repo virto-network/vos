@@ -184,7 +184,7 @@ pub fn auth_reference() -> Vec<u8> {
     let binding: Words = core::array::from_fn(|i| 0x0b1d_0000 + i as u32);
     let siblings: [Words; DEPTH] = core::array::from_fn(|level| EMPTY[level]);
     let member = credentials::compress(&Tag::Member.block(), &secret);
-    let root = credentials::root_of(&credentials::leaf(&member), 0, &siblings);
+    let root = credentials::member_root(&member, 0, &siblings);
     let nullifier =
         credentials::compress(&credentials::compress(&Tag::Nf.block(), &secret), &scope);
     let public = auth_public(
