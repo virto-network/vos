@@ -164,6 +164,11 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   where the root, the kit and the Wasm blob run it on `0.15.5`
   (`tools/gates/locks.py`'s `DRIFT` names the edge). Bounding the
   requirement in the fork closes it, at its next pin.
+- **The interpreter's two loops** share skip and the division, remainder
+  and upper-multiply results (`interpreter/alu.rs`); the other register
+  results (shifts, rotates, 32-bit arithmetic, the immediate forms,
+  comparisons and bit counts) are spelled out in `step` and in the
+  predecoded loop, each over its own operand decoding.
 - **The kit's lock:** shipping the lock VOS's `check-kit` builds on beside
   the kit, with a command listing every package of the verify graph a
   consumer resolves at another version; and signed release tags with a
