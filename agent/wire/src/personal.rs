@@ -986,4 +986,8 @@ pub enum PersonalError {
     /// re-sealed that is not the agent's kit.
     #[codec(index = 44)]
     Rekey,
+    /// The operation a cosign or a resolution would make mature has no
+    /// evidence yet (or no `R2` where it carries one): post it first.
+    #[codec(index = 45)]
+    Unevidenced,
 }

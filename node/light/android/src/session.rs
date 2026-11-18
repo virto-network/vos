@@ -513,9 +513,13 @@ impl Inner {
                         &wire::devices_request(method.agent, method.instance),
                     )
                     .await
-                    .map_err(|error| refused(Code::Api, error))?;
+                    .map_err(|error| {
+                        refused(Code::Api, format!("the space's device window: {error}"))
+                    })?;
                 let window = wire::devices_answer(&answer)
-                    .map_err(|error| refused(Code::Api, error.to_string()))?
+                    .map_err(|error| {
+                        refused(Code::Api, format!("the space's device window: {error}"))
+                    })?
                     .ok_or_else(|| refused(Code::Refused, "the space holds no such instance"))?;
                 self.windows
                     .lock()

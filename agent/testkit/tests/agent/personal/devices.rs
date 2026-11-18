@@ -205,9 +205,9 @@ fn two_seasoned_devices_remove_at_once() {
 }
 
 /// An operation the devices hold no evidence of matures for none of them:
-/// a removal or a cosigned one due without its call's evidence is
-/// cancelled `Unevidenced`, its target keeps its voice, and the removal
-/// after it, its evidence posted, matures as usual.
+/// a removal due without its call's evidence is cancelled `Unevidenced`,
+/// its target keeping its voice; a cosign before the evidence is refused,
+/// and makes the removal immediate once the evidence came.
 #[test]
 fn an_operation_due_without_its_evidence_is_cancelled() {
     let mut home = seasoned(3);
@@ -219,19 +219,45 @@ fn an_operation_due_without_its_evidence_is_cancelled() {
         Some(Cancel::Unevidenced)
     );
     assert_eq!(standing(&home, sync(0), 2), Standing::Active);
-    // Cosigned at once, its own evidence never posted.
+    // A cosign before the evidence is refused, and taken once it came.
     let removal = home.unevidenced(admin(0), "remove", 2u32).unwrap();
-    home.operate(admin(1), "cosign", removal).unwrap();
     assert_eq!(
-        cancelled(state(&home, sync(0), removal)),
-        Some(Cancel::Unevidenced)
+        home.operate(admin(1), "cosign", removal),
+        Err(PersonalError::Unevidenced)
     );
-    assert_eq!(standing(&home, sync(0), 2), Standing::Active);
-    let removal = home.operate(admin(0), "remove", 2u32).unwrap();
-    home.pass(3 * MINUTE + 1);
-    home.wake(sync(0)).unwrap();
+    let signed = message(device(0).admin, home.method("remove"), &2u32.encode());
+    home.call::<Recorded>(
+        sync(0),
+        "evidence",
+        evidence(removal, signed, Attached::default()),
+    )
+    .unwrap();
+    home.operate(admin(1), "cosign", removal).unwrap();
     assert!(matured(state(&home, sync(0), removal)));
     assert_eq!(standing(&home, sync(0), 2), Standing::Removed);
+}
+
+/// A resolution naming an operation that has no evidence yet is refused:
+/// it would be cancelled at once for want of it, and its rival, the one the
+/// resolution dropped, reopened.
+#[test]
+fn a_resolution_onto_an_unevidenced_operation_is_refused() {
+    let mut home = seasoned(2);
+    let removal = home.unevidenced(admin(0), "remove", 1u32).unwrap();
+    home.operate(admin(1), "veto", removal).unwrap();
+    assert_eq!(
+        home.operate(KIT, "resolve", (removal, true)),
+        Err(PersonalError::Unevidenced)
+    );
+    let signed = message(device(0).admin, home.method("remove"), &1u32.encode());
+    home.call::<Recorded>(
+        sync(0),
+        "evidence",
+        evidence(removal, signed, Attached::default()),
+    )
+    .unwrap();
+    home.operate(KIT, "resolve", (removal, true)).unwrap();
+    assert!(matured(state(&home, sync(0), removal)));
 }
 
 /// Rule 5: two removals aimed at each other are one contest, which no

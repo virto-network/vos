@@ -13,7 +13,7 @@ use vos_wire::personal::{
 use super::link::{AgentLink, Signer, answer};
 use super::{
     AdminKey, Approval, Error, Held, Host, Personal, Posted, Prompts, WAKES, admin_sign,
-    entered_kit, failed, link, new_kit, unreached,
+    entered_kit, failed, new_kit, unreached,
 };
 use crate::group::{Event, Prepared};
 use crate::personal::Link as _;
@@ -296,42 +296,17 @@ impl<H: Host> Personal<H> {
         let admin = new_admin(next);
         held.state.set_next_admin(next);
         self.keep(&held.light, &held.state)?;
-        let (kept, agent) = (
-            held.state.home.clone().ok_or(Error::NoSpace)?,
-            held.state.agent.ok_or(Error::NoSpace)?,
-        );
-        // The kit's call and its evidence, each under the kit's key.
-        let signing = kit.signing();
-        let mut signer = Signer::new(signing.verifying_key().to_bytes());
-        let mut session = signer;
-        let recorded = {
-            let mut link = link(
-                &self.host,
-                &kept,
-                Purpose::Personal,
-                agent,
-                &signing,
-                &mut session,
-            );
-            let sign = |message: &[u8]| Ok(signing.sign(message).to_bytes());
-            let called = link
-                .settled(&mut signer, &sign, method::REPLACE, (me, admin).encode())
-                .map_err(unreached)?;
-            let recorded = answer::<Recorded>(&called.outcome)
-                .map_err(failed)?
-                .map_err(agent_refused)?;
-            evidence(
-                &mut link,
-                recorded.index,
-                (&called.message, &called.signature),
-                Attached {
-                    welcome: None,
-                    r2: None,
-                },
-            )?;
-            recorded
-        };
-        self.posted(&mut held, recorded)
+        let kept = held.state.home.clone().ok_or(Error::NoSpace)?;
+        drop(held);
+        // The kit's call, kept as signed until its evidence is posted.
+        let posted = self.kit_call(&kit, kept, method::REPLACE, (me, admin).encode())?;
+        self.posted(
+            &mut self.held(),
+            Recorded {
+                at: posted.at,
+                index: posted.index,
+            },
+        )
     }
 
     /// A new admin key for this device, made in the UI's keystore, offered
@@ -533,7 +508,9 @@ impl<H: Host> Personal<H> {
                 Attached { welcome: None, r2 },
             ) {
                 // Held: the next pass posts it.
-                Ok(()) | Err(Error::Unreachable(_)) => Ok(recorded),
+                Ok(())
+                | Err(Error::Unreachable(_))
+                | Err(Error::AgentRefused(PersonalError::Settling)) => Ok(recorded),
                 Err(error) => {
                     group.evidence_refused(recorded.index).map_err(failed)?;
                     Err(error)

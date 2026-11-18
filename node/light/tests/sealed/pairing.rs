@@ -174,9 +174,10 @@ fn pair_in(
     let (mut joining, second) = Joiner::scan(&code).unwrap();
     leave(home, &code.slot_key(), &second);
 
-    let Opened::Put(third) = opener_reads(home, opener, &mut side) else {
+    let Opened::Check(_) = opener_reads(home, opener, &mut side) else {
         panic!("the handshake's last message")
     };
+    let third = side.offer().unwrap();
     leave(home, &opener.sync, &third);
     let Joined::Offer(offered) = joiner_reads(home, &code, &mut joining) else {
         panic!("the offer")
@@ -365,9 +366,10 @@ fn another_code_or_a_replaced_item_fails_the_handshake() {
     code.code[0] ^= 1;
     let (mut joining, second) = Joiner::scan(&code).unwrap();
     leave(&mut home, &code.slot_key(), &second);
-    let Opened::Put(third) = side.read(&inbox(&home, phones[0].sync_key())).unwrap() else {
+    let Opened::Check(_) = side.read(&inbox(&home, phones[0].sync_key())).unwrap() else {
         panic!("the last message")
     };
+    let third = side.offer().unwrap();
     leave(&mut home, &phones[0].sync, &third);
     assert_eq!(
         joining
@@ -401,9 +403,10 @@ fn another_code_or_a_replaced_item_fails_the_handshake() {
     );
     let (mut joining, _) = Joiner::scan(&code).unwrap();
     leave(&mut home, &code.slot_key(), &second);
-    let Opened::Put(third) = side.read(&inbox(&home, phones[0].sync_key())).unwrap() else {
+    let Opened::Check(_) = side.read(&inbox(&home, phones[0].sync_key())).unwrap() else {
         panic!("the last message")
     };
+    let third = side.offer().unwrap();
     leave(&mut home, &phones[0].sync, &third);
     let mut served = inbox(&home, code.slot_key().verifying_key().to_bytes());
     for item in &mut served {
@@ -472,9 +475,10 @@ fn a_pairing_cut_short_is_abandoned_and_paired_again() {
     let code = Code::from_bytes(&qr).unwrap();
     let (mut joining, second) = Joiner::scan(&code).unwrap();
     leave(&mut home, &code.slot_key(), &second);
-    let Opened::Put(third) = opener_reads(&home, &phones[0], &mut side) else {
+    let Opened::Check(_) = opener_reads(&home, &phones[0], &mut side) else {
         panic!("the last message")
     };
+    let third = side.offer().unwrap();
     leave(&mut home, &phones[0].sync, &third);
     let Joined::Offer(offered) = joiner_reads(&home, &code, &mut joining) else {
         panic!("the offer")

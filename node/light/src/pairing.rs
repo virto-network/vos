@@ -16,10 +16,11 @@
 //!   joiner's "home" nullifier is of, and the user's other memberships,
 //!   which it is enrolled in.
 //! - **The check:** both sides derive a six-digit check from the
-//!   handshake's hash ([`check`]), the joiner showing it, the opener asking
-//!   its user to confirm the joiner shows the same before anything is handed
-//!   over: someone who photographed the QR and answered first holds a
-//!   handshake of its own, whose check the user's new phone does not show.
+//!   handshake's hash after its second message ([`check`]), the joiner
+//!   showing it, the opener asking its user to confirm the joiner shows the
+//!   same before it writes the third, the offer: someone who photographed
+//!   the QR and answered first holds a handshake of its own, whose check
+//!   the user's new phone does not show, and is given nothing.
 //! - **Over the channel:** the joiner sends its [`Hello`] (its keys, its
 //!   nullifier, its key package, its handles in the offered spaces); the
 //!   opener pairs it ([`crate::group::DeviceGroup::pair`]) and hands over
@@ -337,8 +338,6 @@ fn handshake(
 /// order, and reads in its peer's order.
 struct Channel {
     transport: snow::TransportState,
-    /// The handshake's check ([`check`]).
-    check: String,
     /// The next item this side writes and the next of its peer's it reads.
     written: u32,
     read: u32,
@@ -378,6 +377,9 @@ fn find<'a>(items: &'a [InboxItem], slot: &Scope, peer: Side, n: u32) -> Option<
 enum Opening {
     /// Its first message is in the code: waiting for the joiner's second.
     Shown(Box<snow::HandshakeState>),
+    /// The joiner's second read, its check to confirm: then
+    /// [`Opener::offer`], the handshake's last message.
+    Checked(Box<snow::HandshakeState>),
     /// The offer sent: waiting for the joiner's hello.
     Offered(Channel),
     /// The hello read: the handover to send.
@@ -392,8 +394,9 @@ enum Opening {
 pub enum Opened {
     /// Nothing new: read the slot again.
     Waiting,
-    /// Leave this item in the slot: the handshake's last message.
-    Put(Put),
+    /// The joiner's second message read: its user confirms the joiner
+    /// shows this check ([`Opener::check`]), then [`Opener::offer`].
+    Check(String),
     /// The joiner's hello: pair it, then [`Opener::hand_over`].
     Hello(Hello),
     /// The joiner holds the handover: make the commit adding it.
@@ -402,6 +405,8 @@ pub enum Opened {
 
 /// The device that pairs another: its slot and its side of the channel.
 pub struct Opener {
+    /// The handshake's check, once the joiner's second message is read.
+    check: Option<String>,
     slot: Scope,
     identity: [u8; 32],
     expires: u64,
@@ -453,6 +458,7 @@ impl Opener {
         }
         let key = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
         let opener = Self {
+            check: None,
             slot,
             identity,
             expires: 0,
@@ -502,15 +508,33 @@ impl Opener {
         self.slot
     }
 
-    /// The handshake's check, once its last message is written: what the
-    /// user confirms the joiner shows before [`Opener::hand_over`].
+    /// The handshake's check, once the joiner's second message is read:
+    /// what the user confirms the joiner shows before [`Opener::offer`].
     pub fn check(&self) -> Option<&str> {
-        match &self.state {
-            Opening::Offered(channel) | Opening::Greeted(channel) | Opening::Handed(channel, _) => {
-                Some(&channel.check)
-            }
-            Opening::Shown(_) | Opening::Done => None,
+        self.check.as_deref()
+    }
+
+    /// The handshake's last message, carrying the offer, once the user
+    /// confirmed its check: the item to leave in the slot.
+    pub fn offer(&mut self) -> Result<Put, PairError> {
+        let Opening::Checked(mut handshake) = core::mem::replace(&mut self.state, Opening::Done)
+        else {
+            return Err(PairError::Order);
+        };
+        let offer = self.offer.encode();
+        if offer.len() + 64 + 3 * TAG > NOISE_MAX.min(self.item_bytes) {
+            return Err(PairError::Decode);
         }
+        let mut third = vec![0; offer.len() + 64 + 3 * TAG];
+        let len = handshake.write_message(&offer, &mut third)?;
+        third.truncate(len);
+        let channel = Channel {
+            transport: handshake.into_transport_mode()?,
+            written: 1,
+            read: 1,
+        };
+        self.state = Opening::Offered(channel);
+        Ok(self.put(0, third))
     }
 
     fn put(&self, n: u32, bytes: Vec<u8>) -> Put {
@@ -527,6 +551,9 @@ impl Opener {
         let state = core::mem::replace(&mut self.state, Opening::Done);
         let (state, opened) = self.step(state, items)?;
         self.state = state;
+        if let Opened::Check(shown) = &opened {
+            self.check = Some(shown.clone());
+        }
         Ok(opened)
     }
 
@@ -538,21 +565,10 @@ impl Opener {
                 };
                 let mut payload = vec![0; item.item.bytes.len()];
                 handshake.read_message(&item.item.bytes, &mut payload)?;
-                let offer = self.offer.encode();
-                if offer.len() + 64 + 3 * TAG > NOISE_MAX.min(self.item_bytes) {
-                    return Err(PairError::Decode);
-                }
-                let mut third = vec![0; offer.len() + 64 + 3 * TAG];
-                let len = handshake.write_message(&offer, &mut third)?;
-                third.truncate(len);
-                let channel = Channel {
-                    check: check(handshake.get_handshake_hash()),
-                    transport: handshake.into_transport_mode()?,
-                    written: 1,
-                    read: 1,
-                };
-                (Opening::Offered(channel), Opened::Put(self.put(0, third)))
+                let shown = check(handshake.get_handshake_hash());
+                (Opening::Checked(handshake), Opened::Check(shown))
             }
+            state @ Opening::Checked(_) => (state, Opened::Waiting),
             Opening::Offered(mut channel) => {
                 let Some(item) = find(items, &self.slot, Side::Joiner, channel.read) else {
                     return Ok((Opening::Offered(channel), Opened::Waiting));
@@ -634,6 +650,8 @@ impl core::fmt::Debug for Joined {
 
 /// The device being paired: its side of the channel.
 pub struct Joiner {
+    /// The handshake's check, from its second message on.
+    check: String,
     slot: Scope,
     expires: u64,
     state: Joining,
@@ -650,6 +668,7 @@ impl Joiner {
         let len = state.write_message(&[], &mut second)?;
         second.truncate(len);
         let joiner = Self {
+            check: check(state.get_handshake_hash()),
             slot: code.slot,
             expires: code.expires,
             state: Joining::Scanned(Box::new(state)),
@@ -667,13 +686,10 @@ impl Joiner {
         }
     }
 
-    /// The handshake's check, once the offer is read: what this device
-    /// shows while the opener's user confirms it.
-    pub fn check(&self) -> Option<&str> {
-        match &self.state {
-            Joining::Offered(channel) | Joining::Greeted(channel, ..) => Some(&channel.check),
-            Joining::Scanned(_) | Joining::Done => None,
-        }
+    /// The handshake's check: what this device shows, from its scan on,
+    /// while the opener's user confirms it.
+    pub fn check(&self) -> &str {
+        &self.check
     }
 
     /// Read the slot's `items`: the next step.
@@ -694,7 +710,6 @@ impl Joiner {
                 let len = handshake.read_message(&item.item.bytes, &mut payload)?;
                 let offer = Offer::decode_exact(&payload[..len]).ok_or(PairError::Decode)?;
                 let channel = Channel {
-                    check: check(handshake.get_handshake_hash()),
                     transport: handshake.into_transport_mode()?,
                     written: 1,
                     read: 1,

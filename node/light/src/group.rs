@@ -623,7 +623,7 @@ impl Sent {
     }
 
     /// Whether it is the operation at `op`, or a veto, cosign or
-    /// resolution of it: settled, its evidence decides nothing more.
+    /// resolution of it: cancelled, its evidence decides nothing more.
     pub(crate) fn about(&self, op: u64) -> bool {
         use vos_wire::personal::method::{COSIGN, RESOLVE, VETO};
         self.index == Some(op)
@@ -833,31 +833,43 @@ pub struct Restored {
 }
 
 /// The policy the control log `entries` set, read from its start in
-/// order, as a device following it takes it: the claim's configuration
-/// (one before its assignment, or the one beside it) whole, each later one
-/// over it ([`Policy::over`]); `None` before any. A restored device starts
-/// from it, never from a policy of its own.
+/// order, as a device following it takes it ([`configure`]): the claim's
+/// configuration (one before its assignment, or the one beside it) whole,
+/// each later one over it ([`Policy::over`]), from [`Policy::DEFAULT`]. A
+/// restored device starts from it, never from a policy of its own.
 pub fn configured<'a>(
     entries: impl IntoIterator<Item = &'a (u64, vos_wire::personal::Entry)>,
-) -> Option<Policy> {
+) -> Policy {
     use vos_wire::personal::Body;
     let mut assigned = None;
-    let mut policy: Option<Policy> = None;
+    let mut policy = Policy::DEFAULT;
     for (index, entry) in entries {
         match &entry.body {
             Body::Assigned { device: 0, .. } if assigned.is_none() => assigned = Some(*index),
             Body::Configured(configured) => {
-                policy = Some(match (assigned, policy) {
-                    (Some(assigned), Some(held)) if *index != assigned + 1 => {
-                        configured.over(&held)
-                    }
-                    _ => *configured,
-                });
+                policy = configure(assigned, *index, *configured, &policy)
             }
             _ => {}
         }
     }
     policy
+}
+
+/// A configuration `policy` at log index `index`, the claim's assignment
+/// at `assigned` if read, over `held`: the claim's (one before the
+/// assignment, or the one beside it) taken whole, a later one over
+/// `held`.
+pub(crate) fn configure(
+    assigned: Option<u64>,
+    index: u64,
+    policy: Policy,
+    held: &Policy,
+) -> Policy {
+    if assigned.is_none_or(|assigned| index == assigned + 1) {
+        policy
+    } else {
+        policy.over(held)
+    }
 }
 
 impl Pairing {

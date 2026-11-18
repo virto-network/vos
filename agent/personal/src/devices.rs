@@ -530,6 +530,7 @@ impl Personal {
             }
             Signer::Kit(_) => return Err(PersonalError::NotSigner),
         }
+        self.evidenced_op(index, &operation.op)?;
         let at = self.append(
             now,
             Body::Cosign {
@@ -561,6 +562,11 @@ impl Personal {
         }
         let rival = self.rivals.get(&index);
         let winner = if upheld { Some(index) } else { rival };
+        if let Some(winner) = winner
+            && let Some(operation) = self.operations.get(&winner)
+        {
+            self.evidenced_op(winner, &operation.op)?;
+        }
         let contest = rival.map_or(index, |rival| rival.min(index));
         let decided = match by {
             Signer::Kit(_) => true,
@@ -608,6 +614,17 @@ impl Personal {
             }
         }
         Ok(Recorded { at: now, index: at })
+    }
+
+    /// Whether the operation `op` at `index` holds what it matures with:
+    /// its evidence, and its `R2` where it carries one. A cosign or a
+    /// resolution that would make one without them mature is refused, so
+    /// it is not cancelled for want of them (reopening its rival) at once.
+    fn evidenced_op(&self, index: u64, op: &Op) -> Result<(), PersonalError> {
+        if !self.evidenced.contains(&index) || needs_r2(op) && !self.deposits.contains(&index) {
+            return Err(PersonalError::Unevidenced);
+        }
+        Ok(())
     }
 
     /// A device's `alive` cancels a pending restore, which asserts every

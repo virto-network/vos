@@ -126,9 +126,20 @@ impl<H: Host> Personal<H> {
         arguments: Vec<u8>,
     ) -> Result<Posted, Error> {
         let kit = entered_kit(prompts, kind)?;
+        self.kit_call(&kit, home, method, arguments)
+    }
+
+    /// [`Personal::by_kit`] with the kit entered already.
+    pub(super) fn kit_call(
+        &self,
+        kit: &KitSecret,
+        home: Kept,
+        method: MethodId,
+        arguments: Vec<u8>,
+    ) -> Result<Posted, Error> {
         let signing = kit.signing();
         let origin = signing.verifying_key().to_bytes();
-        self.with_kit(&home, &kit, |link, identity| {
+        self.with_kit(&home, kit, |link, identity| {
             let entries = link.log_all(0).map_err(unreached)?.map_err(agent_refused)?;
             if let Some(posted) =
                 self.post_kept(link, identity, &entries, origin, method, &arguments)?
@@ -173,10 +184,10 @@ impl<H: Host> Personal<H> {
         })
     }
 
-    /// The evidence of each call the kit made at the agent `identity` that
-    /// the log `entries` hold without it, posted; each the log holds with
-    /// it, or not at all, kept no more: the call of `method` with
-    /// `arguments` among them, answered.
+    /// The evidence of each call the kit's key `origin` made at the agent
+    /// `identity` that the log `entries` hold open without it, posted; each
+    /// kept no more once posted, refused, settled or not in the log: the
+    /// call of `method` with `arguments` among them, answered while open.
     fn post_kept(
         &self,
         link: &mut AgentLink<'_, H>,
@@ -186,21 +197,28 @@ impl<H: Host> Personal<H> {
         method: MethodId,
         arguments: &[u8],
     ) -> Result<Option<Posted>, Error> {
+        // The calls this kit's key made there: another entry's key posts
+        // none of them.
         let kept: Vec<KitCall> = self
             .held()
             .state
             .kit_calls
             .iter()
-            .filter(|call| call.identity == identity)
+            .filter(|call| {
+                call.identity == identity
+                    && CallMessage::parse(&call.message)
+                        .is_some_and(|signed| signed.session.key == origin)
+            })
             .cloned()
             .collect();
         let mut answered = None;
         for call in kept {
             let Some(signed) = CallMessage::parse(&call.message) else {
-                self.keep_kit_call(identity, Some(call.message), None)?;
                 continue;
             };
-            let found = entries.iter().find(|(_, entry)| match &entry.body {
+            // The latest such call, while it is open: an earlier one with
+            // the same arguments, settled since, is not this one.
+            let found = entries.iter().rev().find(|(_, entry)| match &entry.body {
                 Body::Operation { call: logged, .. } | Body::Resolve { call: logged, .. } => {
                     logged.origin == signed.session.key
                         && logged.method == signed.method.0
@@ -208,12 +226,18 @@ impl<H: Host> Personal<H> {
                 }
                 _ => false,
             });
-            if let Some((index, entry)) = found {
+            let open = found.filter(|(index, _)| {
+                !entries.iter().any(
+                    |(_, other)| matches!(&other.body, Body::Settled { op, .. } if op == index),
+                )
+            });
+            if let Some((index, entry)) = open {
                 let evidenced = entries.iter().any(|(_, other)| {
                     matches!(&other.body, Body::Evidence { index: of, .. } if of == index)
                 });
-                if !evidenced {
-                    evidence(
+                let posted = match evidenced {
+                    true => Ok(()),
+                    false => evidence(
                         link,
                         *index,
                         (&call.message, &call.signature),
@@ -221,12 +245,14 @@ impl<H: Host> Personal<H> {
                             welcome: None,
                             r2: None,
                         },
-                    )?;
+                    ),
+                };
+                match posted {
+                    // Refused for good: kept no more, the rest go on.
+                    Ok(()) | Err(Error::AgentRefused(_)) => {}
+                    Err(error) => return Err(error),
                 }
-                if signed.session.key == origin
-                    && signed.method == method
-                    && signed.arguments == arguments
-                {
+                if signed.method == method && signed.arguments == arguments {
                     answered = Some(Posted {
                         index: *index,
                         at: entry.at,

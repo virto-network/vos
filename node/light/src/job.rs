@@ -184,8 +184,9 @@ pub enum Commit {
     /// recovery envelope is pushed.
     Removals,
     /// The kit re-sealed under a new `R`: the agent's verdict on the epoch
-    /// that re-sealed it did not confirm it, so the `R` before, a removed
-    /// device's, stands, and nothing is pushed to the recovery scope.
+    /// that re-sealed it did not confirm it (or this device did not), so
+    /// the `R` before, a removed device's, stands, and nothing is pushed to
+    /// the recovery scope.
     Reseal,
 }
 
@@ -342,9 +343,10 @@ pub fn run<L: Control>(
     }
 }
 
-/// The commit `group` owes, if it follows and is in the set.
+/// The commit `group` owes, if it follows, is in the set and no
+/// candidate is pending (which may be the one carrying it).
 pub fn owed_commit(group: &DeviceGroup) -> Option<Commit> {
-    if group.course() != group::Course::Following || group.id().is_none() {
+    if group.course() != group::Course::Following || group.id().is_none() || group.pending() {
         return None;
     }
     if !group.owed().is_empty() {

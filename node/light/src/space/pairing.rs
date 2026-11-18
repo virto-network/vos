@@ -189,15 +189,15 @@ impl<H: Host> Personal<H> {
             })?;
             match opener.read(&items).map_err(failed)? {
                 Opened::Waiting => self.host.sleep(POLL),
-                Opened::Put(put) => {
-                    self.put(held, &put.arguments())?;
-                    // The handshake is done: nothing is handed over until
-                    // the user confirms the new device shows its check.
-                    let check = opener.check().ok_or_else(|| failed("no check"))?;
-                    if !prompts.confirm_pairing(check) {
+                Opened::Check(check) => {
+                    // Nothing, the offer included, leaves until the user
+                    // confirms the new device shows this check.
+                    if !prompts.confirm_pairing(&check) {
                         self.close_slot(held, opener)?;
                         return Err(Error::Declined);
                     }
+                    let put = opener.offer().map_err(failed)?;
+                    self.put(held, &put.arguments())?;
                 }
                 Opened::Hello(heard) => {
                     // The commit is made on what the log decided, its admin
@@ -369,6 +369,11 @@ impl<H: Host> Personal<H> {
                 .map(drop)
         };
         slot_put(&mut slot_signer, put.arguments())?;
+        // The check shown while the opener's user confirms it; until then
+        // the opener sends nothing.
+        if !prompts.show_pairing(joiner.check()) {
+            return Err(Error::Declined);
+        }
         let mut home = None;
         let until = code.expires;
         let (pairing, ack, offer, device) = loop {
@@ -396,11 +401,6 @@ impl<H: Host> Personal<H> {
             match joiner.read(&items).map_err(failed)? {
                 Joined::Waiting => self.host.sleep(POLL),
                 Joined::Offer(offer) => {
-                    // The check shown while the opener's user confirms it.
-                    let check = joiner.check().ok_or_else(|| failed("no check"))?;
-                    if !prompts.show_pairing(check) {
-                        return Err(Error::Declined);
-                    }
                     // The code is the opener's: the space this device holds
                     // is left, and it pairs as a fresh install.
                     if held.group.is_some()

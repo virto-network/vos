@@ -454,9 +454,9 @@ fn a_joiner_cut_short_pairs_again_on_the_same_phone() {
 }
 
 /// The pairing's check: both phones show the same, and an opener whose
-/// user does not confirm it hands nothing over (its one put is the
-/// handshake's last message) and closes the slot; confirmed, the pairing
-/// runs to its end.
+/// user does not confirm it puts nothing in the slot (not even the
+/// handshake's last message, which carries the offer) and closes it;
+/// confirmed, the pairing runs to its end.
 #[test]
 fn a_pairing_hands_nothing_over_until_its_check_is_confirmed() {
     let world = world();
@@ -481,7 +481,7 @@ fn a_pairing_hands_nothing_over_until_its_check_is_confirmed() {
         .into_iter()
         .filter(|step| *step == Step::call(method::PUT))
         .count();
-    assert_eq!(puts, 1, "nothing handed over");
+    assert_eq!(puts, 0, "nothing handed over, the offer included");
     let checks = |phone: &Phone| phone.checks.lock().unwrap().clone();
     assert_eq!(checks(&first.phone), checks(&joiner.phone));
     assert_eq!(checks(&first.phone)[0].len(), 7, "six digits");
@@ -491,4 +491,42 @@ fn a_pairing_hands_nothing_over_until_its_check_is_confirmed() {
     assert_eq!(id, 1);
     assert_eq!(checks(&first.phone)[1], checks(&joiner.phone)[1]);
     assert_ne!(checks(&first.phone)[0], checks(&first.phone)[1]);
+}
+
+/// A cosign whose evidence post dies on the way is held past the maturity
+/// it caused: the devices take that maturity only with the cosign's
+/// evidence, which the cosigner's next pass posts, and the commit carries
+/// the removal.
+#[test]
+fn a_cosigns_lost_evidence_is_posted_after_the_maturity_it_caused() {
+    let world = world_of(Policy {
+        probation_ms: 500,
+        seasoning_ms: 3_000,
+        operation_delay_ms: 60_000,
+        ..suite()
+    });
+    let home = world.home(HOME, 2, 1);
+    let first = device(&world, 0xb1);
+    first.claim(&world, home);
+    let second = device(&world, 0xb2);
+    first.pair(&second);
+    let third = device(&world, 0xb3);
+    let target = first.pair(&third);
+    after(3_000);
+    for device in [&first, &second, &third] {
+        device.pass();
+    }
+    let removal = first.space.remove(&first.phone, target).unwrap();
+    second.pass();
+    world.kill(0xb2, Step::call(method::EVIDENCE), 1, Death::Before);
+    second
+        .space
+        .cosign(&second.phone, removal.index)
+        .unwrap_err();
+    world.revive(0xb2);
+    second.pass();
+    first.space.update(&first.phone).unwrap();
+    assert_eq!(first.standing(target), Some(Standing::Removed));
+    let passed = second.pass();
+    assert!(passed.alarms.is_empty(), "{:?}", passed.alarms);
 }

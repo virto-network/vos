@@ -300,10 +300,19 @@ impl<H: Host> Personal<H> {
                 .map_err(agent_refused)?;
             // The log's policy, as every device of the set follows it.
             let entries = link.log_all(0).map_err(unreached)?.map_err(agent_refused)?;
-            let policy = crate::group::configured(
-                entries.iter().filter(|(index, _)| *index < overview.next),
-            )
-            .ok_or_else(|| failed("a log that configures no policy"))?;
+            let read: Vec<_> = entries
+                .into_iter()
+                .filter(|(index, _)| *index < overview.next)
+                .collect();
+            // The log as the agent's head names it, so the policy is the
+            // head's log's.
+            let chain = read.iter().fold([0; 32], |chain, (index, entry)| {
+                vos_wire::personal::chain(&chain, *index, entry.at, &entry.body)
+            });
+            if read.len() as u64 != overview.next || chain != overview.chain {
+                return Err(failed("the log read is not the one the agent's head names"));
+            }
+            let policy = crate::group::configured(&read);
             (view, envelopes, overview, devices, policy)
         };
         held.sync = sync;

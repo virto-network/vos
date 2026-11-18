@@ -707,7 +707,8 @@ natives! {
     personal fn Java_team_virto_s4_vos_VosNode_nativeResolveByKit(home: JObject<'l>, kind: jbyte, index: jlong, upheld: jboolean, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let home = Home::from_java(env, &home)?;
         let lent = prompts(env, &lent)?;
-        let posted = node.personal()?.resolve_by_kit(&*lent, home, kit(kind)?, index as u64, upheld)?;
+        let index = u64::try_from(index).map_err(|_| refused(Code::Arguments, "a negative log index"))?;
+        let posted = node.personal()?.resolve_by_kit(&*lent, home, kit(kind)?, index, upheld)?;
         made(env, &posted)
     }
 

@@ -177,8 +177,11 @@ impl DeviceGroup {
                 upheld,
             } => self.call(index, at, call, by, Act::Resolve { op, upheld }),
             Body::Settled { op, state } => match state {
+                // A cosign or a resolution that made it mature is held
+                // until its own evidence is logged: the devices take the
+                // maturity only with it.
                 OpState::Matured { at } => {
-                    self.state.sent.retain(|sent| !sent.about(op));
+                    self.state.sent.retain(|sent| sent.index != Some(op));
                     self.claim(index, op, at, events)?
                 }
                 OpState::Cancelled { .. } => {
@@ -222,15 +225,7 @@ impl DeviceGroup {
     /// or window of the device set's rules ([`Policy::over`]), which it
     /// raises [`Alarm::Policy`] for.
     fn configure(&mut self, index: u64, policy: Policy, events: &mut Vec<Event>) {
-        if self
-            .state
-            .assigned
-            .is_none_or(|assigned| index == assigned + 1)
-        {
-            self.state.policy = policy;
-            return;
-        }
-        let kept = policy.over(&self.state.policy);
+        let kept = super::configure(self.state.assigned, index, policy, &self.state.policy);
         if kept != policy {
             events.push(Event::Alarm(Alarm::Policy { index }));
         }
@@ -505,8 +500,10 @@ impl DeviceGroup {
                     events.push(Event::Alarm(Alarm::Verdict { epoch }));
                 }
                 // The agent re-seals the kit at its verdict: from this entry
-                // the commit's `R` is the kit's. Any other verdict on an
-                // epoch this device confirmed leaves its `R` unheld: the
+                // the commit's `R` is the kit's, once this device confirmed
+                // it too. Any other verdict on the epoch whose commit
+                // re-sealed it (or one this device did not confirm) leaves
+                // its `R` unheld: the
                 // agent installed no `R2` for it, and the `R` before is a
                 // removed device's, so nothing is pushed under either and
                 // the next commit, which the device asks its user for
