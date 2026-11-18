@@ -127,9 +127,9 @@ fn open() -> Result<Descriptors, String> {
     }
 }
 
-/// Whether this host can track native guest writes.
-pub(crate) fn available() -> bool {
-    descriptors().is_ok()
+/// Whether this host can track native guest writes, or why not.
+pub(crate) fn available() -> Result<(), String> {
+    descriptors().map(|_| ())
 }
 
 /// Register a mapped window range for write tracking. Nothing is protected

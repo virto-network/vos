@@ -1161,10 +1161,11 @@ mod tests {
                 u64::from(u32::from_le_bytes([9, 8, 7, 6]))
             );
         }
-        assert!(matches!(
-            Machine::load_prepared(&prepared, &[], 1_000_000, MemoryModel::Sparse),
-            Err(RefineError::Backend)
-        ));
+        // Sparse memory does not run natively: the program is interpreted
+        // over it, with the same result.
+        let mut sparse =
+            Machine::load_prepared(&prepared, &[], 1_000_000, MemoryModel::Sparse).unwrap();
+        assert_eq!(sparse.try_resume().unwrap(), ExitReason::HostCall(42));
     }
 
     #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]

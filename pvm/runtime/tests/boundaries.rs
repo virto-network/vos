@@ -218,11 +218,11 @@ fn traps() -> Vec<u8> {
 }
 
 /// A program of 2^21 + 1 one-byte traps, 2,359,319 bytes: past the
-/// recompiler's native bound and within the service-code bound. The
-/// interpreter runs it as the text does; the recompiler refuses it as its
-/// own resource, a backend error and no guest outcome.
+/// recompiler's native bound and within the service-code bound. Both
+/// backends run it as the text does: a selection of the recompiler
+/// interprets code past its bound, so the result never depends on it.
 #[test]
-fn code_past_the_native_bound_is_the_recompilers_alone() {
+fn code_past_the_native_bound_runs_on_the_interpreter() {
     let blob = standard(&[], &traps());
     assert_eq!(blob.len(), 2_359_319);
     assert!(vos_pvm::spi::parse_standard_program(&blob).is_some());
@@ -230,17 +230,18 @@ fn code_past_the_native_bound_is_the_recompilers_alone() {
     let invocation = run(&blob, 1_000, PvmBackend::ForceInterpreter);
     assert_eq!(invocation.exit, ExitReason::Panic, "the first trap");
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        assert_eq!(
-            Machine::load_with_backend(
-                &blob,
-                &[],
-                1_000,
-                MemoryModel::Auto,
-                PvmBackend::ForceRecompiler
-            )
-            .err(),
-            Some(RefineError::Backend)
-        );
+        let machine = Machine::load_with_backend(
+            &blob,
+            &[],
+            1_000,
+            MemoryModel::Auto,
+            PvmBackend::ForceRecompiler,
+        )
+        .unwrap();
+        assert_eq!(machine.backend(), PvmBackend::ForceInterpreter);
+        let selected = run(&blob, 1_000, PvmBackend::ForceRecompiler);
+        assert_eq!(selected.exit, invocation.exit);
+        assert_eq!(selected.gas_used, invocation.gas_used);
     }
 }
 

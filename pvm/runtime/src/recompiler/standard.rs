@@ -4,11 +4,15 @@
 use super::{CompiledCode, JitContext, prepare_external_entry, signal};
 use crate::{ExitReason, Interpreter, PendingHostCall};
 
+/// Run one slice of `vm` natively: `None` where its memory runs on the
+/// interpreter, which then runs the slice over the same state.
 pub(crate) fn run_standard(
     compiled: &CompiledCode,
     vm: &mut Interpreter,
-) -> Result<ExitReason, String> {
-    let (window, activation) = vm.memory_mut().native_window()?;
+) -> Result<Option<ExitReason>, String> {
+    let Some((window, activation)) = vm.memory_mut().native_window()? else {
+        return Ok(None);
+    };
     let context_pointer = window.ctx_ptr().cast::<JitContext>();
     let flat_buf = window.base();
     let flat_perms = window.perms();
@@ -84,7 +88,7 @@ pub(crate) fn run_standard(
             resume_pc: context.host_resume_pc,
         }),
     );
-    Ok(match context.exit_reason {
+    Ok(Some(match context.exit_reason {
         0 => ExitReason::Halt,
         1 => ExitReason::Panic,
         2 => ExitReason::OutOfGas,
@@ -97,5 +101,5 @@ pub(crate) fn run_standard(
             return Err("native write tracking failed".into());
         }
         _ => return Err("invalid native exit reason".into()),
-    })
+    }))
 }

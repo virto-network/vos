@@ -35,6 +35,7 @@
 pub mod asm;
 pub mod codegen;
 pub(crate) mod memory;
+pub(crate) mod probe;
 pub mod signal;
 mod standard;
 pub(crate) mod write_tracking;
@@ -1341,31 +1342,23 @@ mod tests {
     }
 
     /// Code past [`MAX_CODE`] bytes is the recompiler's refusal before any
-    /// work, its own resource bound: the interpreter prepares the same
-    /// code, and a validation accepts it.
+    /// work, its own resource bound, and never the program's: a selection
+    /// of the recompiler interprets the same code, and a validation
+    /// accepts it.
     #[test]
-    fn code_past_the_native_bound_is_the_recompilers_refusal_alone() {
+    fn code_past_the_native_bound_runs_on_the_interpreter() {
         let code = vec![0; MAX_CODE + 1];
         let bitmask = vec![1; code.len()];
         assert!(compile_code(&code, &bitmask, &[]).is_err());
-        assert!(
-            crate::backend::compile(
-                &code,
-                &bitmask,
-                &[],
-                crate::backend::PvmBackend::ForceRecompiler
-            )
-            .is_err()
-        );
-        assert!(
-            crate::backend::compile(
-                &code,
-                &bitmask,
-                &[],
-                crate::backend::PvmBackend::ForceInterpreter
-            )
-            .is_ok()
-        );
+        for backend in [
+            crate::backend::PvmBackend::ForceRecompiler,
+            crate::backend::PvmBackend::ForceInterpreter,
+        ] {
+            assert!(matches!(
+                crate::backend::compile(&code, &bitmask, &[], backend),
+                Ok(crate::backend::CompiledProgram::Interpreter(_))
+            ));
+        }
         let blob = crate::spi::CodeBlob {
             jump_table: Vec::new(),
             code,

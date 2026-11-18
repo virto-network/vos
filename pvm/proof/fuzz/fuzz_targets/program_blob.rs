@@ -6,9 +6,9 @@
 //! and a Gray Paper service program (`cargo run --example seed`).
 //!
 //! Properties: **no panic, no abort**, and **one machine:** both backends
-//! load the same blobs, and refuse the same ones alike, but for code past
-//! the recompiler's own bound, its backend refusal; each run ends with the
-//! same exit, gas, registers, instruction counter and output.
+//! load the same blobs and refuse the same ones alike (code the recompiler
+//! does not take runs on the interpreter); each run ends with the same
+//! exit, gas, registers, instruction counter and output.
 //!
 //! ```text
 //! cd pvm/proof/fuzz
@@ -40,13 +40,6 @@ fuzz_target!(|data: &[u8]| {
                 );
             }
             (Err(reference), Err(native)) => assert_eq!(reference, native, "refusal"),
-            // The recompiler's own resource bound (code past
-            // `vos_pvm::recompiler::MAX_CODE`), never a guest outcome; any
-            // other refusal of the recompiler's is a divergence.
-            (Ok(_), Err(vos_pvm::refine::RefineError::Backend))
-                if vos_pvm::spi::parse_standard_program(data).is_some_and(|program| {
-                    program.code.code.len() > vos_pvm::recompiler::MAX_CODE
-                }) => {}
             (reference, native) => panic!(
                 "the backends differ: {} / {}",
                 program_run::label(reference),

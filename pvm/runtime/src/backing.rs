@@ -27,18 +27,35 @@ impl BackingStore {
     /// Create a new backing store with `total_pages` of capacity.
     ///
     /// Calls `memfd_create` + `ftruncate`. Physical pages are allocated
-    /// lazily by the kernel on first write.
+    /// lazily by the kernel on first write. `None` where the host refuses
+    /// it: a file-size limit below the size is checked first, since past it
+    /// `ftruncate` raises `SIGXFSZ`, which ends the process.
     pub fn new(total_pages: u32) -> Option<Self> {
+        let size = total_pages as libc::off_t * PVM_PAGE_SIZE as libc::off_t;
+        // SAFETY: getrlimit writes the limit into a valid struct.
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) } != 0
+            || (limit.rlim_cur != libc::RLIM_INFINITY && limit.rlim_cur < size as libc::rlim_t)
+        {
+            return None;
+        }
         let name = b"pvm_untyped\0";
         // Set close-on-exec atomically: another thread may launch a process
         // while an invocation is constructing its temporary shared mapping.
-        // SAFETY: memfd_create with a valid null-terminated name and flags.
-        let fd =
-            unsafe { libc::memfd_create(name.as_ptr() as *const libc::c_char, libc::MFD_CLOEXEC) };
+        // Guest memory is never executable: seal it so (which a host with
+        // `vm.memfd_noexec = 2` requires); a kernel before 6.3 knows no such
+        // flag and refuses it.
+        let create = |flags| {
+            // SAFETY: memfd_create with a valid null-terminated name and flags.
+            unsafe { libc::memfd_create(name.as_ptr() as *const libc::c_char, flags) }
+        };
+        let mut fd = create(libc::MFD_CLOEXEC | libc::MFD_NOEXEC_SEAL);
+        if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+            fd = create(libc::MFD_CLOEXEC);
+        }
         if fd < 0 {
             return None;
         }
-        let size = total_pages as libc::off_t * PVM_PAGE_SIZE as libc::off_t;
         // SAFETY: fd is valid from memfd_create; size is non-negative.
         let ret = unsafe { libc::ftruncate(fd, size) };
         if ret < 0 {

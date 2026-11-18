@@ -740,12 +740,12 @@ fn memory_sized_gas_is_exact_at_every_rate() {
     assert_eq!(linear(u64::MAX, 1, 1), None);
 }
 
-/// An inner machine's code past the interpreter's preparation bound is a
+/// An inner machine's code past the host's preparation bound is a
 /// valid program the host refuses as its resource: `Backend`, never the
 /// guest's `HUH`, while `deblob` accepts it.
 #[test]
 fn code_past_the_interpreters_bound_is_a_backend_refusal() {
-    let code = vec![0; crate::backend::MAX_INTERPRETED_CODE + 1];
+    let code = vec![0; crate::backend::MAX_PREPARED_CODE + 1];
     let mut packed = vec![0xffu8; code.len().div_ceil(8)];
     *packed.last_mut().unwrap() = 0x01;
     let mut blob = vec![0, 1];

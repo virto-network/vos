@@ -1181,21 +1181,23 @@ impl Memory {
         }))
     }
 
+    /// The native window with this memory's permissions installed, or
+    /// `None` where this memory runs on the interpreter.
     #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn native_window(
         &mut self,
     ) -> Result<
-        (
+        Option<(
             &crate::backing::CodeWindow,
             *const crate::recompiler::memory::Activation,
-        ),
+        )>,
         alloc::string::String,
     > {
         let Self::Flat(memory) = self else {
-            return Err("native execution requires native memory".into());
+            return Ok(None);
         };
         let FlatBytes::Native(bytes) = &mut memory.bytes else {
-            return Err("native execution requires native memory".into());
+            return Ok(None);
         };
         bytes.sync_permissions(&mut memory.perms)?;
         // Native stores bypass checked host writes. Invalidate cached value
@@ -1204,7 +1206,7 @@ impl Memory {
             .value_revision
             .checked_add(1)
             .expect("memory revision cannot wrap in one invocation");
-        Ok((bytes.window(), bytes.activation()))
+        Ok(Some((bytes.window(), bytes.activation())))
     }
 
     /// Flat memory over `bytes` (zero-padded to whole pages), all pages RW.

@@ -21,7 +21,7 @@ pub use vos_pvm_program::{
 /// is its standard program alone, so its whole blob is what counts.
 pub const MAX_SERVICE_CODE: usize = 4_000_000;
 
-const _: () = assert!(MAX_SERVICE_CODE <= crate::backend::MAX_INTERPRETED_CODE);
+const _: () = assert!(MAX_SERVICE_CODE <= crate::backend::MAX_PREPARED_CODE);
 
 /// Whether `blob`, a service's whole code, is within [`MAX_SERVICE_CODE`]:
 /// the admission of a service, apart from what any one backend prepares
