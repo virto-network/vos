@@ -1420,6 +1420,23 @@ mod tests {
         }
     }
 
+    /// The exits of a guest access and of a trap are shared and out of
+    /// line: a long run of one-byte `trap`, `load_u64` or `store_imm_u64`
+    /// compiles to 62, 61 and 65 native bytes a code byte (inline, they
+    /// were 115, 206 and 210).
+    #[test]
+    fn panics_and_faults_exit_out_of_line() {
+        for (name, opcode) in [("trap", 0u8), ("load_u64", 58), ("store_imm_u64", 33)] {
+            let code = vec![opcode; 1 << 16];
+            let compiled = compile_code(&code, &vec![1; code.len()], &[]).unwrap();
+            let per_byte = compiled.native_code.len / code.len();
+            assert!(
+                per_byte <= 66,
+                "{name}: {per_byte} native bytes a code byte"
+            );
+        }
+    }
+
     #[test]
     fn test_recompile_trap() {
         let code = vec![0u8]; // trap

@@ -85,6 +85,9 @@ pub const CTX_CODE_BASE: i32 = -CTX_OFFSET + offset_of!(JitContext, code_base) a
 pub const CTX_FLAT_PERMS: i32 = -CTX_OFFSET + offset_of!(JitContext, flat_perms) as i32;
 pub const CTX_FAST_REENTRY: i32 = -CTX_OFFSET + offset_of!(JitContext, fast_reentry) as i32;
 
+/// Native bytes a wide access's cold wrap stub takes, at most.
+const WRAP_STUB: usize = 40;
+
 /// Exit reason codes (matching ExitReason enum).
 pub const EXIT_HALT: u32 = 0;
 pub const EXIT_PANIC: u32 = 1;
@@ -161,6 +164,10 @@ pub struct Compiler {
     abort_label: Label,
     /// A prologue dispatch past the table: [`EXIT_INVALID_ENTRY`].
     invalid_entry_label: Label,
+    /// The page fault at the last guest page, its counter in SCRATCH.
+    high_fault_label: Label,
+    /// Cold halves of wide accesses: (label, pvm_pc, required permission).
+    wrap_stubs: Vec<(Label, u32, u8)>,
     /// Label for the shared out-of-gas exit (sets EXIT_OOG + jumps to exit).
     oog_label: Label,
     /// Label for panic exit.
@@ -223,6 +230,7 @@ impl Compiler {
         let exit_label = asm.new_label();
         let abort_label = asm.new_label();
         let invalid_entry_label = asm.new_label();
+        let high_fault_label = asm.new_label();
         let oog_label = asm.new_label();
         let panic_label = asm.new_label();
         let oog_pc_label = asm.new_label();
@@ -243,6 +251,8 @@ impl Compiler {
             exit_label,
             abort_label,
             invalid_entry_label,
+            high_fault_label,
+            wrap_stubs: Vec::new(),
             oog_label,
             panic_label,
             oog_pc_label,
@@ -312,8 +322,7 @@ impl Compiler {
             // gas-block start on either backend).
             if pc >= bitmask.len() || bitmask[pc] != 1 {
                 self.asm.bind_label(self.label_for_pc(pc as u32));
-                self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
-                self.emit_exit(EXIT_PANIC, 0);
+                self.emit_panic();
                 // The gap swallows the post-terminator flag: the following
                 // real instruction is NOT a gas-block start (matching the
                 // interpreter's computation, which only marks post-terminator
@@ -363,8 +372,7 @@ impl Compiler {
                 // outside varpi) panics at this instruction.
                 let next_pc = (pc + 1 + skip) as u32;
                 if !self.is_basic_block_start(next_pc) {
-                    self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
-                    self.emit_exit(EXIT_PANIC, 0);
+                    self.emit_panic();
                 }
                 next_is_gas_start = true; // fallthrough IS a terminator
                 pc += 1 + skip;
@@ -391,8 +399,7 @@ impl Compiler {
                         self.asm.bind_label(self.label_for_pc(pc as u32));
                     }
                     self.bind_fault_resume(pc as u32);
-                    self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
-                    self.emit_exit(EXIT_PANIC, 0);
+                    self.emit_panic();
                     pc += 1;
                     continue;
                 }
@@ -643,8 +650,7 @@ impl Compiler {
         self.asm.bind_label(sentinel_body);
         self.fault_resume_labels
             .push((code_len as u32, sentinel_body));
-        self.asm.mov_store32_imm(CTX, CTX_GAS_CHARGED, 0);
-        self.emit_exit(EXIT_PANIC, 0);
+        self.emit_panic();
 
         // Emit epilogue and exit sequences
         self.emit_exit_sequences()?;
@@ -864,50 +870,42 @@ impl Compiler {
     fn emit_memory_access_guard(&mut self, width: u32, write: bool, pvm_pc: u32) {
         debug_assert!(matches!(width, 1 | 2 | 4 | 8));
 
-        let accessible_zone = self.asm.new_label();
+        // The exits are out of line: the hot path is two compares.
         self.asm.cmp_ri(SCRATCH, crate::PVM_ZONE_SIZE as i32);
-        self.asm.jcc_label(Cc::AE, accessible_zone);
-        self.asm.mov_store32_imm(CTX, CTX_PC, pvm_pc as i32);
-        self.emit_exit(EXIT_PANIC, 0);
-        self.asm.bind_label(accessible_zone);
+        self.asm.jcc_label(Cc::B, self.panic_label);
 
         if width == 1 {
             return;
         }
 
-        let native_safe = self.asm.new_label();
-        let high_fault = self.asm.new_label();
+        let wrap = self.asm.new_label();
         let last_non_wrapping = u32::MAX - (width - 1);
         self.asm.cmp_ri32(SCRATCH, last_non_wrapping as i32);
-        self.asm.jcc_label(Cc::BE, native_safe);
-
-        // Maximum scalar width is eight bytes, so every byte before the wrap
-        // lies on the final guest page. Permissions are synchronized with
-        // mmap/mprotect by both standalone and kernel window owners.
-        self.asm.mov_load64(SCRATCH, CTX, CTX_FLAT_PERMS);
+        self.asm.jcc_label(Cc::A, wrap);
         let required = if write {
             crate::interpreter::PERM_RW
         } else {
             crate::interpreter::PERM_RO
         };
+        self.wrap_stubs.push((wrap, pvm_pc, required));
+    }
+
+    /// The cold half of a wide access that crosses 2^32
+    /// ([`Self::emit_memory_access_guard`]). Maximum scalar width is eight
+    /// bytes, so every byte before the wrap lies on the final guest page:
+    /// inaccessible, it faults there; accessible, the access reaches the
+    /// wrapped low zone and panics.
+    fn emit_wrap_stub(&mut self, label: Label, pvm_pc: u32, required: u8) {
+        self.asm.bind_label(label);
+        self.asm.mov_load64(SCRATCH, CTX, CTX_FLAT_PERMS);
         self.asm.cmp_byte_mem_disp32(
             SCRATCH,
             (crate::backing::CODE_WINDOW_PERMS_SIZE - 1) as i32,
             required,
         );
-        self.asm.jcc_label(Cc::B, high_fault);
-
-        self.asm.mov_store32_imm(CTX, CTX_PC, pvm_pc as i32);
-        self.emit_exit(EXIT_PANIC, 0);
-
-        self.asm.bind_label(high_fault);
-        self.asm.mov_store32_imm(CTX, CTX_PC, pvm_pc as i32);
-        self.emit_exit(
-            EXIT_PAGE_FAULT,
-            u64::from(u32::MAX & !(crate::PVM_PAGE_SIZE - 1)),
-        );
-
-        self.asm.bind_label(native_safe);
+        self.asm.jcc_label(Cc::AE, self.panic_label);
+        self.asm.mov_ri32(SCRATCH, pvm_pc);
+        self.asm.jmp_label(self.high_fault_label);
     }
 
     /// Emit gas block boundary: bind label, flush previous block cost, emit new gas check.
@@ -971,14 +969,12 @@ impl Compiler {
             // Never produced by decode_opcode_fast — invalid opcodes compile
             // to an inline panic above; this arm exists for exhaustiveness.
             Opcode::Invalid => {
-                self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
-                self.emit_exit(EXIT_PANIC, 0);
+                self.emit_panic();
             }
 
             // === A.5.1: No arguments ===
             Opcode::Trap => {
-                self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
-                self.emit_exit(EXIT_PANIC, 0);
+                self.emit_panic();
             }
             Opcode::Fallthrough | Opcode::Unlikely => {
                 // Just fall through to next instruction.
@@ -1074,7 +1070,7 @@ impl Compiler {
             // === A.5.5: One offset (jump) ===
             Opcode::Jump => {
                 if let Args::Offset { offset } = args {
-                    self.emit_static_branch(*offset as u32, true, next_pc, pc);
+                    self.emit_static_branch(*offset as u32, true, next_pc);
                 }
             }
 
@@ -1129,7 +1125,7 @@ impl Compiler {
             Opcode::LoadImmJump => {
                 if let Args::RegImmOffset { ra, imm, offset } = args {
                     self.asm.mov_ri64(REG_MAP[*ra], *imm);
-                    self.emit_static_branch(*offset as u32, true, next_pc, pc);
+                    self.emit_static_branch(*offset as u32, true, next_pc);
                 }
             }
             Opcode::BranchEqImm => {
@@ -2086,13 +2082,12 @@ impl Compiler {
     // === Helper emission methods ===
 
     /// Emit a static branch (validated at compile time).
-    fn emit_static_branch(&mut self, target: u32, condition: bool, _fallthrough: u32, pc: u32) {
+    fn emit_static_branch(&mut self, target: u32, condition: bool, _fallthrough: u32) {
         if !condition {
             return;
         }
         if !self.is_basic_block_start(target) {
-            self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
-            self.emit_exit(EXIT_PANIC, 0);
+            self.emit_panic();
             return;
         }
         let label = self.label_for_pc(target);
@@ -2239,8 +2234,7 @@ impl Compiler {
         if !self.is_basic_block_start(target) || !self.is_basic_block_start(fallthrough) {
             // v0.8 validates both possible successors before evaluating the
             // condition, so either invalid leg is an unconditional panic.
-            self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
-            self.emit_exit(EXIT_PANIC, 0);
+            self.emit_panic();
             return;
         }
         if !self.is_basic_block_start(target) {
@@ -2261,8 +2255,7 @@ impl Compiler {
         if !self.is_basic_block_start(target) || !self.is_basic_block_start(fallthrough) {
             // v0.8 validates both possible successors before evaluating the
             // condition, so either invalid leg is an unconditional panic.
-            self.asm.mov_store32_imm(CTX, CTX_PC, pc as i32);
-            self.emit_exit(EXIT_PANIC, 0);
+            self.emit_panic();
             return;
         }
         if !self.is_basic_block_start(target) {
@@ -2699,6 +2692,11 @@ impl Compiler {
         }
     }
 
+    /// Panic: the shared exit, with instruction counter zero.
+    fn emit_panic(&mut self) {
+        self.asm.jmp_label(self.panic_label);
+    }
+
     /// Emit an exit sequence that sets exit_reason and exit_arg.
     fn emit_exit(&mut self, reason: u32, arg: u64) {
         if matches!(reason, EXIT_HALT | EXIT_PANIC) {
@@ -2789,9 +2787,10 @@ impl Compiler {
 
     /// Emit exit sequences and epilogue.
     fn emit_exit_sequences(&mut self) -> Result<(), String> {
-        // Reserve capacity for exit sequences + all OOG stubs.
-        // Each OOG stub is ~12 bytes.
-        let needed = asm::INSTRUCTION + self.oog_stubs.len() * 16;
+        // Reserve capacity for exit sequences + all OOG and wrap stubs:
+        // each OOG stub is ~12 bytes, each wrap stub ~32.
+        let needed =
+            asm::INSTRUCTION + self.oog_stubs.len() * 16 + self.wrap_stubs.len() * WRAP_STUB;
         self.asm.reserve(needed)?;
         // Shared OOG handler that reads PC from SCRATCH — emitted BEFORE OOG
         // stubs so backward jumps from stubs can use jmp rel8 (2 bytes).
@@ -2813,7 +2812,19 @@ impl Compiler {
             self.asm.jmp_label(self.oog_pc_label);
         }
 
-        // Page faults are handled by the SIGSEGV handler (signal.rs).
+        // Page faults are handled by the SIGSEGV handler (signal.rs), but
+        // for a wide access's tail on the last guest page.
+        for (label, pvm_pc, required) in std::mem::take(&mut self.wrap_stubs) {
+            self.emit_wrap_stub(label, pvm_pc, required);
+        }
+        self.asm.bind_label(self.high_fault_label);
+        self.asm.mov_store32(CTX, CTX_PC, SCRATCH);
+        self.asm
+            .mov_store32_imm(CTX, CTX_EXIT_REASON, EXIT_PAGE_FAULT as i32);
+        self.asm
+            .mov_ri64(SCRATCH, u64::from(u32::MAX & !(crate::PVM_PAGE_SIZE - 1)));
+        self.asm.mov_store64(CTX, CTX_EXIT_ARG, SCRATCH);
+        self.asm.jmp_label(self.exit_label);
 
         // Before any guest register is loaded: leave them as they were.
         self.asm.bind_label(self.invalid_entry_label);
@@ -2821,13 +2832,16 @@ impl Compiler {
             .mov_store32_imm(CTX, CTX_EXIT_REASON, EXIT_INVALID_ENTRY as i32);
         self.asm.jmp_label(self.abort_label);
 
-        // Panic exit
+        // Panic exit, shared by every panic: Ψ returns counter zero, and
+        // the exit leaves the terminal instruction's block funded (see
+        // `emit_exit`).
         self.asm.bind_label(self.panic_label);
         self.asm.mov_store32_imm(CTX, CTX_PC, 0);
-        // Dynamic-jump validation also exits from a funded instruction.
         self.asm.mov_store32_imm(CTX, CTX_GAS_CHARGED, 1);
         self.asm
             .mov_store32_imm(CTX, CTX_EXIT_REASON, EXIT_PANIC as i32);
+        self.asm.mov_ri64(SCRATCH, 0);
+        self.asm.mov_store64(CTX, CTX_EXIT_ARG, SCRATCH);
         // fall through to exit_label
 
         // Common exit: save all 13 PVM registers to context, restore callee-saved, return
