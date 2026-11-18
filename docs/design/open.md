@@ -236,6 +236,13 @@ identity and privacy, the core model's unbuilt parts) arrive with it.
   `OuterMachines` refuses a service's code past 4,000,000 bytes; the node
   side's install, and its refine and accumulate answering `BIG`, call it
   when they land.
+- **The JAM-only host's inner machines** follow the Gray Paper
+  (`inner::Profile::GrayPaper`): a halted or panicked machine keeps its
+  funded flag, and nothing bounds the programs they prepare or the pages
+  they map, at the text's `machine` and `pages` prices. VOS hosts bound
+  both (`inner::budget`); the two erratum drafts (the funded flag, the
+  budget) are for the text, until which a host serving untrusted refines
+  runs them as a VOS host.
 - **The JAM-only host's package** (`JamRefine`): `fetch` kinds 7 and 10
   serve the encoded package and context as the caller gives them; the
   fixture encodes no work package, so nothing holds them to its items.
