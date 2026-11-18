@@ -241,9 +241,12 @@ pub const LEAF_FOLD: Format = Format {
 
 /// Format 39's masking: 8 salt columns a tree (248 bits); an `R` of 8
 /// columns, whose 8 independent DEEP coefficients span QM31 over M31 but
-/// with probability about `p^-5`, so R3 holds without a check; and `h = 256`,
-/// at least `2(4|O| + q(|O| + 1)) = 112` for `q = 16` queries and `|O| = 2`
-/// offsets, and at most a quarter of the smallest component's `2^11` rows.
+/// with probability about `p^-5`, so R3 holds without a check; and `h` at
+/// most 256, at most a quarter of the smallest component's `2^11` rows.
+/// Each component takes twice the rows a column of it reveals, rounded up
+/// to a power of two (the final verifier's `mask_rows`): `h = 128` for the
+/// wrap's, as `2(4|O| + q(|O| + 1)) = 112` for `q = 16` queries and
+/// `|O| = 2` offsets.
 pub const MASKED_WRAP_MASKING: Masking = Masking {
     salt_columns: 8,
     fri_mask_columns: 8,

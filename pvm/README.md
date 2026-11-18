@@ -85,12 +85,15 @@ missing CPU feature, a guest window whose protections would pass its
 mapping budget) runs on the interpreter instead of failing.
 
 **How the backend is chosen:** the recompiler is the default where the
-host permits it. Once a process, a start-up probe checks that written
-memory may become executable, that `userfaultfd` write-protect is
-available (Linux 6.7 or later; the default Docker and Podman seccomp
-profiles deny `userfaultfd`, so a default container runs the
-interpreter) and that the CPU has LZCNT, BMI1 and POPCNT; it logs the
-backend chosen and why. `VOS_PVM_BACKEND` forces one.
+host permits it. Once a process, a start-up probe does what a native
+machine does: it checks that the CPU has LZCNT, BMI1 and POPCNT, compiles
+code and makes it executable, opens `userfaultfd` write-protect (Linux
+6.7 or later; the default Docker and Podman seccomp profiles deny
+`userfaultfd`, so a default container runs the interpreter), reserves a
+guest window and runs a trap natively; it logs the backend chosen and
+why (`backend::backend_choice`). The operator's `VOS_PVM_BACKEND`
+forces one: `interpreter` skips the probe, `recompiler` is an error on a
+host that fails it, and any other value is an error.
 
 **Threat model.** The recompiler is software fault isolation inside the
 node's process: compiled guest code runs on the node's threads, each

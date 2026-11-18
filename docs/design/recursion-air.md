@@ -463,6 +463,14 @@ harmless.
   exponents in step) and one fused row per other sample: 1,091 rows and 739
   samples a query for the kernel [model]. Each point then costs 6 rows a query
   (its line, its inverse, its numerator, the sum).
+- **A degenerate point is refused.** Stwo draws the line through a point and
+  its conjugate, which does not exist when `Im(z.y) = 0`, and its verifier
+  refuses such a point (`complex_conjugate_line_coeffs`); there the quotient's
+  term is a constant and frees every sample at that point. The circuit
+  constrains `c = conj(z.y) − z.y` invertible at every point of the plan, the
+  out-of-domain point, each mask offset and each periodicity point (one QM31
+  inverse row a point, once), so such a point has no witness
+  (`recair/tests/gates/degenerate_point.rs`).
 
 ### 4.7 Cost per verified column and per query
 
