@@ -103,6 +103,10 @@ pub enum StatementError {
     Rerun(&'static str),
     /// The record names no kernel this prover proves: refused for good.
     Kernel(&'static str),
+    /// The kernel's run on the record's witness is past what its gas buys
+    /// a proof of (`vos_pvm_proof::max_segments`) or past a proof's steps:
+    /// refused for good, before anything is proved where the plan shows it.
+    Bound(&'static str),
     /// The prover failed: tried again.
     Failed(&'static str),
 }
@@ -446,7 +450,11 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 let program = match self.prover.program(&blob) {
                     Ok(program) => program,
                     Err(StatementError::Kernel(_)) => ProgramId([u32::MAX; 8]),
-                    Err(_) => return Ok(None),
+                    Err(
+                        StatementError::Rerun(_)
+                        | StatementError::Bound(_)
+                        | StatementError::Failed(_),
+                    ) => return Ok(None),
                 };
                 self.programs.insert(attest.program, program);
                 program
@@ -611,6 +619,15 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 );
                 self.jobs
                     .put(&id, &job.to(State::Refused(Refusal::Rerun)))?;
+            }
+            Err(StatementError::Bound(reason)) => {
+                tracing::error!(
+                    agent,
+                    reason,
+                    "a record's run is past what its gas proves: refused"
+                );
+                self.jobs
+                    .put(&id, &job.to(State::Refused(Refusal::Bound)))?;
             }
             Err(StatementError::Kernel(reason)) => {
                 tracing::error!(agent, reason, "a record's kernel is not provable: refused");

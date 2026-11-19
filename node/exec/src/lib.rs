@@ -238,9 +238,9 @@ fn serve(id: u64, machine: &mut Machine, programs: &AgentPrograms) -> Result<(),
 }
 
 /// The longest key the agent stores, a hashed table's key at its cap
-/// escaped whole behind the table's prefix ([`vos_abi::keys::row`]): one
-/// `state_read` and `state_scan` serve, so no row the agent writes is past
-/// its reads.
+/// escaped whole behind the table's prefix ([`vos_abi::keys::row`]), is a
+/// key `state_read` and `state_scan` accept: no row the agent writes is
+/// past its reads.
 const _: () = assert!(
     vos_abi::keys::TABLE_PREFIX + 16 + 2 * vos_abi::abi::cap::KEY + 2
         <= vos_pvm::refine_host::MAX_STATE_KEY as usize

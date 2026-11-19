@@ -1,8 +1,8 @@
 //! A statement's proof, priced by the gas its attest paid: a run is planned
 //! before anything is proved, and one that takes more segments than its
 //! gas buys (`vos_pvm_proof::max_segments`) is refused for good before the
-//! kernel's program is computed; a run within it plans as the prover cuts
-//! it, at the attest's unchanged charge.
+//! kernel's program is computed; an ordinary run plans within it, at the
+//! attest's unchanged charge.
 
 use vos_abi::ids::ProgramHash;
 use vos_abi::result::{Attest, KernelReturn};
@@ -109,22 +109,18 @@ fn a_page_walk_past_its_gas_is_refused_before_any_proving() {
     let run = trace_kernel(&blob, &[], RERUN_GAS)
         .expect("halts")
         .side_note;
-    let refused = StatementError::Rerun("the run takes more segments than its gas buys");
+    let refused = StatementError::Bound("the run takes more segments than its gas buys");
     assert_eq!(plan(&blob, &run).err(), Some(refused.clone()));
-    let started = std::time::Instant::now();
-    assert_eq!(
-        MaskedProver::new().prove(&blob, &attest(&blob)).err(),
-        Some(refused)
-    );
-    // Computing the kernel's program alone takes seconds.
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let prover = MaskedProver::new();
+    assert_eq!(prover.prove(&blob, &attest(&blob)).err(), Some(refused));
+    assert_eq!(prover.computed(), 0, "no kernel program computed");
 }
 
-/// A copy, a word a step, pays far more gas a segment than a segment's
-/// price: its plan holds, cut as the prover cuts it, within the segments
-/// its gas buys, at the attest's charge as before (its kernel's gas).
+/// No price moves: the attest's charge is its kernel's gas, as before, and
+/// a copy, a word a step, pays far more gas a segment than a segment's
+/// price, so its plan holds within the segments that gas buys.
 #[test]
-fn a_copy_is_priced_by_its_gas_as_before() {
+fn a_copy_plans_within_its_gas() {
     let blob = copy(64);
     let trace = trace_kernel(&blob, &[], RERUN_GAS).expect("halts");
     let plan = plan(&blob, &trace.side_note).expect("the run's gas buys its segments");

@@ -25,6 +25,10 @@ pub enum Refusal {
     Rootless,
     /// The record holds no witness: no re-run proves it.
     Unwitnessed,
+    /// The kernel's run on the record's witness is past what its gas buys
+    /// a proof of: more segments than `vos_pvm_proof::max_segments`, or
+    /// more steps than a proof orders.
+    Bound,
 }
 
 impl Refusal {
@@ -32,6 +36,7 @@ impl Refusal {
     const KERNEL: u32 = 0x1_0002;
     const ROOTLESS: u32 = 0x1_0003;
     const UNWITNESSED: u32 = 0x1_0004;
+    const BOUND: u32 = 0x1_0005;
 
     /// Its code, as a job's row holds it.
     pub fn code(self) -> u32 {
@@ -41,6 +46,7 @@ impl Refusal {
             Self::Kernel => Self::KERNEL,
             Self::Rootless => Self::ROOTLESS,
             Self::Unwitnessed => Self::UNWITNESSED,
+            Self::Bound => Self::BOUND,
         }
     }
 
@@ -51,6 +57,7 @@ impl Refusal {
             Self::KERNEL => Self::Kernel,
             Self::ROOTLESS => Self::Rootless,
             Self::UNWITNESSED => Self::Unwitnessed,
+            Self::BOUND => Self::Bound,
             code => Self::Venue(code),
         }
     }
@@ -233,6 +240,7 @@ mod tests {
             (Refusal::Kernel, 0x1_0002),
             (Refusal::Rootless, 0x1_0003),
             (Refusal::Unwitnessed, 0x1_0004),
+            (Refusal::Bound, 0x1_0005),
         ] {
             let row = State::Refused(refusal).encode();
             assert_eq!(row, [&[5][..], &code.to_le_bytes()].concat());

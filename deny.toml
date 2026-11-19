@@ -69,10 +69,13 @@ skip = [
     { crate = "hashbrown@0.14.5", reason = "dashmap 6's; indexmap 2 takes 0.17." },
     { crate = "hashbrown@0.15.5", reason = "the Stwo fork's, pinned at its revision; indexmap 2 takes 0.17." },
     { crate = "syn@1.0.109", reason = "vos-pvm-proof-derive is written against syn 1; every other macro crate takes syn 2." },
-    # The node's: two generations of the RustCrypto crates (russh 0.65 and
-    # ed25519-dalek 3 on the newer; mls-rs, snow, arti 0.47 and
-    # ed25519-dalek 2 on the older), arti's and ratatui's own pins, and the
-    # Windows crates of those. Reviewed 2026-11-19.
+    # The node's, each with what takes each version: two generations of
+    # the RustCrypto crates (russh 0.65 and ed25519-dalek 3 on the newer;
+    # mls-rs, snow, arti 0.47 and ed25519-dalek 2 on the older), arti's and
+    # ratatui's own pins and the Windows crates of those; and a few of our
+    # own pins an upgrade would remove (lz4_flex 0.11 in the PVM bench,
+    # convert_case 0.7 in the proof derive, getrandom 0.2 taken directly).
+    # Listed 2026-11-19.
     { crate = "aead@0.5.2", reason = "aes-gcm 0.10, chacha20poly1305 0.10, mls-rs-crypto-rustcrypto 0.22 take 0.5.2; aes-gcm 0.11, ssh-cipher 0.3 take 0.6.1." },
     { crate = "aes@0.8.4", reason = "aes-gcm 0.10 takes 0.8.4; aes-gcm 0.11, pkcs5 0.8, russh 0.65 and 3 more take 0.9.3." },
     { crate = "aes-gcm@0.10.3", reason = "mls-rs-crypto-rustcrypto 0.22, snow 0.9 take 0.10.3; pkcs5 0.8, ssh-cipher 0.3 take 0.11.1." },

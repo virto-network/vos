@@ -77,6 +77,11 @@ impl MaskedProver {
         Ok(program)
     }
 
+    /// The kernels whose programs it computed so far.
+    pub fn computed(&self) -> usize {
+        self.programs().len()
+    }
+
     fn programs(&self) -> std::sync::MutexGuard<'_, HashMap<ProgramHash, Program>> {
         lock(&self.programs)
     }
@@ -189,8 +194,10 @@ impl MaskedProver {
     }
 
     /// `kernel` re-run on `attest`'s witness, its run planned ([`plan`]),
-    /// and proved by `prove`: a run past what its gas buys is refused
-    /// before the kernel's program is computed or anything proved.
+    /// and proved by `prove`: a run the plan shows past what its gas buys
+    /// is refused before the kernel's program is computed or anything
+    /// proved. The prover plans the run again as it proves, and refuses
+    /// it too should a window its pages overflow be cut past the bound.
     fn proved(
         &self,
         kernel: &[u8],
@@ -223,14 +230,14 @@ impl MaskedProver {
 /// [`vos_pvm_proof::SEGMENT_GAS`] of the gas
 /// ([`vos_pvm_proof::max_segments`]). `kernel`'s run `run` is planned
 /// ([`vos_pvm_proof::plan_kernel`], cut by its class of the most steps, as
-/// the prover cuts it) before anything is proved: its segments, or a
+/// the prover first cuts it) before anything is proved: its segments, or a
 /// refusal for good of a run that takes more than its gas buys, or more
 /// steps than a proof orders. Planning traces nothing; it builds each
-/// window's side note and page multiproof.
+/// window's side note and page multiproof, which the prover builds again.
 pub fn plan(kernel: &[u8], run: &SideNote<CompactStep>) -> Result<KernelPlan, StatementError> {
     let record = kernel_record(kernel).map_err(StatementError::Kernel)?;
     let shape = KernelShape::try_from(&record.shape)
-        .map_err(|_| StatementError::Kernel("the kernel's shape is not an install's"))?;
+        .map_err(|error| StatementError::Kernel(error.reason()))?;
     vos_pvm_proof::plan_kernel(run, &shape, vos_pvm_recair::tree::cut_class(&shape))
         .map_err(|error| not_proved(&error))
 }
@@ -239,14 +246,14 @@ pub fn plan(kernel: &[u8], run: &SideNote<CompactStep>) -> Result<KernelPlan, St
 /// kernel's shape or its gas cannot hold, refused for good, or the prover's
 /// own failure, tried again.
 fn not_proved(error: &SegmentError) -> StatementError {
-    use StatementError::{Failed, Kernel, Rerun};
+    use StatementError::{Bound, Failed, Kernel};
     match error {
         SegmentError::Shape { .. } | SegmentError::MalformedShape => {
             Kernel("the run does not fit its kernel's shape")
         }
         SegmentError::Transfer => Kernel("the kernel transfers to the halt address"),
-        SegmentError::Segments => Rerun("the run takes more segments than its gas buys"),
-        SegmentError::RunLength => Rerun("the run is past a proof's steps"),
+        SegmentError::Segments => Bound("the run takes more segments than its gas buys"),
+        SegmentError::RunLength => Bound("the run is past a proof's steps"),
         SegmentError::Stwo(_) => Failed("a segment does not prove"),
         SegmentError::FormatNotAdmitted(_) => Failed("the segment format is not admitted"),
         SegmentError::NoMemoryLayout => Failed("a segment has no memory layout"),
@@ -269,7 +276,9 @@ fn not_rerun(error: &KernelTraceError) -> StatementError {
         KernelTraceError::Exit => Rerun("the kernel does not halt on the witness"),
         KernelTraceError::Output => Rerun("the kernel's output is not readable"),
         KernelTraceError::Unread => Rerun("the kernel reads less than the witness"),
-        KernelTraceError::Steps => Rerun("the kernel's run is past a proof's steps"),
+        KernelTraceError::Steps => {
+            StatementError::Bound("the kernel's run is past a proof's steps")
+        }
         KernelTraceError::Allocation => Failed("the kernel's output could not be allocated"),
     }
 }
