@@ -27,7 +27,7 @@ use std::sync::Arc;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 use vos_abi::ids::{AgentId, InstanceId};
 use vos_abi::{Decode, Encode};
-use vos_exec::{ProgramStore, StateReader};
+use vos_exec::{ProgramStore, StateReader, value_window};
 use vos_wire::apply::State;
 
 use crate::group::Archive;
@@ -442,6 +442,25 @@ impl Snapshot {
             .map(|value| value.to_vec()))
     }
 
+    /// The local agent's rows whose key starts with `prefix`, in key order,
+    /// after `after` when given, each with its value. A read that fails
+    /// panics, as [`StateReader`]'s do.
+    pub fn scan<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        after: Option<&'a [u8]>,
+    ) -> impl Iterator<Item = (Vec<u8>, fjall::Slice)> + 'a {
+        let start = match after {
+            Some(after) if after >= prefix => Bound::Excluded(after.to_vec()),
+            _ => Bound::Included(prefix.to_vec()),
+        };
+        self.snapshot
+            .range(&self.store.0.rows, (start, Bound::<Vec<u8>>::Unbounded))
+            .map(|row| row.into_inner().expect("a store read"))
+            .take_while(move |(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.to_vec(), value))
+    }
+
     /// The last local operation's time and seed; none before the first.
     pub fn last(&self) -> Result<Option<(u64, [u8; 32])>, StoreError> {
         let Some(bytes) = self.snapshot.get(&self.store.0.meta, LAST_ROW)? else {
@@ -458,25 +477,19 @@ impl Snapshot {
 /// The local agent's rows, as the agent program reads them. A read that
 /// fails panics, which the light node answers as a fault.
 impl StateReader for Snapshot {
-    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.get(key).expect("a store read")
+    fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+        let value = self.get(key).expect("a store read")?;
+        Some(value_window(&value, offset, max))
     }
 
     fn rows<'a>(
         &'a self,
         prefix: &'a [u8],
         after: Option<&'a [u8]>,
-    ) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
-        let start = match after {
-            Some(after) if after >= prefix => Bound::Excluded(after.to_vec()),
-            _ => Bound::Included(prefix.to_vec()),
-        };
+    ) -> Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a> {
         Box::new(
-            self.snapshot
-                .range(&self.store.0.rows, (start, Bound::<Vec<u8>>::Unbounded))
-                .map(|row| row.into_inner().expect("a store read"))
-                .take_while(move |(key, _)| key.starts_with(prefix))
-                .map(|(key, value)| (key.to_vec(), value.to_vec())),
+            self.scan(prefix, after)
+                .map(|(key, value)| (key, value.len())),
         )
     }
 }
@@ -491,7 +504,7 @@ impl State for Applying<'_> {
     fn read(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         match self.written.get(key) {
             Some(value) => value.clone(),
-            None => self.snapshot.read(key),
+            None => self.snapshot.get(key).expect("a store read"),
         }
     }
 

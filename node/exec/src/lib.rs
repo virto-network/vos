@@ -10,7 +10,7 @@ pub mod fault;
 pub mod store;
 
 pub use fault::{Fault, decode, panic_message, stopped};
-pub use vos_pvm::refine_host::StateReader;
+pub use vos_pvm::refine_host::{StateReader, value_window};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -243,17 +243,19 @@ struct Overlay<'a> {
 }
 
 impl ServiceStorage for Overlay<'_> {
-    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+    fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
         match self.written.get(key) {
-            Some(value) => value.clone(),
-            None => self.state.read(key),
+            Some(value) => value
+                .as_deref()
+                .map(|value| value_window(value, offset, max)),
+            None => self.state.read(key, offset, max),
         }
     }
 
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize> {
         let previous = match self.written.get(key) {
             Some(value) => value.as_ref().map(Vec::len),
-            None => self.state.read(key).map(|value| value.len()),
+            None => self.state.read(key, 0, 0).map(|(len, _)| len),
         };
         self.written.insert(key.to_vec(), value.map(<[u8]>::to_vec));
         previous

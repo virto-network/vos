@@ -17,7 +17,9 @@ use vos_abi::result::{PAGE, WorkResult, digest, split_output};
 use vos_abi::{Encode, keys};
 use vos_pvm::ExitReason;
 use vos_pvm::refine::{MemoryModel, PreparedProgram};
-use vos_pvm::refine_host::{JamItem, JamRefine, Preimages, RefineContext, StateReader};
+use vos_pvm::refine_host::{
+    JamItem, JamRefine, Preimages, RefineContext, StateReader, value_window,
+};
 use vos_tree::keys::{after, prefix_end};
 use vos_wire::batch::{Batch, Work};
 use vos_wire::defaults;
@@ -192,6 +194,9 @@ struct Log {
     missing: Vec<(WorkflowId, u32)>,
     /// A read the store failed, which spoils the simulation.
     error: Option<Error>,
+    /// The row a scan pulled last, whose value the scan's read takes as
+    /// stored and unrecorded, as the scanned range covers it.
+    scanned: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Log {
@@ -207,33 +212,41 @@ impl Log {
 impl StateReader for Recorder {
     /// A row as stored. A page row holds the page's hash on JAM, where the
     /// page is imported; the VOS refine simulated reads the page itself,
-    /// LZ4-compressed. A page the source lacks is recorded missing.
-    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+    /// LZ4-compressed. A page the source lacks is recorded missing. A
+    /// scan's read of the row it pulled gives the row as stored.
+    fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
         let mut log = self.log.lock().expect("the log");
+        if let Some((_, value)) = log
+            .scanned
+            .take_if(|(scanned, _)| scanned.as_slice() == key)
+        {
+            return Some(value_window(&value, offset, max));
+        }
         log.reads.insert(key.to_vec());
         let value = log.ok(self.view.get(key))??;
         let Some(place) = keys::page_entry(key) else {
-            return Some(value);
+            return Some(value_window(&value, offset, max));
         };
         let page = (self.pages)(place.0, place.1)
             .filter(|page| page.len() == PAGE && unstored(&value) == Some(&digest(page)[..]));
-        match page {
+        let value = match page {
             Some(page) => {
                 log.imports.insert(place);
-                Some(stored(&lz4_flex::block::compress(&page)))
+                stored(&lz4_flex::block::compress(&page))
             }
             None => {
                 log.missing.push(place);
-                Some(value)
+                value
             }
-        }
+        };
+        Some(value_window(&value, offset, max))
     }
 
     fn rows<'a>(
         &'a self,
         prefix: &'a [u8],
         after: Option<&'a [u8]>,
-    ) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+    ) -> Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a> {
         let mut from = prefix.to_vec();
         if let Some(cursor) = after {
             from = from.max(self::after(cursor));
@@ -262,16 +275,20 @@ struct Scan<'a> {
 }
 
 impl Iterator for Scan<'_> {
-    type Item = (Vec<u8>, Vec<u8>);
+    type Item = (Vec<u8>, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
+        let mut log = self.log.lock().expect("the log");
+        log.scanned = None;
         match self.rows.next() {
             Some(Ok((key, value))) if key.starts_with(self.prefix) => {
                 self.last = Some(key.clone());
-                Some((key, value))
+                let len = value.len();
+                log.scanned = Some((key.clone(), value));
+                Some((key, len))
             }
             Some(Err(error)) => {
-                self.log.lock().expect("the log").ok::<()>(Err(error));
+                log.ok::<()>(Err(error));
                 None
             }
             _ => {
@@ -284,6 +301,7 @@ impl Iterator for Scan<'_> {
 
 impl Drop for Scan<'_> {
     fn drop(&mut self) {
+        self.log.lock().expect("the log").scanned = None;
         let to = match (&self.last, self.exhausted) {
             (_, true) => prefix_end(self.prefix),
             (Some(last), false) => Some(after(last)),

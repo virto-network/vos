@@ -72,6 +72,10 @@ pub enum Error {
     /// The data directory, the space, the network or the ingress's
     /// listener failed.
     Data(String),
+    /// The process's PVM backend cannot be chosen: an override
+    /// (`VOS_PVM_BACKEND`) this host cannot honour or does not know
+    /// (`vos_pvm::backend::backend_choice`).
+    Backend(String),
 }
 
 impl From<fjall::Error> for Error {

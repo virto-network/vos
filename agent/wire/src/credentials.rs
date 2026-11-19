@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use scale::{Decode, DecodeError, Encode};
 
 use vos_abi::credentials::{
-    DEPTH, Digest, EMPTY, Tag, compress, digest, leaf, reduced, root_of, words,
+    DEPTH, Digest, EMPTY, Tag, compress, digest, member_root, reduced, words,
 };
 
 use vos_abi::SpaceId;
@@ -178,7 +178,7 @@ impl Path {
                 None => return false,
             }
         }
-        root_of(&leaf(&member), self.slot, &siblings) == root
+        member_root(&member, self.slot, &siblings) == root
     }
 }
 

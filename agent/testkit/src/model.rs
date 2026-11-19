@@ -667,14 +667,14 @@ pub fn device_auth_input() -> (Vec<u8>, Vec<u8>) {
 /// 7,919·i`) at `slot`, the siblings at the levels `filled` nonzero and
 /// the rest the empty tree's: a path of its own shape.
 pub fn device_auth_arguments(seed: u32, slot: u32, filled: &[usize]) -> (Vec<u8>, Vec<u8>) {
-    use vos_abi::credentials::{DEPTH, EMPTY, Tag, compress, digest, leaf, root_of};
+    use vos_abi::credentials::{DEPTH, EMPTY, Tag, compress, digest, member_root};
     let secret: [u32; 8] = core::array::from_fn(|i| seed + 7_919 * i as u32);
     let mut siblings: [[u32; 8]; DEPTH] = core::array::from_fn(|level| EMPTY[level]);
     for (n, &level) in filled.iter().enumerate() {
         siblings[level] = core::array::from_fn(|i| (n as u32 + 1) * 1_000_003 + i as u32);
     }
     let member = compress(&Tag::Member.block(), &secret);
-    let root = root_of(&leaf(&member), slot, &siblings);
+    let root = member_root(&member, slot, &siblings);
     let scope: [u32; 8] = core::array::from_fn(|i| 0x5c5c_0000 + i as u32);
     let nullifier = compress(&compress(&Tag::Nf.block(), &secret), &scope);
     let binding: [u32; 8] = core::array::from_fn(|i| 0x0b1b_0000 + i as u32);

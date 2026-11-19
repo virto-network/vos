@@ -306,7 +306,10 @@ impl<S: Service> Shared<S> {
             let Some(known) = read.spaces.get_mut(&space) else {
                 return Fate::Again(SLOT);
             };
-            let last = known.record.as_ref().and_then(|record| record.last);
+            let last = known
+                .record
+                .as_ref()
+                .and_then(|record| record.last(RootKind::Space));
             match held {
                 Some(root) if root == anchor.root => {
                     known.held.insert(window, Some(root));
@@ -533,7 +536,7 @@ impl VenueClient for JamVenue {
             if !record.keys.contains(&anchor.signer) {
                 return AnchorOutcome::Unlisted(AnchorCode::Key as u32);
             }
-            let last = record.last;
+            let last = record.last(RootKind::Space);
             if let Some(code) = known.never.get(&window) {
                 return AnchorOutcome::Never(*code);
             }
@@ -613,7 +616,10 @@ impl VenueClient for JamVenue {
         let Some(known) = read.spaces.get_mut(space).filter(|known| known.read) else {
             return Holding::Unread;
         };
-        let last = known.record.as_ref().and_then(|record| record.last);
+        let last = known
+            .record
+            .as_ref()
+            .and_then(|record| record.last(RootKind::Space));
         match known.held.get(&window) {
             Some(Some(root)) => Holding::Root(*root),
             Some(None) => Holding::Nothing,

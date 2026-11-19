@@ -177,8 +177,7 @@ impl AuthWitness {
         self.root.is_canonical()
             && member.is_canonical()
             && self.siblings.iter().all(Digest::is_canonical)
-            && credentials::root_of(&credentials::leaf(&member.0), self.slot, &siblings)
-                == self.root.0
+            && credentials::member_root(&member.0, self.slot, &siblings) == self.root.0
     }
 }
 

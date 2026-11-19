@@ -30,9 +30,21 @@ impl Fault {
     }
 }
 
+/// A run the host could not make: the agent's own program, loaded at the
+/// node's start, or the host's backend, whose machine the run consumed, so
+/// it is dropped rather than kept idle.
 impl From<vos_pvm::refine::RefineError> for Fault {
     fn from(error: vos_pvm::refine::RefineError) -> Self {
-        Fault::Infrastructure(format!("{error:?}"))
+        use vos_pvm::refine::RefineError;
+        Fault::Infrastructure(
+            match error {
+                RefineError::InvalidBlob => "the program is not a standard program",
+                RefineError::LayoutOverflow => "the program's memory does not fit",
+                RefineError::Backend => "the execution backend failed",
+                RefineError::NoStateReader => "a run that reads state was given none",
+            }
+            .into(),
+        )
     }
 }
 

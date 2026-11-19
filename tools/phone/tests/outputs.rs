@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 
 use vos_abi::credentials as tree;
-use vos_abi::credentials::{Tag, leaf, root_of};
+use vos_abi::credentials::{Tag, member_root};
 use vos_abi::ids::{AgentId, InstanceId};
 use vos_abi::{Encode, SpaceId};
 use vos_checker::carriers::{Audit, Kind, Reach};
@@ -61,7 +61,7 @@ fn the_benchs_lines_and_proofs_hold_no_secret() {
         .device_secret("the bench's member", &SOURCE_OUTPUT, &HANDLE);
     let member = tree::digest(&tree::compress(&Tag::Member.block(), &words));
     let siblings = siblings();
-    let root = root_of(&leaf(&tree::words(&member).unwrap()), SLOT, &siblings);
+    let root = member_root(&tree::words(&member).unwrap(), SLOT, &siblings);
     let path = vos_wire::credentials::Path {
         root: tree::digest(&root),
         slot: SLOT,

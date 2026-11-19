@@ -232,6 +232,7 @@ fn not_rerun(error: &KernelTraceError) -> StatementError {
         KernelTraceError::Exit => Rerun("the kernel does not halt on the witness"),
         KernelTraceError::Output => Rerun("the kernel's output is not readable"),
         KernelTraceError::Unread => Rerun("the kernel reads less than the witness"),
+        KernelTraceError::Steps => Rerun("the kernel's run is past a proof's steps"),
         KernelTraceError::Allocation => Failed("the kernel's output could not be allocated"),
     }
 }

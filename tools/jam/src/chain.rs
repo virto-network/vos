@@ -11,7 +11,7 @@ use vos_abi::jam::{AccumulateInput, Operand};
 use vos_pvm::ExitReason;
 use vos_pvm::accumulate_host::{AccumulateContext, ServiceStorage};
 use vos_pvm::refine::MemoryModel;
-use vos_pvm::refine_host::RefineContext;
+use vos_pvm::refine_host::{RefineContext, value_window};
 use vos_tree::{Blake2b, Hash, Hasher};
 use vos_wire::package::{EXPORTS, Exports, JamOutput, ROOT, slot_of};
 
@@ -153,6 +153,7 @@ impl Emulated {
         let mut storage = Storage {
             values: &mut self.storage,
             solicited: &mut self.solicited,
+            unsettled: Vec::new(),
         };
         let invocation = AccumulateContext::load(
             &runner.program,
@@ -228,11 +229,16 @@ impl Chain for Emulated {
 struct Storage<'a> {
     values: &'a mut BTreeMap<Vec<u8>, Vec<u8>>,
     solicited: &'a mut BTreeSet<(Hash, u64)>,
+    /// The requests made since the last checkpoint (or the run's start),
+    /// which an end other than a halt drops.
+    unsettled: Vec<(Hash, u64)>,
 }
 
 impl ServiceStorage for Storage<'_> {
-    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.values.get(key).cloned()
+    fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+        self.values
+            .get(key)
+            .map(|value| value_window(value, offset, max))
     }
 
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize> {
@@ -244,6 +250,20 @@ impl ServiceStorage for Storage<'_> {
     }
 
     fn solicit(&mut self, hash: &[u8; 32], len: u64) -> Option<bool> {
-        Some(self.solicited.insert((*hash, len)))
+        let new = self.solicited.insert((*hash, len));
+        if new {
+            self.unsettled.push((*hash, len));
+        }
+        Some(new)
+    }
+
+    fn checkpoint(&mut self) {
+        self.unsettled.clear();
+    }
+
+    fn revert(&mut self) {
+        for request in self.unsettled.drain(..) {
+            self.solicited.remove(&request);
+        }
     }
 }

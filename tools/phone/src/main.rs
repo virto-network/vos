@@ -66,7 +66,7 @@ use stwo::core::channel::{Blake2sM31Channel, Channel};
 use stwo::core::proof_of_work::GrindOps;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_abi::Decode;
-use vos_abi::credentials::{leaf, root_of};
+use vos_abi::credentials::member_root;
 use vos_light::release::Release;
 use vos_light::{
     AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Digest, Proven, Prover, ProverConfig, Threads,
@@ -130,7 +130,7 @@ fn call() -> Call {
 /// The member's path ([`member::siblings`]).
 fn witness(member: &Digest) -> AuthWitness {
     let siblings = member::siblings();
-    let root = root_of(&leaf(&member.0), SLOT, &siblings);
+    let root = member_root(&member.0, SLOT, &siblings);
     AuthWitness {
         root: Digest(root),
         slot: SLOT,

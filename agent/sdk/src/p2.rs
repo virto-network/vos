@@ -437,7 +437,7 @@ mod tests {
             };
             assert_eq!(
                 path.root(&digest(&leaf)),
-                digest(&credentials::root_of(&leaf, slot, &siblings))
+                digest(&credentials::member_root(&member, slot, &siblings))
             );
         }
     }

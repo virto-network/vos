@@ -272,7 +272,9 @@ impl Statements {
             found(&keys::seen(&vos_statement::StatementId(*subject)))?;
         }
         for (space, record) in &spaces {
-            let Some(last) = record.last else { continue };
+            let Some(last) = record.last(RootKind::Space) else {
+                continue;
+            };
             for window in record.start..=last {
                 found(&keys::anchor(space, RootKind::Space, window))?;
                 found(&keys::evidence(space, RootKind::Space, window))?;

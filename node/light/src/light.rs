@@ -39,7 +39,7 @@ use vos_abi::merge::{Cutoff, Origin};
 use vos_abi::records::{Installed, stored, unstored};
 use vos_abi::result::{Outcome, Run, Step, split_output};
 use vos_abi::{Decode, Encode, SpaceId, WindowClock, keys};
-use vos_exec::{Fault, Machines, ProgramStore, StateReader, decode, panic_message};
+use vos_exec::{Fault, Machines, ProgramStore, StateReader, decode, panic_message, value_window};
 use vos_pvm::PvmBackend;
 use vos_pvm::pool::{MachinePool, OuterMachines, PoolError};
 use vos_wire::apply::{Host, apply};
@@ -603,7 +603,8 @@ impl Light {
     /// The operations kept under `prefix`.
     fn kept<W: Copy + Encode + Decode>(&self, prefix: &[u8]) -> Result<Vec<Kept<W>>, Error> {
         let snapshot = self.store.snapshot();
-        StateReader::rows(&snapshot, prefix, None)
+        snapshot
+            .scan(prefix, None)
             .map(|(key, value)| Ok(Kept::read(prefix, &key, &value)?))
             .collect()
     }
@@ -972,7 +973,7 @@ impl Rows for Staged<'_> {
     fn read(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         match self.written.get(key) {
             Some(value) => value.clone(),
-            None => self.snapshot.read(key),
+            None => self.snapshot.get(key).expect("a store read"),
         }
     }
 
@@ -1159,10 +1160,12 @@ struct Layered {
 }
 
 impl StateReader for Layered {
-    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+    fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
         match self.written.get(key) {
-            Some(value) => value.clone(),
-            None => self.snapshot.read(key),
+            Some(value) => value
+                .as_deref()
+                .map(|value| value_window(value, offset, max)),
+            None => self.snapshot.read(key, offset, max),
         }
     }
 
@@ -1170,7 +1173,7 @@ impl StateReader for Layered {
         &'a self,
         prefix: &'a [u8],
         after: Option<&'a [u8]>,
-    ) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+    ) -> Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a> {
         let start = match after {
             Some(after) if after >= prefix => Bound::Excluded(after),
             _ => Bound::Included(prefix),
@@ -1198,7 +1201,7 @@ impl StateReader for Layered {
                 }
                 let (key, value) = written.next().expect("peeked");
                 if let Some(value) = value {
-                    return Some((key.clone(), value.clone()));
+                    return Some((key.clone(), value.len()));
                 }
             }
         }))

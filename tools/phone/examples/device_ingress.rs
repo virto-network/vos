@@ -15,7 +15,7 @@
 
 use std::time::{Duration, Instant};
 
-use vos_abi::credentials::{DEPTH, EMPTY, leaf, root_of};
+use vos_abi::credentials::{DEPTH, EMPTY, member_root};
 use vos_light::release::device;
 use vos_light::{AuthWitness, Call, Digest, Prover, ProverConfig, Threads, claim_io};
 use vos_light::{derive_secret, member};
@@ -51,7 +51,7 @@ fn main() {
     let secret = derive_secret(&[0x5e; 32], &[7; 32]);
     let siblings: [_; DEPTH] = std::array::from_fn(|level| EMPTY[level]);
     let witness = AuthWitness {
-        root: Digest(root_of(&leaf(&member(&secret).0), 0, &siblings)),
+        root: Digest(member_root(&member(&secret).0, 0, &siblings)),
         slot: 0,
         siblings: siblings.map(Digest),
     };

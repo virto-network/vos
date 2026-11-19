@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use vos_abi::ids::AgentId;
-use vos_exec::{ProgramStore, StateReader};
+use vos_exec::{ProgramStore, StateReader, value_window};
 
 use crate::blobs::Blobs;
 use crate::store::Snapshot;
@@ -32,19 +32,23 @@ impl AgentState {
 }
 
 impl StateReader for AgentState {
-    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.snapshot.get(self.agent, key).expect("a store read")
+    fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+        let value = self.snapshot.get(self.agent, key).expect("a store read")?;
+        Some(value_window(&value, offset, max))
     }
 
+    /// The store's scan reads each row's value with its key: a row's length
+    /// is its value's, read whole.
     fn rows<'a>(
         &'a self,
         prefix: &'a [u8],
         after: Option<&'a [u8]>,
-    ) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+    ) -> Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a> {
         Box::new(
             self.snapshot
                 .scan(self.agent, prefix, after)
-                .map(|row| row.expect("a store read")),
+                .map(|row| row.expect("a store read"))
+                .map(|(key, value)| (key, value.len())),
         )
     }
 }

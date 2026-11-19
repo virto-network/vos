@@ -38,6 +38,9 @@ impl Node {
     /// Open the node's data directory `data` (its store and its keys),
     /// join its space and start every agent it replicates.
     pub fn open(data: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
+        // Decided once for the process and logged; the agent program's
+        // machines run on it.
+        vos_pvm::backend::backend_choice().map_err(Error::Backend)?;
         if config.refine_gas < defaults::min_refine_gas(config.max_inputs.max(1)) {
             return Err(Error::Gas);
         }

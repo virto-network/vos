@@ -18,7 +18,7 @@ fn a_device_kernels_shape_holds_no_blake2b() {
     let blob = kernel("device", "auth");
     assert!(!derived("device").devices.is_empty());
     let code = kernel_side_note(&blob).unwrap();
-    let chips = device_chips_of_code(&code.code, &code.bitmask);
+    let chips = device_chips_of_code(&code.code, &code.bitmask).expect("a code without BLAKE2b");
     assert_eq!(
         chips & (1 << chip_idx::BLAKE2B | 1 << chip_idx::BITWISE_AND_BYTE),
         0,
@@ -103,7 +103,7 @@ fn every_path_shape_proves_under_one_device_program() {
 /// one, and its shape holding neither BLAKE2b nor the AND table.
 fn device_steps(blob: &[u8], input: &[u8], public: &[u8]) -> usize {
     let code = kernel_side_note(blob).unwrap();
-    let chips = device_chips_of_code(&code.code, &code.bitmask);
+    let chips = device_chips_of_code(&code.code, &code.bitmask).expect("a code without BLAKE2b");
     assert_eq!(
         chips & (1 << chip_idx::BLAKE2B | 1 << chip_idx::BITWISE_AND_BYTE),
         0,
