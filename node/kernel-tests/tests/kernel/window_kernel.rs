@@ -633,17 +633,18 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
 /// - **another window:** the root claimed at the window before, which the
 ///   venue does not hold (5); and, at a venue whose space anchored that
 ///   root there too, the io-hash, which binds the root's window: the
-///   proof's words (0x108);
+///   proof's words (0x108, or 0x109 past the 8-bit interaction PoW);
 /// - **another space:** the statement claiming a space its root is not of,
 ///   the space rule (4); and its root claimed of a second space of the
 ///   founder's, anchored there: the io-hash, which binds the root's space
-///   (0x108);
+///   (0x108, or 0x109);
 /// - **a missing representative row:** `S_w` anchored over a
 ///   representative's tree without the agent's row, so the statement's
 ///   `S_w` is not the anchored root: unanchored (5). The served row's
 ///   absence itself traps the prologue ([`rows_off_the_cut_are_refused`]);
 /// - **a tampered output:** the net a tampered row would give, against the
-///   proof's words (0x108); the tampered row itself traps the prologue;
+///   proof's words (0x108, or 0x109); the tampered row itself traps the
+///   prologue;
 /// - **a venue mismatch:** the anchor digest binds the venue, so an anchor
 ///   signed for this venue is refused at another (`Signature`) and the root
 ///   is unanchored there (5).
@@ -663,8 +664,11 @@ fn the_window_is_stated_at_the_model_venue() {
         venue
     };
     let code = |venue: &Venue, statement: &Statement| venue.venue.submit(statement, &proof).code();
-    // The proof refused against the words the statement makes.
-    let words = Refusal::Proof(FinalError::InteractionPow).code();
+    // The proof refused against the words the statement makes: at the
+    // interaction PoW drawn over them, or, past its 8 bits at odds of
+    // 2^-8 with fresh masks, at the claimed sums the words fix.
+    let words =
+        [FinalError::InteractionPow, FinalError::Logup].map(|error| Refusal::Proof(error).code());
 
     let accepting = anchored();
     assert_eq!(code(&accepting, &statement), 0, "accepted");
@@ -702,9 +706,8 @@ fn the_window_is_stated_at_the_model_venue() {
     let both = venue(VENUE);
     both.anchor(&before).expect("anchored at the window before");
     both.anchor(&root).expect("anchored");
-    assert_eq!(
-        code(&both, &at_another_window),
-        words,
+    assert!(
+        words.contains(&code(&both, &at_another_window)),
         "another window, anchored"
     );
 
@@ -731,7 +734,10 @@ fn the_window_is_stated_at_the_model_venue() {
     there
         .anchor(&of_second)
         .expect("anchored in the second space");
-    assert_eq!(code(&there, &moved), words, "another space, anchored");
+    assert!(
+        words.contains(&code(&there, &moved)),
+        "another space, anchored"
+    );
 
     let without = venue(VENUE);
     without
@@ -753,7 +759,10 @@ fn the_window_is_stated_at_the_model_venue() {
         output: (net + 1, seq, c_new).encode(),
         ..statement.clone()
     };
-    assert_eq!(code(&anchored(), &tampered), words, "a tampered output");
+    assert!(
+        words.contains(&code(&anchored(), &tampered)),
+        "a tampered output"
+    );
 
     let elsewhere = venue(VenueId([0x7f; 32]));
     assert_eq!(
