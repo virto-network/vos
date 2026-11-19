@@ -562,7 +562,12 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         .needles
         .kernel_arguments("the member", &arguments, claim.len());
     let kernel = vos_pvm_device::Program::from_release(&auth).unwrap();
-    let ((proved, _), drawn) = drawn_in(|| kernel.prove(&arguments, MaskRng::default()).unwrap());
+    // On a prover's pool of this thread's own making: the watch is the
+    // thread's, and a prover on a pool of its own (when another caller
+    // built rayon's global one first) draws on its workers.
+    let pool = vos_light::thread_pool(&vos_light::Threads::Count(2)).unwrap();
+    let ((proved, _), drawn) =
+        pool.install(|| drawn_in(|| kernel.prove(&arguments, MaskRng::default()).unwrap()));
     let drawn: Vec<(&str, Vec<u8>)> = drawn.into_iter().map(|d| (d.what, d.bytes)).collect();
     for what in [
         "an attempt's entropy",
