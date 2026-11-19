@@ -885,11 +885,13 @@ async fn starved(trickle: bool) {
         )
     };
     let header = vos_api::Framing::Stream.header();
-    // Four circuits, two channels each, every one sending a header alone
-    // and holding it until the gateway closes it.
+    // Five circuits, two channels each, every one sending a header alone
+    // and holding it until the gateway closes it: ten calls for the port's
+    // four places and at most one waiter a circuit, so some circuit's
+    // second is refused whatever the order.
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut holders = Vec::new();
-    for circuit in 0..4u8 {
+    for circuit in 0..5u8 {
         for lane in 0..2u64 {
             let (stop, bytes) = (
                 Arc::clone(&stop),
