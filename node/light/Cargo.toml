@@ -5,6 +5,9 @@ version.workspace = true
 license.workspace = true
 description = "The light node: a device's local agent run on the interpreter over its own store with no log, installed from release artifacts; and the device library: a member's secret from a secret source, its proven calls, their verification, the node-API requests a client sends for them, and the path it keeps apart from its proofs."
 
+[package.metadata.vos]
+test-features = { seeded-masks = ["seeded-masks"] }
+
 [features]
 # The release build of the light node's artifacts from ELFs
 # (`release::package`, `release::agent`): the transpiler, on the host that

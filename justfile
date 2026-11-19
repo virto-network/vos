@@ -1,5 +1,12 @@
 set shell := ["nu", "-c"]
 
+# The pinning tests write their pins under `VOS_PINS=write` and hold them
+# otherwise. No recipe inherits it: the recipes that write pins (`repin`,
+# `repin-proof`, `fixtures`, each in no tier) set it on their own lines, so
+# a `VOS_PINS=write` left in the caller's environment cannot turn a gate's
+# check into a rewrite (`just check-tiers` holds the tiers to that).
+unexport VOS_PINS
+
 default:
     @just --list
 
@@ -145,7 +152,7 @@ vectors:
 # among them. Last, the wrap files the suites wrote
 # checked to be final wraps alone, and the carrier audit (`test-carriers`).
 test-proof: build-test-actors build-programs build-final-verify judge-wasm
-    cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
+    cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa --test pool -- --test-threads=2
     cargo test -p vos-kernel-tests --features debug-internals --lib --test witness_input -- --test-threads=2
     for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse \
         | lines | where {|line| $line ends-with ': test' } | each {|line| $line \
@@ -219,25 +226,35 @@ build-wasm-blobs:
 # lays out the program's code: built from the fixed path, a guest whose
 # path dependencies lie outside its workspace is the same bytes from any
 # checkout. The path is part of the blobs' bytes, so it cannot move to a
-# per-user directory: on a host with other users, `/tmp/vos-checkout` or
-# its lock made by another user (who builds from it, or left it) blocks
-# this user's builds, and the recipe stops naming that user; build inside
-# a private mount namespace that binds the checkout at the fixed path
-# instead.
+# per-user directory. What keeps another user from pointing the build at
+# other sources, each checked, the build refused without it: `/tmp` is
+# root's and sticky, so no other user can replace or remove this user's
+# link or lock there, and the kernel follows no other user's symbolic
+# link in it (`fs.protected_symlinks`), so the lock cannot be redirected;
+# the link, once made, is this user's and names this checkout. On a host
+# with other users, a `/tmp/vos-checkout` or lock another user made (who
+# builds from it, or left it) blocks this user's builds, and the recipe
+# names that user; build inside a private mount namespace that binds the
+# checkout at the fixed path instead.
 _at-fixed-path dir +args:
     #!/usr/bin/env bash
     set -euo pipefail
     fixed=/tmp/vos-checkout
+    me=$(id -un)
+    here=$(pwd -P)
+    if [ "$(stat -c %U /tmp)" != root ] || [ ! -k /tmp ]; then echo "/tmp is not root's and sticky: another user could replace $fixed" >&2; exit 1; fi
+    if [ "$(cat /proc/sys/fs/protected_symlinks)" != 1 ]; then echo "fs.protected_symlinks is off: another user's link could redirect $fixed.lock" >&2; exit 1; fi
     for entry in "$fixed.lock" "$fixed"; do
         if [ -e "$entry" ] || [ -L "$entry" ]; then
             owner=$(stat -c %U "$entry")
-            if [ "$owner" != "$(id -un)" ]; then echo "$entry is $owner's, not $(id -un)'s: another user builds from the fixed path on this host" >&2; exit 1; fi
+            if [ "$owner" != "$me" ]; then echo "$entry is $owner's, not $me's: another user builds from the fixed path on this host" >&2; exit 1; fi
         fi
     done
-    exec 9>"$fixed.lock"
+    exec 9>>"$fixed.lock"
     flock 9
     if [ -e "$fixed" ] && [ ! -L "$fixed" ]; then echo "$fixed is not a symbolic link" >&2; exit 1; fi
-    ln -sfn "$(pwd -P)" "$fixed"
+    ln -sfn "$here" "$fixed"
+    if [ "$(stat -c %U "$fixed")" != "$me" ] || [ "$(readlink "$fixed")" != "$here" ]; then echo "$fixed is not this user's link to $here" >&2; exit 1; fi
     cd "{{dir}}"
     CARGO_INCREMENTAL=0 cargo build --manifest-path "$fixed/{{dir}}/Cargo.toml" {{args}}
 
@@ -696,64 +713,87 @@ check-no-faults: (_forbidden "faults")
     if ((^target/debug/vos --version) | str contains "faults") { error make { msg: "a plain build of vos injects faults" } } else { print "no faults in a plain build of vos" }
 
 # The gates' table: by gate, each build `cargo tree <args>` resolves (its
-# normal and build edges, for every target), the features no package in it
-# may enable and the packages it may not hold. Each package's enabled
-# features (`{f}`) are compared whole, so one a feature enables through
-# another is caught. `_forbidden <gate>...` resolves each build the gates
-# name once, prints every feature enabled and package held, and fails on
-# any, or when a build does not resolve.
+# normal and build edges, for every target). What a gate refuses in its
+# builds is read from the manifests, beside what it names: a package's
+# `[package.metadata.vos]` `test-features`, each of its test-only features
+# with the gates that refuse it, and `test-package`, the gates that refuse
+# the package itself. A feature named there that the package does not
+# define, or a gate no row builds, fails here, so a renamed feature is
+# never silently passed; every package under `tools/` names the `tools`
+# gate. Each package's enabled features (`{f}`) are
+# compared whole, so one a feature enables through another is caught.
+# `_forbidden <gate>...` resolves each build the gates name once, prints
+# every feature enabled and package held, and fails on any, or when a
+# build does not resolve.
 _forbidden +gates:
-    let tools = (cargo metadata --no-deps --format-version 1 | from json | get packages | where {|package| $package.manifest_path | str starts-with $"(pwd)/tools/" } | get name); \
-    if not ([vos-jam vos-kreivo] | all {|package| $package in $tools }) { error make { msg: $"the tools under tools/ not found: ($tools)" } }; \
+    let untagged = (cargo metadata --no-deps --format-version 1 | from json | get packages | where {|package| ($package.manifest_path | str starts-with $"(pwd)/tools/") and ("tools" not-in ($package.metadata?.vos?."test-package"? | default [])) } | get name); \
+    if ($untagged | is-not-empty) { error make { msg: $"the tools under tools/ the tools gate does not refuse: ($untagged)" } }; \
     let table = [ \
-        [gate args features packages]; \
-        [faults "--workspace" [faults] []] \
-        [faults "-p vos-cli" [faults] []] \
-        [faults "-p vos-cli --features prover" [faults] []] \
-        [tools "-p vos-cli" [] $tools] \
-        [tools "-p vos-cli --features prover" [] $tools] \
-        [tools "-p vos-node" [] $tools] \
-        [tools "-p vos-node --features prover" [] $tools] \
-        [venue-model "--workspace" [model kreivo-mock] []] \
-        [venue-model "-p vos-cli" [model model-judge] []] \
-        [venue-model "-p vos-cli --features prover" [model model-judge] []] \
-        [venue-model "-p vos-node" [model model-judge] []] \
-        [venue-model "-p vos-node --features prover" [model model-judge] []] \
-        [venue-model "-p vos-statement-service --features pvm-guest" [model model-judge] []] \
-        [seeded-masks "--workspace" [seeded-masks other-pins chip-isolated] []] \
-        [seeded-masks "-p vos-cli --features prover" [seeded-masks other-pins chip-isolated] []] \
-        [seeded-masks "-p vos-light" [seeded-masks other-pins chip-isolated] []] \
-        [seeded-masks "--manifest-path agent/programs/Cargo.toml --workspace" [seeded-masks other-pins chip-isolated] []] \
-        [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml --locked" [seeded-masks other-pins chip-isolated] []] \
-        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [seeded-masks other-pins chip-isolated] []] \
-        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml --locked" [seeded-masks other-pins chip-isolated] []] \
-        [debug-internals "--workspace" [debug-internals disclosing watch] []] \
-        [debug-internals "-p vos-cli --features prover" [debug-internals disclosing watch] []] \
-        [debug-internals "-p vos-statement-service --features pvm-guest" [debug-internals] []] \
-        [debug-internals "--manifest-path agent/programs/Cargo.toml --workspace" [debug-internals] []] \
-        [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [debug-internals] []] \
-        [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml --locked" [debug-internals] []] \
-        [test-device-format "--workspace" [test-device-format] []] \
-        [test-device-format "-p vos-cli --features prover" [test-device-format] []] \
-        [test-device-format "--manifest-path node/light/android/Cargo.toml --features android" [test-device-format] [vos-testkit]] \
-        [test-device-format "--manifest-path node/gateway/demo/Cargo.toml" [test-device-format] []] \
-        [store-dump "-p vos-cli" [dump] []] \
-        [store-dump "-p vos-cli --features prover" [dump] []] \
-        [store-dump "-p vos-node" [dump] []] \
-        [store-dump "-p vos-node --features prover" [dump] []] \
-        [heap-peak "--workspace" [heap-peak] []] \
-        [heap-peak "-p vos-cli --features prover" [heap-peak] []] \
-        [heap-peak "-p vos-statement --features pvm-guest" [heap-peak] []] \
-        [heap-peak "-p vos-statement-service --features pvm-guest" [heap-peak] []] \
+        [gate args]; \
+        [faults "--workspace"] \
+        [faults "-p vos-cli"] \
+        [faults "-p vos-cli --features prover"] \
+        [tools "-p vos-cli"] \
+        [tools "-p vos-cli --features prover"] \
+        [tools "-p vos-node"] \
+        [tools "-p vos-node --features prover"] \
+        [venue-mock "--workspace"] \
+        [venue-model "-p vos-cli"] \
+        [venue-model "-p vos-cli --features prover"] \
+        [venue-model "-p vos-node"] \
+        [venue-model "-p vos-node --features prover"] \
+        [venue-model "-p vos-statement-service --features pvm-guest"] \
+        [seeded-masks "--workspace"] \
+        [seeded-masks "-p vos-cli --features prover"] \
+        [seeded-masks "-p vos-light"] \
+        [seeded-masks "--manifest-path agent/programs/Cargo.toml --workspace"] \
+        [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml --locked"] \
+        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml"] \
+        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml --locked"] \
+        [debug-internals "--workspace"] \
+        [debug-internals "-p vos-cli --features prover"] \
+        [debug-internals "-p vos-statement-service --features pvm-guest"] \
+        [debug-internals "--manifest-path agent/programs/Cargo.toml --workspace"] \
+        [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml"] \
+        [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml --locked"] \
+        [test-device-format "--workspace"] \
+        [test-device-format "-p vos-cli --features prover"] \
+        [test-device-format "--manifest-path node/light/android/Cargo.toml --features android"] \
+        [test-device-format "--manifest-path node/gateway/demo/Cargo.toml"] \
+        [light-app "--manifest-path node/light/android/Cargo.toml --features android"] \
+        [store-dump "-p vos-cli"] \
+        [store-dump "-p vos-cli --features prover"] \
+        [store-dump "-p vos-node"] \
+        [store-dump "-p vos-node --features prover"] \
+        [heap-peak "--workspace"] \
+        [heap-peak "-p vos-cli --features prover"] \
+        [heap-peak "-p vos-statement --features pvm-guest"] \
+        [heap-peak "-p vos-statement-service --features pvm-guest"] \
     ]; \
+    let manifests = (cargo metadata --no-deps --format-version 1 | from json | get packages); \
+    let features = ($manifests | each {|package| $package.metadata?.vos?."test-features"? | default {} \
+        | transpose feature gates | each {|row| { package: $package.name, feature: $row.feature, gates: $row.gates, \
+        defined: ($row.feature in ($package.features | columns)) } } } | flatten); \
+    let packages = ($manifests | each {|package| $package.metadata?.vos?."test-package"? | default [] \
+        | each {|gate| { package: $package.name, gate: $gate } } } | flatten); \
+    let known = ($table.gate | uniq); \
+    let stale = ($features | where not defined | each {|row| $"($row.package) declares no feature ($row.feature)" }) \
+        ++ ($features | each {|row| $row.gates | where {|gate| $gate not-in $known } | each {|gate| $"($row.package)'s ($row.feature) names no gate ($gate)" } } | flatten) \
+        ++ ($packages | where {|row| $row.gate not-in $known } | each {|row| $"($row.package) names no gate ($row.gate)" }) \
+        ++ ($known | where {|gate| ($features | where {|row| $gate in $row.gates } | is-empty) and ($packages | where gate == $gate | is-empty) } \
+        | each {|gate| $"no manifest names a feature or package the gate ($gate) refuses" }); \
+    for failure in $stale { print -e $failure }; \
+    if ($stale | is-not-empty) { error make { msg: "the manifests' test features and the gates' table disagree" } }; \
     let failures = ($table | where gate in [{{gates}}] | group-by args | items {|args, rows| \
+        let refused = ($features | where {|row| $row.gates | any {|gate| $gate in $rows.gate } } | get feature | uniq); \
+        let barred = ($packages | where gate in $rows.gate | get package | uniq); \
         let resolved = (cargo tree ...($args | split row ' ') -e no-dev --target all -f '{p}|{f}' --prefix none | complete); \
         if $resolved.exit_code != 0 { print -e $resolved.stderr; error make { msg: $"cargo tree ($args) failed" } }; \
         let tree = ($resolved.stdout | lines | each {|line| $line | str replace ' (*)' '' | split row '|' }); \
         let held = ($tree | each {|parts| $parts.0 | split row ' ' | first }); \
         let enabled = ($tree | each {|parts| $parts.1? | default '' | split row ',' } | flatten); \
-        ($rows.features | flatten | uniq | where {|feature| $feature in $enabled } | each {|feature| $"cargo tree ($args) enables ($feature)" }) \
-        ++ ($rows.packages | flatten | uniq | where {|package| $package in $held } | each {|package| $"cargo tree ($args) holds ($package)" }) \
+        ($refused | where {|feature| $feature in $enabled } | each {|feature| $"cargo tree ($args) enables ($feature)" }) \
+        ++ ($barred | where {|package| $package in $held } | each {|package| $"cargo tree ($args) holds ($package)" }) \
     } | flatten); \
     for failure in $failures { print -e $failure }; \
     if ($failures | is-not-empty) { error make { msg: "a production build enables a forbidden feature or holds a forbidden package" } }
@@ -822,16 +862,18 @@ check-venue-rules:
     if ($found ++ $missing | is-not-empty) { error make { msg: "an anchor rule lives outside vos_anchor::venue, or a venue does not call it" } }; \
     print $"the venue rules live in vos_anchor::venue alone: ($sources | length) files searched, ($calls | length) calls found"
 
-# Every `check-no-*` gate below, each build resolved once, and two more
-# of the table's: the model venue (`venue-model`: `vos-venue`'s `model`
-# and Kreivo's mock, `kreivo-mock`, on no normal or build edge of any
-# workspace member; `vos-statement`'s `model-judge` in neither the node,
-# the `vos` binary nor the JAM statements service's program, which the
-# development tools' harnesses link), and the guests' heap peak
-# (`heap-peak`: `vos-statement`'s and the JAM statements service's, a
-# measurement build's, in no workspace member's, the `vos` binary's with
-# the prover nor the venues' guests' builds).
-check-no-leaks: (_forbidden "tools" "venue-model" "seeded-masks" "debug-internals" "test-device-format" "store-dump" "heap-peak") _seeded-masks-unimplied _debug-names-absent
+# Every `check-no-*` gate below, each build resolved once, and more of
+# the table's: the model venue (`venue-mock`: `vos-venue`'s `model` and
+# Kreivo's mock, `kreivo-mock`, on no normal or build edge of any
+# workspace member; `venue-model`: those and `vos-statement`'s
+# `model-judge` in neither the node, the `vos` binary nor the JAM
+# statements service's program, which the development tools' harnesses
+# link), the light node's app (`light-app`: the Android build holds no
+# `vos-testkit`), and the guests' heap peak (`heap-peak`:
+# `vos-statement`'s and the JAM statements service's, a measurement
+# build's, in no workspace member's, the `vos` binary's with the prover
+# nor the venues' guests' builds).
+check-no-leaks: (_forbidden "tools" "venue-model" "venue-mock" "seeded-masks" "debug-internals" "test-device-format" "light-app" "store-dump" "heap-peak") _seeded-masks-unimplied _debug-names-absent
     print "no test seam, debug output, test device format, store dump, heap peak, model venue or development tool in a production build"
 
 # A node links none of VOS's development tooling (`tools/`): the JAM
@@ -1019,7 +1061,9 @@ node_fuzz_targets := "api_reader operated_decode credentialed_decode"
 
 # Each target's checked-in corpus (`replay/<target>.tar` of its workspace,
 # unpacked into its `target/replay/` by `pvm/proof/fuzz/corpus.py`) run
-# once, every input, optimized and without a sanitizer: no crash. `cargo
+# once, every input, optimized and without a sanitizer: no crash, within
+# the memory `fuzz` gives a target (a kernel's segments proved take about
+# 3 GB). `cargo
 # run --example paths` there lists what each input reaches. `cargo fuzz`
 # sets RUSTFLAGS, which replaces the host's `target-cpu=native`
 # (`.cargo/config.toml`), so the recipes pass it again: without it the
@@ -1031,11 +1075,11 @@ fuzz-replay:
     cd pvm/proof/fuzz; python3 -I corpus.py unpack replay target/replay; \
         with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{proof_fuzz_targets}}" \
         | split row ' ') { cargo fuzz run -O -s none --target-dir target/no-sanitizer $target \
-        $"target/replay/($target)" -- -runs=0 } }
+        $"target/replay/($target)" -- -runs=0 -rss_limit_mb=8192 } }
     cd node/fuzz; python3 -I ../../pvm/proof/fuzz/corpus.py unpack replay target/replay; \
         with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" \
         | split row ' ') { cargo fuzz run --fuzz-dir . -O -s none --target-dir target/no-sanitizer $target \
-        $"target/replay/($target)" -- -runs=0 } }
+        $"target/replay/($target)" -- -runs=0 -rss_limit_mb=8192 } }
 
 # What each replay corpus reaches (`cargo run --example paths` in
 # `pvm/proof/fuzz`), held to `pvm/proof/fuzz/reach.txt`: every verdict it
@@ -1098,7 +1142,7 @@ fuzz secs="60":
 # each a binary past about 20 s): minutes, warm. It builds the guests its
 # tests run, the agent's programs, the test actors and the venues' refine
 # programs, and nothing else outside the workspace.
-check: fmt-check check-tiers check-layers build-test-actors build-programs build-final-verify build-statement-service
+check: fmt-check check-tiers check-layers check-device-verifier build-test-actors build-programs build-final-verify build-statement-service
     python3 -I pvm/proof/fuzz/test_corpus.py
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test {{core_crates}} ...(python3 -I tools/gates/tiers.py fast {{core_crates}} | split row ' ')
@@ -1144,16 +1188,38 @@ test-changed base="vos-core" *flags="": build-test-actors build-programs
 # The workspace's dependencies (`deny.toml`, cargo-deny): every licence on
 # the AGPL-compatible allowlist, no advisory of the RustSec database but
 # those the file names with its reason, and no source but crates.io and
-# the forks it lists. Duplicate versions and yanked crates are warnings.
+# the forks it lists. A crate held in two versions fails but those the
+# file names with their reasons; yanked crates are warnings.
 # The advisory database is fetched; without a network it is the cached one.
-# Then the side workspaces' graphs (`just locks`), on their lock files: no
-# advisory and no other source there either (the root's ignores that match
-# nothing there allowed).
+# Then the side workspaces' graphs, on their lock files: no advisory and no
+# other source there either (the root's ignores that match nothing there
+# allowed): the Wasm blob's and the fuzz targets' (`just locks`) and the
+# bench guests'. The Wasm runner's is held to its sources alone: it pins
+# wasmtime at the version a Polkadot client runs the blob under, which its
+# measurements must match, whose advisories are that client's and reach no
+# shipped code. The verifier
+# kit's (`pvm/proof/kit/Cargo.lock`) is no workspace's here: it is the
+# root's pruned to what the kit links (`kit-lock`), which the root's check
+# holds.
 deny:
     cargo deny check --hide-inclusion-graph
-    for manifest in [pvm/proof/final-verifier/wasm/blob/Cargo.toml pvm/proof/fuzz/Cargo.toml] { \
+    for manifest in ([pvm/proof/final-verifier/wasm/blob/Cargo.toml pvm/proof/fuzz/Cargo.toml] \
+        ++ (glob pvm/bench/guests/*/Cargo.toml --exclude ['**/target/**'] | path relative-to $env.PWD)) { \
         cargo deny --locked --manifest-path $manifest check --hide-inclusion-graph -A advisory-not-detected advisories \
         sources }
+    cargo deny --locked --manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml check --hide-inclusion-graph sources
+
+# The device verifier built alone, ingress's build (`vos-pvm-device`
+# without its `prover` feature): it builds and lints clean, and its normal
+# dependencies hold neither the prover (`vos-pvm-recair`), nor the runtime
+# and its recompiler (`vos-pvm`), nor `rayon`.
+check-device-verifier:
+    cargo clippy -p vos-pvm-device --no-default-features --quiet -- -D warnings
+    let crates = (cargo tree -p vos-pvm-device --no-default-features -e normal --prefix none \
+        | lines | each {|line| $line | split row ' ' | first } | uniq); \
+    let linked = ($crates | where {|name| $name in ["vos-pvm", "vos-pvm-recair", "rayon"] }); \
+    if not ($linked | is-empty) { error make { msg: $"the device verifier links ($linked | str join ', ')" } }; \
+    print "the device verifier links neither the prover, nor the runtime, nor rayon"
 
 # The layers: a package under `pvm/` has no path dependency outside
 # `pvm/`, on a normal, a build or a dev edge, so the PVM, its compiler,
@@ -1235,7 +1301,8 @@ release:
     with-env { CARGO_INCREMENTAL: "0" } { cargo build --release --locked --target x86_64-unknown-linux-musl -p vos-scale }
     just _names-absent target/x86_64-unknown-linux-musl/release/vos
 
-# Use the repository's hooks: fmt and clippy before commits, `just ci`
-# before pushes.
+# Use the repository's hooks, which run only once this sets them: fmt and
+# clippy before commits, `just ci` before pushes, on a push of HEAD from a
+# tree that is HEAD alone (`.githooks/pre-push`).
 install-hooks:
     git config core.hooksPath .githooks

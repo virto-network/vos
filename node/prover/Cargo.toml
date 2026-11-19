@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "The node's prover worker: an agent's leader proves the statements its attests at a window's cut make, keeps each final proof, records it in the agent and submits it at the space's venue, once."
 
+[package.metadata.vos]
+test-features = { disclosing = ["debug-internals"] }
+
 [features]
 # The masked prover (`masked::MaskedProver`): a kernel's run re-traced on
 # its record's witness, proved segment by segment, its leaves folded and

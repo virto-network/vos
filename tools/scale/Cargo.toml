@@ -6,6 +6,9 @@ license.workspace = true
 description = "The scale test's harness, which no VOS node links: an inventory of LAN hosts checked, a space deployed on them over ssh, its nodes started and stopped as user units, agents placed by weight, a load driven, and each run's samples collected and reported."
 publish = false
 
+[package.metadata.vos]
+test-package = ["tools"]
+
 [[bin]]
 name = "vos-scale"
 path = "src/main.rs"

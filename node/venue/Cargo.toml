@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "A venue as a VOS node reaches it: anchoring a space's roots, submitting statements, and asking what is anchored; the anchor queue of a client that reaches a chain; and, for tests alone, the model venue the node's tests anchor at."
 
+[package.metadata.vos]
+test-features = { model = ["venue-model", "venue-mock"] }
+
 # No production build enables it: a node carries no venue's client.
 [features]
 # The model venue, for the node's tests.

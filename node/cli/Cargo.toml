@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "The `vos` command: run a node, operate it, and call its agents."
 
+[package.metadata.vos]
+test-features = { faults = ["faults"] }
+
 [[bin]]
 name = "vos"
 path = "src/main.rs"

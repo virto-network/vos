@@ -6,6 +6,9 @@ license.workspace = true
 description = "Development and test tooling for JAM, which no VOS node links: a PolkaJam node's JSON-RPC and `jamt`, a JAM statements service's client and a node's venue over it (`JamVenue`), and `vos-jam-dev`, which links a JAM service blob, runs an agent on a PolkaJam testnet, and deploys and drives the statements service there."
 publish = false
 
+[package.metadata.vos]
+test-package = ["tools"]
+
 [[bin]]
 name = "vos-jam-dev"
 path = "src/main.rs"

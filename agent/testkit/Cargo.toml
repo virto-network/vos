@@ -6,6 +6,9 @@ license.workspace = true
 description = "A native host for VOS actor programs: the reference model of the default agent."
 publish = false
 
+[package.metadata.vos]
+test-package = ["light-app"]
+
 [dependencies]
 blake2 = "0.10"
 vos-pvm = { workspace = true }

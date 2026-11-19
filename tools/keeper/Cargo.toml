@@ -6,6 +6,9 @@ license.workspace = true
 description = "The home's keeper (`light-node.md` §3.3): under an operator key, it makes the pool's personal agents (each created, `Personal` installed, the home's agent granted its role `homes`), stocks them at `Homes`, tops the pool up, and upgrades `Personal` across the pool in batches, stopping at the first refusal."
 publish = false
 
+[package.metadata.vos]
+test-package = ["tools"]
+
 [[bin]]
 name = "vos-keeper"
 path = "src/main.rs"

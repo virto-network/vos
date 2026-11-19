@@ -6,6 +6,10 @@ license.workspace = true
 description = "Development and test tooling for Kreivo's spaces pallet, which no VOS node links: a venue client of the pallet over a transport, its reference mock and a transport over it, and the conformance vectors the mock writes."
 publish = false
 
+[package.metadata.vos]
+test-features = { kreivo-mock = ["venue-model", "venue-mock"] }
+test-package = ["tools"]
+
 [features]
 # The reference mock of the pallet and a transport over it, for the node's
 # tests.

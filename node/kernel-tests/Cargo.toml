@@ -6,6 +6,9 @@ license.workspace = true
 description = "The agent's kernels proved: each test actor's kernel re-run from its attest against the agent's reference model, read at a cut, proved, folded and wrapped under format 39, and its statement judged at the model venue."
 publish = false
 
+[package.metadata.vos]
+test-features = { debug-internals = ["debug-internals"] }
+
 # Tests alone: the library is empty, and every dependency is a dev edge, so
 # the test seams below reach no production build.
 [features]

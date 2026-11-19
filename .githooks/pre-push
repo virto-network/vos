@@ -1,5 +1,30 @@
 #!/bin/sh
-# Heavier checks before pushing. Skip in emergencies with `git push --no-verify`.
-# Install with `just install-hooks`.
+# The pre-push gate: `just ci` on the commit being pushed. Opt-in: it runs
+# only once `just install-hooks` points `core.hooksPath` here, and
+# `git push --no-verify` skips it in an emergency.
+#
+# `just ci` tests the working tree, warm, so the gate holds only a push of
+# HEAD from a tree that is HEAD: a push of another commit, or from a tree
+# with uncommitted changes to tracked files or untracked sources a build
+# could pick up, is refused, never tested as something else. A clean
+# checkout of each pushed commit would build cold, for hours.
+#
+# Not run here, by design: the forgery and soundness gates and the leakage
+# tests (`just test-proof`, in `just ci-full`), hours of proving under a
+# 12 GiB limit; run `just ci-full` before a release candidate.
 set -e
+zero=0000000000000000000000000000000000000000
+head=$(git rev-parse HEAD)
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue
+    if [ "$(git rev-parse "$local_sha^{commit}")" != "$head" ]; then
+        echo "pre-push: $local_ref ($local_sha) is not HEAD: push HEAD, or --no-verify" >&2
+        exit 1
+    fi
+done
+if [ -n "$(git status --porcelain --untracked-files=no)" ] \
+    || [ -n "$(git ls-files --others --exclude-standard -- '*.rs' '*Cargo.toml' '*Cargo.lock' '*.json')" ]; then
+    echo "pre-push: the working tree is not HEAD: commit or set aside its changes, or --no-verify" >&2
+    exit 1
+fi
 just ci

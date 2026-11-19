@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "The VOS node host: storage, the leader loops and its binary API."
 
+[package.metadata.vos]
+test-features = { faults = ["faults"], disclosing = ["debug-internals"], dump = ["store-dump"] }
+
 [features]
 # Faults a test injects into a running node (`vos_node::faults`): never
 # in a production build.

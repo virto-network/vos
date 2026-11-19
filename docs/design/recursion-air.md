@@ -59,8 +59,8 @@ verifier, and the gates its build passed.
    40 queries and PoW 24) needs 57,655 Poseidon2, 101,638 QM31 and 46,000
    DEEP rows before the leaf's own work [measured: the topology built; the
    model 59,242 / 102,049 / 46,080]; on the current segment format, whose
-   window shape holds no DIVREM, 55,451 / 99,412 / 43,960 [measured,
-   2026-11-02]: the padded shape 2^16 / 2^17 / 2^16, `p2` 15% spare,
+   window shape holds no DIVREM, 55,455 / 99,485 / 44,040 [measured,
+   2026-11-18]: the padded shape 2^16 / 2^17 / 2^16, `p2` 15% spare,
    **33.2M cells, 0.14× the segment's own 230.4M** [model], 0.6–1.4 GiB
    and 1.2–2.6 s [projected].
 5. **Per verified column and query it spends 56 cells, StarkWare's circuit 824**
@@ -68,14 +68,14 @@ verifier, and the gates its build passed.
    about an eighth of a DEEP row a sample.
 6. **The fold converges at once.** Verifying two children of the padded shape
    needs 30,619 / 41,480 / 3,588 rows, 47% / 32% / 5% of the shape [model];
-   built, **32,167 / 42,896 / 4,048** finalized, 49.1% / 32.7% / 6.2%
+   built, **32,167 / 42,902 / 4,048** finalized, 49.1% / 32.7% / 6.2%
    [measured, §6]. The leaf sets the shape; a fold alone
    would settle at 2^15 / 2^16 / 2^12.
 7. **The final wrap** verifies the root fold in 2^14 / 2^15 / 2^11 rows
    (tallest 2^15 ≤ 2^17) [model]: 2.2–4.9 GiB at blowup 64 [projected], about
    85M JAM gas with Blake2b-256 in software, 64M through `0x400`, about
    122 KB unmasked [model]; masked as built (format 39, a fixed layout,
-   16 queries), a verify of 60.5M gas [measured].
+   16 queries), a verify of 61.2M gas [measured].
 8. **Every node carries the fold's circuit-hash word** (§6): a fold requires
    each child to carry its own word, and the wrap pins the root's, so every
    fold in the tree is the true fold circuit and every other node a leaf of
@@ -463,6 +463,14 @@ harmless.
   exponents in step) and one fused row per other sample: 1,091 rows and 739
   samples a query for the kernel [model]. Each point then costs 6 rows a query
   (its line, its inverse, its numerator, the sum).
+- **A degenerate point is refused.** Stwo draws the line through a point and
+  its conjugate, which does not exist when `Im(z.y) = 0`, and its verifier
+  refuses such a point (`complex_conjugate_line_coeffs`); there the quotient's
+  term is a constant and frees every sample at that point. The circuit
+  constrains `c = conj(z.y) − z.y` invertible at every point of the plan, the
+  out-of-domain point, each mask offset and each periodicity point (one QM31
+  inverse row a point, once), so such a point has no witness
+  (`recair/tests/gates/degenerate_point.rs`).
 
 ### 4.7 Cost per verified column and per query
 
@@ -496,8 +504,8 @@ refuses it with. What the build found against the model:
   the leaf's own work: `p2` 12.0% under 2^16. The `qm31` count holds the
   nonces' 16-bit limb checks, 100 rows each, which the model leaves out.
   On the current segment format, whose window shape multiplies its
-  logical right shifts and so holds no DIVREM (7,600 columns): 55,451 /
-  99,412 / 43,960 [measured, 2026-11-02], `p2` 15% under 2^16.
+  logical right shifts and so holds no DIVREM (7,600 columns): 55,455 /
+  99,485 / 44,040 [measured, 2026-11-18], `p2` 15% under 2^16.
 - **The logup check is the native one:** the claimed sums add to zero and
   each boundary chip's is its public term, about 650 rows.
 - **The header is checked word by word** against the circuit's constants
@@ -513,8 +521,9 @@ refuses it with. What the build found against the model:
 - **The kernel leaves** (`vos-pvm-recair`'s `leaf`): the window
   kernel's real segments verified in their classes' leaves, which prove and
   verify. The leaf's own work is 45 `p2` rows (the two state digests, 19
-  permutations each, and the output's 7) and 535 `qm31` (the flags 85, the
-  io-hash's 32 range-checked bytes and 16 limbs 448, the outputs 2), as
+  permutations each, and the output's 7) and 691 `qm31` (the flags 85, the
+  io-hash's 32 range-checked bytes and 16 limbs 448, the entry timestamp's
+  and the exit pc's 12 range-checked bytes 156, the outputs 2), as
   §4.1's model counts; finalizing adds 54 `qm31` rows of constants. The
   class-1 leaf: **57,700 / 102,227 / 46,000** finalized [measured], `p2`
   12.0% under 2^16, proved in 1.5 s at 942 MiB of heap, 0.22× its
@@ -570,8 +579,8 @@ Every leaf has the recursion AIR's 458 columns; what varies is the rows.
 - **Headroom:** at the segment format's 40 queries a kernel-like shape
   fits up to about 9,033 columns [model, the Appendix] (about 8,100 at 44
   queries, 9,300 at 39); Poseidon2 rows bind first. The window kernel
-  leaf's `p2` is 55,451 of 2^16 before the leaf's own work on the current
-  segment format, 15% spare [measured, 2026-11-01] (57,655, 12.0%, over the
+  leaf's `p2` is 55,455 of 2^16 before the leaf's own work on the current
+  segment format, 15% spare [measured, 2026-11-18] (57,655, 12.0%, over the
   8,009-column shape); at 44 queries over the 8,024-column shape it was
   about 64.8k, about 1% spare [model]. Without the shape per kernel, the 32-chip full shape (13,037
   columns) would have doubled every node; the hardened full shape without the
@@ -651,14 +660,14 @@ multiverifier structure (`UP/circuit_multiverifier/src/verify.rs:52-90`):
   **2^19, not 2^20**: the largest component, `qm31` at 2^17, bounds the
   composition at 2^18, split once and blown up by 4. So 17 FRI layers,
   not 18, and 486 sampled values (514 DEEP samples with the periodicity
-  ones) at **3 points**: 16,065 / 21,394 / 2,024 rows a child, against
+  ones) at **3 points**: 16,065 / 21,397 / 2,024 rows a child, against
   the model's 15,291 / 20,686 / 1,794.
 - **The fold's own work** (A.3's re-hash of each preimage, the circuit
   hash from the child's preprocessed root, the one-hot choice among the
   program's four leaf-circuit hashes and W, the program id from its
   44-word preimage, adjacency, continuity, the output): 37 `p2` and 74
   `qm31` rows, against the model's 37 and 110.
-- **The fold:** **32,167 / 42,896 / 4,048** finalized, 49.1% / 32.7% /
+- **The fold:** **32,167 / 42,902 / 4,048** finalized, 49.1% / 32.7% /
   6.2% of the padded shape; proved in 1.5 s at 942 MiB of heap, as a leaf,
   over the window kernel's leaves and over two folds. The fixed point is
   reached at once: the fold of two children of the padded shape fits the
@@ -700,8 +709,8 @@ and fold layout of §1.1 is unchanged.
 | cells, extended cells | 7.5M, 481M | model |
 | memory, time | 2.2–4.9 GiB, 4.4–9.5 s unmasked [projected]; masked (format 39) as built: a 3.6 GiB heap [measured] | projected, measured |
 | JAM gas, unmasked | 81.1M with the model's Blake2s; **85.2M Blake2b-256 in software (×1.05); 64.1M through `0x400` (×0.79)** | model |
-| JAM gas, masked | **60.5M** the verify as built at 16 queries [measured, 2026-11-18]; 79.3M at 24 queries, the decode 1.50M of it [measured, 2026-10] | measured |
-| proof | about 122 KB unmasked [model]; masked as built, `wrap.proof` is 103,236 bytes (the committed fixture) | model, measured |
+| JAM gas, masked | **61.2M** the verify as built at 16 queries [measured, 2026-11-18]; 79.3M at 24 queries, the decode 1.50M of it [measured, 2026-10] | measured |
+| proof | about 122 KB unmasked [model]; masked as built, `wrap.proof` is 103,748 bytes (the committed fixture) | model, measured |
 
 - The gas uses a fit, within 5.8%, measured on a proxy verifier
   (`gas ≈ −4.2M + 59.3k·C + 2,171·q·C + 17,183·P + 9,376·F`) at 458 columns,
@@ -712,7 +721,7 @@ and fold layout of §1.1 is unchanged.
   verification is a fold child's (`fold::verify_node`), plus the program id
   from its 44-word preimage, the one-hot choice among the program's leaf
   circuits and `H_fold` (a constant), `W = H_fold`, the three lanes of the
-  run, and the 24 public words a lane each: **16,083 / 21,489 / 2,024**
+  run, and the 24 public words a lane each: **16,083 / 21,492 / 2,024**
   rows finalized, **2^14 / 2^15 / 2^11** (the model's), `p2` 98.2% full.
   A run of one segment has no fold: its leaf is the root, and the circuit
   set admits it. Proved in **5.45 s at a 2.5 GiB heap** (the window
@@ -760,8 +769,8 @@ by the format: the trees' widths (57 / 381 / 48 / 20) and the FRI round
 list (`[3, 3, 3, 2]`). `R` has 8 columns, so it needs no rank check. A
 venue links it (the JAM statements service's program, 391,784 bytes as a
 PVM program [measured, 2026-10-24]); the
-`valid` fixture's verify takes 60.5M gas on the JAM-only host and a
-statement judged 62.6M (`proving.md` §3.5).
+`valid` fixture's verify takes 61.2M gas on the JAM-only host and a
+statement judged 62.8M (`proving.md` §3.5).
 
 **The statement over it:** `vos-statement`
 (`pvm/proof/statement`) depends on it, not it on the statement: the
@@ -824,9 +833,9 @@ its gate [measured].
 | 1 | **The gate VM:** `vos-pvm-recair` (`pvm/proof/recair`) with `Context` and its static checks (§1.1), the three components and their trace generation, padding rows filled, the `Gate` relation with signed multiplicities, constants, padding, preprocessing, the circuit hash; the bodies of §1 in `vos-pvm-recair-air` | random circuits proved and verified natively on the Poseidon2 channel; yields exactly once; tamper per component and mode; the permutation against `poseidon2::permute` | a 10k-gate circuit proves and verifies; degree ≤ 3 audited; a three-component multi-fraction logup at three log sizes proves (§11, R5); `vos-pvm-final-verifier`'s skeleton builds no_std (stable for x86 and wasm32, the pinned nightly for JAM) | passed |
 | 2 | **The gate compiler** | §3's four tests on all 25 chips | 25/25 equivalent; counts within 1% of the count re-baselined on the hardened AIR | passed: the count exactly (§3) |
 | 3 | **The in-AIR verifier's pieces:** channel, lifted Merkle with `expand_decommitment`, FRI (fold step 1), DEEP with `h8`, OODS, logup sums | each against the native code on recorded data; transcript equality with `Poseidon2M31Channel`'s recorder | every piece accepts real data and refuses each tamper | passed (§4.8) |
-| 4 | **COMPARE's leaf**, and **the window kernel leaf's topology** (`Context<NoValue>`, no proof) | a COMPARE proof verified in circuit, the circuit proved and verified natively; tampered OODS sample, queried value, sibling, FRI value and nonce refused; the topology's rows pinned per term of the model (the Appendix), not only in total | accepted; rows within 15% of 8,644 / 10,352 / 280 (40 queries); ≤ 1 s; the topology within 2^16 / 2^17 / 2^16 | 7,732 / 10,279 / 240, 0.21–0.24 s; the topology 57,655 / 101,638 / 46,000 (55,451 / 99,412 / 43,960 on the current segment format) |
+| 4 | **COMPARE's leaf**, and **the window kernel leaf's topology** (`Context<NoValue>`, no proof) | a COMPARE proof verified in circuit, the circuit proved and verified natively; tampered OODS sample, queried value, sibling, FRI value and nonce refused; the topology's rows pinned per term of the model (the Appendix), not only in total | accepted; rows within 15% of 8,644 / 10,352 / 280 (40 queries); ≤ 1 s; the topology within 2^16 / 2^17 / 2^16 | 7,732 / 10,279 / 240, 0.21–0.24 s; the topology 57,655 / 101,638 / 46,000 (55,455 / 99,485 / 44,040 on the current segment format) |
 | 5 | **The window kernel's leaf**, and the solvency predicate's: boundary states mixed as bytes, entry and exit digests, the flags, the A.3 output | a real segment on the Poseidon2 channel; in-circuit and native transcripts equal; a tampered boundary byte refused | rows within the padded shape; ≤ 4 GiB; ≤ 1× the segment's proving (target 0.13–0.5×) | 57,700 / 102,227 / 46,000, 1.5 s at 942 MiB, 0.22× its segment (§4.8) |
-| 6 | **The fold and the fixed point** | a fold of two leaves, a fold of two folds within the constant shape; a tree over four segments; refusals: wrong program, gap, broken continuity, prefix, mid-start, wrong child circuit, a child carrying a foreign word, a leaf carrying a wrong program id | the fold verifies two folds in the shape; memory and time of a leaf | 32,167 / 42,896 / 4,048, 1.5 s, 942 MiB |
+| 6 | **The fold and the fixed point** | a fold of two leaves, a fold of two folds within the constant shape; a tree over four segments; refusals: wrong program, gap, broken continuity, prefix, mid-start, wrong child circuit, a child carrying a foreign word, a leaf carrying a wrong program id | the fold verifies two folds in the shape; memory and time of a leaf | 32,167 / 42,902 / 4,048, 1.5 s, 942 MiB |
 | 7 | **The final wrap:** Blake2b-256 Merkle and channel in our Stwo fork, fold step 3 admitted, the wrap circuit, `vos-pvm-final-verifier` | the fork's review; tamper tests on fold step 3 and Blake2b; Wasm and JAM-only host verification | ≤ 150M gas unmasked on the JAM-only host; ≤ 2^17 rows; ≤ 8 GiB unmasked | 96.4M gas, 2^15 tallest, 2.5 GiB heap, 5.45 s |
 | 8 | **End to end:** `vos-statement`, the window statement and the solvency predicate, golden fixtures (A.6) | every venue judges the fixtures alike | both statements verified natively, in Wasm and on JAM | eleven fixtures judged alike natively, in Wasm (PVF and client) and on the JAM-only host; both statements accepted at all three |
 
@@ -844,7 +853,7 @@ needs the SIMD Poseidon2 hasher for speed, not for correctness.
 | R4 | **The in-AIR verifier departs from the native one** (periodicity points, lifted leaf order, transcript order, PoW) | piecewise differential tests on recorded transcripts; tamper tests; the external audit (`proving.md` §4) |
 | R5 | **The archive's failure with two multi-fraction components** (`AR:zkpvm/tests/merkle_decommit.rs:772-777`, never root-caused) | the three-component test of §10's step 1; vos-core's 22-chip Poseidon2 segment proofs prove [measured, the AIR audit], so it is likely the archive's own |
 | R6 | **A wider kernel outgrows the shape** (about 9,033 columns at the segment format's 40 queries, 8,100 at 44) | each kernel's leaf rows computed at derive time from its shape; a kernel over the limit is refused, or the format changes: fewer queries with more PoW, FRI fold step 3 in inner proofs, or `p2` at 2^17 (+70% cells, tallest unchanged) |
-| R7 | **The model misses rows** (query points, twiddles, DEEP per point are estimates) | §10's step 4 counts the kernel leaf's topology, term by term, and step 5 proves it; at 44 queries over the hardened shape the leaf's `p2` was about 64.8k of 2^16, about 1% spare [model], so the inner parameters were recounted and segments take 40 queries with PoW 24; the topology built at 57,655 `p2` rows, 12.0% spare (55,451, 15%, on the current segment format), each term pinned beside the model [measured] |
+| R7 | **The model misses rows** (query points, twiddles, DEEP per point are estimates) | §10's step 4 counts the kernel leaf's topology, term by term, and step 5 proves it; at 44 queries over the hardened shape the leaf's `p2` was about 64.8k of 2^16, about 1% spare [model], so the inner parameters were recounted and segments take 40 queries with PoW 24; the topology built at 57,655 `p2` rows, 12.0% spare (55,455, 15%, on the current segment format), each term pinned beside the model [measured] |
 | R8 | **Time and memory** come from other provers' rates | §10's steps 4–6 measure |
 | R9 | **Fold step 3 or the Blake2b channel is unsound** | the fork's review and tamper tests before the format admits them (§10's step 7) |
 | R10 | **The wrap's gas**: the fit is on a one-component proxy | §10's step 7 verifies the real wrap on the JAM-only host |
@@ -960,8 +969,8 @@ The appendix's numbers are pinned by
 `pvm/proof/recair/tests/recursion/leaves.rs`
 (`the_window_kernels_leaf_rows_per_term`): it builds the window kernel's
 leaf topology, checks each term's rows against the model's, and asserts
-the class-1 totals 59,242 / 102,049 / 46,080 (the built rows 55,451 /
-99,412 / 43,960 on the current segment format):
+the class-1 totals 59,242 / 102,049 / 46,080 (the built rows 55,455 /
+99,485 / 44,040 on the current segment format):
 
 ```sh
 cargo test --release -p vos-pvm-recair --test recursion leaves

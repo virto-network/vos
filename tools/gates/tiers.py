@@ -28,7 +28,10 @@ justfile's variables and this tool's own flags expanded. It fails when
 - a workspace outside the root's is named by no command a tier reaches
   (`--manifest-path`, `cd`, `_at-fixed-path`);
 - the agent's guest workspace (`agent/programs`) and `programs.toml` name
-  different programs.
+  different programs;
+- the justfile does not unexport `VOS_PINS`, the pinning tests' write
+  mode, or a recipe a tier reaches sets it, so that a gate holds its pins
+  and never writes them.
 
 `changed` runs `cargo test` for the workspace packages the diff against
 `base` touches and those that depend on them, the fast targets alone
@@ -55,6 +58,9 @@ UNTIERED = {
     # A PolkaJam testnet: `just e2e-chain`.
     ("vos-node", "chain"),
 }
+
+# The pinning tests' write mode, which only the re-pin recipes set.
+PIN_MODE = "VOS_PINS"
 
 # The packages no light or step tier runs whole: their suites prove, and
 # belong to `ci` and above (`test-bench`, `test-proof`, `test-carriers`).
@@ -332,6 +338,15 @@ def check():
     for directory in sorted(outside):
         if not re.search(rf"(^|[\s/'\"\[(]){re.escape(directory)}([/\s'\"\]);]|$)", joined, re.M):
             failures.append(f"the workspace at {directory} is built or tested by no tier")
+
+    # The pins' write mode: never inherited, never set within a tier.
+    if PIN_MODE not in dump.get("unexports", []):
+        failures.append(f"the justfile does not unexport {PIN_MODE}: an inherited write mode "
+                        f"would turn a gate's pin checks into rewrites")
+    for tier in TIERS:
+        for line in lines[tier]:
+            if re.search(rf"\b{PIN_MODE}\b", line):
+                failures.append(f"`{tier}` reaches a line setting {PIN_MODE}: {line.strip()}")
 
     failures.extend(programs())
     for failure in failures:
