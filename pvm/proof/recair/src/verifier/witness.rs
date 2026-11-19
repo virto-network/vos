@@ -75,6 +75,8 @@ pub enum WitnessError {
     Expand(ExpandError),
     /// A recomputed root is not the proof's.
     Root(&'static str),
+    /// The proof does not verify natively: there are no values to lay out.
+    Unverified,
 }
 
 impl From<ShapeMismatch> for WitnessError {
@@ -126,11 +128,16 @@ impl<V: Value> SegmentValues<V> {
 }
 
 impl SegmentValues<SecureField> {
-    /// The values of `proof`, a valid proof of `shape`.
+    /// The values of `proof`, a valid proof of `shape`: the builder lays
+    /// out a valid proof's values, which a test may then tamper.
+    ///
+    /// # Errors
+    /// [`WitnessError::Unverified`] when the proof does not verify natively
+    /// against `shape`'s preprocessed root; a shape mismatch first.
     ///
     /// # Panics
-    /// When the proof does not verify natively: the builder lays out a valid
-    /// proof's values, which a test may then tamper.
+    /// On an invalid proof of a chip-isolated shape (no boundary terms),
+    /// which no native verifier takes without its trace: a test's alone.
     pub fn from_proof(shape: &SegmentShape, proof: &Proof) -> Result<Self, WitnessError> {
         let (stark, data) = recursion_data(shape, proof)?;
         let drawn = drawn_positions(&shape.stark, &data);
@@ -141,6 +148,9 @@ impl SegmentValues<SecureField> {
     /// each a position the proof opens: [`SegmentValues::from_proof`]'s
     /// layout at draws the proof did not make, such as a position drawn
     /// twice, which some 0.15% of proofs draw.
+    ///
+    /// # Errors
+    /// As [`SegmentValues::from_proof`].
     ///
     /// # Panics
     /// As [`SegmentValues::from_proof`], and when a draw is a position the
@@ -289,6 +299,11 @@ fn recursion_data<'a>(
     let StarkProofAny::Poseidon2M31(stark) = &proof.stark_proof else {
         return Err(ShapeMismatch::Structure("not a Poseidon2-M31 proof").into());
     };
+    if shape.boundary.is_some() {
+        let root = vos_pvm_proof::pcs::Commitment::Poseidon2M31(shape.preprocessed_root);
+        vos_pvm_proof::standalone::verify_standalone(proof.clone(), root)
+            .map_err(|_| WitnessError::Unverified)?;
+    }
     let data = vos_pvm_proof::extract_recursion_data(proof);
     if data.lifting_log_size != shape.stark.layout.lifting_log_size
         || stark.sampled_values.len() != 4

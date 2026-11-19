@@ -226,10 +226,10 @@ mod tests {
         assert_eq!(fri_rounds(4, &config(0, 0)), None);
     }
 
-    /// The masked wrap's pins, as numbers: format 39, blowup 32, 24
+    /// The masked wrap's pins, as numbers: format 39, blowup 32, 16
     /// queries, PoW 26, fold step 3, a 2^6 last layer, affine batching, 8
-    /// bits of interaction PoW, 8 salts, an `R` of 8, `h = 256`, its bytes a
-    /// fixed layout. A change to the registry entry that moves the venue's
+    /// bits of interaction PoW, 8 salts, an `R` of 8, an `h` of at most 256,
+    /// its bytes a fixed layout. A change to the registry entry that moves the venue's
     /// verifier fails here.
     #[test]
     fn the_masked_wrap_is_format_39s() {

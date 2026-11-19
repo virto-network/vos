@@ -19,8 +19,7 @@
 //!
 //! **Reachability follows relocations,** so an ELF without them, or with a
 //! relocation type the linker does not follow, is refused, as is one whose
-//! code lies in more than one section. The heuristic scan for code-like
-//! values in data may add targets, never prune one. A code pointer whose
+//! code lies in more than one section. A code pointer whose
 //! target was pruned becomes an address no jump table reaches, and a branch
 //! to pruned code reaches a trap: a missed target can only trap, never run
 //! something else. A data object reached is kept whole, from the symbol at
@@ -66,9 +65,13 @@
 //! **Bounded work:** every lookup is logarithmic, and a kernel is built
 //! from what its entry reaches alone, so a derivation's work grows with the
 //! ELF once and with each kernel's reach and size, whatever the ELF claims:
-//! the sections it copies hold at most the file's bytes, the walk reads
-//! each code byte once however function ranges overlap, and the programs
-//! it keeps hold at most [`MAX_DERIVED`] bytes.
+//! the sections it copies hold at most the file's bytes, the code it
+//! translates at most [`MAX_CODE`], the walk reads each code byte once
+//! however function ranges overlap, the data its kernels copy is at most
+//! [`MAX_KERNEL_DATA`] bytes, the programs it keeps hold at most
+//! [`MAX_DERIVED`] bytes, and a leaf is sized once for each class however
+//! many kernels share it: a sizing takes a few milliseconds, so kernels of
+//! distinct shapes, each with up to four classes, take seconds at most.
 //!
 //! **Bit-reproducible:** the output's order comes from sorted sections,
 //! symbols and addresses, never from a map's iteration, so the same ELF and
@@ -80,8 +83,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use crate::TranspileError;
 use crate::linker::{
     Link, LinkedElf, STT_FUNC, Z_Z, direct_targets, in_ranges, merge_ranges, name_at, name_is,
-    parse_linked_elf, range_at, raw_code_pointers, spi_blob, transpile_with,
-    without_temporary_names, zone_round,
+    parse_linked_elf, range_at, spi_blob, transpile_with, without_temporary_names, zone_round,
 };
 use crate::riscv::rv::{add, addi, auipc, b_type, jal, jalr, ld, lui, sub};
 use crate::riscv::{self, decode_b_imm, decode_j_imm, op};
@@ -142,6 +144,17 @@ pub use vos_abi::abi::cap::MAX_ELF;
 /// The most bytes a derivation's programs hold together: its actor's, its
 /// kernels' and their references'.
 pub const MAX_DERIVED: usize = 4 * MAX_ELF;
+
+/// The most bytes of code a derivation translates, 2^21 instructions: the
+/// translation keeps a few maps an instruction, so its memory and time
+/// grow with the code (about 25 bytes of memory a byte of code).
+pub const MAX_CODE: usize = 8 << 20;
+
+/// The most bytes of data a derivation's kernels copy together: each
+/// kernel copies the data it reaches, at least the actor's read-only data,
+/// whose zeros its blob may leave out, so an object reached by every
+/// kernel is copied once for each.
+pub const MAX_KERNEL_DATA: u64 = MAX_DERIVED as u64;
 
 /// The most attestable methods an actor may have: a schema's methods.
 const MAX_ATTESTABLES: usize = 1024;
@@ -220,6 +233,10 @@ pub enum DeriveError {
     Relocation(u32),
     #[error("the ELF's code lies in {0} sections, not one")]
     CodeSections(usize),
+    #[error("the ELF's code holds {0} bytes, past {MAX_CODE}")]
+    Code(usize),
+    #[error("the derivation's kernels copy {0} bytes of data, past {MAX_KERNEL_DATA}")]
+    KernelData(u64),
     #[error("the ELF has no `.vos_schema` section")]
     NoSchema,
     #[error("the attestable methods' table: {0}")]
@@ -287,6 +304,14 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
     if linked.code_sections.len() > 1 {
         return Err(DeriveError::CodeSections(linked.code_sections.len()));
     }
+    let code: usize = linked
+        .code_sections
+        .iter()
+        .map(|(_, _, code)| code.len())
+        .sum();
+    if code > MAX_CODE {
+        return Err(DeriveError::Code(code));
+    }
     let schema = linked.schema.take().ok_or(DeriveError::NoSchema)?;
     let heap = invocation_heap(&mut linked)?;
     let actor = spi_blob(transpile_with(&linked, Link::Whole)?)?;
@@ -310,17 +335,26 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
         }
         Ok(program)
     };
+    // And the data the kernels copy, counted before each copies it.
+    let mut copied = 0;
     let kernels: Vec<(u32, Vec<u8>)> = entries
         .into_iter()
-        .map(|entry| Ok((entry.method, hold(kernel(&graph, &entry)?)?)))
+        .map(|entry| Ok((entry.method, hold(kernel(&graph, &entry, &mut copied)?)?)))
         .collect::<Result<_, DeriveError>>()?;
     let references = reference_entries
         .into_iter()
         .map(|entry| {
             let headroom = entry.reference.expect("a reference entry");
-            Ok((entry.method, hold(kernel(&graph, &entry)?)?, headroom))
+            Ok((
+                entry.method,
+                hold(kernel(&graph, &entry, &mut copied)?)?,
+                headroom,
+            ))
         })
         .collect::<Result<_, DeriveError>>()?;
+    // A leaf's rows follow from its class alone: kernels of one shape are
+    // sized once.
+    let mut leaves = crate::leaf::LeafRows::default();
     let shapes = kernels
         .iter()
         .zip(inputs)
@@ -332,7 +366,7 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
                 return Ok(shape);
             }
             step_fits(*method, input, &shape)?;
-            match crate::leaf::oversized_leaves(&shape).first() {
+            match leaves.oversized(&shape).first() {
                 Some(&(class, rows)) => Err(DeriveError::Leaf {
                     method: *method,
                     class,
@@ -689,7 +723,7 @@ mod tests {
         const ENTRY: u64 = 0x10_0000;
         let derived = |id| {
             let elf = LinkedElf::text(ENTRY, calling(id));
-            kernel(&Graph::new(&elf), &entry(ENTRY, false))
+            kernel(&Graph::new(&elf), &entry(ENTRY, false), &mut 0)
         };
         for id in 110..=114 {
             match derived(id) {
@@ -718,7 +752,7 @@ mod tests {
         const ENTRY: u64 = 0x10_0000;
         let derived = |id: u64| {
             let elf = LinkedElf::text(ENTRY, calling(id as i32));
-            kernel(&Graph::new(&elf), &entry(ENTRY, true))
+            kernel(&Graph::new(&elf), &entry(ENTRY, true), &mut 0)
         };
         for admitted in [
             vos_pvm::precompile::POSEIDON2,

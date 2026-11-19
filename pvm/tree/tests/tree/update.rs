@@ -25,7 +25,8 @@ proptest! {
             let keys: Vec<Vec<u8>> = writes.iter().map(|(key, _)| key.clone()).collect();
             let before = store.inner.clone();
             let proof = BatchProof::generate(&before, &keys).unwrap();
-            let witness = proof.verify(&H, &scratch(&model), &claims(&model, &keys));
+            let old_root = scratch(&model);
+            let witness = proof.verify(&H, &old_root, &claims(&model, &keys));
 
             let root = store.update(&writes);
             apply(&mut model, &writes);
@@ -33,7 +34,7 @@ proptest! {
             prop_assert_eq!(stored_root(&H, &store.inner).unwrap(), root);
             check(&store.inner, &model);
 
-            prop_assert_eq!(proof.update(&H, &commitments(&writes)), Ok(root));
+            prop_assert_eq!(proof.update(&H, &old_root, &commitments(&writes)), Ok(root));
             prop_assert_eq!(witness.unwrap().update(&H, &commitments(&writes)), Ok(root));
 
             for size in [1, 3] {
@@ -83,11 +84,17 @@ fn the_empty_tree() {
             .verify(&H, &empty_root(&H), &[(key.clone(), None)])
             .is_ok()
     );
-    assert_eq!(proof.update(&H, &commitments(&put)), Ok(root));
+    assert_eq!(
+        proof.update(&H, &empty_root(&H), &commitments(&put)),
+        Ok(root)
+    );
     let range = RangeProof::generate(&store, b"", None).unwrap();
     let rows: [(Vec<u8>, _); 0] = [];
     assert!(range.verify(&H, &empty_root(&H), b"", None, &rows).is_ok());
-    assert_eq!(range.update(&H, &commitments(&put)), Ok(root));
+    assert_eq!(
+        range.update(&H, &empty_root(&H), &commitments(&put)),
+        Ok(root)
+    );
 }
 
 /// A batch of 10,000 keys as one call, then changed and half deleted.
@@ -187,5 +194,33 @@ fn the_store_path_refuses_rather_than_panics() {
     assert_eq!(
         RangeProof::generate(&broken, b"", None).err(),
         Some(Error::Missing)
+    );
+}
+
+/// A proof is updated only from the root it proves: against any other the
+/// update is refused, never computed from what the proof alone claims.
+#[test]
+fn a_proof_is_updated_only_from_its_root() {
+    let mut model = Model::new();
+    for raw in [b"alpha".as_slice(), b"beta", b"gamma"] {
+        let key = row_key(false, raw);
+        model.insert(key.clone(), leaf(&key, 0, raw));
+    }
+    let store = store_of(&model);
+    let root = scratch(&model);
+    let other = [7; 32];
+    let key = row_key(false, b"beta");
+    let put = [(key.clone(), Some(leaf(&key, 1, b"new")))];
+    let proof = BatchProof::generate(&store, std::slice::from_ref(&key)).unwrap();
+    assert!(proof.update(&H, &root, &commitments(&put)).is_ok());
+    assert_eq!(
+        proof.update(&H, &other, &commitments(&put)),
+        Err(Error::Root)
+    );
+    let range = RangeProof::generate(&store, b"", None).unwrap();
+    assert!(range.update(&H, &root, &commitments(&put)).is_ok());
+    assert_eq!(
+        range.update(&H, &other, &commitments(&put)),
+        Err(Error::Root)
     );
 }

@@ -1,4 +1,4 @@
-//! Instruction argument decoding (Appendix A.5 of the Gray Paper v0.7.2).
+//! Instruction argument decoding (Appendix A.5 of the Gray Paper v0.8.0).
 //!
 //! Handles register extraction, immediate decoding, and sign extension.
 

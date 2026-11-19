@@ -205,6 +205,7 @@ fn the_bound_holds_the_built_leaves() {
             [
                 "leaf: flags",
                 "leaf: io-hash",
+                "leaf: ts in, pc out",
                 "leaf: digests",
                 "leaf: output",
             ]

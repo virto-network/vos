@@ -9,6 +9,7 @@
 //! - `Option<T>`: discriminator byte (0=None, 1=Some) + payload
 //! - Enums: u8 discriminator + variant payload
 
+#![forbid(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
@@ -64,6 +65,13 @@ pub trait Decode: Sized {
     /// is at most four times `data`'s own size (honest items are rarely
     /// smaller encoded than a quarter of their size in memory), and the
     /// rest grows as items decode.
+    ///
+    /// A sequence holds at most an item for each byte of its input (a
+    /// longer count is refused), each `size_of::<Self>()` bytes, so items
+    /// whose encoding is shorter than their size grow by that ratio: an
+    /// `Option<[u8; 64]>`, one byte when absent, 65 times, nested sequences
+    /// each by their own. A kernel decoding bytes it was given sizes its
+    /// heap, or caps its input, by the types it decodes.
     fn decode_items(data: &[u8], count: usize) -> Result<(Vec<Self>, usize), DecodeError> {
         let reserve = data.len().saturating_mul(4) / size_of::<Self>().max(1);
         let mut items = Vec::with_capacity(count.min(reserve));

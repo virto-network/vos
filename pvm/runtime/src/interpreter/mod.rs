@@ -148,6 +148,12 @@ pub struct InstructionObservation<'a> {
 impl Interpreter {
     /// Create a new PVM from parsed program components, with flat memory
     /// over `flat_mem` (zero-padded to whole pages).
+    ///
+    /// The code is taken as given, unvalidated: on code `deblob` refuses
+    /// (`crate::spi::deblob`: an invalid opcode, a final instruction that
+    /// is no terminator, a bad mask) no rule fixes the gas, and the two
+    /// loops and the recompiler may charge it differently. Every loader
+    /// validates first; a caller of this does so itself.
     pub fn new(
         code: Vec<u8>,
         bitmask: Vec<u8>,
@@ -169,7 +175,8 @@ impl Interpreter {
     /// Create a new PVM with an explicit memory representation
     /// ([`Memory::flat`] or [`Memory::sparse`]). Memory starts with
     /// RW-everywhere default permissions; the embedder installs the real
-    /// per-page map via [`Self::set_page_perms`].
+    /// per-page map via [`Self::set_page_perms`]. The code is unvalidated,
+    /// as [`Self::new`]'s.
     pub fn with_memory(
         code: Vec<u8>,
         bitmask: Vec<u8>,
@@ -226,6 +233,7 @@ impl Interpreter {
     /// Pre-decode code into an `InterpreterProgram`.
     /// This performs the expensive one-time work (gas block computation, instruction
     /// pre-decoding) without allocating runtime state (registers, memory, gas).
+    /// The code is unvalidated, as [`Self::new`]'s.
     pub fn predecode(
         code: &[u8],
         bitmask: &[u8],

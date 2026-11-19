@@ -471,9 +471,12 @@ pub const EMPTY: [Words; DEPTH + 1] = [
     ],
 ];
 
-/// The root a path gives `leaf` at `slot`: its siblings from level 0 up.
-pub fn root_of(leaf: &Words, slot: u32, siblings: &[Words; DEPTH]) -> Words {
-    let mut node = *leaf;
+/// The root a path gives `member` at `slot`, its leaf `leaf(member)`: its
+/// siblings from level 0 up. A path is taken from a member, never from a
+/// leaf or node given: the compression has no feed-forward, so the tree
+/// binds a path only over leaves its leaf function made.
+pub fn member_root(member: &Words, slot: u32, siblings: &[Words; DEPTH]) -> Words {
+    let mut node = leaf(member);
     for (level, sibling) in siblings.iter().enumerate() {
         node = if slot >> level & 1 == 0 {
             compress(&node, sibling)

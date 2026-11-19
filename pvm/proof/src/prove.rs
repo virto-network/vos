@@ -31,12 +31,14 @@ pub(crate) mod active;
 mod debug;
 mod preprocessed;
 pub(crate) use preprocessed::preprocessed_root;
+pub(crate) mod plan;
 mod profile;
 mod request;
 mod shaped;
 
 #[cfg(feature = "debug-internals")]
 pub use debug::debug_assert_constraints_explicit;
+pub use plan::{KernelPlan, PlannedSegment, SEGMENT_GAS, max_segments, plan_kernel};
 pub use profile::ProveProfile;
 pub(crate) use request::{ProveRequest, Sizes};
 pub use shaped::{KernelSegment, program_commitment_for_shape, prove_kernel, prove_shaped};
@@ -60,6 +62,17 @@ pub enum SegmentError {
     /// The shape names a chip outside the segment AIR, has a log size more
     /// or fewer than its chips, or lacks the class named.
     MalformedShape,
+    /// The program's code jumps or branches statically to the halt
+    /// address: the machine panics there, where a proof would end the run
+    /// as a halt.
+    Transfer,
+    /// The run is longer than [`MAX_RUN_STEPS`]: its ledgers' ordering
+    /// deltas would pass their bits. Refused before any trace.
+    RunLength,
+    /// The run takes more segments than its gas buys
+    /// ([`max_segments`]): refused before any proof, or once the cuts a
+    /// chip's rows force pass it.
+    Segments,
 }
 
 impl SegmentError {
@@ -92,28 +105,72 @@ impl core::fmt::Display for SegmentError {
                 overflow: false,
             } => write!(formatter, "chip {chip} is another size than its shape"),
             Self::MalformedShape => formatter.write_str("the shape is not one of the segment AIR"),
+            Self::Transfer => formatter.write_str("the code jumps statically to the halt address"),
+            Self::RunLength => {
+                formatter.write_str("the run is longer than a proof's ledgers order")
+            }
+            Self::Segments => formatter.write_str("the run takes more segments than its gas buys"),
         }
     }
 }
 
 impl std::error::Error for SegmentError {}
 
+/// The most steps a run proves, `2^27 − 1`. A ledger orders its rows by the
+/// key `2·ts + is_write`, each chain from its `ts = 0` write to its closing
+/// read at the run's last timestamp plus one, and range-checks each gap in
+/// 28 bits (`ORDER_DELTA_BITS`); timestamps are the run's, from 1. So a run
+/// of `n` steps has a gap up to `2(n + 1) − 1`, which fits 28 bits for `n`
+/// below `2^27`: an absolute bound on a run's length, whatever its segments.
+/// A longer run, or a segment ending past it, is refused
+/// ([`SegmentError::RunLength`]) before any trace.
+pub const MAX_RUN_STEPS: usize = (1 << 27) - 1;
+
+/// Whether `side_note`'s code holds no static transfer to the halt address
+/// ([`SegmentError::Transfer`]), which its pin cannot take.
+pub(crate) fn check_transfers(side_note: &SideNote) -> Result<(), SegmentError> {
+    if crate::chips::program_memory::jumps_to_halt(&side_note.code, &side_note.bitmask) {
+        return Err(SegmentError::Transfer);
+    }
+    Ok(())
+}
+
+/// Whether `side_note`'s last step is within [`MAX_RUN_STEPS`] of the run's
+/// start: its ledgers' closing reads order within their bits.
+pub(crate) fn check_run_length(side_note: &SideNote) -> Result<(), SegmentError> {
+    let closing = crate::chips::register_memory_closing::closing_ts_for(side_note);
+    if closing > MAX_RUN_STEPS as u64 + 1 {
+        return Err(SegmentError::RunLength);
+    }
+    Ok(())
+}
+
 /// Cap rayon's global thread pool at a sensible default for our
-/// workload, unless the user has explicitly set `RAYON_NUM_THREADS`
-/// or initialised their own pool, and give its workers
-/// 16 MiB of stack.  Idempotent — safe to call many
-/// times; only the first effective call wins (we use a `OnceLock`
-/// guard around `ThreadPoolBuilder::build_global`).
+/// workload, unless the user has explicitly set `RAYON_NUM_THREADS`, and
+/// give its workers 16 MiB of stack. Idempotent: only the first call
+/// builds it. When another user built the global pool first, its stacks
+/// are theirs (rayon's default 2 MiB, at which a release prover's worker
+/// overflows): the prover then proves on a pool of its own
+/// ([`on_prover_pool`]), and this reports it.
 ///
 /// Past about 10 threads, memory-bandwidth contention overtakes the
 /// parallel gains, so the cap is `min(logical_cpus, 10)`: phones (4-8
 /// cores) run uncapped.
 ///
-/// Returns the number of threads the pool ended up with.
+/// Returns the number of threads the prover's pool has.
 pub fn install_thread_pool() -> usize {
+    prover_pool().map_or_else(
+        rayon::current_num_threads,
+        rayon::ThreadPool::current_num_threads,
+    )
+}
+
+/// The prover's own pool, when the global one is not the prover's: `None`
+/// when [`install_thread_pool`]'s build of the global pool took.
+fn prover_pool() -> Option<&'static rayon::ThreadPool> {
     use std::sync::OnceLock;
-    static INSTALLED: OnceLock<usize> = OnceLock::new();
-    *INSTALLED.get_or_init(|| {
+    static OWN: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    OWN.get_or_init(|| {
         // Honour explicit RAYON_NUM_THREADS — user knows best: zero
         // threads is the builder's own reading of it.
         let threads = if std::env::var_os("RAYON_NUM_THREADS").is_some() {
@@ -124,14 +181,37 @@ pub fn install_thread_pool() -> usize {
                 .unwrap_or(1);
             logical.min(10)
         };
-        // build_global fails if a pool already exists; ignore that
-        // case (e.g., test harness, downstream lib that set its own).
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .stack_size(WORKER_STACK)
-            .build_global();
-        rayon::current_num_threads()
+        let builder = || {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .stack_size(WORKER_STACK)
+        };
+        match builder().build_global() {
+            Ok(()) => None,
+            Err(_) => Some(
+                builder()
+                    .thread_name(|index| format!("vos-prover-{index}"))
+                    .build()
+                    .expect("the prover's pool"),
+            ),
+        }
     })
+    .as_ref()
+}
+
+/// `work` on a pool whose workers have the prover's 16 MiB stacks: on the
+/// caller's own pool when it is on one (a caller that pools its threads
+/// sizes their stacks, as the light node's prover does), else on the
+/// global pool when it is the prover's ([`install_thread_pool`]), else on
+/// the prover's own. Every proving entry point runs its work so.
+pub fn on_prover_pool<R: Send>(work: impl FnOnce() -> R + Send) -> R {
+    if rayon::current_thread_index().is_some() {
+        return work();
+    }
+    match prover_pool() {
+        Some(pool) => pool.install(work),
+        None => work(),
+    }
 }
 
 /// A prover worker's stack: 16 MiB, as a worker blocked in a `join` runs
@@ -364,17 +444,25 @@ pub fn prove_chip_isolated_format(
 }
 
 /// The components' main traces: the producers in order, filling the side
-/// note's multiplicities, then the consumers in parallel.
+/// note's multiplicities, then the consumers in parallel. With `pinned`, each
+/// at exactly its size in `min_log_sizes`: the position and log size of the
+/// first producer of another size are returned as soon as it is traced,
+/// before any later chip's; a consumer's is the caller's to compare.
 pub(crate) fn generate_component_traces(
     side_note: &mut SideNote,
     components: &[&dyn crate::framework::MachineProverComponent],
     min_log_sizes: &[u32],
-) -> Vec<ComponentTrace> {
+    pinned: bool,
+) -> Result<Vec<ComponentTrace>, (usize, u32)> {
     let mut traces: Vec<Option<ComponentTrace>> = (0..components.len()).map(|_| None).collect();
     for (index, component) in components.iter().enumerate() {
         if component.is_producer() {
             let min_log_size = min_log_sizes.get(index).copied().unwrap_or(0);
-            traces[index] = Some(component.generate_component_trace_min(side_note, min_log_size));
+            let trace = component.generate_component_trace_min(side_note, min_log_size);
+            if pinned && trace.log_size() != min_log_size {
+                return Err((index, trace.log_size()));
+            }
+            traces[index] = Some(trace);
         }
     }
     {
@@ -400,10 +488,16 @@ pub(crate) fn generate_component_traces(
             traces[index] = Some(trace);
         }
     }
-    traces
+    Ok(traces
         .into_iter()
         .map(|trace| trace.expect("every component is classified as producer or consumer"))
-        .collect()
+        .collect())
+}
+
+/// Whether `side_note`'s steps fit a CPU of `log_size`, a row a step: what a
+/// pinned trace checks before any chip is traced.
+pub(crate) fn steps_fit(side_note: &SideNote, log_size: u32) -> bool {
+    crate::trace::utils::ceil_log2_at_least_lanes(side_note.num_steps()) <= log_size
 }
 
 /// The boundary states a proof ships, with the page-Merkle roots the
@@ -485,8 +579,10 @@ pub(crate) fn prove_with(
     request: ProveRequest<'_>,
 ) -> Result<(Proof, ProveProfile), SegmentError> {
     let format = request.target.format;
-    crate::with_stack!(format.channel, Stack => prove_on::<Stack>(side_note, request),
-        unbuilt => Err(SegmentError::FormatNotAdmitted(format.number)))
+    on_prover_pool(|| {
+        crate::with_stack!(format.channel, Stack => prove_on::<Stack>(side_note, request),
+            unbuilt => Err(SegmentError::FormatNotAdmitted(format.number)))
+    })
 }
 
 fn prove_on<MC: PcsStack>(
@@ -513,7 +609,26 @@ where
     prepare(side_note)?;
 
     let t = Instant::now();
-    let traces = generate_component_traces(side_note, components, sizes.floors());
+    let pinned = matches!(sizes, Sizes::Pinned(_));
+    let refusal = |position: usize, overflow: bool| SegmentError::Shape {
+        chip: crate::chips_of_mask(component_mask)
+            .nth(position)
+            .unwrap_or(position),
+        overflow,
+    };
+    // The CPU is the first chip of a mask holding it, a row a step.
+    if pinned
+        && component_mask & 1 << crate::chip_idx::CPU != 0
+        && !steps_fit(side_note, sizes.floors().first().copied().unwrap_or(0))
+    {
+        return Err(refusal(0, true));
+    }
+    let traces = generate_component_traces(side_note, components, sizes.floors(), pinned).map_err(
+        |(position, log_size)| {
+            let pinned = sizes.floors().get(position).copied().unwrap_or(0);
+            refusal(position, log_size > pinned)
+        },
+    )?;
     let log_sizes = traced_sizes(&traces, sizes, component_mask)?;
     let trace_gen = t.elapsed();
 
@@ -675,11 +790,13 @@ where
     ))
 }
 
-/// What a proof needs of `side_note` before its traces: its memory
-/// witnesses checked (a malformed or faulting trace is the caller's error,
+/// What a proof needs of `side_note` before its traces: its length within
+/// [`MAX_RUN_STEPS`], its memory witnesses checked (a malformed or faulting trace is the caller's error,
 /// not an expensive attempt at an unsatisfiable proof), its boundary
 /// registers filled, and its memory pages' Merkle payload built.
 fn prepare(side_note: &mut SideNote) -> Result<(), SegmentError> {
+    check_run_length(side_note)?;
+    check_transfers(side_note)?;
     validate_memory_witnesses(side_note)?;
     // RegisterMemoryBoundaryChip needs `initial_regs` populated.
     backfill_initial_regs(side_note);
@@ -746,4 +863,35 @@ where
     }
     tree_builder.commit(channel);
     columns
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vos_pvm::instruction::Opcode;
+
+    /// A code whose jump lands on the halt address, which the program
+    /// memory's pin cannot take, is refused before any trace or pin; one
+    /// jumping elsewhere is not refused for it.
+    #[test]
+    fn a_static_jump_to_the_halt_address_is_refused() {
+        let jump = |target: u32| {
+            let mut code = vec![Opcode::Jump as u8];
+            code.extend_from_slice(&target.to_le_bytes());
+            code.push(Opcode::Trap as u8);
+            SideNote::new(Vec::new(), code, vec![1, 0, 0, 0, 0, 1])
+        };
+        let mut halt = jump(vos_pvm::PVM_HALT_ADDR as u32);
+        assert!(matches!(
+            check_transfers(&halt),
+            Err(SegmentError::Transfer)
+        ));
+        assert!(matches!(prove(&mut halt), Err(SegmentError::Transfer)));
+        let shape = crate::shape::ProofShape {
+            components: crate::chip_idx::ALWAYS,
+            log_sizes: vec![16; crate::chip_idx::ALWAYS.count_ones() as usize],
+        };
+        assert!(program_commitment_for_shape(&halt, &shape, &crate::format::SEGMENT).is_none());
+        assert!(check_transfers(&jump(5)).is_ok());
+    }
 }

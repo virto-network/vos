@@ -44,10 +44,27 @@ use crate::verdict::{AnchorCode, ControlCode, Judged, RegisterCode, Registered, 
 /// row queued, an anchor's at `MaxRootAge` included, expires within it.
 pub const OUTCOME_KEEP_MS: u64 = 86_400_000;
 
+/// The gas a work item's accumulate must at least carry on the VOS
+/// accumulate host, which prices every call at its flat 10 (a JAM node's
+/// tariff is higher: `write` alone is 2,442 and its length terms).
+/// Measured there, with the drop budget an item adds: a refused item takes
+/// 28,620, a registration of 16 founding keys 64,741, an anchor 91,859,
+/// and an accepted statement of two roots 70,577. Estimated, not measured:
+/// a statement grows by its roots' reads, to [`crate::item::MAX_ROOTS`],
+/// and an accumulate after an idle week passes up to [`IDLE_HOURS`] empty
+/// hours, a read each, once; this bound holds both with headroom. An item
+/// that runs the shared invocation out of gas reverts from the last item's
+/// checkpoint on, never the items before it.
+pub const ITEM_GAS_VOS_HOST: u64 = 1_000_000;
+
 /// The rows queued to drop, by the hour they expire in.
 pub const BUCKET_MS: u64 = 3_600_000;
 /// The queued rows an accumulate drops at most: this, and two an input.
-const PRUNE_BASE: u32 = 8;
+pub const PRUNE_BASE: u32 = 8;
+/// The hours with no row queued an accumulate passes beside its budget: a
+/// week, so the cursor catches up on a week idle in one accumulate and
+/// rows queued past it drop from the next.
+pub const IDLE_HOURS: u32 = 168;
 
 /// A work item's result as accumulate takes it: its package's and its
 /// payload's hashes, and refine's output or its work error
@@ -71,7 +88,7 @@ pub fn time(config: &Config, slot: u64) -> u64 {
 }
 
 /// Apply `operands` at `slot` to `storage`, as the service `venue`, then
-/// drop the rows past their hour.
+/// drop the rows past their hour: [`take`] each, then [`finish`].
 pub fn accumulate(
     config: &Config,
     venue: VenueId,
@@ -81,15 +98,32 @@ pub fn accumulate(
 ) {
     let now = time(config, slot);
     for operand in operands {
-        let outcome = apply(storage, venue, now, operand);
-        let at = keys::outcome(&state::outcome_id(
-            &operand.package_hash,
-            &operand.payload_hash,
-        ));
-        storage.write(&at, Some(&outcome.encode()));
-        enqueue(storage, now, now.saturating_add(OUTCOME_KEEP_MS), &at);
+        take(storage, venue, now, operand);
     }
-    let budget = u32::try_from(operands.len())
+    finish(storage, now, operands.len());
+}
+
+/// Apply `operand` at the venue's time `now` to `storage`, as the service
+/// `venue`, and keep its outcome for its submitter. An item whose package
+/// gave an item of its payload an outcome in this accumulate (its time
+/// `now`) is not applied: the first item of a package with a payload is
+/// the one its outcome reports.
+pub fn take(storage: &mut impl Storage, venue: VenueId, now: u64, operand: &Operand) {
+    let id = state::outcome_id(&operand.package_hash, &operand.payload_hash);
+    if state::outcome(storage, &id).is_some_and(|outcome| outcome.time == now) {
+        return;
+    }
+    let at = keys::outcome(&id);
+    let outcome = apply(storage, venue, now, operand);
+    storage.write(&at, Some(&outcome.encode()));
+    enqueue(storage, now, now.saturating_add(OUTCOME_KEEP_MS), &at);
+}
+
+/// After `taken` operands at `now`, drop the rows past their hour: at most
+/// [`PRUNE_BASE`] and two an operand, and the empty hours an idle service
+/// left, at most [`IDLE_HOURS`] of them.
+pub fn finish(storage: &mut impl Storage, now: u64, taken: usize) {
+    let budget = u32::try_from(taken)
         .unwrap_or(u32::MAX)
         .saturating_mul(2)
         .saturating_add(PRUNE_BASE);
@@ -227,8 +261,8 @@ impl VenueState for Snapshot {
             .is_some_and(|record| record.keys.contains(key))
     }
 
-    fn last(&self, _: &SpaceId, _: RootKind) -> Option<u64> {
-        self.space.as_ref()?.last
+    fn last(&self, _: &SpaceId, kind: RootKind) -> Option<u64> {
+        self.space.as_ref()?.last(kind)
     }
 
     /// Refine verified it, strictly.
@@ -258,7 +292,7 @@ fn register(storage: &mut impl Storage, now: u64, registered: &Registered) -> Re
         controller: registered.controller,
         keys: registered.keys.clone(),
         start,
-        last: None,
+        last: [None; RootKind::COUNT],
         ended: false,
         nonce: 0,
     };
@@ -285,7 +319,7 @@ fn anchor(storage: &mut impl Storage, venue: VenueId, now: u64, anchor: &Anchor)
     match anchoring {
         Anchoring::Again => AnchorCode::Again,
         Anchoring::New => {
-            record.last = Some(window);
+            record.set_last(kind, window);
             storage.write(&keys::space(&space), Some(&record.encode()));
             let at = keys::anchor(&space, kind, window);
             storage.write(&at, Some(&signed.encode()));
@@ -426,13 +460,15 @@ fn enqueue(storage: &mut impl Storage, now: u64, expiry: u64, key: &[u8]) {
 }
 
 /// Drop at most `budget` of the queued rows whose hour is past `now`, or
-/// pass that many hours' ends.
+/// pass that many hours' ends; an hour no row was queued in is passed
+/// beside the budget, at most [`IDLE_HOURS`] of them.
 fn prune(storage: &mut impl Storage, now: u64, budget: u32) {
     let Some((mut bucket, mut index)) = cursor(storage) else {
         return;
     };
     let moved = (bucket, index);
-    for _ in 0..budget {
+    let (mut budget, mut idle) = (budget, IDLE_HOURS);
+    while budget > 0 {
         let over = bucket
             .checked_add(1)
             .and_then(|next| next.checked_mul(BUCKET_MS))
@@ -440,7 +476,8 @@ fn prune(storage: &mut impl Storage, now: u64, budget: u32) {
         if !over {
             break;
         }
-        if index < count(storage, bucket) {
+        let queued = count(storage, bucket);
+        if index < queued {
             let at = keys::queued(bucket, index);
             if let Some(key) = storage.read(&at) {
                 storage.write(&key, None);
@@ -448,10 +485,16 @@ fn prune(storage: &mut impl Storage, now: u64, budget: u32) {
             }
             index = index.saturating_add(1);
         } else {
-            storage.write(&keys::bucket(bucket), None);
+            if queued == 0 && idle > 0 {
+                idle = idle.saturating_sub(1);
+                budget = budget.saturating_add(1);
+            } else {
+                storage.write(&keys::bucket(bucket), None);
+            }
             bucket = bucket.saturating_add(1);
             index = 0;
         }
+        budget = budget.saturating_sub(1);
     }
     if (bucket, index) != moved {
         set_cursor(storage, bucket, index);

@@ -17,8 +17,9 @@ use crate::{ExitReason, Gas, PVM_PAGE_SIZE, PVM_REGISTER_COUNT};
 /// Maximum live inner machines in one Refine invocation.
 pub const MAX_INNER_MACHINES: usize = 63;
 
-/// Number of pages in the 32-bit PVM address space.
-pub const INNER_ADDRESS_PAGES: usize = (1u64 << 32) as usize / PVM_PAGE_SIZE as usize;
+/// Number of pages in the 32-bit PVM address space, 2^20, whatever the
+/// host's pointer width (the division is in u64, before any narrowing).
+pub const INNER_ADDRESS_PAGES: u32 = ((1u64 << 32) / PVM_PAGE_SIZE as u64) as u32;
 
 /// The first page an inner machine may map.
 pub const INNER_FIRST_MAPPABLE_PAGE: u32 = 16;
@@ -60,8 +61,9 @@ pub mod host_call {
     /// VOS extension: read the agent's applied state by key, served when the
     /// node supplies a state reader. φ7/φ8 hold the key, φ9 the output, φ10
     /// the offset into the value and φ11 the output length; φ7 becomes the
-    /// value's length, or `NONE`. On JAM the call answers `WHAT` and state
-    /// comes from witnesses in the work package.
+    /// value's length, `NONE`, or `HUH` for a key past
+    /// `refine_host::MAX_STATE_KEY`. On JAM the call answers `WHAT` and
+    /// state comes from witnesses in the work package.
     pub const STATE_READ: u32 = 0x481;
     /// VOS extension: rows of the agent's applied state under a prefix, in
     /// key order, served when the node supplies a state reader; `WHAT` on
@@ -84,6 +86,9 @@ pub mod gp_call {
     pub const INFO: u32 = 6;
     pub const HISTORICAL_LOOKUP: u32 = 7;
     pub const EXPORT: u32 = 8;
+    /// Accumulate's: what the invocation has written so far stands, should
+    /// it later end exceptionally.
+    pub const CHECKPOINT: u32 = 18;
     /// Accumulate's: ask for a preimage of the service's.
     pub const SOLICIT: u32 = 24;
     pub const LOG: u32 = 100;
@@ -132,6 +137,47 @@ pub mod gas {
     }
 }
 
+/// A VOS host's bounds on what one invocation's inner machines make the
+/// host hold, past the Gray Paper's: `machine`'s price is the text's, a
+/// base and 112 gas a KiB, while preparing a program costs the host tens of
+/// bytes and about a microsecond for each byte of it, and a page mapped
+/// with `pages` is memory the host keeps. Each is counted from what the
+/// guest asks for (blob bytes, pages mapped), never from what a backend
+/// happens to hold, so either backend refuses alike, as `FULL`. Under
+/// [`Profile::GrayPaper`] none applies.
+pub mod budget {
+    /// The longest compact code blob `machine` prepares, or `instantiate`
+    /// lends a machine of: the recompiler's code bound, so every inner
+    /// program a VOS host takes runs on either backend.
+    pub const MACHINE_BLOB: usize = 2 << 20;
+    /// The blob bytes the invocation's live machines hold together.
+    pub const LIVE_BLOBS: usize = 4 << 20;
+    /// The blob bytes `machine` prepares in one invocation, expunged
+    /// machines' included: what bounds the host's preparation work, a few
+    /// seconds of one core at about half a microsecond a byte.
+    pub const PREPARED_BLOBS: usize = 8 << 20;
+    /// The pages the invocation's live machines hold mapped together, 1 GiB.
+    pub const MAPPED_PAGES: usize = 1 << 18;
+}
+
+/// The rules an invocation's inner machines follow where a VOS host and the
+/// Gray Paper's text part.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Profile {
+    /// A VOS host's: a machine that halts or panics restarts at counter 0
+    /// with its first block unfunded, so the next `invoke` pays for it
+    /// again; and the host's [`budget`] bounds the machines.
+    #[default]
+    Vos = 0,
+    /// Gray Paper v0.8.0's, as a JAM node runs refine: Ψ returns counter 0
+    /// on a halt or panic and carries the gas-charged flag out
+    /// (`pvm.tex`, Ψ), which `invoke` stores in the machine
+    /// (`pvm_invocations.tex`, `invoke`), so the next `invoke` runs block 0
+    /// unpaid when the machine had funded the block it stopped in.
+    GrayPaper = 1,
+}
+
 /// Result-code-shaped failures from an inner-machine operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InnerError {
@@ -143,6 +189,9 @@ pub enum InnerError {
     Unknown,
     /// The requested inner-memory range is not accessible.
     OutOfBounds,
+    /// A VOS host's [`budget`] for the invocation's machines would be
+    /// exceeded: `FULL` to the guest, as the machine limit is.
+    Budget,
     /// The selected host backend could not prepare or execute the machine.
     /// This is not a guest result and must not be translated to HUH.
     Backend,
@@ -232,6 +281,10 @@ struct InnerMachine {
     /// Set when the execution backend failed on this machine. Its host
     /// state is no longer trusted, so it never returns to the pool.
     backend_failed: bool,
+    /// The blob bytes this machine counts against [`budget::LIVE_BLOBS`].
+    blob_bytes: usize,
+    /// The pages it holds mapped, against [`budget::MAPPED_PAGES`].
+    mapped_pages: usize,
 }
 
 impl InnerMachine {
@@ -283,6 +336,13 @@ pub struct InnerMachines {
     machines: BTreeMap<u32, InnerMachine>,
     next_generation: u64,
     backend: PvmBackend,
+    profile: Profile,
+    /// Blob bytes of the live machines `machine` created.
+    live_blobs: usize,
+    /// Blob bytes `machine` has prepared in this invocation.
+    prepared_blobs: usize,
+    /// Pages the live machines hold mapped.
+    mapped_pages: usize,
     /// The node's pool, which serves `instantiate`.
     #[cfg(feature = "std")]
     pool: Option<Arc<crate::pool::MachinePool>>,
@@ -299,16 +359,31 @@ impl InnerMachines {
         Self::default()
     }
 
-    /// Select execution for this invocation's dictionary. Each machine keeps
-    /// independent memory, registers and gas; only preparation is immutable.
+    /// Select execution for this invocation's dictionary, under the VOS
+    /// host's [`Profile`]. Each machine keeps independent memory, registers
+    /// and gas; only preparation is immutable.
     pub fn with_backend(backend: PvmBackend) -> Self {
         Self {
             machines: BTreeMap::new(),
             next_generation: 0,
             backend,
+            profile: Profile::Vos,
+            live_blobs: 0,
+            prepared_blobs: 0,
+            mapped_pages: 0,
             #[cfg(feature = "std")]
             pool: None,
         }
+    }
+
+    /// Follow `profile` from now on.
+    pub fn set_profile(&mut self, profile: Profile) {
+        self.profile = profile;
+    }
+
+    /// The rules this dictionary follows.
+    pub fn profile(&self) -> Profile {
+        self.profile
     }
 
     /// Serve `instantiate` from `pool`, and return its machines there.
@@ -369,6 +444,15 @@ impl InnerMachines {
         // Ω_M maps a failed deblob to HUH; unlike full Ψ it does not create
         // a machine which immediately panics.
         let program = deblob(program_blob, u64::from(initial_pc)).ok_or(InnerError::Invalid)?;
+        let blob_bytes = program_blob.len();
+        if self.profile == Profile::Vos
+            && (blob_bytes > budget::MACHINE_BLOB
+                || self.live_blobs + blob_bytes > budget::LIVE_BLOBS
+                || self.prepared_blobs + blob_bytes > budget::PREPARED_BLOBS)
+        {
+            return Err(InnerError::Budget);
+        }
+        self.prepared_blobs += blob_bytes;
         let execution = prepare_inner_program(program_blob, &program, self.backend)?;
         let id = (0..MAX_INNER_MACHINES as u32)
             .find(|id| !self.machines.contains_key(id))
@@ -389,8 +473,11 @@ impl InnerMachines {
                 #[cfg(feature = "std")]
                 pooled: None,
                 backend_failed: false,
+                blob_bytes,
+                mapped_pages: 0,
             },
         );
+        self.live_blobs += blob_bytes;
         Ok(id)
     }
 
@@ -412,6 +499,13 @@ impl InnerMachines {
         let pool = self.pool.as_ref().ok_or(InnerError::Unknown)?;
         if !program.enters_at(initial_pc) {
             return Err(InnerError::Invalid);
+        }
+        let mapped_pages = program.mapped_pages();
+        if self.profile == Profile::Vos
+            && (program.code_blob().len() > budget::MACHINE_BLOB
+                || self.mapped_pages + mapped_pages > budget::MAPPED_PAGES)
+        {
+            return Err(InnerError::Budget);
         }
         let (mut vm, execution, ticket) = pool
             .acquire(program, self.backend)
@@ -436,8 +530,11 @@ impl InnerMachines {
                 vm: Some(vm),
                 pooled: Some(ticket),
                 backend_failed: false,
+                blob_bytes: 0,
+                mapped_pages,
             },
         );
+        self.mapped_pages += mapped_pages;
         Ok(id)
     }
 
@@ -474,7 +571,7 @@ impl InnerMachines {
     ) -> Result<(), InnerError> {
         let machine = self.machines.get_mut(&id).ok_or(InnerError::Unknown)?;
         let end = first.checked_add(count).ok_or(InnerError::Invalid)?;
-        if first < INNER_FIRST_MAPPABLE_PAGE || end as usize >= INNER_ADDRESS_PAGES {
+        if first < INNER_FIRST_MAPPABLE_PAGE || end >= INNER_ADDRESS_PAGES {
             return Err(InnerError::Invalid);
         }
 
@@ -486,6 +583,19 @@ impl InnerMachines {
             && !memory.pages_mapped(first, count)
         {
             return Err(InnerError::Invalid);
+        }
+        let mapped_before = memory.mapped_pages(first, count);
+        let mapped_after = match mode {
+            PageMode::Free => 0,
+            PageMode::AllocateReadOnly | PageMode::AllocateReadWrite => count,
+            PageMode::SetReadOnly | PageMode::SetReadWrite => mapped_before,
+        };
+        let mapped = self.mapped_pages - mapped_before + mapped_after;
+        if self.profile == Profile::Vos
+            && mapped_after > mapped_before
+            && mapped > budget::MAPPED_PAGES
+        {
+            return Err(InnerError::Budget);
         }
 
         let permission = match mode {
@@ -506,6 +616,8 @@ impl InnerMachines {
             }
         }
         assert!(memory.set_page_range(first, count, permission));
+        machine.mapped_pages = machine.mapped_pages - mapped_before + mapped_after;
+        self.mapped_pages = mapped;
         Ok(())
     }
 
@@ -534,13 +646,18 @@ impl InnerMachines {
                 return Err(InnerError::Backend);
             }
         };
+        let profile = self.profile;
+        let restart = |vm: &mut Interpreter| match profile {
+            Profile::Vos => vm.set_pc(0),
+            Profile::GrayPaper => vm.pc = 0,
+        };
         let exit = match exit {
             ExitReason::Halt => {
-                vm.pc = 0;
+                restart(vm);
                 InnerExit::Halt
             }
             ExitReason::Panic => {
-                vm.pc = 0;
+                restart(vm);
                 InnerExit::Panic
             }
             ExitReason::OutOfGas => InnerExit::OutOfGas,
@@ -571,6 +688,8 @@ impl InnerMachines {
     /// machine lent from the pool returns there.
     pub fn expunge(&mut self, id: u32) -> Result<u32, InnerError> {
         let machine = self.machines.remove(&id).ok_or(InnerError::Unknown)?;
+        self.live_blobs -= machine.blob_bytes;
+        self.mapped_pages -= machine.mapped_pages;
         let pc = machine.pc();
         #[cfg(feature = "std")]
         machine.release(self.pool.as_deref());

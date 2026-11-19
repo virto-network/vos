@@ -16,6 +16,11 @@
 //! exponents in a step, no other sample of `z` between them), and a fused
 //! `qm31` row any other sample, `acc·α^Δ + lane`. The chain's lowest power
 //! is folded into `c_z`.
+//!
+//! `c_z` is constrained to have an inverse at every point, the OODS point,
+//! each mask offset's and each periodicity point alike: Stwo refuses a
+//! sample point whose `y` lies in CM31, where no line through `z` and `z̄`
+//! exists and the quotient no longer binds the samples at `z`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -137,11 +142,12 @@ impl DeepPlan {
             point
                 .items
                 .sort_unstable_by_key(|item| core::cmp::Reverse(item.high()));
-            debug_assert!(
+            assert!(
                 point
                     .items
                     .windows(2)
-                    .all(|pair| pair[0].low() > pair[1].high())
+                    .all(|pair| pair[0].low() > pair[1].high()),
+                "a point's Horner chain over disjoint exponent ranges"
             );
         }
         Self { points }
@@ -408,6 +414,11 @@ pub fn prepare<V: Value>(
                 Some(re_x_im_y),
             );
             let c = pointwise(context, z.y, [0, 0, -2, -2]);
+            // The line through `z` and its conjugate exists only when
+            // `Im(z.y)` is not zero, as Stwo's verifier refuses otherwise:
+            // at such a point `c` is zero and the quotient a constant, tying
+            // no sample at `z` to a committed column. `c` has an inverse.
+            context.inverse(c);
 
             // V and W' = Σ ᾱ^k·v_k, Horner from the highest exponent.
             let chain = |context: &mut Context<V>, powers: &dyn Fn(usize) -> Var| {

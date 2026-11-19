@@ -26,23 +26,23 @@
 /// The window kernel's program id: the `window` test actor's `settle`,
 /// eight M31 words.
 pub const WINDOW_PROGRAM: [u32; 8] = [
-    309355765, 2075571411, 88309196, 1566574617, 971480555, 2043282748, 768167072, 27312385,
+    1134855099, 747866561, 671088315, 1522360042, 805738041, 1419018115, 1475238648, 353450360,
 ];
 
 /// The balance kernel's: the `balance` test actor's `at_least`.
 pub const BALANCE_PROGRAM: [u32; 8] = [
-    483230369, 294041800, 1285345797, 543508950, 1919941908, 148336065, 777495096, 654333530,
+    993526642, 1755187750, 435712459, 1991305185, 601016329, 1668991450, 1492866769, 221165399,
 ];
 
 /// The solvency predicate's: the `kernels` test actor's `areas`.
 pub const PREDICATE_PROGRAM: [u32; 8] = [
-    2064928712, 1384602898, 444759005, 943285289, 1209270466, 339088366, 1630979476, 73326039,
+    930763808, 801961563, 2115120588, 814325023, 166596691, 1827530137, 800015836, 2074849052,
 ];
 
 /// `H_fold`: the fold circuit's hash over the padded shape, the fold word
 /// every node of a tree carries and the wrap checks.
 pub const H_FOLD: [u32; 8] = [
-    1926018953, 708720600, 521533944, 511795374, 1724860191, 691497565, 1028082666, 1483953229,
+    432279264, 1157161350, 1252342881, 268022195, 1782745271, 1221220570, 741909909, 271327132,
 ];
 
 /// The final wrap's preprocessed root under `format::MASKED_WRAP`, on the

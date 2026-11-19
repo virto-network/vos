@@ -67,6 +67,13 @@ impl<'a> Reader<'a> {
 /// [`BatchProof::generate`](crate::BatchProof::generate) splits the keys
 /// it proves: paths end in the proof's order, which is not the keys' when
 /// an absent key differs from a subtree at a bit no branch splits on.
+///
+/// Its memory is the claims' order, a word a claim, and a stack of the
+/// branches open on the path being read: a branch entry is three bytes of
+/// the proof and holds about 56 bytes on the stack, at most 2^16 of them (a
+/// branch's level is a `u16`, rising down a path), so a proof of nested
+/// branches takes about 20 times its own size, at most a few MiB. A kernel
+/// verifying a proof it was given sizes its heap, or caps the proof, so.
 pub fn verify_encoded<H: Hasher, K: AsRef<[u8]>>(
     hasher: &H,
     proof: &[u8],

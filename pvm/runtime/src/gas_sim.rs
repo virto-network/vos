@@ -42,6 +42,11 @@ struct ConformanceState {
     exec_units: [u8; 5],
     rob: [RobEntry; ROB_CAPACITY],
     rob_len: u8,
+    /// The fewest cycles an EXE entry has left after the last tick.
+    least_executing: u8,
+    /// Whether quiet ticks run at once; the tests also tick one by one.
+    #[cfg(test)]
+    skips: bool,
 }
 
 impl Default for ConformanceState {
@@ -53,6 +58,9 @@ impl Default for ConformanceState {
             exec_units: EXEC_UNITS,
             rob: [RobEntry::default(); ROB_CAPACITY],
             rob_len: 0,
+            least_executing: u8::MAX,
+            #[cfg(test)]
+            skips: true,
         }
     }
 }
@@ -77,6 +85,9 @@ impl ConformanceState {
         while !self.can_decode(cost.decode_slots) {
             if !self.dispatch_one() {
                 self.tick();
+                if !self.can_decode(cost.decode_slots) {
+                    self.skip_quiet_ticks();
+                }
             }
         }
 
@@ -131,13 +142,7 @@ impl ConformanceState {
         if self.start_slots == 0 {
             return false;
         }
-        let len = usize::from(self.rob_len);
-        let Some(index) = (0..len).find(|&index| {
-            let entry = self.rob[index];
-            entry.state == RobState::Wait
-                && self.dependencies_ready(entry.deps)
-                && units_fit(self.exec_units, entry.exec_unit)
-        }) else {
+        let Some(index) = self.ready() else {
             return false;
         };
 
@@ -146,6 +151,49 @@ impl ConformanceState {
         self.rob[index].state = RobState::Exe;
         self.start_slots -= 1;
         true
+    }
+
+    /// The lowest-index WAIT entry whose dependencies are done and whose
+    /// execution units are free.
+    fn ready(&self) -> Option<usize> {
+        (0..usize::from(self.rob_len)).find(|&index| {
+            let entry = self.rob[index];
+            entry.state == RobState::Wait
+                && self.dependencies_ready(entry.deps)
+                && units_fit(self.exec_units, entry.exec_unit)
+        })
+    }
+
+    /// Run at once the ticks after this one in which nothing but the
+    /// executing entries' countdown changes: called right after a tick that
+    /// left the machine unable to decode. A tick leaves no entry decoding;
+    /// when none is retiring, none can start and none is one cycle from
+    /// releasing its units, each following tick only decrements every EXE
+    /// entry's cycles and counts a cycle. So `least - 1` of them run
+    /// together, `least` the fewest cycles an EXE entry has left, give the
+    /// state the ticks one by one give: simulating a block of long
+    /// divisions takes a few ticks an instruction, not one a cycle. Runs of
+    /// one tick are left to `tick`.
+    fn skip_quiet_ticks(&mut self) {
+        #[cfg(test)]
+        if !self.skips {
+            return;
+        }
+        let least = self.least_executing;
+        if !(3..u8::MAX).contains(&least)
+            || (self.rob_len > 0 && self.rob[0].state == RobState::Fin)
+            || self.ready().is_some()
+        {
+            return;
+        }
+        let quiet = least - 1;
+        for entry in &mut self.rob[..usize::from(self.rob_len)] {
+            if entry.state == RobState::Exe {
+                entry.cycles_left -= quiet;
+            }
+        }
+        self.least_executing = 1;
+        self.cycles += u32::from(quiet);
     }
 
     fn dependencies_ready(&self, mut deps: u32) -> bool {
@@ -176,6 +224,7 @@ impl ConformanceState {
             .take_while(|entry| entry.state == RobState::Fin)
             .count();
 
+        let mut least_executing = u8::MAX;
         for entry in &mut self.rob[..len] {
             let old_state = entry.state;
             let old_cycles = entry.cycles_left;
@@ -187,7 +236,11 @@ impl ConformanceState {
             if old_state == RobState::Exe && old_cycles > 0 {
                 entry.cycles_left -= 1;
             }
+            if entry.state == RobState::Exe {
+                least_executing = least_executing.min(entry.cycles_left);
+            }
         }
+        self.least_executing = least_executing;
 
         if retired != 0 {
             self.rob.copy_within(retired..len, 0);
@@ -208,6 +261,7 @@ impl ConformanceState {
         while self.rob_len != 0 {
             if !self.dispatch_one() {
                 self.tick();
+                self.skip_quiet_ticks();
             }
         }
         self.cycles.saturating_sub(3).max(1)
@@ -338,8 +392,10 @@ impl GasSimulator {
     }
 }
 
+/// The literal, allocation-heavy transcription of the v0.8.0 scheduler
+/// (A.49--A.57) the online state is held to, over at most 64 costs.
 #[cfg(test)]
-fn reference_conformance_cost(costs: &[FastCost]) -> u32 {
+pub(crate) fn reference_conformance_cost(costs: &[FastCost]) -> u32 {
     use alloc::vec::Vec;
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -661,6 +717,72 @@ mod proptests {
                 simulator.flush_and_get_cost(),
                 reference_conformance_cost(&costs),
             );
+        }
+
+        /// Long latencies on few units fill the reorder buffer and leave
+        /// runs of quiet cycles, which the online state runs at once: still
+        /// the literal transcription's cost, cycle for cycle.
+        #[test]
+        fn conformance_with_full_reorder_buffers_matches_spec_reference(
+            raw in proptest::collection::vec(
+                (1u8..=80, 1u8..5, 0u8..7, any::<u16>(), any::<u16>(), 0u8..8),
+                // Past the 32 entries the buffer holds, within the 64 the
+                // reference's dependency words index.
+                0..=64,
+            ),
+        ) {
+            let costs: alloc::vec::Vec<FastCost> = raw
+                .into_iter()
+                .map(|(cycles, decode_slots, exec_unit, src, dst, kind)| FastCost {
+                    cycles: if kind == 0 { 0 } else { cycles },
+                    decode_slots: if kind == 0 { 1 } else { decode_slots },
+                    exec_unit: if kind == 0 { 0 } else { exec_unit },
+                    src_mask: src & 0x1fff,
+                    dst_mask: dst & 0x1fff,
+                    is_terminator: false,
+                    is_move_reg: kind == 0,
+                })
+                .collect();
+            let mut simulator = GasSimulator::new();
+            for cost in &costs {
+                simulator.feed(cost);
+            }
+            prop_assert_eq!(
+                simulator.flush_and_get_cost(),
+                reference_conformance_cost(&costs),
+            );
+        }
+
+        /// Long mixed blocks, thousands of instructions past what the
+        /// literal transcription indexes, cost the same whether quiet ticks
+        /// run at once or one by one.
+        #[test]
+        fn quiet_ticks_run_at_once_change_no_cost(
+            raw in proptest::collection::vec(
+                (prop_oneof![1u8..=4, 1u8..=80, Just(60u8)], 1u8..5, 0u8..7, any::<u16>(), any::<u16>(), 0u8..8),
+                0..4000,
+            ),
+        ) {
+            let costs: alloc::vec::Vec<FastCost> = raw
+                .into_iter()
+                .map(|(cycles, decode_slots, exec_unit, src, dst, kind)| FastCost {
+                    cycles: if kind == 0 { 0 } else { cycles },
+                    decode_slots: if kind == 0 { 1 } else { decode_slots },
+                    exec_unit: if kind == 0 { 0 } else { exec_unit },
+                    src_mask: src & 0x1fff,
+                    dst_mask: dst & 0x1fff,
+                    is_terminator: false,
+                    is_move_reg: kind == 0,
+                })
+                .collect();
+            let run = |skips: bool| {
+                let mut state = ConformanceState { skips, ..ConformanceState::default() };
+                for &cost in &costs {
+                    state.feed(cost);
+                }
+                state.drain()
+            };
+            prop_assert_eq!(run(true), run(false));
         }
 
         /// flush_and_get_cost always returns at least 1.

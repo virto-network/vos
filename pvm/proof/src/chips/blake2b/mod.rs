@@ -6,8 +6,10 @@
 //!   a' = a1 + b1 + my; xor3 = d1 ^ a'; d' = xor3 >>> 16  (byte permutation)
 //!   c' = c1 + d';     xor4 = b1 ^ c'; b' = xor4 >>> 63  (1-bit carry)
 //!
-//! Each G-row emits 64 nibble-AND lookups (4 ANDs × 8 bytes × 2 nibbles) to
-//! the BitwiseLookupChip, constraining the AND witnesses used in XOR derivations.
+//! Each G-row emits 48 byte-wide AND lookups (six a byte, over eight bytes:
+//! the four XORs' ANDs and two for the rotation's split) to the bitwise AND
+//! table (`BitwiseAndByteLookupElements`), constraining the AND witnesses
+//! the XORs derive from.
 
 use crate::prelude::*;
 use num_traits::{One, Zero};
@@ -46,8 +48,9 @@ use compression::{add_compression_core, read_schedule};
 pub struct Blake2bChip;
 
 impl BuiltInComponent for Blake2bChip {
-    // Carry bound identity is_real · c · (c-1) · (c-2) is degree 4, so require
-    // the same bound that CpuChip uses.
+    // The carries' bounds, `is_real · c · (c-1) · (c-2)` and its kin, are
+    // flattened to degree 2 by helper columns (`compression::constraints`'s
+    // `carry_bounds`), within the bound CpuChip uses.
     const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
 
     type PreprocessedColumn = PreprocessedColumn;
@@ -151,6 +154,9 @@ impl BuiltInComponent for Blake2bChip {
         m_addr.add_range_lookups(eval, range256_lookup, &init_gate);
 
         // ── Memory-access tuples (addr[4], value, ts[8], is_write, is_closing) ──
+        // Their address limbs are bytes by the addresses' carry identity and
+        // range checks above, which the word ledger's group test by 16-bit
+        // halves rests on (`word_memory`).
         let f_zero = E::F::zero();
         let mut access = |addr: [E::F; 4], value: E::F, is_write: E::F, mult: &E::F| {
             let mut tuple: Vec<E::F> = Vec::with_capacity(15);

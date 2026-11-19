@@ -8,6 +8,9 @@
 //! - 4 decode slots per cycle, 5 dispatch slots per cycle
 //! - Execution units: ALU:4, LOAD:4, STORE:4, MUL:1, DIV:1
 
+#[cfg(test)]
+mod gray_paper;
+
 /// Normalize encoded register fields to the gas table's `(dst, src1, src2)`
 /// convention.
 ///

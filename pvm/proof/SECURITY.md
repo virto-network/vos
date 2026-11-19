@@ -26,12 +26,15 @@ Two paths verify in production, and one is a reference:
 | verifier | what an accepted proof binds | what its caller supplies or rests on |
 |---|---|---|
 | 41, a segment (`verify_standalone`) | a window of a run of the program its preprocessed root commits (code, layout, permissions, at the class's shape): the format's exact parameters, the shape, the boundary registers, pc, timestamps (both in `[1, 2^28)`) and memory roots, bound to the trace | the root, derived from the intended program and layout (§ Trust boundary: a segment proof); a window may start and stop inside a run, so whether its boundary states are the ones meant is the caller's |
-| 32, a leaf and a fold (in circuit) | a leaf: its segment's native checks, the entry constants under the entry flag and the halt pc under the halt flag; a fold: both children verified, both carrying the program id it recomputes and a circuit of that program's or the fold's, adjacent positions, the left exit's state digest equal to the right entry's | no caller outside the recursion; the two inductions (§ The leaf's binding): that boundary limbs are bytes and timestamps stay in the ledgers' range rests on the fold chain from the installed entry and on the state digest's collision resistance |
+| 32, a leaf and a fold (in circuit) | a leaf: its segment's native checks, the entry constants under the entry flag and the halt pc under the halt flag; a fold: both children verified, both carrying the program id it recomputes and a circuit of that program's or the fold's, the left exit's state digest equal to the right entry's (continuity, which orders the run; the positions' adjacency is checked too, but a leaf's positions are its witness, so it binds nothing) | no caller outside the recursion; the two inductions (§ The leaf's binding): that boundary limbs are bytes and timestamps stay in the ledgers' range rests on the fold chain from the installed entry and on the state digest's collision resistance |
 | 39, the wrap (`vos-pvm-final-verifier`, judged by `vos-statement`) | a run from the program's entry to a halt (position 0, the entry and halt flags), the fold circuit pinned, the program id and the io-hash public | the program id the venue pinned, never the statement's; the venue's accepted formats, its anchored roots and its refusal of a repeated statement id (§ Trust boundary: a statement) |
 | 47, a device proof (`Verifier::verify`) | a run of the installed program's code from its entry to its halt, with io-hash `io` | the `Verifier` the node computed from the kernel at install (its program, masked format and id), and `io`, computed by ingress from the claim, never the proof's (§ Trust boundary: a device proof) |
 
-What none of them binds: a run's gas, the witness stream's framing, and
-an honest run's provability (§ Three boundaries).
+What none of them binds: a run's gas or its step count (a `trap` or an
+unserved host call may repeat as extra rows, only the timestamp growing;
+no statement field holds a step count, so this binds no result), the
+witness stream's framing, and an honest run's provability (§ Three
+boundaries).
 
 ## Formats and their bit counts
 
@@ -42,7 +45,7 @@ Each number names one AIR, one channel and one set of parameters
 |---|---|---|---|
 | 41 | segments, the shared chip set (the Poseidon2 call among a node kernel's) | Poseidon2-M31 | admitted |
 | 32 | leaves and folds | Poseidon2-M31 | internal (`Status::Internal`): proved and verified inside the recursion, refused by every outside verifier |
-| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | admitted: what venues accept |
+| 39 | the final wrap, masked (variant (c)), `h = 128` a component (the format's cap 256; § Masking) | Blake2b-256 | admitted: what venues accept |
 | 47 | device proofs, masked (variant (c)), `h = 256`, the per-program CPU and the word ledger | Blake2s-M31 | admitted: proven calls at a space's ingress, a device kernel's run each |
 
 Each format's figures, from the security tool (`src/security.rs`) at the
@@ -86,7 +89,7 @@ differs from this copy; every figure is rounded down:
   quotient batches, one coefficient each: a column's samples and, for a
   column sampled at two points, the periodicity value the fork adds
   (`deep_values_of_column`); `c`, the most of one column, is counted the
-  same way, 3. The segment shape batches 11,091 values; 41's query term
+  same way, 3. The segment shape batches 11,107 values; 41's query term
   binds. The masked device reference (every device chip at 2^17 rows)
   batches 7,470, and 47 batches affinely.
 - A verifier rejects a number the registry does not admit
@@ -129,6 +132,29 @@ heuristic a proof's figures are about halved against a quantum prover (31
 proven and 52 conjectured bits for 41's): post-quantum readiness rests on
 the conjectured count.
 
+**A statement's proofs are verified in circuit, so every refusal the
+native verifier makes needs its twin there.** One is load-bearing for the
+counts: the DEEP quotient draws a line through each sample point `z` and
+its conjugate, which does not exist when `Im(z.y) = 0`. The fork's
+verifier refuses such a point (`InvalidStructure`, DIVERGENCE-013, row 16
+below); in a circuit without the refusal the quotient at that point is a
+constant at every query, so the values sampled there, the composition's
+among them, are tied to no commitment and the out-of-domain check holds
+for any trace. About `p^2` of the `p^4` circle points qualify, 2^-62 a
+point, and a transcript has one chance for each point of its DEEP plan
+(the out-of-domain point, each mask offset's, each periodicity point's;
+16 for the window kernel's leaf, `docs/design/recursion-air.md` §4), so
+some point is degenerate with probability about 16 times that. Only the
+out-of-domain point's case is shown to free the composition; what the
+other points free (previous-row samples, the running sums' among them)
+is not taken to a forgery. Either way the chance sits at the proven
+floor, about 40 bits under the conjectured count. The
+circuits therefore constrain `Im(z.y)` invertible for every DEEP plan
+point (one inverse a point, `recair/src/verifier/deep.rs`'s `prepare`),
+in the leaf (verifying format 41) and in the fold's and the wrap's child
+verifier (format 32). Device proofs (47) and the wrap's native
+verification (39) run Stwo's own quotient, which refuses the point.
+
 ## The segment AIR
 
 - **Hardened by audit.** An audit of the AIR in four parts (the CPU and
@@ -140,18 +166,39 @@ the conjectured count.
   `debug-internals`), which `just ci-full` runs: not `check`, `gate` or
   `ci`.
 - **Not yet under a forgery gate of that kind:** PROGRAM_MEMORY's decode
-  binding, JUMP_TABLE (one padding fix), the lookup tables, MEMORY_PAGE and
-  MEMORY_MERKLE, the witness-input chip, the boundary-binding argument
-  (the boundary states recomputed into the boundary chips' claimed sums),
-  the segment cut and closing-flag rule. These are in the
-  external audit's scope (below).
+  binding, JUMP_TABLE (one padding fix), MEMORY_MERKLE, the
+  boundary-binding argument (the boundary states recomputed into the
+  boundary chips' claimed sums), the segment cut and closing-flag rule.
+  These are in the external audit's scope (below). The lookup tables are
+  held to their functions (`lookup_table_gate`), not by a forgery;
+  MEMORY_PAGE (a page listed twice; pages closing at two timestamps, the
+  chip holding one closing timestamp across its rows, which value only
+  the claimed-sum binding holds) and the witness input (a chain off its
+  call) have theirs.
 - **Recorded, unfixed:** an invalid dynamic jump cannot be proved (no
-  kernel needs it); the ledgers cannot prove a gap of 2^27 steps between
-  two accesses to one key; a BLAKE2b pointer within 256 bytes of 2^32
-  cannot be proved. Each makes an honest run unprovable, never a false one
-  provable. The 2^27 gap is also a soundness bound: the ledgers compare
-  timestamps mod p, and it is what keeps two accesses 2^30 steps apart
-  from aliasing (the leaf's binding, below).
+  kernel needs it); a run past 2^27 − 1 steps cannot be proved; a
+  BLAKE2b pointer within 256 bytes of 2^32 cannot be proved. Each makes
+  an honest run unprovable, never a false one provable. The 2^27 limit
+  bounds a run's length, not only the gap between two accesses: every
+  ledger chain of a segment starts at a `ts = 0` write and the ordering
+  delta has 28 bits, so no segment whose timestamps pass 2^27 proves,
+  wherever its accesses fall. A longer run is refused before any trace,
+  by its step count (`MAX_RUN_STEPS`, `SegmentError::RunLength`). The
+  limit is also a soundness bound:
+  the ledgers compare timestamps mod p, and it is what keeps two accesses
+  2^30 steps apart from aliasing (the leaf's binding, below).
+- **A precompile call a host does not serve:** a host that serves
+  `0x400` or `0x402` leaves every register unchanged, so φ7 still holds
+  the first argument, a pointer (`0x401` writes its count there). A call
+  a VOS node does not serve (a removed id, or any precompile on a node
+  that computes none) is no answer: the run exits to the host at the call
+  (`refine_host.rs`'s `dispatch`, `ExitReason::HostCall`), and the proof
+  ends the run there too (an unacknowledged call has no real successor
+  row, `src/chips/cpu/constraints/host_call.rs`). The JAM-only host, as
+  a JAM node, answers Gray Paper `WHAT` in φ7 and the run goes on. The
+  guest library's `call` (`precompiles/src/ecalls.rs`) is written for
+  both: on `WHAT` it computes in software, and a pointer is never `WHAT`.
+  A guest that reads φ7 otherwise runs to different ends on the two.
 - **The Ristretto and scalar chips are removed:** they were unsound.
   Precompile ids 110 to 114 are served nowhere, and `derive` refuses a
   kernel that reaches one.
@@ -169,7 +216,16 @@ the conjectured count.
   when both inputs are free. It is safe in a fixed-depth tree over sponge
   leaves, or a chain from a fixed tag with a length block (`H_io`), and
   not as a general two-input commitment: a kernel must not commit to a
-  pair of free values with one call.
+  pair of free values with one call. A credential tree binds a member
+  only through its leaf, `leaf(m) = C(T, m)` (`vos-abi`'s `credentials`):
+  a path from a free leaf value is a preimage of the root at one inverse
+  permutation a level, so a kernel computes a membership root only from
+  `leaf(member)`, never from a raw leaf value: `credentials::member_root`
+  takes the member, and is the only entry point. Through it, a forged
+  membership needs a leaf-level value reached both down from the root (by
+  inversion, the siblings free) and up from the tag (`C(T, m)`): a meet in
+  the middle on the 248-bit output, about 2^124 compressions, a hash
+  assumption the security tool does not count.
 - **The halt rule:** a halting step's `next_pc` is `PVM_HALT_ADDR`
   (2^32 − 2^16), which no static jump, branch or jump-table entry of a
   pinned program names: `kernel::kernel_side_note`, which every install's
@@ -214,7 +270,7 @@ the conjectured count.
 | `proof.initial_state`, `proof.final_state` | bound | registers, pc and ts bound to the committed boundary columns and to the trace, both ts in `[1, 2^28)` (`TIMESTAMP_BOUND`); `memory_root` to the in-AIR page tree of the images |
 | `proof.pcs_config` | no | the format's exactly; Fiat–Shamir-bound |
 | `proof.component_mask` | no | the chips it names: within this AIR's, its popcount the component count. Format 41's header mixes no mask: a kernel's verifier pins it to one of its shape's classes (`class_of`), and the leaf's constants pin it; in bare `verify_standalone` it is the prover's, and dropping or adding a chip only restricts the traces that verify |
-| `hash`, the preprocessed root | **yes** | the class's program identity: its code, layout and permissions, at its shape. For a kernel, the install's record derives it, and the program id covers it |
+| `hash`, the preprocessed root | **yes** | the class's program identity: its code, layout and permissions. It does not pin a chip's log size: the lifted tree commits the columns' values, not their sizes (§ Masking), and in bare `verify_standalone` the log sizes are the proof's (`proof.log_sizes`). A kernel's verifier pins them to one of its shape's classes exactly (`class_of`), as the leaf's constants do; for a kernel, the install's record derives the root, and the program id covers it |
 
 The preflight, the format checks, the boundary timestamps' range, the root
 against `hash`, the logup sum, the boundary binding, then Stwo's verifier,
@@ -237,10 +293,25 @@ from its side note.
   from its entry state (the kernel's entry pc, ts 1, the loader's
   registers, the image root) through contiguous segments of that
   program's classes to a halt, with that io-hash at the halt. Leaves
-  re-do the native verifier's checks in circuit; every fold checks
-  adjacency, state continuity and that both children carry the program id
-  it recomputes and the fold circuit's hash; the wrap pins that hash and
-  refuses a root without position 0, the entry and the halt.
+  re-do the native verifier's checks in circuit, the refusal of a
+  degenerate DEEP sample point among them (§ Formats and their bit
+  counts); every fold checks state continuity and that both children
+  carry the program id it recomputes and the fold circuit's hash; the
+  wrap pins that hash and refuses a root without the entry and the halt.
+  The order of the segments is continuity's: a fold also checks its
+  children's positions adjacent and the wrap a root at position 0, but a
+  leaf's positions are its witness, so neither binds anything; the entry
+  flag, whose constants the leaf asserts, binds where the run starts.
+- **No statement counts steps.** A `trap`, or a host call the run does not
+  serve, stays at its pc (`chips/cpu/constraints/control.rs`, `host_call.rs`),
+  and the step chain is a lookup, not the rows' order (only the row below it
+  must be padding), so the same instruction may follow it again, in its
+  segment or the next, each a row that only advances the timestamp. Such a
+  run never leaves that pc, so never reaches the halt a statement requires,
+  and a segment's boundary timestamps are positions in its run, not the
+  steps it executed. No statement, the wrap's, a device
+  proof's or a venue's, carries a step count or a timestamp; a field that
+  ever did would need those rows refused.
 - **The program id is the trust anchor.** A Poseidon2-M31 hash over the
   transpiler version, the program hash, the shape, the segment channel,
   the classes' preprocessed roots, the image root and the leaf circuits'
@@ -283,17 +354,24 @@ A leaf re-does the native verifier's checks in circuit, over the boundary
 states' 296 bytes as wires. Two properties every statement rests on hold
 along the fold chain, not in a leaf alone (`recair/src/leaf/mod.rs`):
 
-- **The boundary bytes are bytes.** The leaf range-checks 32 of the 296
-  (the io-hash's); a wire of 256 or more would enter the segment AIR as a
-  register, a timestamp or a root limb no native state can express. The
-  leftmost entry is byte constants (the entry flag, which the wrap
-  requires), every exit's state digest equals the next entry's (the fold's
-  continuity), so each entry is the previous exit up to a collision of
-  that digest (§ Three boundaries), and an exit is bytes the AIR produced (the next timestamp's
-  and a register write's limbs Range256-checked, a memory root the
-  BLAKE2b boundary compression's output, an XOR of byte pairs the bitwise
-  table fixes, the chip under `blake2b_boundary_gate`) or
-  a copy of its entry.
+- **The boundary bytes are bytes.** The leaf range-checks 44 of the 296:
+  the io-hash's 32, which it combines lossily, and the entry timestamp's 8
+  and the exit pc's 4, so that a leaf alone states no timestamp or pc
+  outside its integer type. Any other wire of 256 or more would enter the
+  segment AIR as a register, a timestamp or a root limb no native state
+  can express. The leftmost entry is byte constants (the entry flag,
+  which the wrap requires), every exit's state digest equals the next
+  entry's (the fold's continuity), so each entry is the previous exit up
+  to a collision of that digest (§ Three boundaries), and an exit is
+  bytes the AIR produced (the next timestamp's and a register write's
+  limbs Range256-checked, a memory root the BLAKE2b boundary
+  compression's output, an XOR of byte pairs the bitwise table fixes, the
+  chip under `blake2b_boundary_gate`) or a copy of its entry. The exit
+  pc's limbs (the CPU's `next_pc`) are not range-checked in the AIR;
+  besides the leaf's check, a non-byte exit pc cannot start the next
+  segment, whose first step looks its pc up in the program's canonical
+  bytes, nor reach the halt, which the halt flag pins to the halt pc's
+  constant.
 - **Timestamps stay in the ledgers' range.** The register and memory
   ledgers compare `2·ts + is_write` reduced mod p, so two accesses about
   2^30 steps apart alias; no gas is proved and the CPU's timestamp is a
@@ -301,10 +379,10 @@ along the fold chain, not in a leaf alone (`recair/src/leaf/mod.rs`):
   a segment whose timestamps lie in `[2^27, p/2)` is unprovable, and a
   run, contiguous from ts 1, cannot cross that zone. The native verifier
   states the bound for a segment alone (both boundary timestamps under
-  2^28); the leaf does not range-check the timestamp's bytes, and a leaf
-  alone accepts a first limb of `p − 1`, which the fold chain then cannot
-  continue from an honest entry. Range-checking `ts_in`'s bytes in the leaf
-  is recorded for the next re-pin (`docs/design/open.md`).
+  2^28); the leaf range-checks the entry timestamp's bytes, so a leaf
+  alone states a `u64` entry timestamp (a first limb of `p − 1` is
+  refused, `recair/tests/gates/boundary_bytes.rs`), and the fold chain
+  carries the rest.
 
 ## Trust boundary: a device proof
 
@@ -356,12 +434,29 @@ ledger's closing read, the io-hash words the verifier fixes from `io`, the
 accesses the CPU and the precompiles produce. Below `p` fractions a
 relation, logup forces those tuples to match as multisets, so each such
 column holds a value its counterpart bounds; a change to a counterpart's
-own checks is a change to these columns' soundness.
+own checks is a change to these columns' soundness. The word ledger ties
+an inner row's address to its group by 16-bit halves (`lo_diff`,
+`hi_diff` in `src/chips/word_memory/mod.rs`, each half `lo + 256·hi` of
+two limbs), so two rows are one word only because every producer's
+address limbs are bytes: each producer's own carry identity (the CPU's
+loads and stores, the BLAKE2b and Poseidon2 calls', the witness
+input's) is
+what makes that so, and each holds today; a new producer of word
+accesses must have one.
+
+**The program id** (`DeviceProgramId::of`, `device/src/verify.rs`)
+hashes the format's number and every parameter of it (blowup, queries,
+PoW, fold step, last layer, interaction PoW, `log h`, the DEEP batching,
+the channel, the masking's salt and `R` column counts), the chips, the
+log sizes, the CPU cut, the word ledger's tag and the preprocessed root:
+it names the format whole, not by its number alone.
 
 **A panic is a refusal, not a crash:** the device crate runs with std and
-is not linted panic-free; ingress catches a verifier's panic and counts it
-a failed proof (`node/host/src/credentialed.rs`'s `verifies`), as
-`Verifier::verify`'s docs ask of a caller. The fuzz targets
+is not linted panic-free. `Verifier::verify` catches a panic of the
+verifier and returns `Refusal::Panic` (in an unwinding build: one that
+aborts on a panic, as the fuzz builds do, crashes instead), and decodes a
+proof only once a counting scan holds what the decode would allocate to
+three times its bytes (`Refusal::Decode`). The fuzz targets
 `device_verify_bytes` and `device_verify_mutate` hold it to no panic on
 arbitrary bytes and on the golden device proof mutated past its pre-check.
 
@@ -408,8 +503,18 @@ panic-free on every input by construction:
 - **Stwo's code at the pin:** every index, `unwrap`, `expect`, `zip_eq`,
   `assert` and unchecked arithmetic reachable from format 39's
   `masking::verify_masked` (its `replay`, then `verify_values`) is in the
-  table below with what guards it. Two had no guard and are the fork's fix
-  (DIVERGENCE-013).
+  table below with what guards it. Two had no guard upstream and are the
+  fork's fix (DIVERGENCE-013), in the pinned revision. The table is
+  format 39's; format 47 (the device verifier, natively at a node's
+  ingress, which refuses its own panic as `Refusal::Panic`, above) runs
+  the same masked verifier and Stwo path, so its "shape" rows hold
+  through the same `check_shape`, but every row that cites 39's parameters (its
+  trees' heights, its 16 queries, its fold step 3 and its subsets, its
+  last layer of 2^6 and 64 coefficients, its circle draw's odds) is to be
+  re-derived at 47's (fold step 1, last layer 2^0, 47 queries, its own
+  heights), an audit item ([AUDIT.md](AUDIT.md)); an independent read
+  of those rows at 47's parameters found no reachable panic, which the
+  audit is to confirm.
 - **Fuzzing:** twelve targets (`fuzz/`, the justfile's
   `proof_fuzz_targets`): the final verifier on arbitrary bytes
   (`final_verifier_bytes`), on the golden wraps mutated
@@ -457,8 +562,8 @@ doc-check` fails when the pin moves and this line does not).
 | 13 | `pcs/quotients.rs` `fri_answers`: `assert!` every queried column one value a query; `col[idx]` | every tree's Merkle `verify` (10) passed first, tree 0's on as many positions |
 | 14 | `build_samples_with_randomness_and_periodicity`: `expect(ONE_COEFFICIENT_A_VALUE)` | ours: the affine coefficients drawn by `n_deep_values` over the same samples (powers are unbounded) |
 | 15 | `accumulate_row_quotients`: `queried_values_at_row[column_index]`; `zip_eq` of a batch's columns × its line coefficients | shape: the sampled columns (whose indices these are) and the queried columns both the trees' widths; the coefficients built from the same batch |
-| 16 | `constraints.rs` `complex_conjugate_line_coeffs`: `assert_ne!(z.y, conj(z.y))` | **none at the pin**: Im(z.y) = 0, about 2^-62 a draw, z grindable. The fork's fix: `InvalidStructure` (DIVERGENCE-013) |
-| 17 | `denominator_inverses` → `CM31::batch_inverse` → `inverse()`'s zero `assert!` | **none at the pin**. The fork's fix: `InvalidStructure` (DIVERGENCE-013). Unreachable for z on the circle with Im(z.y) ≠ 0: the line vanishes at a base-field circle point only if Im(z) is isotropic, which no circle point's is (proved in its doc) |
+| 16 | `constraints.rs` `complex_conjugate_line_coeffs`: upstream's `assert_ne!(z.y, conj(z.y))` | the fork's `InvalidStructure` (DIVERGENCE-013): Im(z.y) = 0 is about 2^-62 a sample point, a chance a transcript gets once a point of its DEEP plan, and z is grindable, so this refusal, not chance, is what stops it. The circuits that verify formats 41 and 32 hold the same refusal (§ Formats and their bit counts) |
+| 17 | `denominator_inverses` → `CM31::batch_inverse` → `inverse()`'s zero `assert!` | the fork's `InvalidStructure` (DIVERGENCE-013). Unreachable for z on the circle with Im(z.y) ≠ 0: the line vanishes at a base-field circle point only if Im(z) is isotropic, which no circle point's is (proved in its doc) |
 | 18 | `fri_answers`: `lifting_domain.at(bit_reverse_index(position, ..))` | ours: positions drawn below `2^lifting_log_size` |
 | 19 | `fri.rs` `FriVerifier::commit`: `CanonicCoset::new(..)`'s `try_new().unwrap()`, `LineDomain::new`'s `assert!`, `n_inner_layers − 1` | ours: the degree bound from the verifier's tallest tree (22 − 5); the subtraction only inside the loop over the layers; a wrong layer count is `InvalidNumFriLayers`, a last layer of another size `LastLayerDegreeInvalid` |
 | 20 | `FriConfig::new`'s `assert!`s; `draw_queries`' `(1 << log_size) − 1` and `try_into().unwrap()` | ours: the format's configuration; `u32` into `usize` |
@@ -479,6 +584,37 @@ probability about 2^-124 a term, over challenges drawn after the main
 root. The device path has the same shape in DeviceIoChip's recomputed sum
 (`src/chips/device_boundary.rs`'s `io_claimed_sum`, 4 terms, φ9..12).
 The channel's draws and `verify_pow_nonce` index nothing from the proof.
+
+Three behaviours of the fork's verify path, each with what VOS does about
+it; each fix on the fork's side is listed in `docs/design/open.md`:
+
+- **A height-0 tree verifies before its shape is checked**
+  (`vcs_lifted/verifier.rs` `verify` returns `Ok` when `height == 0`).
+  Unreachable here: every tree's height is ours, its log sizes plus the
+  blowup (row 7), never 0, and the shape check pins every tree's widths
+  before any Stwo call.
+- **The Blake2s-M31 channel's draws are not uniform** (format 47). A
+  draw reduces each 32-bit word of a digest mod p (`vcs/blake2_hash.rs`'s
+  `reduce_to_m31`, read by `channel/blake2s.rs`'s draws), and `2^32 = 2p
+  + 2`, so 0 and 1 have three preimages and every other value two: each
+  is 1.5 times as likely as the rest, though the fork's doc calls the
+  draws uniform. A QM31 challenge then hits one value with probability at
+  most `(3/2^32)^4` against `p^-4`, about 2^2.34 times more, so a term
+  bounded by one challenge's chance loses at most 2.34 bits. Its effect on
+  the affine DEEP batching term, whose coefficients are many draws, is
+  not derived, an audit item ([AUDIT.md](AUDIT.md)). The Blake2b channel
+  (format 39) draws by rejection and is uniform; the Poseidon2-M31
+  channel (41, 32) does not draw through this reduction.
+- **The PCS leaves two things to its caller** (`pcs/verifier.rs`
+  `verify_values`): the number of affine DEEP coefficients is drawn from
+  the samples' count (`n_deep_values`), and the batching mode is not
+  mixed into the transcript. VOS supplies both: the masked verifier
+  checks every column's samples against the format's sample points before
+  `verify_values` (`final-verifier/src/masking.rs`'s `admitted` and
+  `check_shape`), so the count is the format's, and the transcript's
+  header mixes the format's number (`recair-air/src/format.rs`'s
+  `mix_statement_header`), which names the batching, taken from the
+  registry entry and never from a proof.
 
 ### The corpus
 
@@ -611,7 +747,12 @@ trace are in the clear, and they must never leave the prover role.
 AIR, `vos-pvm-recair`'s masked prover and `vos-pvm-final-verifier`'s masked
 verifier (the masked transcript below, every parameter the format's, the
 shape checked before any Stwo call), its bytes a fixed layout with one
-encoding a proof.
+encoding a proof. Its randomizers: `mask_rows`
+(`final-verifier/src/masking.rs`) gives each component an `h` of twice
+the rows a column of it reveals, rounded up to a power of two, under the
+format's cap (`log_mask_rows` 8, so 256); every wrap component's columns
+read a second row, so each reveals `4·2 + 16·3 = 56` rows at 16 queries
+and takes `h = 128`. Format 47's chips reveal 149 and take the cap, 256.
 The verifier leaves three facts to Stwo, each pinned and tested: the
 trees' widths `verify_values` zips; the FRI rounds `FriVerifier::commit`
 derives from the largest column (`[3, 3, 3, 2]`); and FRI's degree bound,
@@ -742,7 +883,9 @@ uniformity, exact at 64 or fewer; α = 10^-3 over the family with
 Bonferroni) find gross leaks only: at 2,000 small-circuit proofs a witness
 a field leaking about 0.13 in total variation; at the real wrap's 32, by
 uniformity, a field leaking about 0.6, and between witnesses only a field
-fixed by the witness.
+fixed by the witness. They test each revealed value alone, so they cannot
+see a witness-fixed linear combination of a column's revealed values:
+that is the leak R1's rank check guards, and only R1 does.
 
 ## What leaves the prover role
 
@@ -929,14 +1072,12 @@ the prover role, where an audit most needs it said.
   `a_tree_root_wraps` (`recair/tests/recursion/wrap.rs`, in `just gate`)
   holds continuity across a real run: four segments, four leaves, three
   folds, the root wrapped and its io-hash the one-segment run's.
-  Range-checking the leaf's own timestamp bytes is recorded for the next
-  circuit change (`docs/design/open.md`).
 
 ### Completeness and privacy
 
 - **Honest runs that cannot be proved** (`docs/design/open.md`,
-  "Completeness limits"): an invalid dynamic jump; a gap of 2^27 steps or
-  more between two accesses to one key; a BLAKE2b pointer within 256
+  "Completeness limits"): an invalid dynamic jump; a run past 2^27 − 1
+  steps (refused before proving, § above); a BLAKE2b pointer within 256
   bytes of 2^32. Each refuses an honest run's proof, never admits a false
   one; a statement's absence is not a refusal (§ What a verified proof
   does not guarantee, liveness).
@@ -966,7 +1107,7 @@ the prover role, where an audit most needs it said.
 - **Side channels:** the prover is not constant-time, and its time reveals
   the trace's size. Statements are published at the window cadence for
   that reason.
-- **Cost:** no gas is proved.
+- **Cost:** no gas and no step count is proved.
 
 ## Deployment checklist
 

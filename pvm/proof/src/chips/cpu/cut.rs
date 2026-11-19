@@ -66,6 +66,15 @@ impl CpuColumns {
         self.0
     }
 
+    /// The set of `words` ([`Self::words`]); `None` when one names no
+    /// column.
+    pub fn from_words(words: [u64; CPU_COLUMN_WORDS]) -> Option<Self> {
+        let columns = Self(words);
+        (0..CPU_COLUMN_WORDS)
+            .all(|word| words[word] & !Self::ALL.0[word] == 0)
+            .then_some(columns)
+    }
+
     /// Whether it holds `column`.
     pub fn contains(&self, column: Column) -> bool {
         let index = column as usize;

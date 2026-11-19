@@ -39,7 +39,10 @@ fn slot_mut(regions: [(u64, &mut [u8]); 2], vaddr: u64, len: usize) -> Option<&m
 /// Detects code pointers via:
 /// 1. R_RISCV_32/64 absolute relocations targeting code sections
 /// 2. R_RISCV_SUB32 relocations (relative jump table entries: value = target - table_base)
-/// 3. Heuristic scan for 8-byte values in initialized data that match code addresses
+/// 3. In an ELF without relocations alone, a heuristic scan for 8-byte
+///    values in initialized data that match code addresses: in one with
+///    them every code pointer has its relocation, and a value the scan
+///    finds is plain data that happens to equal a code address.
 ///
 /// Creates PVM jump table entries for each target and rewrites the data
 /// so that the loaded values are valid PVM djump addresses. A target never
@@ -107,9 +110,11 @@ pub(super) fn rewrite_data_code_ptrs(
     }
 
     // Heuristic: 8-byte values in either initialized region that are code
-    // addresses.
+    // addresses, in an ELF without relocations.
+    let unrelocated =
+        (elf.relocations == 0).then_some([(ro_base, &*ro_data), (rw_base, &*rw_data)]);
     for (vaddr, target) in raw_code_pointers(
-        [(ro_base, &*ro_data), (rw_base, &*rw_data)],
+        unrelocated.into_iter().flatten(),
         &elf.data_relocation_ranges,
         &elf.code_ranges,
     ) {
@@ -177,6 +182,7 @@ pub(super) fn translate_section_linked(
                 detail: "compressed instruction in rv64em ELF".into(),
             });
         }
+        ctx.note_write(inst);
 
         if riscv::opcode(inst) == op::AUIPC {
             let rd = riscv::rd(inst);
@@ -198,6 +204,7 @@ pub(super) fn translate_section_linked(
                 // the emitted call and truncate its bytes.
                 ctx.flush_pending()?;
                 // Fused load_imm_jump: set return address and jump in one instruction
+                ctx.note_write(jalr);
                 ctx.emit_call(riscv::rd(jalr), rv_addr + 8, target_addr)?;
                 ctx.address_map.insert(rv_addr + 4, ctx.code.len() as u32);
                 offset += 8;
@@ -205,6 +212,10 @@ pub(super) fn translate_section_linked(
             }
 
             if let Some(&target_addr) = elf.hi20_targets.get(&rv_addr) {
+                // An AUIPC consumes no buffered LUI or AUIPC: emit it first,
+                // as `translate_one` does, so it is neither emitted after
+                // this load nor removed with it by a fusion.
+                ctx.flush_pending()?;
                 // PCREL_HI20: AUIPC for data reference.
                 // Peek ahead: if the next instruction is a paired LO12 ADDI (nop),
                 // skip it and set pending_load_imm to enable cascading fusion
@@ -222,11 +233,17 @@ pub(super) fn translate_section_linked(
                         && riscv::funct3(next_inst) == 0
                         && riscv::rs1(next_inst) == rd
                     {
+                        ctx.note_write(next_inst);
                         // LO12 ADDI: address is already complete from HI20.
                         // Load it into the ADDI's destination register,
-                        // pending for cascading fusion.
+                        // pending for cascading fusion, and into the
+                        // AUIPC's own when the ADDI's is another: a later
+                        // LO12 site of this HI20 reads the AUIPC's.
                         let next_rd = riscv::rd(next_inst);
                         let dest = if next_rd != 0 { next_rd } else { rd };
+                        if dest != rd {
+                            ctx.load_address(rd, target_addr)?;
+                        }
                         ctx.load_address(dest, target_addr)?;
                         ctx.address_map.insert(next_addr, ctx.code.len() as u32);
                         offset += 8;
@@ -249,10 +266,18 @@ pub(super) fn translate_section_linked(
         // with the pending_load_imm the HI20 set.
         let lo12 = elf.lo12_sites.contains(&rv_addr);
         let (rd, rs1, funct3) = (riscv::rd(inst), riscv::rs1(inst), riscv::funct3(inst));
+        // A LO12 site bypasses `translate_one` too: a LUI or AUIPC buffered
+        // before it is emitted first, as it would be there.
+        if lo12 && matches!(riscv::opcode(inst), op::OP_IMM | op::LOAD | op::STORE) {
+            ctx.flush_buffered()?;
+        }
         if riscv::opcode(inst) == op::LOAD && rd == 0 {
             ctx.discard_into = dead_register(&data[offset + 4..]);
+            if ctx.discard_into == Some(5) {
+                ctx.last_t0_imm = None;
+            }
         }
-        match riscv::opcode(inst) {
+        let translated = match riscv::opcode(inst) {
             // ADDI rd, rs1, lo12 → address already loaded by HI20, reached
             // when the HI20 peek-ahead didn't consume this ADDI (e.g. a
             // non-adjacent HI20/LO12 pair).
@@ -265,14 +290,16 @@ pub(super) fn translate_section_linked(
                 } else {
                     ctx.emit_op(Opcode::Fallthrough);
                 }
+                Ok(())
             }
             // LOAD rd, lo12(rs1): with the HI20's load pending, a direct
             // load (load_* rd, addr), which saves an instruction.
-            op::LOAD if lo12 => ctx.translate_load(funct3, rd, rs1, 0, rv_addr)?,
+            op::LOAD if lo12 => ctx.translate_load(funct3, rd, rs1, 0, rv_addr),
             // STORE rs2, lo12(rs1)
-            op::STORE if lo12 => ctx.translate_store(funct3, rs1, riscv::rs2(inst), 0, rv_addr)?,
-            _ => ctx.translate_one(inst, rv_addr)?,
-        }
+            op::STORE if lo12 => ctx.translate_store(funct3, rs1, riscv::rs2(inst), 0, rv_addr),
+            _ => ctx.translate_one(inst, rv_addr),
+        };
+        translated.map_err(|error| error.at(rv_addr))?;
         offset += 4;
     }
 

@@ -30,7 +30,10 @@
 //! free (address and multiplicity 0) under a coefficient, a free message
 //! absorbed outside a node row, and a lane of a wire that every row
 //! absorbing it leaves unread and no gate computes. The relation cannot see
-//! those reads; the check makes every read of a committed circuit bound.
+//! those reads; the check leaves a committed circuit one kind of unbound
+//! read, the one it means: a guess, a wire yielded with no use and read
+//! where it is yielded, which the prover chooses and only the constraints
+//! over it hold.
 //!
 //! # Why it is sound
 //!

@@ -10,13 +10,6 @@ pub struct MemoryLayout {
     pub regions: [PageRange; REGIONS],
 }
 
-/// The pages `[first, end)`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PageRange {
-    pub first: u32,
-    pub end: u32,
-}
-
 /// What a page allows, as the ledger's permission column holds it.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

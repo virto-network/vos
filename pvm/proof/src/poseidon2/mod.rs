@@ -16,7 +16,6 @@
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
-use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::fields::m31::BaseField;
@@ -95,22 +94,6 @@ impl P2Hash {
             out[i * 4..i * 4 + 4].copy_from_slice(&limb.0.to_le_bytes());
         }
         out
-    }
-}
-
-/// Parse a 32-byte commitment (8 little-endian `u32` limbs, each reduced mod
-/// `p`) back into a `P2Hash`. Mirrors `Blake2sHash: From<&[u8]>` so the
-/// channel-agnostic `CommitmentHash::from(&[u8])` in the prover extension works
-/// under the Poseidon2-M31 stack. Panics on a non-32-byte slice (callers guard).
-impl From<&[u8]> for P2Hash {
-    fn from(bytes: &[u8]) -> Self {
-        assert_eq!(bytes.len(), 32, "P2Hash requires exactly 32 bytes");
-        let mut limbs = [BaseField::zero(); 8];
-        for (i, limb) in limbs.iter_mut().enumerate() {
-            let w = u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
-            *limb = BaseField::reduce(w as u64);
-        }
-        P2Hash(limbs)
     }
 }
 
@@ -240,6 +223,11 @@ impl Poseidon2M31Channel {
     }
 }
 
+/// Every mix is one [`Transcript::absorb`] run, which records neither its
+/// length nor its kind: the verifiers mix only runs whose counts their
+/// format and shape fix before any is read from a proof (the header, the
+/// roots, the sampled values a checked shape lays out, the public words),
+/// or that a later check pins (the recursion's outputs, by its logup sum).
 impl Channel for Poseidon2M31Channel {
     const BYTES_PER_HASH: usize = 32;
 

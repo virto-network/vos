@@ -59,6 +59,7 @@ const R_RISCV_JAL: u32 = 17;
 /// [`LinkedElf`]'s.
 #[derive(Default)]
 pub(super) struct Relocations {
+    /// The entries of the sections that apply to a loaded section.
     pub(super) count: usize,
     pub(super) unknown: Option<u32>,
     pub(super) hi20_targets: BTreeMap<u64, u64>,
@@ -84,23 +85,29 @@ pub(super) fn relocations(
     // known.
     let mut lo12_entries: Vec<(u64, u64)> = Vec::new();
     let mut ranges = Vec::new();
+    let mut entries = 0usize;
 
     for &ri in &elf.relas {
         let rs = &elf.headers[ri];
         let count = (rs.size / RELA_ENTRY as u64) as usize;
-        found.count = found.count.saturating_add(count);
-        if found.count > limits::RELOCATIONS {
+        entries = entries.saturating_add(count);
+        if entries > limits::RELOCATIONS {
             return Err(TranspileError::ElfParse(format!(
                 "past {} relocations",
                 limits::RELOCATIONS
             )));
         }
         // The section the relocations apply to: one not loaded, as debug
-        // information, places no pointer in the program.
+        // information, places no pointer in the program, and its offsets
+        // are no program addresses. Its relocations are not read.
         let applies = elf
             .headers
             .get(rs.info)
             .is_some_and(|target| target.flags & SHF_ALLOC != 0);
+        if !applies {
+            continue;
+        }
+        found.count = found.count.saturating_add(count);
         let table = span(data, rs.file_off, rs.size).unwrap_or(&[]);
         for entry in table.chunks_exact(RELA_ENTRY) {
             let r_offset = u64::from_le_bytes(entry[0..8].try_into().expect("eight bytes"));
@@ -110,7 +117,7 @@ pub(super) fn relocations(
             let r_sym = (r_info >> 32) as usize;
 
             let Some(rtype) = RelocType::from_raw(r_type) else {
-                if applies && !matches!(r_type, R_RISCV_BRANCH | R_RISCV_JAL) {
+                if !matches!(r_type, R_RISCV_BRANCH | R_RISCV_JAL) {
                     found.unknown.get_or_insert(r_type);
                 }
                 continue;
@@ -123,10 +130,8 @@ pub(super) fn relocations(
                 RelocType::Abs32 | RelocType::Abs64 | RelocType::Add32 => {
                     let width = rtype.width();
                     ranges.push((r_offset, r_offset.saturating_add(width.into())));
-                    if applies {
-                        found.data_relocs.push((r_offset, target));
-                        found.symbol_refs.push((r_offset, sym_value));
-                    }
+                    found.data_relocs.push((r_offset, target));
+                    found.symbol_refs.push((r_offset, sym_value));
                     if in_ranges(code_ranges, target) {
                         found.abs_code_ptrs.push((r_offset, target, width));
                     }
@@ -137,9 +142,7 @@ pub(super) fn relocations(
                     found.sub32_relocs.push((r_offset, target));
                 }
                 RelocType::PcrelHi20 => {
-                    if applies {
-                        found.symbol_refs.push((r_offset, sym_value));
-                    }
+                    found.symbol_refs.push((r_offset, sym_value));
                     // The resolved data or function address.
                     found.hi20_targets.insert(r_offset, target);
                 }

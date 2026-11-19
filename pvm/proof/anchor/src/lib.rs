@@ -42,6 +42,7 @@
 //! that can overflow is a lint error, each one left allowed in place with
 //! the reason it cannot fail.
 
+#![forbid(unsafe_code)]
 #![no_std]
 #![cfg_attr(
     not(test),
@@ -303,6 +304,11 @@ pub enum RootKind {
 }
 
 impl RootKind {
+    /// Every kind, by its byte.
+    pub const ALL: [Self; 1] = [Self::Space];
+    /// How many kinds there are.
+    pub const COUNT: usize = Self::ALL.len();
+
     /// The kind byte `byte` names; none for an unknown one.
     pub const fn from_u8(byte: u8) -> Option<Self> {
         match byte {

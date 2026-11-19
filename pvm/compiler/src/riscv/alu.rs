@@ -16,11 +16,6 @@ impl TranslationContext {
         rs1: u8,
         imm: i32,
     ) -> Result<(), TranspileError> {
-        // Track `li t0, N` (ADDI x5, x0, N) for ecall ID translation
-        if funct3 == 0 && rd == 5 && rs1 == 0 {
-            self.last_t0_imm = Some(imm);
-        }
-
         // AUIPC+ADDI fusion: the full address, a jump-table address when it
         // is code (a function pointer), so indirect calls via djump work.
         if let Some((auipc_rd, auipc_val)) = self.pending_auipc.take() {
@@ -82,10 +77,17 @@ impl TranslationContext {
                 4 => return self.emit_load_imm(rd, imm as i64), // XORI rd, x0, imm = imm
                 6 => return self.emit_load_imm(rd, imm as i64), // ORI rd, x0, imm = imm
                 7 => return self.emit_load_imm(rd, 0),          // ANDI rd, x0, imm = 0
-                // SLLI/SRLI/SRAI rd, x0, shamt → 0 (0 shifted any way is 0). MUST
-                // emit it: PVM has no zero register (x0 maps to reg 0 = RA), so
-                // falling through to the register path would shift RA, not 0.
-                _ => return self.emit_load_imm(rd, 0),
+                // A shift, rotate or unary op of 0: its value. MUST emit it:
+                // PVM has no zero register (x0 maps to reg 0 = RA), so falling
+                // through to the register path would operate on RA, not 0.
+                _ => {
+                    let (opcode, _) = shift_imm(funct3, funct7, imm)?;
+                    let of_zero = match opcode {
+                        Opcode::LeadingZeroBits64 | Opcode::TrailingZeroBits64 => 64,
+                        _ => 0,
+                    };
+                    return self.emit_load_imm(rd, of_zero);
+                }
             }
         }
 
@@ -94,74 +96,21 @@ impl TranslationContext {
 
         let pvm_opcode = match funct3 {
             0 => Opcode::AddImm64, // ADDI
-            1 => {
-                if funct7 == 0x30 {
-                    // Zbb unary: clz/ctz/cpop/sext.b/sext.h
-                    let rs2 = (imm & 0x1F) as u8;
-                    let opc = match rs2 {
-                        0 => Opcode::LeadingZeroBits64,
-                        1 => Opcode::TrailingZeroBits64,
-                        2 => Opcode::CountSetBits64,
-                        4 => Opcode::SignExtend8,
-                        5 => Opcode::SignExtend16,
-                        _ => {
-                            return Err(TranspileError::UnsupportedInstruction {
-                                offset: 0,
-                                detail: format!("Zbb rs2={rs2}"),
-                            });
-                        }
-                    };
-                    self.emit_op(opc);
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                    return Ok(());
-                }
-                // SLLI (funct7=0x00)
-                let shamt = imm & 0x3F;
-                self.emit_op(Opcode::ShloLImm64);
+            1 | 5 => {
+                // SLLI/SRLI/SRAI, RORI, and Zbb's unary ops.
+                let (opcode, shifts) = shift_imm(funct3, funct7, imm)?;
+                self.emit_op(opcode);
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                self.emit_var_imm(shamt);
+                if shifts {
+                    self.emit_var_imm(imm & 0x3F);
+                }
                 return Ok(());
             }
             2 => Opcode::SetLtSImm, // SLTI
             3 => Opcode::SetLtUImm, // SLTIU
             4 => Opcode::XorImm,    // XORI
-            5 => {
-                if (funct7 == 0x35 || funct7 == 0x34) && (imm & 0x1F) == 0x18 {
-                    // Zbb rev8 (RV64: 0x35, RV32: 0x34)
-                    self.emit_op(Opcode::ReverseBytes);
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                    return Ok(());
-                }
-                if funct7 == 0x30 || funct7 == 0x31 {
-                    // Zbb RORI: funct6=0x18 (bits 31:26).
-                    // funct7=0x30 when shamt<32, funct7=0x31 when shamt>=32 (bit 25 set).
-                    let shamt = imm & 0x3F;
-                    self.emit_op(Opcode::RotR64Imm);
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                    self.emit_var_imm(shamt);
-                    return Ok(());
-                }
-                if funct7 == 0x14 {
-                    // Zbb orc.b — OR-combine bytes
-                    // No PVM equivalent; emit as trap (rare instruction)
-                    return Err(TranspileError::UnsupportedInstruction {
-                        offset: 0,
-                        detail: "Zbb orc.b not yet supported".into(),
-                    });
-                }
-                // SRLI (funct7=0x00) / SRAI (funct7=0x20+)
-                let shamt = imm & 0x3F;
-                if funct7 & 0x20 != 0 {
-                    self.emit_op(Opcode::SharRImm64);
-                } else {
-                    self.emit_op(Opcode::ShloRImm64);
-                }
-                self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                self.emit_var_imm(shamt);
-                return Ok(());
-            }
-            6 => Opcode::OrImm,  // ORI
-            7 => Opcode::AndImm, // ANDI
+            6 => Opcode::OrImm,     // ORI
+            7 => Opcode::AndImm,    // ANDI
             _ => unreachable!(),
         };
 
@@ -528,12 +477,16 @@ impl TranslationContext {
         // materialize the result directly instead of operating on RA. Mirrors the
         // rs1==0 handling in `translate_op_imm`.
         if rs1 == 0 {
-            match funct3 {
-                0 => return self.emit_load_imm(rd, imm as i64), // ADDIW rd, x0, imm = sext32(imm)
-                1 if funct7 != 0x30 => return self.emit_load_imm(rd, 0), // SLLIW rd, x0, _ = 0
-                5 if funct7 != 0x30 => return self.emit_load_imm(rd, 0), // SRLIW/SRAIW rd, x0, _ = 0
-                _ => {} // Zbb unary (clzw/ctzw/cpopw/roriw) on x0 → general path (no Zbb on target)
+            if funct3 == 0 {
+                return self.emit_load_imm(rd, imm as i64); // ADDIW rd, x0, imm = sext32(imm)
             }
+            // A shift, rotate or unary op of 0: its value.
+            let (opcode, _) = shift_imm_32(funct3, funct7, imm)?;
+            let of_zero = match opcode {
+                Opcode::LeadingZeroBits32 | Opcode::TrailingZeroBits32 => 32,
+                _ => 0,
+            };
+            return self.emit_load_imm(rd, of_zero);
         }
 
         let pvm_rd = self.require_reg(rd)?;
@@ -546,45 +499,14 @@ impl TranslationContext {
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
                 self.emit_var_imm(imm);
             }
-            1 => {
-                if funct7 == 0x30 {
-                    // Zbb: clzw(rs2=0), ctzw(rs2=1), cpopw(rs2=2)
-                    let rs2 = (imm & 0x1F) as u8;
-                    let opc = match rs2 {
-                        0 => Opcode::LeadingZeroBits32,
-                        1 => Opcode::TrailingZeroBits32,
-                        2 => Opcode::CountSetBits32,
-                        _ => {
-                            return Err(TranspileError::UnsupportedInstruction {
-                                offset: 0,
-                                detail: format!("Zbb-W rs2={rs2}"),
-                            });
-                        }
-                    };
-                    self.emit_op(opc);
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                } else {
-                    // SLLIW (funct7=0x00)
-                    let shamt = imm & 0x1F;
-                    self.emit_op(Opcode::ShloLImm32);
-                    self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                    self.emit_var_imm(shamt);
-                }
-            }
-            5 => {
-                let shamt = imm & 0x1F;
-                if funct7 == 0x30 {
-                    // Zbb roriw
-                    self.emit_op(Opcode::RotR32Imm);
-                } else if funct7 & 0x20 != 0 {
-                    // SRAIW (funct7=0x20)
-                    self.emit_op(Opcode::SharRImm32);
-                } else {
-                    // SRLIW (funct7=0x00)
-                    self.emit_op(Opcode::ShloRImm32);
-                }
+            1 | 5 => {
+                // SLLIW/SRLIW/SRAIW, RORIW, and Zbb's unary word ops.
+                let (opcode, shifts) = shift_imm_32(funct3, funct7, imm)?;
+                self.emit_op(opcode);
                 self.emit_data(pvm_rd | (pvm_rs1 << 4));
-                self.emit_var_imm(shamt);
+                if shifts {
+                    self.emit_var_imm(imm & 0x1F);
+                }
             }
             _ => {
                 return Err(TranspileError::UnsupportedInstruction {
@@ -811,11 +733,6 @@ impl TranslationContext {
             self.emit_data(pvm_rs1 | (pvm_rs2 << 4));
             self.emit_data(pvm_rd);
             return Ok(());
-        } else if funct7 == 0x04 && funct3 == 4 {
-            // Zbb zext.h
-            self.emit_op(Opcode::ZeroExtend16);
-            self.emit_data(pvm_rd | (pvm_rs1 << 4));
-            return Ok(());
         } else if funct7 == 0 {
             match funct3 {
                 0 => Opcode::Add32,   // ADDW
@@ -860,5 +777,61 @@ impl TranslationContext {
             self.bitmask.truncate(undo_pos);
             self.address_map.insert(addr, undo_pos as u32);
         }
+    }
+}
+
+/// The PVM opcode of an OP-IMM of funct3 1 or 5, by its immediate's upper
+/// bits (`funct7`, which holds the shift amount's sixth bit): a shift, a
+/// rotate or one of Zbb's unary ops, and whether it takes a shift amount.
+/// Any other encoding (Zbs's `bseti` or `bexti`, `orc.b`) is refused.
+fn shift_imm(funct3: u32, funct7: u32, imm: i32) -> Result<(Opcode, bool), TranspileError> {
+    Ok(match (funct3, funct7) {
+        (1, 0x00 | 0x01) => (Opcode::ShloLImm64, true), // SLLI
+        (1, 0x30) => (
+            match imm & 0x1F {
+                0 => Opcode::LeadingZeroBits64,  // CLZ
+                1 => Opcode::TrailingZeroBits64, // CTZ
+                2 => Opcode::CountSetBits64,     // CPOP
+                4 => Opcode::SignExtend8,        // SEXT.B
+                5 => Opcode::SignExtend16,       // SEXT.H
+                _ => return Err(unsupported_imm("OP-IMM", funct3, imm)),
+            },
+            false,
+        ),
+        (5, 0x00 | 0x01) => (Opcode::ShloRImm64, true), // SRLI
+        (5, 0x20 | 0x21) => (Opcode::SharRImm64, true), // SRAI
+        (5, 0x30 | 0x31) => (Opcode::RotR64Imm, true),  // RORI
+        (5, 0x35) if imm & 0x1F == 0x18 => (Opcode::ReverseBytes, false), // REV8
+        _ => return Err(unsupported_imm("OP-IMM", funct3, imm)),
+    })
+}
+
+/// [`shift_imm`] for an OP-IMM-32, whose shift amount has five bits:
+/// `slli.uw` and the rest are refused.
+fn shift_imm_32(funct3: u32, funct7: u32, imm: i32) -> Result<(Opcode, bool), TranspileError> {
+    Ok(match (funct3, funct7) {
+        (1, 0x00) => (Opcode::ShloLImm32, true), // SLLIW
+        (1, 0x30) => (
+            match imm & 0x1F {
+                0 => Opcode::LeadingZeroBits32,  // CLZW
+                1 => Opcode::TrailingZeroBits32, // CTZW
+                2 => Opcode::CountSetBits32,     // CPOPW
+                _ => return Err(unsupported_imm("OP-IMM-32", funct3, imm)),
+            },
+            false,
+        ),
+        (5, 0x00) => (Opcode::ShloRImm32, true), // SRLIW
+        (5, 0x20) => (Opcode::SharRImm32, true), // SRAIW
+        (5, 0x30) => (Opcode::RotR32Imm, true),  // RORIW
+        _ => return Err(unsupported_imm("OP-IMM-32", funct3, imm)),
+    })
+}
+
+/// An immediate-form encoding the translation does not take; the caller
+/// names its address.
+fn unsupported_imm(kind: &str, funct3: u32, imm: i32) -> TranspileError {
+    TranspileError::UnsupportedInstruction {
+        offset: 0,
+        detail: format!("{kind} funct3={funct3} immediate={:#05x}", imm & 0xFFF),
     }
 }

@@ -69,9 +69,10 @@ pub(crate) struct TranslationContext {
     /// Enables fusion with a subsequent ADD/AND/OR/XOR/load/store into the
     /// immediate form, eliminating the load_imm instruction entirely.
     pub(crate) pending_load_imm: Option<(u8, i64, usize)>,
-    /// Last immediate loaded into t0 (x5): the id of the `ecalli` a marked
-    /// ecall becomes.
-    last_t0_imm: Option<i32>,
+    /// The constant t0 (x5) holds, when its basic block loaded it and
+    /// nothing wrote t0 since: the id of the `ecalli` a marked ecall
+    /// becomes.
+    pub(crate) last_t0_imm: Option<i64>,
     /// Set by the CSR marker 0x801: the next ecall becomes a PVM `ecalli`
     /// whose id was loaded into t0.
     ecalli_marked: bool,
@@ -104,6 +105,17 @@ impl TranslationContext {
         Ok(())
     }
 
+    /// Emit a buffered LUI or AUIPC, as [`Self::translate_one`] does before
+    /// an instruction that consumes neither, for the relocated instructions
+    /// that bypass it. A load_imm pending for fusion stays pending only when
+    /// nothing is emitted after it.
+    pub(crate) fn flush_buffered(&mut self) -> Result<(), TranspileError> {
+        if self.pending_auipc.is_some() || self.pending_lui.is_some() {
+            self.flush_pending()?;
+        }
+        Ok(())
+    }
+
     /// Begin translating one RISC-V instruction at an address whose PVM
     /// location may be referenced by another control-flow edge.
     ///
@@ -118,9 +130,42 @@ impl TranslationContext {
     ) -> Result<(), TranspileError> {
         if is_control_flow_target {
             self.flush_pending()?;
+            // An edge in brings its own t0, and may skip an ecall's marker.
+            self.last_t0_imm = None;
+            if self.ecalli_marked {
+                return Err(TranspileError::UnsupportedInstruction {
+                    offset: address as usize,
+                    detail: "a control-flow target between an ecalli's marker and its ecall".into(),
+                });
+            }
         }
         self.address_map.insert(address, self.code.len() as u32);
         Ok(())
+    }
+
+    /// Follow t0's (x5's) constant through `inst`, before it is
+    /// translated: `li t0, N` in any of its forms (`addi` or `addiw` from
+    /// x0, or `lui` then `addi` or `addiw` of t0) fixes it, and any other
+    /// write to t0 leaves it unknown.
+    pub(crate) fn note_write(&mut self, inst: u32) {
+        const T0: u8 = 5;
+        // A store or a branch writes no register: its bits 7-11 are an
+        // immediate's.
+        if rd(inst) != T0 || matches!(opcode(inst), op::STORE | op::BRANCH) {
+            return;
+        }
+        let (rs1, imm) = (rs1(inst), i64::from(i_imm(inst)));
+        let base = match rs1 {
+            0 => Some(0),
+            T0 => self.last_t0_imm,
+            _ => None,
+        };
+        self.last_t0_imm = match (opcode(inst), funct3(inst)) {
+            (op::LUI, _) => Some(i64::from(u_imm(inst))),
+            (op::OP_IMM, 0) => base.map(|base| base.wrapping_add(imm)),
+            (op::OP_IMM_32, 0) => base.map(|base| i64::from(base.wrapping_add(imm) as i32)),
+            _ => None,
+        };
     }
 
     /// Translate the 32-bit RISC-V instruction `inst` at `addr`.
@@ -214,10 +259,20 @@ impl TranslationContext {
                 // ECALL: a marked one becomes `ecalli`; an unmarked one traps.
                 (0, 0) => {
                     if std::mem::take(&mut self.ecalli_marked) {
-                        let id = self.last_t0_imm.unwrap_or(0) as u32;
+                        // The id is t0's constant in this block; an ecall
+                        // whose t0 the block does not fix is refused.
+                        let id = self
+                            .last_t0_imm
+                            .take()
+                            .and_then(|id| u32::try_from(id).ok())
+                            .ok_or_else(|| TranspileError::UnsupportedInstruction {
+                                offset: addr as usize,
+                                detail: "a marked ecall whose t0 holds no constant id its \
+                                         block loads"
+                                    .into(),
+                            })?;
                         self.emit_ecalli(id);
                         self.host_calls.push((addr, id));
-                        self.last_t0_imm = None;
                     } else {
                         self.emit_op(Opcode::Trap);
                     }
@@ -228,8 +283,15 @@ impl TranslationContext {
                 // EBREAK, unimp, and every other CSR operation trap.
                 _ => self.emit_op(Opcode::Trap),
             },
-            // FENCE is a no-op.
-            op::MISC_MEM => self.emit_op(Opcode::Fallthrough),
+            // FENCE is a no-op: one thread, no device memory. FENCE.I and
+            // the cache-block operations are refused.
+            op::MISC_MEM if funct3 == 0 => self.emit_op(Opcode::Fallthrough),
+            op::MISC_MEM => {
+                return Err(TranspileError::UnsupportedInstruction {
+                    offset: addr as usize,
+                    detail: format!("MISC-MEM funct3={funct3}"),
+                });
+            }
             // T-Head extensions
             op::CUSTOM_0 => match (funct7, funct3) {
                 (0x20, 1) => {

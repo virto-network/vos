@@ -10,7 +10,7 @@ use vos_pvm::refine::PreparedProgram;
 use vos_pvm::refine_host::{JamItem, JamRefine};
 use vos_statement::fixtures::{self, Fixture};
 use vos_statement::model::Policy;
-use vos_statement::vos_anchor::{SpaceId, VenueId};
+use vos_statement::vos_anchor::{RootKind, SpaceId, VenueId};
 use vos_statement::{ProgramId, blake2b_256};
 use vos_statement_service::config::{Config, configure};
 use vos_statement_service::item::Item;
@@ -254,7 +254,7 @@ impl Rig {
                 controller: [0; 32],
                 keys: Vec::new(),
                 start: 0,
-                last: None,
+                last: [None; RootKind::COUNT],
                 ended: false,
                 nonce: 0,
             };

@@ -17,8 +17,19 @@
 //! the slots the guest writes, never to how much it maps. A slot with few
 //! writable pages, such as a small actor's stack, starts tracking as soon as
 //! they are mapped, since that is cheaper than its first fault.
+//!
+//! Each run of pages with one protection is one kernel mapping, and the
+//! kernel's mapping limit (`vm.max_map_count`) is the process's, shared by
+//! every guest and the host. A window therefore holds at most
+//! [`PROTECTION_RUNS`] permission runs, and the runs windows hold past
+//! their first [`OWN_PROTECTION_RUNS`] at most [`PROCESS_PROTECTION_RUNS`]
+//! together; a permission map past either, or a protection the kernel
+//! refuses, retires the window: it is made wholly inaccessible (one
+//! mapping again) and its machine runs on the interpreter over the same
+//! memory, with the same result. An ordinary layout stays within a
+//! window's own allowance, so no number of ordinary machines retires one.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::backing::{BackingStore, CodeWindow};
 use crate::interpreter::PERM_RW;
@@ -27,6 +38,28 @@ use crate::interpreter::memory::{PagePerms, SLOT_PAGES, SlotPerms};
 /// A slot with at most this many writable pages tracks writes from the
 /// moment they are mapped.
 const EAGER_PAGES: usize = 64;
+
+/// The most permission runs one window installs, past its first: a
+/// standard program's layout needs a handful.
+pub const PROTECTION_RUNS: usize = 128;
+
+/// The permission runs past its first that a window installs without
+/// counting against the process: a standard program's layout needs fewer.
+pub const OWN_PROTECTION_RUNS: usize = 16;
+
+/// The most permission runs all of a process's windows install together
+/// past their own allowance: a quarter of the kernel's default mapping
+/// limit (65,530), the rest left to the host and to each window's own.
+pub const PROCESS_PROTECTION_RUNS: usize = 16_384;
+
+/// Permission runs the process's live windows install past their own
+/// allowance.
+static PROCESS_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// What a window of `edges` runs past its first counts against the process.
+fn counted(edges: usize) -> usize {
+    edges.saturating_sub(OWN_PROTECTION_RUNS)
+}
 
 pub(crate) struct NativeMemory {
     host: *mut u8,
@@ -48,6 +81,11 @@ pub(crate) struct NativeMemory {
     left: Vec<(usize, usize)>,
     /// Slot activation, shared with the fault handler.
     activation: alloc::boxed::Box<Activation>,
+    /// Adjacent page pairs of different permission in the window's table:
+    /// its permission runs past the first.
+    edges: usize,
+    /// The window was retired: its machine runs on the interpreter.
+    interpreted: bool,
 }
 
 /// Which slots track guest writes, and what the fault handler needs to
@@ -74,6 +112,11 @@ pub(crate) enum Activated {
 }
 
 impl Activation {
+    /// Fail tracking for good: the window's state is no longer trusted.
+    pub(crate) fn fail(&self) {
+        self.failed.store(true, Ordering::Relaxed);
+    }
+
     fn is_active(&self, slot: usize) -> bool {
         self.active[slot].load(Ordering::Relaxed)
     }
@@ -216,6 +259,8 @@ impl NativeMemory {
             writable: Default::default(),
             left: Vec::new(),
             activation,
+            edges: 0,
+            interpreted: false,
         })
     }
 
@@ -250,21 +295,81 @@ impl NativeMemory {
     }
 
     /// Bring the window's protection and permission table in line with
-    /// `perms`, visiting only the slots changed since the last sync.
-    pub(crate) fn sync_permissions(&mut self, perms: &mut PagePerms) -> Result<(), String> {
-        let result = self.sync_permissions_inner(perms);
-        if result.is_err() {
-            // A partial sync leaves the window and the tracking state out of
-            // step; captures stay conservative from now on.
-            self.activation.failed.store(true, Ordering::Relaxed);
+    /// `perms`, visiting only the slots changed since the last sync: true
+    /// when native code may run. False once the window is retired: past
+    /// its permission-run bounds, or for a protection the kernel refused,
+    /// the window is made inaccessible and the machine runs on the
+    /// interpreter for good. An error only when retiring failed too; the
+    /// memory then reports every page.
+    pub(crate) fn sync_permissions(&mut self, perms: &mut PagePerms) -> Result<bool, String> {
+        if self.interpreted {
+            return Ok(false);
         }
-        result
+        match self.sync_permissions_inner(perms) {
+            Ok(()) if self.within_bounds() => return Ok(true),
+            Ok(()) => tracing::debug!(edges = self.edges, "retiring a native window"),
+            Err(error) => tracing::debug!(%error, "retiring a native window"),
+        }
+        let retired = self.retire();
+        if retired.is_err() {
+            self.activation.fail();
+        }
+        retired.map(|()| false)
+    }
+
+    /// Whether the runs installed, with those slot activations split off,
+    /// are within this window's and the process's bounds.
+    fn within_bounds(&self) -> bool {
+        let split = self.activation_splits();
+        let extra = counted(self.edges + split) - counted(self.edges);
+        self.edges + split <= PROTECTION_RUNS
+            && PROCESS_RUNS.load(Ordering::Relaxed) + extra <= PROCESS_PROTECTION_RUNS
+    }
+
+    /// The runs slot activations split off the installed ones: kernel
+    /// mappings past the permission table's runs.
+    pub(crate) fn activation_splits(&self) -> usize {
+        // An active slot maps its writable pages writable and an inactive
+        // one read-only: two writable neighbours on either side of a slot
+        // boundary are two mappings.
+        let activation = &*self.activation;
+        // SAFETY: the window holds a permission byte per guest page.
+        let table = unsafe { core::slice::from_raw_parts(self.window.perms(), self.span / 4096) };
+        self.writable
+            .keys()
+            .filter(|&&slot| {
+                let first = slot * SLOT_PAGES;
+                slot > 0
+                    && table[first] == PERM_RW
+                    && table[first - 1] == PERM_RW
+                    && activation.is_active(slot) != activation.is_active(slot - 1)
+            })
+            .count()
+    }
+
+    /// Retire the window: report what the guest wrote through it, then make
+    /// all of it inaccessible, which merges its mappings into one.
+    fn retire(&mut self) -> Result<(), String> {
+        self.interpreted = true;
+        PROCESS_RUNS.fetch_sub(counted(core::mem::take(&mut self.edges)), Ordering::Relaxed);
+        let activation = &*self.activation;
+        let runs: Vec<(usize, usize)> = core::mem::take(&mut self.writable)
+            .into_iter()
+            .filter(|(slot, _)| activation.is_active(*slot))
+            .flat_map(|(_, runs)| runs)
+            .collect();
+        for (first, count) in runs {
+            leave(&self.window, &mut self.left, first, count)?;
+        }
+        mprotect_pages(&self.window, 0, self.span / 4096, libc::PROT_NONE)
     }
 
     fn sync_permissions_inner(&mut self, perms: &mut PagePerms) -> Result<(), String> {
         if perms.pages() != self.span / 4096 {
             return Err("invalid native memory permissions".into());
         }
+        let pages = self.span / 4096;
+        let edges = &mut self.edges;
         if !self.synced {
             perms.mark_all_changed();
         }
@@ -298,9 +403,34 @@ impl NativeMemory {
             let protect = |first: usize, count: usize, permission: u8| {
                 mprotect_pages(window, first, count, protection(permission, active))
             };
+            // The slot's neighbours, which this visit does not change.
+            // SAFETY: CodeWindow allocates a permission byte for every guest
+            // page; both lie within the span.
+            let prev = (first > 0).then(|| unsafe { *window.perms().add(first - 1) });
+            let next = (first + len < pages).then(|| unsafe { *window.perms().add(first + len) });
             // SAFETY: CodeWindow allocates a permission byte for every guest
             // page, and the slot lies within the span.
             let old = unsafe { core::slice::from_raw_parts_mut(window.perms().add(first), len) };
+            // Account pages `[a, b)` of the slot becoming `permission`, before
+            // any protection of them is installed.
+            let mut account = |old: &[u8], a: usize, b: usize, permission: u8| {
+                let before = range_edges(prev, old, next, a, b, None);
+                let after = range_edges(prev, old, next, a, b, Some(permission));
+                let now = *edges - before + after;
+                let (was, will) = (counted(*edges), counted(now));
+                if now > PROTECTION_RUNS
+                    || PROCESS_RUNS
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |runs| {
+                            let runs = runs - was + will;
+                            (will <= was || runs <= PROCESS_PROTECTION_RUNS).then_some(runs)
+                        })
+                        .is_err()
+                {
+                    return Err(alloc::string::String::from("too many permission runs"));
+                }
+                *edges = now;
+                Ok(())
+            };
 
             // Pages leaving PERM_RW first report what the guest wrote to them;
             // pages entering it are write-protected before the guest can run.
@@ -332,6 +462,7 @@ impl NativeMemory {
                                 }
                             }
                         }
+                        account(old, 0, len, permission)?;
                         let wanted = protection(permission, active);
                         match &mut pending {
                             Some((start, count, prot))
@@ -376,6 +507,7 @@ impl NativeMemory {
                                 leave(first + page + offset, count)?;
                             }
                         }
+                        account(old, page, end, permission)?;
                         protect(first + page, end - page, permission)?;
                         old[page..end].fill(permission);
                         page = end;
@@ -419,6 +551,30 @@ impl NativeMemory {
         self.synced = true;
         Ok(())
     }
+}
+
+/// Adjacent pages of different permission among the pairs that touch
+/// pages `[a, b)` of `slot`, those pages read as `fill` when given; `prev`
+/// and `next` are the pages either side of the slot, where there are any.
+fn range_edges(
+    prev: Option<u8>,
+    slot: &[u8],
+    next: Option<u8>,
+    a: usize,
+    b: usize,
+    fill: Option<u8>,
+) -> usize {
+    let value = |page: isize| -> Option<u8> {
+        match usize::try_from(page) {
+            Err(_) => prev,
+            Ok(page) if page >= slot.len() => next,
+            Ok(page) if (a..b).contains(&page) => Some(fill.unwrap_or(slot[page])),
+            Ok(page) => Some(slot[page]),
+        }
+    };
+    (a as isize..=b as isize)
+        .filter(|&page| matches!((value(page - 1), value(page)), (Some(x), Some(y)) if x != y))
+        .count()
 }
 
 /// Append the maximal runs of `[0, len)` where `selected` holds, as
@@ -512,9 +668,10 @@ impl NativeMemory {
         &*self.activation
     }
 
-    /// Whether write tracking has failed for good.
-    pub(crate) fn tracking_failed(&self) -> bool {
-        self.activation.failed.load(Ordering::Relaxed)
+    /// Whether this memory must not be reused: its write tracking failed
+    /// (it reports every page), or its window was retired.
+    pub(crate) fn retired(&self) -> bool {
+        self.interpreted || self.activation.failed.load(Ordering::Relaxed)
     }
 
     /// The whole span as one run, for captures once tracking has failed:
@@ -581,6 +738,7 @@ impl NativeMemory {
 
 impl Drop for NativeMemory {
     fn drop(&mut self) {
+        PROCESS_RUNS.fetch_sub(counted(self.edges), Ordering::Relaxed);
         // SAFETY: this exact mapping was allocated by `new` and is owned here.
         unsafe {
             libc::munmap(self.host.cast(), self.span.max(4096));
@@ -739,6 +897,22 @@ mod tests {
         Ok(runs)
     }
 
+    /// A write that starts tracking a slot between two that do not splits
+    /// two mappings off the writable run, which the window counts: what an
+    /// idle machine claims from the process's mapping budget.
+    #[test]
+    fn an_activated_slot_counts_the_mappings_it_splits_off() {
+        let pages = 3 * SLOT_PAGES;
+        let mut memory = NativeMemory::new(pages * 4096).unwrap();
+        let mut perms = PagePerms::new_rw(pages);
+        memory.sync_permissions(&mut perms).unwrap();
+        assert_eq!(memory.activation_splits(), 0);
+        first_write(&memory, SLOT_PAGES + 3);
+        assert_eq!(memory.activation_splits(), 2, "both of its boundaries");
+        first_write(&memory, 3);
+        assert_eq!(memory.activation_splits(), 1, "its neighbour joins it");
+    }
+
     #[test]
     fn large_slots_track_from_the_first_write_and_survive_clears() {
         let pages = 2 * SLOT_PAGES;
@@ -782,15 +956,42 @@ mod tests {
         assert_eq!(memory.span_pages(), (0, 4));
     }
 
+    /// Thousands of windows of an ordinary layout's few permission runs,
+    /// past any the process bound would hold if they counted, all run
+    /// natively: only runs past a window's own allowance count.
     #[test]
-    fn zero_span_is_empty_and_bad_permission_maps_fail_explicitly() {
+    fn ordinary_windows_never_exhaust_the_process_bound() {
+        let layout = [0, 1, 1, 0, 2, 2, 0, 1, 0, 2, 2, 2, 0, 2, 0, 0];
+        // Past what the process bound would hold if each window's ten runs
+        // counted, and within the kernel's default mapping limit at a
+        // dozen mappings a window.
+        let windows = PROCESS_PROTECTION_RUNS / 10 + 512;
+        let held: Vec<NativeMemory> = (0..windows)
+            .map(|_| {
+                let mut memory = NativeMemory::new(layout.len() * 4096).unwrap();
+                let mut perms = PagePerms::new_rw(layout.len());
+                perms.install(layout.to_vec());
+                assert_eq!(memory.sync_permissions(&mut perms), Ok(true));
+                assert!(memory.edges <= OWN_PROTECTION_RUNS);
+                memory
+            })
+            .collect();
+        assert!(held.iter().all(|memory| !memory.retired()));
+    }
+
+    #[test]
+    fn zero_span_is_empty_and_bad_permission_maps_retire_the_window() {
         let mut memory = NativeMemory::new(0).unwrap();
         assert!(memory.is_empty());
-        memory.sync_permissions(&mut PagePerms::new_rw(0)).unwrap();
+        assert_eq!(memory.sync_permissions(&mut PagePerms::new_rw(0)), Ok(true));
         assert!(memory.clear_pages(0, 0));
         assert!(!memory.clear_pages(0, 1));
         assert!(!memory.clear_pages(usize::MAX, 1));
-        assert!(memory.sync_permissions(&mut PagePerms::new_rw(1)).is_err());
+        assert_eq!(
+            memory.sync_permissions(&mut PagePerms::new_rw(1)),
+            Ok(false)
+        );
+        assert!(memory.retired());
         assert!(NativeMemory::new(1).is_err());
         assert!(NativeMemory::new((1usize << 32) + 4096).is_err());
     }

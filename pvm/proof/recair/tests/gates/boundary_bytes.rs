@@ -1,5 +1,6 @@
-//! The leaf's boundary bytes (`proving.md` A.3): the leaf range-checks only
-//! φ9..12's 32 bytes, which it combines into the io-hash; every other byte
+//! The leaf's boundary bytes (`proving.md` A.3): the leaf range-checks
+//! φ9..12's 32 bytes, which it combines into the io-hash, and the entry
+//! timestamp's and the exit pc's 12; every other byte
 //! it uses exactly, as an M31, in the transcript, the boundary chips'
 //! public terms, the state digests and the flags. A value of 256 or more
 //! there aliases no other state, and is refused.
@@ -377,5 +378,31 @@ fn an_alias_misses_the_claimed_sums_under_the_proofs_challenges() {
     assert!(!aliases.is_empty());
     for (what, bytes) in aliases {
         assert!(check(&bytes) > 0, "{what}");
+    }
+}
+
+/// The entry timestamp's and the exit pc's bytes are the leaf's own to
+/// range-check: a byte of 256 or more, or of `p − 1`, the forger's sums
+/// forged past the logup check, is refused by the leaf's range checks
+/// whatever else refuses it, as a leaf alone, outside a fold.
+#[test]
+fn a_ts_in_or_pc_out_byte_past_255_is_refused_by_the_leaf_itself() {
+    let honest = bytes_of(&whole().values);
+    assert!(!pieces(&mismatches(&whole().values)).contains(&"leaf: ts in, pc out"));
+    for (field, at) in [("ts in", 212), ("pc out", 220)] {
+        for (what, byte) in [
+            ("plus 256", honest[at] + BaseField::from(256)),
+            ("p − 1", -BaseField::from(1)),
+        ] {
+            let mut bytes = honest.clone();
+            bytes[at] = byte;
+            let mut values = forged(&bytes);
+            forge_claimed_sums(&mut values);
+            let refused = pieces(&mismatches(&values));
+            assert!(
+                refused.contains(&"leaf: ts in, pc out"),
+                "{field}: a byte {what}: {refused:?}"
+            );
+        }
     }
 }

@@ -455,7 +455,7 @@ fn the_folds_rows_are_pinned() {
             ("circle", [0, 6_248, 0]),
             ("context", [0, 2, 0]),
             ("deep", [0, 14_432, 4_048]),
-            ("deep once", [0, 2_216, 0]),
+            ("deep once", [0, 2_222, 0]),
             ("fold: adjacency", [0, 2, 0]),
             ("fold: circuit", [10, 58, 0]),
             ("fold: continuity", [0, 2, 0]),
@@ -470,9 +470,9 @@ fn the_folds_rows_are_pinned() {
             ("queries", [12, 5_632, 0]),
         ]
     );
-    assert_eq!(context.rows(), [32_167, 42_864, 4_048]);
+    assert_eq!(context.rows(), [32_167, 42_870, 4_048]);
     let finalized = context.finalized_rows();
-    assert_eq!(finalized, [32_167, 42_896, 4_048]);
+    assert_eq!(finalized, [32_167, 42_902, 4_048]);
     assert!(
         finalized
             .iter()

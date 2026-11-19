@@ -11,7 +11,6 @@
 //! the logup balance of every chip.
 
 use crate::forge::*;
-use stwo::core::channel::Blake2sM31Channel;
 use stwo::core::fields::m31::BaseField;
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
@@ -23,7 +22,6 @@ use vos_pvm_proof::chips::program_memory::Column as ProgramMemory;
 use vos_pvm_proof::chips::register_memory::Column as Ledger;
 use vos_pvm_proof::chips::{CpuChip, ProgramMemoryChip};
 use vos_pvm_proof::core::tracing::{ECALL_BLAKE2B_COMPRESS, TracingPvm};
-use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::harness::{MachineProverComponent, base_components};
 use vos_pvm_proof::trace::component::ComponentTrace;
 
@@ -492,32 +490,4 @@ fn a_timestamp_s_limbs_are_bytes() {
     }
     assert_eq!(moved, 2, "the successor's two register reads");
     assert!(accepts(components, &traces, &side_note));
-}
-
-/// Whether every chip's constraints hold on `traces` and their logup sums
-/// balance.
-fn accepts(
-    components: &[&dyn MachineProverComponent],
-    traces: &[ComponentTrace],
-    side_note: &SideNote,
-) -> bool {
-    use num_traits::Zero;
-    let mut lookup_elements = AllLookupElements::default();
-    let channel = &mut Blake2sM31Channel::default();
-    for component in components {
-        component.draw_lookup_elements(&mut lookup_elements, channel.into());
-    }
-    let mut total = stwo::core::fields::qm31::SecureField::zero();
-    for (component, trace) in components.iter().zip(traces) {
-        let (interaction_trace, claimed_sum) =
-            component.generate_interaction_trace(trace, side_note, &lookup_elements);
-        component.debug_assert_constraints(
-            trace,
-            &interaction_trace,
-            &lookup_elements,
-            claimed_sum,
-        );
-        total += claimed_sum;
-    }
-    total.is_zero()
 }

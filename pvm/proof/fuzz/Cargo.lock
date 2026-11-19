@@ -1432,6 +1432,7 @@ dependencies = [
  "vos-pvm-compiler",
  "vos-pvm-device",
  "vos-pvm-final-verifier",
+ "vos-pvm-program",
  "vos-pvm-proof",
  "vos-pvm-proof-verifier",
  "vos-statement",

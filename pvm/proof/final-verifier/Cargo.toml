@@ -12,6 +12,11 @@ vos-pvm-recair-air = { workspace = true }
 num-traits = { version = "0.2", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 
+# The gates that refuse each test-only feature in a production build
+# (`just check-no-leaks`).
+[package.metadata.vos]
+test-features = { other-pins = ["seeded-masks"] }
+
 [features]
 # The wrap verified under pins other than its own (`masked::verify_with`),
 # for the tests that a verifier pinning other salts, `R` or widths refuses

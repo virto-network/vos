@@ -72,6 +72,47 @@ VOS-specific evolution starts from the imported commit. This directory is the
 only place in the repository where upstream JAM/JAR terminology and
 conformance notes belong.
 
+## The runtime: backends and threat model
+
+`vos-pvm` (`runtime/`) runs a program on one of two backends, the
+interpreter (the reference the proof tracer drives) and the recompiler
+(x86-64 Linux, native code). **A backend never changes a result:** the
+same program gives the same exit, gas, registers and memory on either
+backend and on every host. The code bound is one for both, enforced
+before a backend is chosen, and whatever the recompiler cannot take
+(code whose native form passes its cap, a mapping the host refuses, a
+missing CPU feature, a guest window whose protections would pass its
+mapping budget) runs on the interpreter instead of failing.
+
+**How the backend is chosen:** the recompiler is the default where the
+host permits it. Once a process, a start-up probe does what a native
+machine does: it checks that the CPU has LZCNT, BMI1 and POPCNT, compiles
+code and makes it executable, opens `userfaultfd` write-protect (Linux
+6.7 or later; the default Docker and Podman seccomp profiles deny
+`userfaultfd`, so a default container runs the interpreter), reserves a
+guest window and runs a trap natively; it logs the backend chosen and
+why (`backend::backend_choice`). The operator's `VOS_PVM_BACKEND`
+forces one: `interpreter` skips the probe, `recompiler` is an error on a
+host that fails it, and any other value is an error.
+
+**Threat model.** The recompiler is software fault isolation inside the
+node's process: compiled guest code runs on the node's threads, each
+guest memory access one operand form inside a reserved 4 GiB window
+behind an emitted bound check, with page protections and a SIGSEGV
+handler. The in-process hardening is a second line against a
+code-generation bug, not a boundary of its own: a fault counts as the
+guest's only at an exact trap-table entry and inside the guest window
+(anything else poisons the machine and is a host error), guard regions
+lie on both sides of the window, the JIT's context is not on a page a
+small guest offset reaches, a dynamic jump's index is masked after its
+bound check (against a mispredicted check), and code is never writable
+and executable at once. Nothing confines the process itself: an escape
+from compiled code reaches the whole node (its keys, other tenants'
+guest memory, its network), as with an in-process WebAssembly engine.
+The interpreter runs no guest native code. Moving the recompiler's
+execution into a confined worker process is open work
+([`docs/design/open.md`](../docs/design/open.md)).
+
 ## Standard conformance
 
 The PVM is pinned to the official Gray Paper v0.8.0

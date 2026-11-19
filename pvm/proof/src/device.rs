@@ -97,10 +97,12 @@ pub const DEVICE_ALWAYS: u32 = {
         | 1 << BYTE_TO_BITS
 };
 
-/// The chips a device shape holds when its code reaches them: the segment
-/// AIR's optional chips (the Poseidon2 chip among them), and the byte-wide
-/// AND table with BLAKE2b (its only consumer once the page boundary is
-/// gone).
+/// The chips a device shape may hold beside those it always does: the
+/// segment AIR's optional chips (the Poseidon2 chip among them), and the
+/// byte-wide AND table with BLAKE2b (its only consumer once the page
+/// boundary is gone). The chip set is the AIR's; a device program holds
+/// those its code reaches, and BLAKE2b's never: [`device_chips_of_code`]
+/// refuses a code naming its precompile.
 pub const DEVICE_OPTIONAL: u32 = chip_idx::OPTIONAL | 1 << chip_idx::BITWISE_AND_BYTE;
 
 /// Every chip a device shape may hold.
@@ -185,11 +187,13 @@ pub mod region {
 /// The bytes of a word of the word ledger.
 pub const WORD_BYTES: usize = crate::lookups::MEMORY_WORD_SIZE;
 
+mod layout;
 #[cfg(feature = "prover")]
 mod pin;
 #[cfg(feature = "prover")]
 mod run;
+pub use layout::DeviceLayout;
 #[cfg(feature = "prover")]
 pub use pin::device_chips_of_code;
 #[cfg(feature = "prover")]
-pub use run::{DeviceLayout, DeviceRun, TouchedWord};
+pub use run::{DeviceRun, TouchedWord};

@@ -4,6 +4,11 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+# The gates that refuse each test-only feature in a production build
+# (`just check-no-leaks`).
+[package.metadata.vos]
+test-features = { seeded-masks = ["seeded-masks"], chip-isolated = ["seeded-masks"], debug-internals = ["debug-internals"] }
+
 [features]
 default = ["prover", "abi"]
 # Prover-side: trace generation, proof creation, the tracer and parallel

@@ -6,8 +6,13 @@ use super::*;
 
 /// The kernel of an attestable method's `entry`: its code and data what the
 /// entry reaches, linked with an instruction-0 prologue that reads its input
-/// and calls it.
-pub(super) fn kernel(graph: &Graph, entry: &AttestEntry) -> Result<Vec<u8>, DeriveError> {
+/// and calls it. The data it copies is added to `copied`, the derivation's,
+/// before it copies it: past [`MAX_KERNEL_DATA`] it is refused.
+pub(super) fn kernel(
+    graph: &Graph,
+    entry: &AttestEntry,
+    copied: &mut u64,
+) -> Result<Vec<u8>, DeriveError> {
     let &AttestEntry {
         method,
         entry,
@@ -43,7 +48,12 @@ pub(super) fn kernel(graph: &Graph, entry: &AttestEntry) -> Result<Vec<u8>, Deri
     let kept = |address: u64, len: u64| {
         range_at(&objects, address).is_some_and(|(_, end)| address.saturating_add(len) <= end)
     };
-    let (ro_data, rw_data) = reached_data(elf, &objects);
+    let lens = reached_lens(elf, &objects);
+    *copied = copied.saturating_add(lens.into_iter().map(|len| len as u64).sum());
+    if *copied > MAX_KERNEL_DATA {
+        return Err(DeriveError::KernelData(*copied));
+    }
+    let (ro_data, rw_data) = reached_data(elf, &objects, lens);
 
     // What the kernel's linking needs of the ELF's relocations, its own.
     let pairs = |map: &BTreeMap<u64, u64>| -> BTreeMap<u64, u64> {
@@ -110,15 +120,12 @@ pub(super) fn kernel(graph: &Graph, entry: &AttestEntry) -> Result<Vec<u8>, Deri
 /// zones as the actor's, so the read-write data stays where it was
 /// linked; the read-write data's initialized part as far as its last
 /// object reaches.
-fn reached_data(elf: &LinkedElf, objects: &[(u64, u64)]) -> (Vec<u8>, Vec<u8>) {
-    let masked = |base: u64, original: &[u8], least: u64| {
-        let last = objects
-            .iter()
-            .filter(|&&(start, _)| start >= base && start < base + original.len() as u64)
-            .map(|&(_, end)| end - base)
-            .max()
-            .unwrap_or(0);
-        let len = last.max(least).min(original.len() as u64) as usize;
+fn reached_data(
+    elf: &LinkedElf,
+    objects: &[(u64, u64)],
+    [ro_len, rw_len]: [usize; 2],
+) -> (Vec<u8>, Vec<u8>) {
+    let masked = |base: u64, original: &[u8], len: usize| {
         let mut bytes = vec![0; len];
         for &(start, end) in objects {
             let from = start.saturating_sub(base).min(len as u64) as usize;
@@ -126,6 +133,24 @@ fn reached_data(elf: &LinkedElf, objects: &[(u64, u64)]) -> (Vec<u8>, Vec<u8>) {
             bytes[from..to].copy_from_slice(&original[from..to]);
         }
         bytes
+    };
+    (
+        masked(elf.ro_base, &elf.ro_data, ro_len),
+        masked(elf.rw_base, &elf.rw_data, rw_len),
+    )
+}
+
+/// The lengths of the read-only and read-write data a kernel keeps,
+/// [`reached_data`]'s, `objects` the ranges it reaches.
+fn reached_lens(elf: &LinkedElf, objects: &[(u64, u64)]) -> [usize; 2] {
+    let len = |base: u64, original: &[u8], least: u64| {
+        let last = objects
+            .iter()
+            .filter(|&&(start, _)| start >= base && start < base + original.len() as u64)
+            .map(|&(_, end)| end - base)
+            .max()
+            .unwrap_or(0);
+        last.max(least).min(original.len() as u64) as usize
     };
     let least = match elf.ro_data.len() as u64 {
         0 => 0,
@@ -136,10 +161,10 @@ fn reached_data(elf: &LinkedElf, objects: &[(u64, u64)]) -> (Vec<u8>, Vec<u8>) {
                 .max(1)
         }
     };
-    (
-        masked(elf.ro_base, &elf.ro_data, least),
-        masked(elf.rw_base, &elf.rw_data, 0),
-    )
+    [
+        len(elf.ro_base, &elf.ro_data, least),
+        len(elf.rw_base, &elf.rw_data, 0),
+    ]
 }
 
 /// The kernel of `method` as its blob, `transpiled` from its linked ELF:

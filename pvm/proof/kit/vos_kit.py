@@ -138,6 +138,9 @@ PACKAGE_KEYS = {
     "license",
     "description",
 }
+# Package tables VOS keeps for itself: `metadata.vos` names the test features
+# a production build refuses, a check of VOS's tree, not of the kit's.
+PACKAGE_DROPPED = {"metadata"}
 DEPENDENCY_KEYS = {
     "version",
     "path",
@@ -351,6 +354,8 @@ class Manifests:
         never published, built or searched for targets."""
         package = {}
         for key, value in manifest["package"].items():
+            if key in PACKAGE_DROPPED:
+                continue
             if key not in PACKAGE_KEYS:
                 raise KitError(f"{crate}: package.{key} is not vendored")
             if isinstance(value, dict) and value.get("workspace"):

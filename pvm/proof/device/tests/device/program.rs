@@ -296,8 +296,8 @@ fn the_device_programs_id_is_pinned() {
         3,
     ];
     const ID: [u8; 32] = [
-        65, 178, 245, 91, 215, 220, 180, 111, 175, 221, 41, 102, 30, 132, 209, 241, 155, 149, 147,
-        234, 200, 68, 72, 136, 17, 31, 215, 145, 87, 138, 187, 240,
+        30, 176, 152, 101, 58, 102, 151, 136, 143, 228, 68, 255, 109, 67, 131, 55, 255, 212, 108,
+        127, 214, 195, 40, 250, 209, 176, 196, 103, 125, 47, 103, 9,
     ];
     let program = Program::sized_for(
         FORMAT.number,
@@ -369,4 +369,52 @@ fn a_release_names_its_program() {
     );
     assert_eq!(refused(&|r| r.id[0] ^= 1), Some(Error::IdMismatch));
     assert_eq!(refused(&|r| r.format = 0), Some(Error::Format(0)));
+}
+
+/// A verifier built from a release and the parts a prover's build computed,
+/// its CPU's words and its preprocessed root, as a build without the prover
+/// builds it, is the program's: it verifies the program's proofs; another
+/// root or another CPU is refused by the release's id.
+#[test]
+fn a_verifier_is_built_from_a_release_without_the_prover() {
+    let kernel = blob();
+    let program = Program::sized_for(
+        FORMAT.number,
+        &kernel,
+        vos_pvm_device::ReferenceArguments(&witness(1)),
+        0,
+    )
+    .expect("installs");
+    let release = vos_pvm_device::Release {
+        elf: [0x5e; 32],
+        method: vos_abi::ids::MethodId(1),
+        kernel,
+        format: FORMAT.number,
+        chips: program.program().active,
+        log_sizes: program.log_sizes().to_vec(),
+        id: program.id().0,
+    };
+    let parts = program.verifier();
+    let verifier = vos_pvm_device::Verifier::of_release(&release, parts.cpu(), parts.circuit())
+        .expect("the release's verifier");
+    assert_eq!(verifier.id(), program.id());
+    let (proof, _) = program
+        .prove(&witness(2), MaskRng::default())
+        .expect("proves");
+    let bytes = program.encode(&proof.proof).expect("encodes");
+    verifier.verify(&proof.io, &bytes).expect("verifies");
+
+    use vos_pvm_device::Error;
+    let mut root = parts.circuit();
+    root[0] ^= 1;
+    assert_eq!(
+        vos_pvm_device::Verifier::of_release(&release, parts.cpu(), root).err(),
+        Some(Error::IdMismatch)
+    );
+    let mut cpu = parts.cpu();
+    cpu[0] ^= 1;
+    assert_eq!(
+        vos_pvm_device::Verifier::of_release(&release, cpu, parts.circuit()).err(),
+        Some(Error::IdMismatch)
+    );
 }

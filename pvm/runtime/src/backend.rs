@@ -3,19 +3,145 @@
 //! The kernel creates CODE caps that wrap compiled code in one of two backends.
 //! `PvmBackend` controls the selection; `CompiledProgram` holds the result.
 
-use alloc::{string::String, sync::Arc, vec};
+use alloc::{string::String, sync::Arc};
 
 /// Backend selection for PVM execution.
+///
+/// Whichever is selected, a program's result is the same: the backends
+/// agree on every exit, gas, register and memory, and code the recompiler
+/// cannot take (past its native bound, or a compile or mapping it refuses)
+/// runs on the interpreter instead. A selection decides speed alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PvmBackend {
-    /// Use recompiler if available (x86-64 Linux), else interpreter.
-    /// Reads `VOS_PVM_BACKEND` env var: "interpreter" forces interpreter,
-    /// "recompiler" forces recompiler.
+    /// This process's choice ([`backend_choice`]): the operator's
+    /// `VOS_PVM_BACKEND` (`interpreter` or `recompiler`; any other value
+    /// is an error), else the recompiler where this host can run it.
     Default,
     /// Always use the software interpreter.
     ForceInterpreter,
-    /// Always use the JIT recompiler (returns an error if unavailable).
+    /// The recompiler: an error where this host cannot run it at all
+    /// ([`Unavailable`]); a program it cannot take still runs on the
+    /// interpreter.
     ForceRecompiler,
+}
+
+/// Why this host cannot run the recompiler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unavailable {
+    /// No recompiler is built for this platform (x86-64 Linux only).
+    Platform,
+    /// The CPU lacks a feature generated code uses.
+    CpuFeature(&'static str),
+    /// No userfaultfd write-protect (Linux 6.7 or later, and permitted:
+    /// default container seccomp profiles deny it).
+    WriteTracking,
+    /// Written memory may not become executable (`PR_SET_MDWE`, systemd's
+    /// `MemoryDenyWriteExecute`, SELinux `execmem`).
+    ExecutableMappings,
+    /// A 4 GiB guest window cannot be built (`RLIMIT_FSIZE`,
+    /// `vm.memfd_noexec`, address space).
+    GuestMemory,
+    /// A probe program did not run natively to its expected exit.
+    NativeRun,
+}
+
+impl core::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Platform => f.write_str("no recompiler for this platform"),
+            Self::CpuFeature(feature) => write!(f, "the CPU lacks {feature}"),
+            Self::WriteTracking => f.write_str("no userfaultfd write-protect"),
+            Self::ExecutableMappings => f.write_str("written memory may not become executable"),
+            Self::GuestMemory => f.write_str("no 4 GiB guest window"),
+            Self::NativeRun => f.write_str("a probe program did not run natively"),
+        }
+    }
+}
+
+/// The backend this process runs for [`PvmBackend::Default`], and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackendChoice {
+    /// `ForceInterpreter` or `ForceRecompiler`.
+    pub backend: PvmBackend,
+    /// Set by the operator through `VOS_PVM_BACKEND`.
+    pub requested: bool,
+    /// Why the recompiler was not chosen, when it was not.
+    pub unavailable: Option<Unavailable>,
+}
+
+/// Whether this host can run the recompiler: probed once per process.
+pub fn recompiler_available() -> Result<(), Unavailable> {
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    return crate::recompiler::probe::available();
+    #[cfg(not(all(feature = "std", target_os = "linux", target_arch = "x86_64")))]
+    return Err(Unavailable::Platform);
+}
+
+/// This process's backend for [`PvmBackend::Default`], decided once (from
+/// `VOS_PVM_BACKEND` and [`recompiler_available`]) and logged; an error
+/// for an override this host cannot honour or does not know.
+pub fn backend_choice() -> Result<BackendChoice, String> {
+    #[cfg(feature = "std")]
+    {
+        static CHOICE: std::sync::OnceLock<Result<BackendChoice, String>> =
+            std::sync::OnceLock::new();
+        CHOICE
+            .get_or_init(|| {
+                let choice = choose(std::env::var("VOS_PVM_BACKEND").ok().as_deref());
+                match &choice {
+                    Ok(choice) => tracing::info!(
+                        backend = ?choice.backend,
+                        requested = choice.requested,
+                        unavailable = choice.unavailable.map(tracing::field::display),
+                        "PVM backend"
+                    ),
+                    Err(error) => tracing::error!(%error, "PVM backend"),
+                }
+                choice
+            })
+            .clone()
+    }
+    #[cfg(not(feature = "std"))]
+    choose(None)
+}
+
+/// The choice for an operator override `requested`. An override of the
+/// interpreter probes nothing: no native code runs in its process.
+fn choose(requested: Option<&str>) -> Result<BackendChoice, String> {
+    if requested == Some("interpreter") {
+        return Ok(BackendChoice {
+            backend: PvmBackend::ForceInterpreter,
+            requested: true,
+            unavailable: None,
+        });
+    }
+    let available = recompiler_available();
+    let (backend, requested) = match requested {
+        None => (
+            if available.is_ok() {
+                PvmBackend::ForceRecompiler
+            } else {
+                PvmBackend::ForceInterpreter
+            },
+            false,
+        ),
+        Some("recompiler") => {
+            if let Err(reason) = available {
+                return Err(alloc::format!("VOS_PVM_BACKEND=recompiler: {reason}"));
+            }
+            (PvmBackend::ForceRecompiler, true)
+        }
+        Some(other) => {
+            return Err(alloc::format!(
+                "VOS_PVM_BACKEND={other:?}: expected \"interpreter\" or \"recompiler\""
+            ));
+        }
+    };
+    Ok(BackendChoice {
+        backend,
+        requested,
+        unavailable: available.err(),
+    })
 }
 
 /// Pre-decoded interpreter program state.
@@ -71,52 +197,20 @@ impl core::fmt::Debug for CompiledProgram {
 
 /// Resolve the backend to use based on `PvmBackend` selection and platform.
 fn resolve_backend(backend: PvmBackend) -> Result<ResolvedBackend, String> {
-    match backend {
-        PvmBackend::ForceInterpreter => Ok(ResolvedBackend::Interpreter),
+    let backend = match backend {
+        PvmBackend::Default => backend_choice()?.backend,
         PvmBackend::ForceRecompiler => {
-            #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-            return Ok(ResolvedBackend::Recompiler);
-            #[cfg(not(all(feature = "std", target_os = "linux", target_arch = "x86_64")))]
-            return Err("requested recompiler is unavailable on this platform".into());
+            recompiler_available()
+                .map_err(|reason| alloc::format!("the recompiler is unavailable: {reason}"))?;
+            PvmBackend::ForceRecompiler
         }
-        PvmBackend::Default => {
-            // Check VOS_PVM_BACKEND env var
-            #[cfg(feature = "std")]
-            {
-                if let Ok(val) = std::env::var("VOS_PVM_BACKEND") {
-                    match val.as_str() {
-                        "interpreter" => return Ok(ResolvedBackend::Interpreter),
-                        "recompiler" => {
-                            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-                            return Ok(ResolvedBackend::Recompiler);
-                            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-                            return Err(
-                                "VOS_PVM_BACKEND=recompiler is unavailable on this platform".into(),
-                            );
-                        }
-                        _ => {} // fall through to platform default
-                    }
-                }
-            }
-            // Platform default: the recompiler where the host can track its
-            // guest writes, otherwise the interpreter.
-            #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-            return Ok(if crate::recompiler::write_tracking::available() {
-                ResolvedBackend::Recompiler
-            } else {
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    tracing::warn!(
-                        "the recompiler needs userfaultfd write-protect (Linux 6.7 or later); \
-                         using the interpreter"
-                    )
-                });
-                ResolvedBackend::Interpreter
-            });
-            #[cfg(not(all(feature = "std", target_os = "linux", target_arch = "x86_64")))]
-            return Ok(ResolvedBackend::Interpreter);
-        }
-    }
+        PvmBackend::ForceInterpreter => PvmBackend::ForceInterpreter,
+    };
+    Ok(match backend {
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        PvmBackend::ForceRecompiler => ResolvedBackend::Recompiler,
+        _ => ResolvedBackend::Interpreter,
+    })
 }
 
 /// The concrete backend a selection resolves to on this host:
@@ -135,38 +229,50 @@ enum ResolvedBackend {
     Recompiler,
 }
 
-/// The most code bytes the interpreter prepares: its tables hold several
-/// bytes for each code byte, and a guest sizes an inner machine's code, so
-/// a host bounds them. It holds every service's code
+/// The most code bytes a host prepares, on either backend: tables hold
+/// several bytes for each code byte, and a guest sizes an inner machine's
+/// code, so a host bounds them. It holds every service's code
 /// ([`crate::spi::MAX_SERVICE_CODE`]); past it a program is valid but
 /// refused as this host's resource, a backend error and never a guest
-/// outcome.
-pub const MAX_INTERPRETED_CODE: usize = 4 << 20;
+/// outcome. Checked before a backend is chosen, so the refusal is the same
+/// on every host.
+pub const MAX_PREPARED_CODE: usize = 4 << 20;
 
 /// Compile PVM code into a `CompiledProgram` using the selected backend.
-/// Each backend bounds the code it prepares as its own resource, past any
-/// rule of the program: the interpreter at [`MAX_INTERPRETED_CODE`], the
-/// recompiler at its native bound (`recompiler::MAX_CODE`).
+/// Refused past [`MAX_PREPARED_CODE`] bytes of code on either backend.
+/// Code the recompiler does not take (past `recompiler::MAX_CODE`, or a
+/// compile it refuses for want of a mapping) is interpreted instead. The
+/// code is unvalidated: on code `crate::spi::deblob` refuses the backends
+/// may charge different gas, so every loader validates first.
 pub fn compile(
     code: &[u8],
     bitmask: &[u8],
     jump_table: &[u32],
     backend: PvmBackend,
 ) -> Result<CompiledProgram, alloc::string::String> {
-    if code.len() > MAX_INTERPRETED_CODE {
+    if code.len() > MAX_PREPARED_CODE {
         return Err(alloc::format!(
-            "{} bytes of code, past the interpreter's {MAX_INTERPRETED_CODE}",
+            "{} bytes of code, past the host's {MAX_PREPARED_CODE}",
             code.len()
         ));
     }
+    let interpret = || {
+        CompiledProgram::Interpreter(crate::interpreter::Interpreter::predecode(
+            code, bitmask, jump_table,
+        ))
+    };
     match resolve_backend(backend)? {
-        ResolvedBackend::Interpreter => Ok(CompiledProgram::Interpreter(
-            crate::interpreter::Interpreter::predecode(code, bitmask, jump_table),
-        )),
+        ResolvedBackend::Interpreter => Ok(interpret()),
         #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-        ResolvedBackend::Recompiler => Ok(CompiledProgram::Recompiler(
-            crate::recompiler::compile_code(code, bitmask, jump_table)?,
-        )),
+        ResolvedBackend::Recompiler => Ok(
+            match crate::recompiler::compile_code(code, bitmask, jump_table) {
+                Ok(native) => CompiledProgram::Recompiler(native),
+                Err(error) => {
+                    tracing::debug!(%error, "interpreting code the recompiler does not take");
+                    interpret()
+                }
+            },
+        ),
     }
 }
 
@@ -213,6 +319,33 @@ impl PreparedExecution {
         &self.interpreter
     }
 
+    /// Host bytes the preparation holds: the interpreter's tables and,
+    /// on the recompiler, its native code and tables.
+    pub(crate) fn footprint(&self) -> usize {
+        use core::mem::size_of_val;
+        let p = &*self.interpreter;
+        let interpreter = size_of_val(&*p.decoded_insts)
+            + size_of_val(&*p.pc_to_idx)
+            + size_of_val(&*p.basic_block_starts)
+            + size_of_val(&*p.block_gas_costs)
+            + size_of_val(&*p.gas_block_start_by_pc)
+            + size_of_val(&*p.code)
+            + size_of_val(&*p.bitmask)
+            + size_of_val(&*p.jump_table);
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        if let Some(native) = &self.native {
+            return interpreter
+                + native.native_code.mmap_cap
+                + size_of_val(&*native.dispatch_table)
+                + size_of_val(&*native.fault_resume_offsets)
+                + size_of_val(&*native.gas_block_start_by_pc)
+                + size_of_val(&*native.block_gas_costs)
+                + size_of_val(&*native.trap_table)
+                + size_of_val(&*native.block_starts);
+        }
+        interpreter
+    }
+
     pub(crate) fn allocate_memory(
         &self,
         span: u64,
@@ -221,12 +354,18 @@ impl PreparedExecution {
         if span > 1u64 << 32 || !span.is_multiple_of(crate::PVM_PAGE_SIZE as u64) {
             return Err("invalid standard memory span".into());
         }
+        // Native memory where this program runs natively. Sparse memory,
+        // and memory the host cannot map natively, runs the program on the
+        // interpreter, with the same result.
         #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-        if self.native.is_some() {
-            if sparse {
-                return Err("recompiler requires native flat memory".into());
-            }
-            return crate::interpreter::Memory::native(span);
+        if self.native.is_some() && !sparse {
+            return Ok(match crate::interpreter::Memory::native(span) {
+                Ok(memory) => memory,
+                Err(error) => {
+                    tracing::debug!(%error, "interpreting over sparse memory");
+                    crate::interpreter::Memory::sparse(span)
+                }
+            });
         }
         Ok(if sparse {
             crate::interpreter::Memory::sparse(span)
@@ -234,38 +373,307 @@ impl PreparedExecution {
             if span > isize::MAX as u64 {
                 return Err("flat memory span exceeds host address space".into());
             }
-            // Up to 4 GiB, zeroed by the allocator, which aborts the process
-            // when it cannot: the sparse model is the one a caller bounds.
-            crate::interpreter::Memory::flat(vec![0; span as usize])
+            // Up to 4 GiB, zeroed by the allocator; a host that cannot give
+            // it refuses the machine rather than aborting.
+            crate::interpreter::Memory::try_flat_zeroed(span as usize)?
         })
     }
 
     /// Execute exactly one slice, preserving an unacknowledged host boundary.
-    /// Backend/host failures are not guest exits and never trigger a retry on
-    /// the interpreter. The caller alone decides when to acknowledge a hostcall.
+    /// A machine whose memory does not run natively runs the slice on the
+    /// interpreter, over the same state. A failure after native code ran is
+    /// the backend's, not a guest exit, and is never retried on the
+    /// interpreter. The caller alone decides when to acknowledge a hostcall.
     pub(crate) fn run(
         &self,
         interpreter: &mut crate::Interpreter,
     ) -> Result<crate::ExitReason, String> {
         #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
-        if let Some(native) = &self.native {
-            return crate::recompiler::run_standard(native, interpreter);
+        if let Some(native) = &self.native
+            && let Some(exit) = crate::recompiler::run_standard(native, interpreter)?
+        {
+            return Ok(exit);
         }
         Ok(interpreter.run().0)
     }
 }
 
-#[cfg(all(
-    test,
-    not(all(feature = "std", target_os = "linux", target_arch = "x86_64"))
-))]
+/// One standard machine over any memory map, run through the path a
+/// service's machine takes: a prepared program, its backend's memory (on
+/// the recompiler the native window, with permission sync and write
+/// tracking) and its slices. For conformance vectors and differential
+/// tests, which set memory and permissions directly.
+pub struct StandardMachine {
+    execution: PreparedExecution,
+    /// The machine's architectural state and memory.
+    pub interpreter: crate::Interpreter,
+}
+
+impl StandardMachine {
+    /// A machine at instruction counter 0 with `span` bytes of memory, all
+    /// pages readable and writable until set otherwise.
+    pub fn new(
+        code: &[u8],
+        bitmask: &[u8],
+        jump_table: &[u32],
+        registers: [u64; crate::PVM_REGISTER_COUNT],
+        gas: crate::Gas,
+        span: u64,
+        backend: PvmBackend,
+    ) -> Result<Self, String> {
+        let execution = PreparedExecution::new_standard(code, bitmask, jump_table, backend)?;
+        let sparse = execution.backend() == PvmBackend::ForceInterpreter;
+        let memory = execution.allocate_memory(span, sparse)?;
+        let interpreter = crate::Interpreter::from_predecoded(
+            execution.interpreter_program(),
+            registers,
+            memory,
+            gas,
+        );
+        Ok(Self {
+            execution,
+            interpreter,
+        })
+    }
+
+    /// The backend the program was prepared on.
+    pub fn backend(&self) -> PvmBackend {
+        self.execution.backend()
+    }
+
+    /// Run one slice: to the next exit. An error is the host's failure,
+    /// never a guest outcome.
+    pub fn run(&mut self) -> Result<crate::ExitReason, String> {
+        self.execution.run(&mut self.interpreter)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A store, a fault on an unmapped page and the state after it are the
+    /// same on every backend's production path.
+    #[test]
+    fn a_standard_machine_runs_alike_on_every_backend() {
+        // store_imm_u32 [0x10000], 0x2a; then load_u8 φ0 from 0x20000,
+        // whose page is unmapped.
+        let code = [32, 4, 0, 0, 1, 0, 42, 52, 0, 0, 0, 2, 0];
+        let bitmask = [1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0];
+        let outcomes: Vec<_> = crate::test_support::backends()
+            .into_iter()
+            .map(|backend| {
+                let mut machine =
+                    StandardMachine::new(&code, &bitmask, &[], [0; 13], 1_000, 0x30000, backend)
+                        .unwrap();
+                assert_eq!(machine.backend(), backend);
+                let mut perms = alloc::vec![crate::interpreter::PERM_RW; 0x30];
+                perms[0x20] = crate::interpreter::PERM_NONE;
+                machine.interpreter.set_page_perms(perms);
+                let exit = machine.run().unwrap();
+                let mut stored = [0; 4];
+                machine
+                    .interpreter
+                    .memory()
+                    .read_bytes(0x10000, &mut stored);
+                (
+                    exit,
+                    machine.interpreter.gas,
+                    machine.interpreter.pc,
+                    stored,
+                )
+            })
+            .collect();
+        assert_eq!(
+            outcomes[0],
+            (
+                crate::ExitReason::PageFault(0x20000),
+                outcomes[0].1,
+                7,
+                [42, 0, 0, 0]
+            )
+        );
+        assert!(outcomes.iter().all(|outcome| *outcome == outcomes[0]));
+    }
+
+    /// A host without the recompiler refuses a demand for it, rather than
+    /// running something else under its name.
+    #[cfg(not(all(feature = "std", target_os = "linux", target_arch = "x86_64")))]
     #[test]
     fn unavailable_recompiler_is_an_error_not_an_interpreter_fallback() {
         assert!(
             PreparedExecution::new_standard(&[0], &[1], &[], PvmBackend::ForceRecompiler).is_err()
         );
+    }
+
+    /// Every load and store faults alike on every backend, on an unmapped
+    /// page and (a store) on a read-only one: each native guest access is
+    /// at its own trap entry, so the fault is the guest's.
+    #[test]
+    fn every_access_faults_alike_on_every_backend() {
+        use crate::interpreter::{PERM_NONE, PERM_RO, PERM_RW};
+        let address = [0, 0, 2, 0]; // 0x20000
+        let mut programs: Vec<Vec<u8>> = Vec::new();
+        for opcode in 30..=33 {
+            programs.push([&[opcode, 4][..], &address, &[1]].concat()); // store_imm
+        }
+        for opcode in 52..=62 {
+            programs.push([&[opcode, 0][..], &address].concat()); // load, store
+        }
+        for opcode in 70..=73 {
+            programs.push([&[opcode, 0x40][..], &address, &[1]].concat()); // store_imm_ind
+        }
+        for opcode in 120..=130 {
+            programs.push([&[opcode, 0][..], &address].concat()); // load_ind, store_ind
+        }
+        for program in programs {
+            let mut code = program.clone();
+            code.push(0);
+            let mut bitmask = alloc::vec![0; code.len()];
+            bitmask[0] = 1;
+            bitmask[program.len()] = 1;
+            for denied in [PERM_NONE, PERM_RO] {
+                let outcomes: Vec<_> = crate::test_support::backends()
+                    .into_iter()
+                    .map(|backend| {
+                        let mut machine = StandardMachine::new(
+                            &code,
+                            &bitmask,
+                            &[],
+                            [0; 13],
+                            1_000,
+                            0x30000,
+                            backend,
+                        )
+                        .unwrap();
+                        assert_eq!(machine.backend(), backend);
+                        let mut perms = alloc::vec![PERM_RW; 0x30];
+                        perms[0x20] = denied;
+                        machine.interpreter.set_page_perms(perms);
+                        let exit = machine.run().unwrap();
+                        let vm = &machine.interpreter;
+                        (exit, vm.gas, vm.pc, vm.registers)
+                    })
+                    .collect();
+                assert!(
+                    outcomes.iter().all(|outcome| *outcome == outcomes[0]),
+                    "opcode {}: {outcomes:?}",
+                    program[0]
+                );
+                if denied == PERM_NONE {
+                    assert_eq!(outcomes[0].0, crate::ExitReason::PageFault(0x20000));
+                }
+            }
+        }
+    }
+
+    /// A machine whose native window retires between slices (its map
+    /// past a window's permission runs, after a host call and a page
+    /// fault) continues on the interpreter with the interpreter's result:
+    /// exits, gas (the faulting block charged once), counter, registers,
+    /// memory and the pages reported written.
+    #[test]
+    fn a_machine_moves_to_the_interpreter_between_slices_alike() {
+        use crate::interpreter::{PERM_NONE, PERM_RO, PERM_RW};
+        // 0: store_imm_u32 [0x10000], 42    7: ecalli 1
+        // 9: load_u8 φ0, [0x20000]          15: store_imm_u32 [0x10004], 7
+        // 22: trap
+        let code = [
+            32, 4, 0, 0, 1, 0, 42, 10, 1, 52, 0, 0, 0, 2, 0, 32, 4, 4, 0, 1, 0, 7, 0,
+        ];
+        let mut bitmask = [0; 23];
+        for start in [0, 7, 9, 15, 22] {
+            bitmask[start] = 1;
+        }
+        let pages = 0x200;
+        let outcomes: Vec<_> = crate::test_support::backends()
+            .into_iter()
+            .map(|backend| {
+                let mut machine = StandardMachine::new(
+                    &code,
+                    &bitmask,
+                    &[],
+                    [0; 13],
+                    10_000,
+                    pages as u64 * 4096,
+                    backend,
+                )
+                .unwrap();
+                assert_eq!(machine.backend(), backend);
+                let mut perms = alloc::vec![PERM_RW; pages];
+                perms[0x20] = PERM_NONE;
+                machine.interpreter.set_page_perms(perms.clone());
+                let host = machine.run().unwrap();
+                assert!(!machine.interpreter.memory().retired());
+                assert!(machine.interpreter.resume_after_host_call());
+                let fault = machine.run().unwrap();
+                assert!(!machine.interpreter.memory().retired());
+                perms[0x20] = PERM_RO;
+                for (offset, page) in perms[0x40..].iter_mut().enumerate() {
+                    *page = if offset.is_multiple_of(2) {
+                        PERM_RO
+                    } else {
+                        PERM_NONE
+                    };
+                }
+                machine.interpreter.set_page_perms(perms);
+                let end = machine.run().unwrap();
+                if backend == PvmBackend::ForceRecompiler {
+                    assert!(machine.interpreter.memory().retired(), "the window retired");
+                }
+                let vm = &mut machine.interpreter;
+                let mut stored = [0; 8];
+                vm.memory().read_bytes(0x10000, &mut stored);
+                let written = vm.memory_mut().take_dirty_pages();
+                (
+                    host,
+                    fault,
+                    end,
+                    vm.gas,
+                    vm.pc,
+                    vm.registers,
+                    stored,
+                    written,
+                )
+            })
+            .collect();
+        let (host, fault, end, ..) = &outcomes[0];
+        assert_eq!(host, &crate::ExitReason::HostCall(1));
+        assert_eq!(fault, &crate::ExitReason::PageFault(0x20000));
+        assert_eq!(end, &crate::ExitReason::Panic);
+        assert_eq!(outcomes[0].6, [42, 0, 0, 0, 7, 0, 0, 0]);
+        assert!(outcomes.iter().all(|outcome| *outcome == outcomes[0]));
+    }
+
+    /// The operator's override is honoured, and one this process does not
+    /// know is an error, never a silent default.
+    #[test]
+    fn an_unknown_backend_override_is_an_error() {
+        let interpreter = choose(Some("interpreter")).unwrap();
+        assert_eq!(interpreter.backend, PvmBackend::ForceInterpreter);
+        assert!(interpreter.requested);
+        for typo in ["interp", "Interpreter", "", "jit"] {
+            let refused = choose(Some(typo)).unwrap_err();
+            assert!(refused.contains("VOS_PVM_BACKEND"), "{refused}");
+        }
+        let default = choose(None).unwrap();
+        assert!(!default.requested);
+        assert_eq!(
+            default.backend == PvmBackend::ForceRecompiler,
+            recompiler_available().is_ok()
+        );
+        assert_eq!(default.unavailable, recompiler_available().err());
+        assert_eq!(
+            choose(Some("recompiler")).is_ok(),
+            recompiler_available().is_ok()
+        );
+    }
+
+    /// The development hosts run the recompiler: a probe that fails there
+    /// is a probe bug, which would silently cost every node its speed.
+    #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn this_host_runs_the_recompiler() {
+        assert_eq!(recompiler_available(), Ok(()));
     }
 }

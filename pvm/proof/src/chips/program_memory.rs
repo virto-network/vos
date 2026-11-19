@@ -223,6 +223,8 @@ mod fill;
 #[cfg(feature = "prover")]
 mod pin;
 #[cfg(feature = "prover")]
+pub(crate) use pin::jumps_to_halt;
+#[cfg(feature = "prover")]
 pub(crate) use pin::pack_flags;
 #[cfg(feature = "prover")]
 pub(crate) use pin::table_log_size;

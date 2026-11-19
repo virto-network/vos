@@ -128,6 +128,23 @@ leaf). Read it as trusted:
   "The external audit" says what the argument must account for (the
   proofs one statement holds, the recursion's depth, PoW counted as
   bits). It is the audit's to make, not to read.
+- **The Blake2s-M31 channel's draws:** 0 and 1 are 1.5 times as likely
+  per coordinate (SECURITY.md, "Stwo's verify path, audited"), at most
+  2.34 bits off a term one challenge bounds; the effect on format 47's
+  affine DEEP batching term, whose coefficients are many draws, is to be
+  derived.
+- **Stwo's panic sites for format 47:** SECURITY.md's table of the
+  fork's verify path is format 39's. The device verifier
+  (`device/src/masked/verify.rs` → `final-verifier/src/masking.rs`'s
+  `verify_masked`) runs the same path; every row that cites 39's
+  parameters (heights, queries, fold step and subsets, last layer) is to
+  be re-derived at 47's, the device's log sizes at most
+  `DEVICE_MAX_LOG_SIZE`.
+- **The in-circuit verifier against the native one:** every refusal
+  Stwo's verifier makes on a format 41 or 32 proof needs a constraint in
+  `recair/src/verifier/` (the degenerate DEEP sample point's is
+  `deep.rs`'s `prepare`, one inverse a plan point); the audit holds the
+  circuit's DEEP plan and its refusals to the native verifier's.
 
 ## The four production paths
 

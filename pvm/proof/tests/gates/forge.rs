@@ -125,3 +125,32 @@ pub fn find_row(
         })
         .expect("no row matched the search predicate")
 }
+
+/// Whether every chip's constraints hold on `traces`, a panic where one
+/// does not, and the logup sums of the whole trace balance.
+#[cfg(feature = "debug-internals")]
+pub fn accepts(
+    components: &[&dyn MachineProverComponent],
+    traces: &[ComponentTrace],
+    side_note: &SideNote,
+) -> bool {
+    use num_traits::Zero;
+    let mut lookup_elements = AllLookupElements::default();
+    let channel = &mut Blake2sM31Channel::default();
+    for component in components {
+        component.draw_lookup_elements(&mut lookup_elements, channel.into());
+    }
+    let mut total = stwo::core::fields::qm31::SecureField::zero();
+    for (component, trace) in components.iter().zip(traces) {
+        let (interaction_trace, claimed_sum) =
+            component.generate_interaction_trace(trace, side_note, &lookup_elements);
+        component.debug_assert_constraints(
+            trace,
+            &interaction_trace,
+            &lookup_elements,
+            claimed_sum,
+        );
+        total += claimed_sum;
+    }
+    total.is_zero()
+}

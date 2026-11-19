@@ -42,6 +42,9 @@ fn only_checked_wirings_are_committed() {
         // row is row 0, which the wiring check refuses, to test the wrap row.
         "pvm/proof/recair/tests/circuit/masked_gates/mod.rs",
         "pvm/proof/recair/tests/gates/pins.rs",
+        // The static check's count against the bodies' fractions, over a
+        // finalized circuit's columns.
+        "pvm/proof/recair/tests/circuit/entries.rs",
     ];
     let mut callers = Vec::new();
     for path in &found {

@@ -1,6 +1,7 @@
 #![cfg(feature = "prover")]
 
-//! Kernels on the prover alone: the Poseidon2-M31 kernel, the recursion's
+//! Kernels on the prover alone: what a run may make the prover do, an
+//! install's shape refused, the Poseidon2-M31 kernel, the recursion's
 //! seams, program identity, the golden fixtures, the circuits' constants
 //! and a run's windows at their cuts. The agent's kernels, run on its
 //! reference model, are `vos-kernel-tests`'.
@@ -11,8 +12,10 @@ mod common;
 #[global_allocator]
 static ALLOCATOR: common::Counting = common::Counting;
 
+mod bounds;
 mod constants;
 mod fixtures;
+mod install;
 mod poseidon2_kernel;
 mod program_identity;
 mod recursion_seams;

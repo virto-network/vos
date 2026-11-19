@@ -142,13 +142,15 @@ impl RangeProof {
     }
 
     /// The root after `writes` to keys in the range or at its boundaries,
-    /// from the proof alone.
+    /// from the proof alone, the proof checked against `root`, the root
+    /// before them: a proof of another root is refused as [`Error::Root`].
     pub fn update<H: Hasher, K: AsRef<[u8]>>(
         &self,
         hasher: &H,
+        root: &Hash,
         writes: &[(K, Option<Hash>)],
     ) -> Result<Hash, Error> {
-        PartialTree::unchecked(&self.entries)?.update(hasher, writes)
+        PartialTree::open(hasher, &self.entries, root)?.update(hasher, writes)
     }
 }
 

@@ -3,7 +3,9 @@
 //! and verifies), its id, a run of it proved masked on the Blake2s-M31
 //! channel, a proof's bytes, and the auth statement's arguments and
 //! io-hash. A space's ingress and a member's device both take it; it links
-//! the masked prover without the recursion.
+//! the masked prover without the recursion, and without its `prover`
+//! feature it is the verifier alone ([`Verifier::of_release`]), ingress's
+//! build, which links neither the prover, nor the runtime, nor rayon.
 //!
 //! - **The program** ([`Program`]) is computed from the kernel alone: the
 //!   chips its code reaches (`device_chips_of_code`), and a log size each
@@ -42,6 +44,8 @@
 //!   arguments and no output; its arguments are the siblings, the secret,
 //!   the slot and those public bytes, in that order ([`auth_arguments`]).
 
+#![forbid(unsafe_code)]
+
 use vos_abi::credentials::{self, DEPTH, EMPTY, Tag, Words};
 use vos_abi::ids::MethodId;
 use vos_abi::{Decode, Encode};
@@ -49,13 +53,16 @@ use vos_pvm_proof::format::{DEVICE_PROOF, Format};
 
 mod error;
 pub mod masked;
+#[cfg(feature = "prover")]
 mod prove;
 mod verify;
 
 pub use error::{Error, Refusal};
-pub use prove::{GAS, Program, REFERENCE_GAS};
+#[cfg(feature = "prover")]
+pub use prove::{GAS, Program, REFERENCE_GAS, REFERENCE_STEPS, STEPS};
 pub use verify::{Verifier, claim_io, decode, encode};
 pub use vos_pvm_final_verifier::masking::MaskedProof;
+#[cfg(feature = "prover")]
 pub use vos_pvm_recair::masked::{MaskRng, MaskStats};
 
 /// A device program's id, which a binding names ([`Program::id`]): a hash
@@ -179,7 +186,7 @@ pub fn auth_reference() -> Vec<u8> {
     let binding: Words = core::array::from_fn(|i| 0x0b1d_0000 + i as u32);
     let siblings: [Words; DEPTH] = core::array::from_fn(|level| EMPTY[level]);
     let member = credentials::compress(&Tag::Member.block(), &secret);
-    let root = credentials::root_of(&credentials::leaf(&member), 0, &siblings);
+    let root = credentials::member_root(&member, 0, &siblings);
     let nullifier =
         credentials::compress(&credentials::compress(&Tag::Nf.block(), &secret), &scope);
     let public = auth_public(

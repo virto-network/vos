@@ -192,14 +192,14 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
         main: &[
             (Current, 256),
             (Next, 128),
-            (Current, 136),
-            (Next, 21),
+            (Current, 128),
+            (Next, 29),
             (Current, 49),
         ],
         interaction: &[(Current, 516), (Previous, 4)],
         relations: 0x180002,
-        gates: 4874,
-        constraints: 480,
+        gates: 4882,
+        constraints: 488,
     },
     // MEMORY_MERKLE
     Chip {
@@ -241,8 +241,8 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
         main: &[(Current, 10)],
         interaction: &[(Previous, 4)],
         relations: 0x00040,
-        gates: 19,
-        constraints: 1,
+        gates: 21,
+        constraints: 2,
     },
     // REGISTER_MEMORY_CLOSING
     Chip {
@@ -250,8 +250,8 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
         main: &[(Current, 18)],
         interaction: &[(Previous, 4)],
         relations: 0x00040,
-        gates: 26,
-        constraints: 1,
+        gates: 28,
+        constraints: 2,
     },
     // PROGRAM_BOUNDARY
     Chip {
@@ -259,8 +259,8 @@ pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
         main: &[(Current, 25)],
         interaction: &[(Previous, 4)],
         relations: 0x00004,
-        gates: 37,
-        constraints: 1,
+        gates: 39,
+        constraints: 2,
     },
     // PROGRAM_MEMORY
     Chip {
@@ -413,8 +413,8 @@ pub const FINALIZE: usize = 512;
 
 /// The `p2` and `qm31` rows of the leaf's own work: the state digests and
 /// the output's hash; the flags, the io-hash's range checks and limbs, the
-/// outputs.
-const LEAF_WORK: [usize; 2] = [2 * 19 + 7, 85 + 448 + 2];
+/// initial timestamp's and the exit pc's range checks, the outputs.
+const LEAF_WORK: [usize; 2] = [2 * 19 + 7, 85 + 448 + 12 * 13 + 2];
 
 /// The boundary chips' public logup terms over the boundary states.
 const BOUNDARY_TERMS: usize = 644;
@@ -574,21 +574,32 @@ fn clean_blocks(
             order
         })
         .collect();
+    // Each column's one sample at a point, by the point: none where it has
+    // two or more there.
+    let alone: Vec<Vec<BTreeMap<u64, Option<usize>>>> = samples
+        .iter()
+        .map(|columns| {
+            columns
+                .iter()
+                .map(|column| {
+                    let mut at: BTreeMap<u64, Option<usize>> = BTreeMap::new();
+                    for &(point, exponent) in column {
+                        at.entry(point)
+                            .and_modify(|one| *one = None)
+                            .or_insert(Some(exponent));
+                    }
+                    at
+                })
+                .collect()
+        })
+        .collect();
     let mut blocks = 0;
     for (tree, order) in orders.iter().enumerate() {
         for lanes in order.chunks_exact(8) {
             for (&point, exponents) in by_point {
                 let at: Option<Vec<usize>> = lanes
                     .iter()
-                    .map(|&column| {
-                        let mut at = samples[tree][column]
-                            .iter()
-                            .filter(|sample| sample.0 == point);
-                        match (at.next(), at.next()) {
-                            (Some(sample), None) => Some(sample.1),
-                            _ => None,
-                        }
-                    })
+                    .map(|&column| alone[tree][column].get(&point).copied().flatten())
                     .collect();
                 let Some(at) = at else { continue };
                 let (low, high) = (at[0], at[7]);
@@ -643,9 +654,9 @@ fn once_rows(by_point: &BTreeMap<u64, Vec<usize>>, items: &mut Items) -> usize {
                 powers.insert(step);
             }
         }
-        // The point, its coordinates' parts, its constants and the two
-        // chains over its samples.
-        point_rows += 13 + 2 * exponents.len() + 3 * usize::from(lowest > 0);
+        // The point, its coordinates' parts, its constants (`c` and its
+        // inverse among them) and the two chains over its samples.
+        point_rows += 14 + 2 * exponents.len() + 3 * usize::from(lowest > 0);
     }
     powers.remove(&0);
     conjugates.remove(&0);
@@ -830,16 +841,28 @@ pub fn leaf_rows(chips: u32, log_sizes: &[u8; SEGMENT_CHIPS]) -> [usize; 3] {
     [p2, qm31 + FINALIZE, h8]
 }
 
-/// Each class of `shape` whose leaf would not fit the padded shape, with
-/// its rows.
-pub(crate) fn oversized_leaves(shape: &Shape) -> Vec<(usize, [usize; 3])> {
-    shape
-        .classes
-        .iter()
-        .enumerate()
-        .map(|(class, sizes)| (class, leaf_rows(shape.chips, &sizes.log_sizes)))
-        .filter(|(_, rows)| rows.iter().zip(PADDED).any(|(&rows, padded)| rows > padded))
-        .collect()
+/// [`leaf_rows`] of each class asked for, each computed once.
+#[derive(Default)]
+pub(crate) struct LeafRows(BTreeMap<(u32, [u8; SEGMENT_CHIPS]), [usize; 3]>);
+
+impl LeafRows {
+    /// Each class of `shape` whose leaf would not fit the padded shape,
+    /// with its rows.
+    pub(crate) fn oversized(&mut self, shape: &Shape) -> Vec<(usize, [usize; 3])> {
+        shape
+            .classes
+            .iter()
+            .enumerate()
+            .map(|(class, sizes)| {
+                let rows = *self
+                    .0
+                    .entry((shape.chips, sizes.log_sizes))
+                    .or_insert_with(|| leaf_rows(shape.chips, &sizes.log_sizes));
+                (class, rows)
+            })
+            .filter(|(_, rows)| rows.iter().zip(PADDED).any(|(&rows, padded)| rows > padded))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -873,18 +896,18 @@ mod tests {
         let terms = leaf_terms(shape.chips, &shape.classes[0].log_sizes);
         assert_eq!(
             (terms.points, terms.blocks, terms.singles),
-            (16, 1_099, 784)
+            (16, 1_101, 784)
         );
         assert_eq!(terms.merkle[0], 40 * (954 + 78));
         assert_eq!(terms.fri, [40 * 243, 40 * 106, 0]);
-        assert_eq!(terms.oods[1], 33_849);
-        assert_eq!(terms.deep_once[1], 19_627);
-        assert_eq!(terms.rows(), [55_496, 99_947, 43_960]);
+        assert_eq!(terms.oods[1], 33_874);
+        assert_eq!(terms.deep_once[1], 19_675);
+        assert_eq!(terms.rows(), [55_500, 100_176, 44_040]);
         assert_eq!(
             leaf_rows(shape.chips, &shape.classes[0].log_sizes),
-            [55_496, 99_947 + FINALIZE, 43_960]
+            [55_500, 100_176 + FINALIZE, 44_040]
         );
-        assert!(oversized_leaves(&shape).is_empty());
+        assert!(LeafRows::default().oversized(&shape).is_empty());
     }
 
     /// A class whose every chip has one log size is refused, named with its
@@ -900,7 +923,7 @@ mod tests {
         shape.classes.push(flat);
         let rows = leaf_rows(shape.chips, &flat.log_sizes);
         assert!(rows[1] > PADDED[1], "{rows:?}");
-        assert_eq!(oversized_leaves(&shape), vec![(1, rows)]);
+        assert_eq!(LeafRows::default().oversized(&shape), vec![(1, rows)]);
         let terms = leaf_terms(shape.chips, &flat.log_sizes);
         assert!(terms.singles > 2 * 784, "{} single samples", terms.singles);
     }

@@ -28,6 +28,12 @@
 //! div_remainder\[8\] + sign_bit_b + sign_bit_d + sign_bit_q +
 //! sign_bit_r + is_div_rem + div_by_zero + is_32bit + is_div_s +
 //! is_shar_r.
+//!
+//! The operands are not range-checked here: each is a register's value
+//! (bytes, as every register write is: `cpu::constraints::memory::result_bytes`,
+//! `tests/gates/register_writes_gate.rs`), an immediate of the program's
+//! preprocessed code, a table's entry, or the CPU's bytes over these (a
+//! low word and its sign's extension).
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 

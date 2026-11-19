@@ -23,7 +23,10 @@
 //!   16 limbs `b0 + 256·b1`, the only lossy use of the bytes;
 //! - **the initial ts is not zero,** as the native verifier refuses a
 //!   segment starting at ts 0 (memory-boundary anchoring): one of its two
-//!   wires is inverted, so one of its eight bytes is not zero.
+//!   wires is inverted, so one of its eight bytes is not zero;
+//! - **the initial ts and the exit pc are bytes:** their 12 bytes are
+//!   range-checked to 8 bits, so a leaf alone states only a `u64` entry
+//!   timestamp and a `u32` exit pc.
 //!
 //! **A flag states its conditions; zero states nothing.** The fold takes the
 //! entry flag from its left child and the halt flag from its right, and the
@@ -34,19 +37,22 @@
 //! Every other use of the boundary bytes is exact on M31 values (`proving.md`
 //! A.3): the transcript, the digests, the flags' comparisons.
 //!
-//! **Why 32 range-checked bytes of 296 suffice.** A boundary wire that is no
+//! **Why 44 range-checked bytes of 296 suffice.** A boundary wire that is no
 //! byte would enter the segment AIR as a register, a timestamp or a root
 //! limb no native state can express (the native verifier's are `u64` and
-//! `[u8; 32]`), and the leaf alone accepts one: `assert_ts_nonzero` takes a
-//! first limb of `p − 1`. Every statement still holds, by induction along
-//! the fold chain:
+//! `[u8; 32]`). The leaf range-checks the io-hash's bytes, which it
+//! combines lossily, and the entry timestamp's and the exit pc's, so that
+//! no leaf alone states a timestamp or a pc outside its integer type. Every
+//! other byte is held by induction along the fold chain:
 //! - the leftmost entry is byte constants: the entry flag ties it to the
 //!   kernel's entry state, and the wrap refuses a root without the flag;
 //! - every exit equals the next segment's entry up to a collision of the
 //!   leaf sponge: the fold checks the exit's digest equal to the entry's,
 //!   each the leaf sponge over the wires as they are;
 //! - an exit is bytes the segment AIR produced, or a copy of its entry: its
-//!   timestamp is `next_timestamp`, whose limbs are Range256-checked
+//!   pc is range-checked by the leaf, and is also the pc the next segment's
+//!   first step looks up in the program's canonical bytes or the halt
+//!   constant under the halt flag; its timestamp is `next_timestamp`, whose limbs are Range256-checked
 //!   (`pvm/proof/src/chips/cpu/constraints/row.rs`); a register is the
 //!   CPU's write tuple's `row.result`, Range256-checked on every real row
 //!   (`cpu/constraints/memory.rs`), the boundary chips being the register
@@ -60,7 +66,7 @@
 //! accepts. The boundary timestamps' range rests on the same chain: the run
 //! starts at ts 1, and a segment cannot cross the zone the ledgers' mod-p
 //! comparison leaves unprovable (`vos_pvm_proof::standalone::TIMESTAMP_BOUND`).
-//! A leaf alone, outside a fold, is held to neither.
+//! A leaf alone, outside a fold, is held to the range checks alone.
 
 mod output;
 mod program;
@@ -215,11 +221,8 @@ fn assert_ts_nonzero<V: Value>(context: &mut Context<V>, ts: [Var; 2]) {
     context.inverse(picked);
 }
 
-/// φ9..12's 32 bytes, each range-checked to 8 bits, as the io-hash's 16
-/// limbs `b0 + 256·b1`: `stated`, four a wire, each lane checked against
-/// its limb.
-fn io_hash<V: Value>(context: &mut Context<V>, boundary: &[Var], stated: &[V; 4]) -> [Var; 4] {
-    let wires = &boundary[wires::IO_HASH];
+/// Each lane of `wires` range-checked to 8 bits.
+fn assert_bytes<V: Value>(context: &mut Context<V>, wires: &[Var]) {
     for &wire in wires {
         for lane in 0..4 {
             let byte = context.limb(wire, lane);
@@ -227,6 +230,14 @@ fn io_hash<V: Value>(context: &mut Context<V>, boundary: &[Var], stated: &[V; 4]
             recompose(context, &bits, 0, Some(byte));
         }
     }
+}
+
+/// φ9..12's 32 bytes, each range-checked to 8 bits, as the io-hash's 16
+/// limbs `b0 + 256·b1`: `stated`, four a wire, each lane checked against
+/// its limb.
+fn io_hash<V: Value>(context: &mut Context<V>, boundary: &[Var], stated: &[V; 4]) -> [Var; 4] {
+    let wires = &boundary[wires::IO_HASH];
+    assert_bytes(context, wires);
     core::array::from_fn(|k| {
         let limbs: [(Var, [u32; 4]); 4] = core::array::from_fn(|j| {
             let limb = 4 * k + j;
@@ -336,6 +347,9 @@ impl LeafCircuit {
                 boundary[wires::TS_IN.start + 1],
             ],
         );
+        context.piece("leaf: ts in, pc out");
+        assert_bytes(context, &boundary[wires::TS_IN]);
+        assert_bytes(context, &boundary[wires::PC_OUT..=wires::PC_OUT]);
         context.piece("leaf: io-hash");
         let io_hash = io_hash(context, boundary, &values.io_hash);
 

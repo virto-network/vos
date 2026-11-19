@@ -179,33 +179,13 @@ impl<'a> Graph<'a> {
         named
     }
 
-    /// What a data object names: its relocations' targets and symbols, and
-    /// its aligned words no relocation covers that look like code
-    /// addresses.
+    /// What a data object names: its relocations' targets and symbols. A
+    /// derived ELF has relocations, so every code pointer in its data has
+    /// one.
     fn named_by_data(&self, (start, end): (u64, u64)) -> Vec<u64> {
-        let mut named: Vec<u64> = Self::named_in(&self.data, start, end)
+        Self::named_in(&self.data, start, end)
             .chain(Self::named_in(&self.symbols, start, end))
-            .collect();
-        let Some((base, bytes)) = self.bytes(start) else {
-            return named;
-        };
-        // The object's words, eight-byte aligned from its region's base.
-        let first = (start - base).div_ceil(8) * 8;
-        let last = end.min(base + bytes.len() as u64) - base;
-        let words = usize::try_from(first)
-            .ok()
-            .zip(usize::try_from(last).ok())
-            .and_then(|(first, last)| bytes.get(first..last))
-            .unwrap_or(&[]);
-        named.extend(
-            raw_code_pointers(
-                [(base + first, words)],
-                &self.elf.data_relocation_ranges,
-                &self.elf.code_ranges,
-            )
-            .map(|(_, target)| target),
-        );
-        named
+            .collect()
     }
 
     /// The code bytes from `start` to `end`, when one section holds them.
@@ -216,14 +196,6 @@ impl<'a> Graph<'a> {
             .iter()
             .find(|(_, base, bytes)| (*base..*base + bytes.len() as u64).contains(&start))?;
         bytes.get(usize::try_from(start - base).ok()?..usize::try_from(end - base).ok()?)
-    }
-
-    /// The initialized data region holding `address`: its base and bytes.
-    pub(super) fn bytes(&self, address: u64) -> Option<(u64, &'a [u8])> {
-        self.elf
-            .initialized()
-            .into_iter()
-            .find(|(base, bytes)| (*base..*base + bytes.len() as u64).contains(&address))
     }
 }
 

@@ -17,6 +17,8 @@
 //!   started, with a full four-byte immediate that trailing continuation
 //!   bytes cannot change.
 
+#![forbid(unsafe_code)]
+
 pub mod assembler;
 mod derive;
 pub mod leaf;
@@ -29,7 +31,8 @@ mod spi;
 use thiserror::Error;
 
 pub use derive::{
-    DeriveError, Derived, INVOCATION_HEAP, MAX_DERIVED, MAX_ELF, TRANSPILER_VERSION, derive,
+    DeriveError, Derived, INVOCATION_HEAP, MAX_CODE, MAX_DERIVED, MAX_ELF, MAX_KERNEL_DATA,
+    TRANSPILER_VERSION, derive,
 };
 pub use linker::{link_elf_spi, link_elf_spi_with_symbols};
 pub use spi::{ServiceMetadata, service_blob};
@@ -63,6 +66,20 @@ pub enum TranspileError {
     /// writes no register it has not read first.
     #[error("load into x0 at {at:#x}: no register is free to receive its value")]
     DiscardedLoad { at: u64 },
+}
+
+impl TranspileError {
+    /// The error of the instruction at `address`: an unsupported
+    /// instruction's offset, when the translation left it unnamed.
+    pub(crate) fn at(self, address: u64) -> Self {
+        match self {
+            Self::UnsupportedInstruction { offset: 0, detail } => Self::UnsupportedInstruction {
+                offset: address as usize,
+                detail,
+            },
+            other => other,
+        }
+    }
 }
 
 /// A program's functions: each one's first PVM instruction in its code, and

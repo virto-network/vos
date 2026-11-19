@@ -17,6 +17,12 @@
 //! nibble-AND lookups); MulChip witnesses mul_high and the product's
 //! words, and its AIR pins them all via the schoolbook + sign-correction
 //! chain.
+//!
+//! The operands are not range-checked here: each is a register's value
+//! (bytes, as every register write is: `cpu::constraints::memory::result_bytes`,
+//! `tests/gates/register_writes_gate.rs`), an immediate of the program's
+//! preprocessed code, a table's entry, or the CPU's bytes over these (a
+//! low word and its sign's extension).
 
 use crate::prelude::*;
 use num_traits::{One, Zero};

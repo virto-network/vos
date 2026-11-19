@@ -12,6 +12,17 @@ pub(super) fn standard_program_with_rw(
     starts: &[usize],
     rw_data: &[u8],
 ) -> Vec<u8> {
+    standard_program_with_heap(args_code, starts, rw_data, 0)
+}
+
+/// [`standard_program_with_rw`] with `heap_pages` zero pages after the
+/// read-write data, readable and writable from load.
+fn standard_program_with_heap(
+    args_code: &[u8],
+    starts: &[usize],
+    rw_data: &[u8],
+    heap_pages: u16,
+) -> Vec<u8> {
     let mut packed = alloc::vec![0u8; args_code.len().div_ceil(8)];
     for &i in starts {
         packed[i / 8] |= 1 << (i % 8);
@@ -23,7 +34,7 @@ pub(super) fn standard_program_with_rw(
     let mut blob = Vec::new();
     blob.extend_from_slice(&[0; 3]);
     blob.extend_from_slice(&(rw_data.len() as u32).to_le_bytes()[..3]);
-    blob.extend_from_slice(&0u16.to_le_bytes());
+    blob.extend_from_slice(&heap_pages.to_le_bytes());
     blob.extend_from_slice(&4096u32.to_le_bytes()[..3]);
     blob.extend_from_slice(rw_data);
     blob.extend_from_slice(&(code_blob.len() as u32).to_le_bytes());
@@ -48,12 +59,14 @@ fn a_nested_run_is_the_same_reused_and_recompiled() {
     let args = inner_program();
     let expected = RefineContext::load_with(&outer, &args, 1_000_000, MemoryModel::Sparse)
         .unwrap()
-        .run();
+        .try_run()
+        .unwrap();
     let prepared = crate::refine::PreparedProgram::new(&outer).unwrap();
     for _ in 0..2 {
         let reused = RefineContext::load_prepared(&prepared, &args, 1_000_000, MemoryModel::Sparse)
             .unwrap()
-            .run();
+            .try_run()
+            .unwrap();
         assert_eq!(reused.exit, expected.exit);
         assert_eq!(reused.pc, expected.pc);
         assert_eq!(reused.registers, expected.registers);
@@ -96,7 +109,8 @@ fn outer_machine_create_and_expunge_run_to_halt() {
     let outer = standard_program(&[10, 9, 10, 14, 50, 0], &[0, 2, 4]);
     let invocation = RefineContext::load(&outer, &inner_program(), 1_000_000)
         .unwrap()
-        .run();
+        .try_run()
+        .unwrap();
     assert_eq!(invocation.exit, ExitReason::Halt);
     assert_eq!(invocation.registers[7], 0, "expunge returned entry PC");
     assert!(invocation.gas_used > 0);
@@ -114,7 +128,8 @@ fn machine_rejects_runtime_only_opcode_three_as_huh() {
     let outer = standard_program(&[10, 9, 50, 0], &[0, 2]);
     let invocation = RefineContext::load(&outer, &runtime_only, 1_000_000)
         .unwrap()
-        .run();
+        .try_run()
+        .unwrap();
 
     assert_eq!(invocation.exit, ExitReason::Halt);
     assert_eq!(invocation.registers[7], result::HUH);
@@ -163,7 +178,8 @@ fn precompile_price_is_charged_identically_on_every_path() {
         PvmBackend::ForceInterpreter,
     )
     .unwrap()
-    .run();
+    .try_run()
+    .unwrap();
     let gas = check(&interpreted, "interpreter");
     #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
     {
@@ -184,10 +200,11 @@ fn precompile_price_is_charged_identically_on_every_path() {
     // the embedder: identical instructions and blocks, minus the price.
     let unpriced = RefineContext::load(&compression_program(0x4ff), &[], 1_000_000)
         .unwrap()
-        .run_with_host(|id, _| {
+        .try_run_with_host(|id, _| {
             assert_eq!(id, 0x4ff);
             Ok(())
-        });
+        })
+        .unwrap();
     assert_eq!(unpriced.exit, ExitReason::Halt);
     assert_eq!(
         gas,
@@ -221,7 +238,8 @@ fn precompile_output_is_a_dirty_page_on_every_path() {
             PvmBackend::ForceInterpreter,
         )
         .unwrap()
-        .run();
+        .try_run()
+        .unwrap();
         check(invocation, "interpreter");
     }
     #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
@@ -327,6 +345,36 @@ fn instantiate_loads_what_its_source_gives_at_the_installed_price() {
         let refused = run(&pool, Some(source));
         assert_eq!(refused.registers[7], result::WHO, "{why}");
         assert!(pool.program(&hash).is_none(), "{why}: nothing pooled");
+    }
+
+    // An invalid program, or one past the service-code bound, under its
+    // own hash is refused once read: asked for again it is not read,
+    // hashed or parsed.
+    struct Counting(core::sync::atomic::AtomicUsize, Vec<u8>);
+    impl ProgramSource for Counting {
+        fn owns(&self, _: &CodeHash) -> bool {
+            true
+        }
+
+        fn program(&self, _: &CodeHash) -> Option<Vec<u8>> {
+            self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Some(self.1.clone())
+        }
+    }
+    for refused in [vec![1, 2, 3], vec![0; crate::spi::MAX_SERVICE_CODE + 1]] {
+        let hash = CodeHash::of(&refused);
+        let source = Arc::new(Counting(0.into(), refused));
+        let pool = Arc::new(MachinePool::new());
+        for _ in 0..3 {
+            let invocation = RefineContext::load(&instantiating_program(hash.0), &[], 1_000_000)
+                .unwrap()
+                .with_pool(Arc::clone(&pool))
+                .with_programs(source.clone())
+                .try_run()
+                .unwrap();
+            assert_eq!(invocation.registers[7], result::WHO);
+        }
+        assert_eq!(source.0.load(core::sync::atomic::Ordering::Relaxed), 1);
     }
 }
 
@@ -448,7 +496,8 @@ fn instantiate_lends_pooled_machines_and_takes_them_back() {
     // Without a pool the call reaches the embedder, as on a JAM host.
     let reached = RefineContext::load(&instantiating_program(hash.0), &[], 1_000_000)
         .unwrap()
-        .run();
+        .try_run()
+        .unwrap();
     assert_eq!(
         reached.exit,
         ExitReason::HostCall(u64::from(crate::inner::host_call::INSTANTIATE))
@@ -498,15 +547,15 @@ fn state_reading_program() -> Vec<u8> {
 
 struct Fixed;
 impl StateReader for Fixed {
-    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
-        (key == b"abc").then(|| b"value".to_vec())
+    fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+        (key == b"abc").then(|| value_window(b"value", offset, max))
     }
 
     fn rows<'a>(
         &'a self,
         _: &'a [u8],
         _: Option<&'a [u8]>,
-    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a> {
         alloc::boxed::Box::new(core::iter::empty())
     }
 }
@@ -517,7 +566,8 @@ fn state_read_serves_the_nodes_state_and_falls_back_to_what() {
     let served = RefineContext::load(&program, &[], 1_000_000)
         .unwrap()
         .with_state(alloc::sync::Arc::new(Fixed))
-        .run();
+        .try_run()
+        .unwrap();
     assert_eq!(served.exit, ExitReason::Halt);
     assert_eq!(served.registers[7], 5, "the value's whole length");
     let mut out = [0u8; 5];
@@ -526,22 +576,23 @@ fn state_read_serves_the_nodes_state_and_falls_back_to_what() {
 
     struct Long;
     impl StateReader for Long {
-        fn read(&self, _: &[u8]) -> Option<Vec<u8>> {
-            Some(vec![7; 1000])
+        fn read(&self, _: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+            Some(value_window(&[7; 1000], offset, max))
         }
 
         fn rows<'a>(
             &'a self,
             _: &'a [u8],
             _: Option<&'a [u8]>,
-        ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+        ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a> {
             alloc::boxed::Box::new(core::iter::empty())
         }
     }
     let long = RefineContext::load(&program, &[], 1_000_000)
         .unwrap()
         .with_state(alloc::sync::Arc::new(Long))
-        .run();
+        .try_run()
+        .unwrap();
     assert_eq!(long.registers[7], 1000);
     assert_eq!(
         long.gas_used - served.gas_used,
@@ -551,7 +602,10 @@ fn state_read_serves_the_nodes_state_and_falls_back_to_what() {
 
     // Without a reader the call reaches the embedder, and a JAM-only
     // run answers it with `WHAT`.
-    let reached = RefineContext::load(&program, &[], 1_000_000).unwrap().run();
+    let reached = RefineContext::load(&program, &[], 1_000_000)
+        .unwrap()
+        .try_run()
+        .unwrap();
     assert_eq!(
         reached.exit,
         ExitReason::HostCall(u64::from(crate::inner::host_call::STATE_READ))
@@ -573,7 +627,10 @@ fn gas_reports_what_is_left() {
         50, 0,                        // jump_ind φ0 (halt)
     ];
     let program = standard_program_with_rw(&code, &[0, 2], &[]);
-    let invocation = RefineContext::load(&program, &[], 1_000_000).unwrap().run();
+    let invocation = RefineContext::load(&program, &[], 1_000_000)
+        .unwrap()
+        .try_run()
+        .unwrap();
     assert_eq!(invocation.exit, ExitReason::Halt);
     let left = invocation.registers[7];
     // The block gas and the call's own 10 are spent before φ7 is set.
@@ -583,7 +640,10 @@ fn gas_reports_what_is_left() {
 #[test]
 fn unpayable_precompile_stops_out_of_gas_unserved() {
     let program = compression_program(crate::precompile::BLAKE2B_COMPRESS as u16);
-    let full = RefineContext::load(&program, &[], 1_000_000).unwrap().run();
+    let full = RefineContext::load(&program, &[], 1_000_000)
+        .unwrap()
+        .try_run()
+        .unwrap();
     assert_eq!(full.exit, ExitReason::Halt);
     // Funds every block but not the price.
     let budget = full.gas_used - crate::precompile::BLAKE2B_COMPRESS_GAS;
@@ -595,7 +655,8 @@ fn unpayable_precompile_stops_out_of_gas_unserved() {
         PvmBackend::ForceInterpreter,
     )
     .unwrap()
-    .run();
+    .try_run()
+    .unwrap();
     assert_eq!(invocation.exit, ExitReason::OutOfGas);
     assert_eq!(invocation.pc, 10, "stops on the call's own counter");
     assert_eq!(invocation.gas_used, budget);
@@ -648,7 +709,8 @@ fn the_live_poseidon2_call_is_served_and_a_word_at_or_above_p_traps() {
     let expected = crate::precompile::poseidon2_compress(&input).unwrap();
     let unpriced = RefineContext::load(&compression_program(0x4ff), &[], 1_000_000)
         .unwrap()
-        .run_with_host(|_, _| Ok(()));
+        .try_run_with_host(|_, _| Ok(()))
+        .unwrap();
     for backend in backends {
         let served = run(&poseidon2_program(&input), backend);
         assert_eq!(served.exit, ExitReason::Halt, "{backend:?}");
@@ -700,7 +762,7 @@ fn invoke_inner_call(id: u16, gas: u64, precompiles: bool) -> (u64, u64) {
     if !precompiles {
         context = context.without_precompiles();
     }
-    let invocation = context.run();
+    let invocation = context.try_run().unwrap();
     assert_eq!(invocation.exit, ExitReason::Halt);
     let mut left = [0u8; 8];
     invocation.memory().read_bytes(RW_BASE, &mut left);
@@ -730,11 +792,12 @@ fn an_inner_machines_precompile_reaches_its_agent() {
     let invocation = RefineContext::load(&outer, &[], 1_000_000)
         .unwrap()
         .without_precompiles()
-        .run_with_host(|call, machine| {
+        .try_run_with_host(|call, machine| {
             seen.push(call);
             machine.registers_mut()[7] = result::WHAT;
             Ok(())
-        });
+        })
+        .unwrap();
     assert_eq!(seen, [u64::from(id)]);
     assert_eq!(invocation.exit, ExitReason::Halt);
 }
@@ -742,7 +805,10 @@ fn an_inner_machines_precompile_reaches_its_agent() {
 #[test]
 fn unknown_host_call_is_returned_to_the_embedder() {
     let outer = standard_program(&[51, 2, 9, 10, 77, 0], &[0, 3, 5]);
-    let invocation = RefineContext::load(&outer, &[], 1_000_000).unwrap().run();
+    let invocation = RefineContext::load(&outer, &[], 1_000_000)
+        .unwrap()
+        .try_run()
+        .unwrap();
     assert_eq!(invocation.exit, ExitReason::HostCall(77));
     assert_eq!(invocation.pc, 3, "unknown host call stays on its cause");
     assert_eq!(invocation.registers[2], 9);
@@ -755,7 +821,7 @@ fn embedder_calls_resume_without_reexecuting_prior_instructions() {
     let mut calls = 0;
     let invocation = RefineContext::load(&outer, &[], 1_000_000)
         .unwrap()
-        .run_with_host(|id, machine| {
+        .try_run_with_host(|id, machine| {
             assert_eq!(id, 77);
             calls += 1;
             if !machine.charge(50) {
@@ -763,7 +829,8 @@ fn embedder_calls_resume_without_reexecuting_prior_instructions() {
             }
             machine.registers_mut()[2] += 1;
             Ok(())
-        });
+        })
+        .unwrap();
     assert_eq!(calls, 2);
     assert_eq!(invocation.exit, ExitReason::Halt);
     assert_eq!(invocation.registers[2], 11);
@@ -776,10 +843,11 @@ fn embedder_refusal_keeps_exact_call_counter_and_stops_execution() {
     let mut calls = 0;
     let invocation = RefineContext::load(&outer, &[], 1_000_000)
         .unwrap()
-        .run_with_host(|id, _| {
+        .try_run_with_host(|id, _| {
             calls += 1;
             Err(ExitReason::HostCall(id))
-        });
+        })
+        .unwrap();
     assert_eq!(calls, 1);
     assert_eq!(invocation.exit, ExitReason::HostCall(77));
     assert_eq!(invocation.pc, 3);
@@ -799,7 +867,8 @@ fn embedder_calls_preserve_inner_machines_and_cannot_intercept_builtins() {
     );
     let expected = RefineContext::load(&baseline, &inner_program(), 1_000_000)
         .unwrap()
-        .run();
+        .try_run()
+        .unwrap();
     let outer = standard_program_with_rw(
         &[10, 9, 10, 77, 51, 8, b0, b1, b2, 10, 13, 10, 77, 50, 0],
         &[0, 2, 4, 9, 11, 13],
@@ -808,11 +877,12 @@ fn embedder_calls_preserve_inner_machines_and_cannot_intercept_builtins() {
     let mut calls = 0;
     let invocation = RefineContext::load(&outer, &inner_program(), 1_000_000)
         .unwrap()
-        .run_with_host(|id, _| {
+        .try_run_with_host(|id, _| {
             assert_eq!(id, 77);
             calls += 1;
             Ok(())
-        });
+        })
+        .unwrap();
     assert_eq!(calls, 2);
     assert_eq!(expected.exit, ExitReason::Halt);
     assert_eq!(invocation.exit, expected.exit);
@@ -833,7 +903,10 @@ fn failed_host_dispatch_does_not_advance_the_outer_counter() {
     // Dispatch fails before Continue, so the owner must retain that
     // ecalli counter rather than exposing its pc-10 successor.
     let outer = standard_program(&[51, 7, 0, 0, 3, 51, 8, 1, 10, 9, 0], &[0, 5, 8, 10]);
-    let invocation = RefineContext::load(&outer, &[], 1_000_000).unwrap().run();
+    let invocation = RefineContext::load(&outer, &[], 1_000_000)
+        .unwrap()
+        .try_run()
+        .unwrap();
     assert_eq!(invocation.exit, ExitReason::Panic);
     assert_eq!(invocation.pc, 8);
 }
@@ -910,27 +983,43 @@ fn state_scanning_program() -> Vec<u8> {
     standard_program_with_rw(&code, &starts, &[0; 0x60])
 }
 
-/// `count` rows of sixteen bytes each, a two-byte key and a six-byte
-/// value, counting the rows read.
+/// `count` rows of a two-byte key and a `value`-byte value (sixteen bytes
+/// a row at six), counting the rows read and the value bytes copied.
 struct Rows {
     count: usize,
+    value: usize,
     read: core::sync::atomic::AtomicUsize,
+    copied: core::sync::atomic::AtomicUsize,
+}
+
+impl Rows {
+    fn new(count: usize, value: usize) -> Self {
+        Self {
+            count,
+            value,
+            read: 0.into(),
+            copied: 0.into(),
+        }
+    }
 }
 
 impl StateReader for Rows {
-    fn read(&self, _: &[u8]) -> Option<Vec<u8>> {
-        None
+    fn read(&self, _: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+        let (len, window) = value_window(&vec![0; self.value], offset, max);
+        self.copied
+            .fetch_add(window.len(), core::sync::atomic::Ordering::Relaxed);
+        Some((len, window))
     }
 
     fn rows<'a>(
         &'a self,
         _: &'a [u8],
         _: Option<&'a [u8]>,
-    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + 'a> {
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a> {
         alloc::boxed::Box::new((0..self.count).map(|row| {
             self.read
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            ((row as u16).to_le_bytes().to_vec(), vec![0; 6])
+            ((row as u16).to_le_bytes().to_vec(), self.value)
         }))
     }
 }
@@ -939,14 +1028,12 @@ impl StateReader for Rows {
 fn state_scan_charges_by_the_byte_and_reads_no_row_it_cannot_pay_for() {
     let program = state_scanning_program();
     let scan = |count, gas| {
-        let rows = alloc::sync::Arc::new(Rows {
-            count,
-            read: 0.into(),
-        });
+        let rows = alloc::sync::Arc::new(Rows::new(count, 6));
         let invocation = RefineContext::load(&program, &[], gas)
             .unwrap()
             .with_state(rows.clone())
-            .run();
+            .try_run()
+            .unwrap();
         (
             invocation,
             rows.read.load(core::sync::atomic::Ordering::Relaxed),
@@ -971,6 +1058,29 @@ fn state_scan_charges_by_the_byte_and_reads_no_row_it_cannot_pay_for() {
     let (short, read) = scan(1 << 20, empty.gas_used + 40 * STATE_READ_BYTE_GAS);
     assert_eq!(short.exit, ExitReason::OutOfGas);
     assert_eq!(read, 3);
+}
+
+/// A row the call does not serve has no byte of its value read: a 16 MiB
+/// value past the writable output stops the call (a panic) having copied
+/// nothing (gathering a row before its checks would copy all of it for the
+/// base price); a served row's value is copied once.
+#[test]
+fn state_scan_reads_no_value_of_a_row_it_does_not_serve() {
+    let program = state_scanning_program();
+    let scan = |value| {
+        let rows = alloc::sync::Arc::new(Rows::new(1, value));
+        let invocation = RefineContext::load(&program, &[], 1_000_000)
+            .unwrap()
+            .with_state(rows.clone())
+            .try_run()
+            .unwrap();
+        (
+            invocation.exit,
+            rows.copied.load(core::sync::atomic::Ordering::Relaxed),
+        )
+    };
+    assert_eq!(scan(16 << 20), (ExitReason::Panic, 0));
+    assert_eq!(scan(6), (ExitReason::Halt, 6));
 }
 
 /// The JAM-only host serves no VOS extension whatever the context holds:
@@ -1051,4 +1161,148 @@ fn the_jam_only_hosts_state_stand_in_serves_state_reads_alone() {
             .err(),
         Some(RefineError::NoStateReader)
     );
+}
+
+/// An outer program that creates an inner machine of `n` one-byte
+/// `load_imm`s and a `trap` (its arguments), invokes it with 100,000 gas,
+/// then again with none, and halts: φ7 the second invoke's status.
+fn panic_then_invoke_unpaid(n: usize) -> (Vec<u8>, Vec<u8>) {
+    const RW_BASE: u32 = 2 * crate::PVM_ZONE_SIZE;
+    let mut frame = [0u8; 112];
+    frame[..8].copy_from_slice(&100_000u64.to_le_bytes());
+    let [b0, b1, b2, _] = RW_BASE.to_le_bytes();
+    let code = [
+        10, 9, // machine(φ7, φ8): the arguments
+        51, 8, b0, b1, b2, // φ8 <- the frame
+        10, 13, // invoke(0, frame)
+        33, 3, b0, b1, b2, // the frame's gas <- 0
+        51, 7, // φ7 <- 0
+        10, 13, // invoke(0, frame)
+        50, 0, // halt
+    ];
+    let outer = standard_program_with_rw(&code, &[0, 2, 7, 9, 14, 16, 18], &frame);
+    let mut inner = vec![51u8; n];
+    inner.push(0);
+    let inner = build_compact_code_blob(&CodeBlob {
+        jump_table: vec![],
+        bitmask: vec![1; inner.len()],
+        code: inner,
+    })
+    .unwrap();
+    (outer, inner)
+}
+
+/// A VOS host's inner machine that panicked pays its first block again
+/// on its next `invoke`, so one invoked with no gas is out of gas; the
+/// JAM-only host keeps the Gray Paper's rule, under which it panics again
+/// having run the block unpaid. Alike on both backends.
+#[test]
+fn a_panicked_inner_machine_is_rerun_unpaid_only_on_the_jam_only_host() {
+    const PANIC_STATUS: u64 = 1;
+    const OUT_OF_GAS_STATUS: u64 = 4;
+    let (outer, inner) = panic_then_invoke_unpaid(10_000);
+    for backend in crate::test_support::backends() {
+        let load = || {
+            RefineContext::load_with_backend(&outer, &inner, 1_000_000, MemoryModel::Auto, backend)
+                .unwrap()
+        };
+        let vos = load().try_run().unwrap();
+        assert_eq!(vos.exit, ExitReason::Halt, "{backend:?}");
+        assert_eq!(vos.registers[7], OUT_OF_GAS_STATUS, "{backend:?}");
+        let jam = load().try_run_jam(JamRefine::default()).unwrap().invocation;
+        assert_eq!(jam.exit, ExitReason::Halt, "{backend:?}");
+        assert_eq!(jam.registers[7], PANIC_STATUS, "{backend:?}");
+    }
+}
+
+/// `pages` past a VOS host's budget answers `FULL` there; the JAM-only
+/// host maps them, as the Gray Paper does.
+#[test]
+fn pages_past_the_budget_answer_full_on_a_vos_host_alone() {
+    let pages = crate::inner::budget::MAPPED_PAGES as u32 + 1;
+    let [p0, p1, p2, _] = pages.to_le_bytes();
+    let code = [
+        10, 9, // machine(φ7, φ8): the arguments
+        51, 8, 16, // φ8 <- 16, the first mappable page
+        51, 9, p0, p1, p2, // φ9 <- the pages
+        51, 10, 2, // φ10 <- allocate read-write
+        10, 12, // pages(0, 16, pages, 2)
+        50, 0, // halt
+    ];
+    let outer = standard_program(&code, &[0, 2, 5, 10, 13, 15]);
+    let gas = 100_000_000;
+    let load = || RefineContext::load_with(&outer, &inner_program(), gas, MemoryModel::Sparse);
+    let vos = load().unwrap().try_run().unwrap();
+    assert_eq!(vos.exit, ExitReason::Halt);
+    assert_eq!(vos.registers[7], result::FULL);
+    let jam = load().unwrap().try_run_jam(JamRefine::default()).unwrap();
+    assert_eq!(jam.invocation.exit, ExitReason::Halt);
+    assert_eq!(jam.invocation.registers[7], result::OK);
+}
+
+/// A key of `len` bytes at the read-write data's start, behind 65,535 heap
+/// pages (256 MiB, readable at load for no gas), read by `state_read` with
+/// φ11 bytes `max` asked for: φ7 at the halt and the gas used.
+fn state_read_of_key(len: u64, max: u64, reader: alloc::sync::Arc<dyn StateReader>) -> (u64, u64) {
+    let [lo, hi] = (crate::inner::host_call::STATE_READ as u16).to_le_bytes();
+    let [l0, l1, l2, l3, ..] = len.to_le_bytes();
+    let [m0, m1, m2, m3, ..] = max.to_le_bytes();
+    let (code, starts) = crate::test_support::code(&[
+        &[51, 7, 0x00, 0x00, 0x02], // load_imm φ7, 0x2_0000 (key)
+        &[51, 8, l0, l1, l2, l3],   // load_imm φ8, len
+        &[51, 9, 0x10, 0x00, 0x02], // load_imm φ9, 0x2_0010 (output)
+        &[51, 10, 0],               // load_imm φ10, 0
+        &[51, 11, m0, m1, m2, m3],  // load_imm φ11, max
+        &[10, lo, hi],              // ecalli state_read
+        &[50, 0],                   // jump_ind φ0 (halt)
+    ]);
+    let program = standard_program_with_heap(&code, &starts, b"abc", u16::MAX);
+    let invocation = RefineContext::load(&program, &[], 1_000_000)
+        .unwrap()
+        .with_state(reader)
+        .try_run()
+        .unwrap();
+    assert_eq!(invocation.exit, ExitReason::Halt);
+    (invocation.registers[7], invocation.gas_used)
+}
+
+/// Records the most bytes each read asked the reader to copy.
+#[derive(Default)]
+struct Recording(std::sync::Mutex<Vec<usize>>);
+
+impl StateReader for Recording {
+    fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+        self.0.lock().unwrap().push(max);
+        Fixed.read(key, offset, max)
+    }
+
+    fn rows<'a>(
+        &'a self,
+        _: &'a [u8],
+        _: Option<&'a [u8]>,
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (Vec<u8>, usize)> + 'a> {
+        alloc::boxed::Box::new(core::iter::empty())
+    }
+}
+
+/// A key is read only within [`MAX_STATE_KEY`] bytes and charged by the
+/// byte before it is read: a 255 MiB key, readable for no gas, answers
+/// `HUH` for the base price (unbounded, the host reads and copies all of
+/// it for 10 gas). The reader copies no byte past what the call asks and the gas
+/// left pays for: a zero-length read copies nothing.
+#[test]
+fn state_read_bounds_its_key_and_its_copy() {
+    let reader = alloc::sync::Arc::new(Recording::default());
+    let (answer, base) = state_read_of_key(255 << 20, 0, reader.clone());
+    assert_eq!(answer, result::HUH);
+    let (answer, bounded) = state_read_of_key(MAX_STATE_KEY, 0, reader.clone());
+    assert_eq!(answer, result::NONE, "no such key");
+    assert_eq!(bounded - base, MAX_STATE_KEY * STATE_READ_BYTE_GAS);
+    let (answer, _) = state_read_of_key(3, 0, reader.clone());
+    assert_eq!(answer, 5, "the value's length, nothing copied");
+    let (answer, _) = state_read_of_key(3, u64::from(u32::MAX), reader.clone());
+    assert_eq!(answer, 5);
+    let asked = reader.0.lock().unwrap().clone();
+    assert_eq!(asked[..2], [0, 0], "a zero-length read asks for nothing");
+    assert!(asked[2] < 1_000_000, "no more than the gas left pays for");
 }

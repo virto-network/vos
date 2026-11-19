@@ -2958,3 +2958,92 @@ fn graypaper_v080_recompiler_satisfies_every_vector() {
         "complete v0.8 corpus cardinality",
     );
 }
+
+/// Every v0.8.0 vector again through the loaders' validation and the
+/// production memory path, on every backend: its program as a compact code
+/// blob through `deblob` (the `machine` call's reader), its pages mapped
+/// and filled with the `pages` and `poke` a loader issues, its run an
+/// `invoke`. A program `deblob` refuses (an invalid opcode, a bad
+/// terminator) is one no loader runs; every other gives the vector's exit,
+/// counter, registers and memory, and the direct interpreter's gas.
+#[test]
+fn graypaper_v080_vectors_hold_through_deblob_on_the_production_path() {
+    use vos_pvm::inner::{InnerError, InnerExit, InnerMachines, InvokeState, PageMode};
+
+    let mut backends = vec![vos_pvm::PvmBackend::ForceInterpreter];
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        backends.push(vos_pvm::PvmBackend::ForceRecompiler);
+    }
+    let (mut run, mut refused) = (0, 0);
+    for (file, v) in discover_v080() {
+        let blob = vos_pvm_program::build_compact_code_blob(&vos_pvm_program::CodeBlob {
+            jump_table: v.jump_table.clone(),
+            code: v.code.clone(),
+            bitmask: v.bitmask.clone(),
+        })
+        .expect("a compact code blob");
+        let valid = vos_pvm::spi::deblob(&blob, u64::from(v.initial_pc)).is_some();
+        let (_, reference) = run_interpreter(&v);
+        for &backend in &backends {
+            let mut machines = InnerMachines::with_backend(backend);
+            let id = match machines.create(&blob, v.initial_pc) {
+                Ok(id) => id,
+                Err(InnerError::Invalid) => {
+                    assert!(!valid, "{file}: deblob takes it, machine does not");
+                    refused += 1;
+                    continue;
+                }
+                Err(error) => panic!("{file}, {backend:?}: {error:?}"),
+            };
+            assert!(valid, "{file}: machine takes what deblob refuses");
+            for &(address, len, _) in &v.page_map {
+                let (first, count) = (address / PAGE, len / PAGE);
+                machines
+                    .pages(id, first, count, PageMode::AllocateReadWrite)
+                    .unwrap_or_else(|error| panic!("{file}: pages {first}+{count}: {error:?}"));
+            }
+            for (address, bytes) in &v.memory {
+                machines.poke(id, *address, bytes).unwrap();
+            }
+            for &(address, len, permission) in &v.page_map {
+                if permission == PERM_RO {
+                    machines
+                        .pages(id, address / PAGE, len / PAGE, PageMode::SetReadOnly)
+                        .unwrap();
+                }
+            }
+            let outcome = machines
+                .invoke(
+                    id,
+                    InvokeState {
+                        gas: v.gas,
+                        registers: v.regs,
+                    },
+                )
+                .unwrap();
+            let exit = match outcome.exit {
+                InnerExit::Halt => ExitReason::Halt,
+                InnerExit::Panic => ExitReason::Panic,
+                InnerExit::Fault(address) => ExitReason::PageFault(address),
+                InnerExit::Host(id) => ExitReason::HostCall(id),
+                InnerExit::OutOfGas => ExitReason::OutOfGas,
+            };
+            assert_eq!(exit, v.exp_status, "{file}, {backend:?}: exit");
+            assert_eq!(outcome.state.registers, v.exp_regs, "{file}, {backend:?}");
+            assert_eq!(outcome.state.gas, reference.gas, "{file}, {backend:?}: gas");
+            for (address, want) in &v.exp_memory {
+                let got = machines.peek(id, *address, want.len()).unwrap();
+                assert_eq!(&got, want, "{file}, {backend:?}: memory at {address:#x}");
+            }
+            // A host call's machine resumes past it; every other exit
+            // leaves the vector's counter.
+            let pc = machines.expunge(id).unwrap();
+            if !matches!(exit, ExitReason::HostCall(_)) {
+                assert_eq!(pc, v.exp_pc, "{file}, {backend:?}: counter");
+            }
+            run += 1;
+        }
+    }
+    assert_eq!(run + refused, backends.len() * V080_CASE_COUNT);
+    assert_eq!(refused, backends.len() * 4, "the corpus's invalid programs");
+}

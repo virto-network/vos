@@ -1,7 +1,8 @@
 //! Lists what each input of the checked-in corpus (`replay/<target>.tar`,
 //! unpacked into `target/replay/<target>/`) reaches: the verdict its
 //! target's verifier, decoder or venue gives it, counted by verdict a
-//! target. `prove_verify_roundtrip`'s inputs are programs, counted alone.
+//! target; `prove_verify_roundtrip`'s, what its runs reach and how its
+//! proofs end (`roundtrip::run`).
 //! A verdict that carries values (a derive's refusal, a run's exit) is
 //! counted by its variant.
 //!
@@ -29,6 +30,8 @@ mod golden;
 mod mutation;
 #[path = "../fuzz_targets/program_run.rs"]
 mod program_run;
+#[path = "../fuzz_targets/roundtrip.rs"]
+mod roundtrip;
 #[path = "../fuzz_targets/service.rs"]
 mod service;
 #[path = "../fuzz_targets/shape.rs"]
@@ -190,6 +193,12 @@ fn paths(target: &str, bytes: &[u8]) -> Vec<String> {
             decoded("anchor", Anchor::decode(bytes)),
             decoded("vector", Vector::decode(bytes)),
         ],
+        "prove_verify_roundtrip" => {
+            match roundtrip::FuzzInput::arbitrary_take_rest(Unstructured::new(bytes)) {
+                Ok(input) => roundtrip::run(&input),
+                Err(_) => vec!["not an input".into()],
+            }
+        }
         _ => vec!["a program".into()],
     }
 }

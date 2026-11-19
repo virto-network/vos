@@ -460,6 +460,29 @@ impl PagePerms {
         self.pages_have_at_least(first, last + 1, permission)
     }
 
+    /// How many pages of `[first, end)` have at least `permission`.
+    fn count_at_least(&self, first: usize, end: usize, permission: u8) -> usize {
+        let mut count = 0;
+        let mut page = first;
+        while page < end {
+            let slot = page / SLOT_PAGES;
+            let slot_end = ((slot + 1) * SLOT_PAGES).min(end);
+            count += match &self.slots[slot] {
+                PermSlot::Uniform(existing) if *existing >= permission => slot_end - page,
+                PermSlot::Uniform(_) => 0,
+                PermSlot::Mixed(leaf) => {
+                    let base = slot * SLOT_PAGES;
+                    leaf[page - base..slot_end - base]
+                        .iter()
+                        .filter(|&&existing| existing >= permission)
+                        .count()
+                }
+            };
+            page = slot_end;
+        }
+        count
+    }
+
     /// Whether pages `[first, end)`, which must lie in the span, all have at
     /// least `permission`.
     fn pages_have_at_least(&self, first: usize, end: usize, permission: u8) -> bool {
@@ -719,7 +742,7 @@ pub struct FlatMem {
     perms: PagePerms,
     dirty: DirtyPages,
     /// Every capture since the last reset ([`Memory::take_pages_since_reset`]).
-    captured: Vec<core::ops::Range<u32>>,
+    captured: Captured,
     value_revision: u64,
 }
 
@@ -800,7 +823,7 @@ impl FlatMem {
             bytes: FlatBytes::Owned(bytes),
             perms: PagePerms::new_rw(pages),
             dirty: DirtyPages::new(pages),
-            captured: Vec::new(),
+            captured: Captured::default(),
             value_revision: 0,
         }
     }
@@ -925,7 +948,7 @@ pub struct SparseMem {
     /// Pages written since the last capture, in first-write order.
     dirty: Vec<u32>,
     /// Every capture since the last reset ([`Memory::take_pages_since_reset`]).
-    captured: Vec<core::ops::Range<u32>>,
+    captured: Captured,
     value_revision: u64,
 }
 
@@ -942,7 +965,7 @@ impl SparseMem {
             perms: PagePerms::new_rw(pages),
             frame_dirty: Vec::new(),
             dirty: Vec::new(),
-            captured: Vec::new(),
+            captured: Captured::default(),
             value_revision: 0,
         }
     }
@@ -1079,6 +1102,41 @@ impl SparseMem {
     }
 }
 
+/// The page ranges captured since a pooled machine's last reset. They are
+/// coalesced whenever they grow past twice what the last coalescing left
+/// (and past a floor), so each capture costs amortized time in its own
+/// ranges, however scattered the pages already held.
+#[derive(Clone, Debug, Default)]
+struct Captured {
+    ranges: Vec<core::ops::Range<u32>>,
+    /// The ranges the last coalescing left.
+    coalesced: usize,
+}
+
+impl Captured {
+    /// Ranges held before the first coalescing.
+    const FLOOR: usize = 4096;
+
+    fn extend(&mut self, pages: &[core::ops::Range<u32>]) {
+        self.ranges.extend_from_slice(pages);
+        if self.ranges.len() > Self::FLOOR.max(2 * self.coalesced) {
+            self.ranges = coalesce(core::mem::take(&mut self.ranges));
+            self.coalesced = self.ranges.len();
+        }
+    }
+
+    /// Every range held, sorted and coalesced, leaving none.
+    fn take(&mut self) -> Vec<core::ops::Range<u32>> {
+        self.coalesced = 0;
+        coalesce(core::mem::take(&mut self.ranges))
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.coalesced = 0;
+    }
+}
+
 /// Sort page ranges and merge those that overlap or touch.
 fn coalesce(mut ranges: Vec<core::ops::Range<u32>>) -> Vec<core::ops::Range<u32>> {
     ranges.sort_unstable_by_key(|range| range.start);
@@ -1118,40 +1176,90 @@ impl Memory {
             bytes: FlatBytes::Native(bytes),
             perms: PagePerms::new_rw(span as usize / PAGE),
             dirty: DirtyPages::new(span as usize / PAGE),
-            captured: Vec::new(),
+            captured: Captured::default(),
             value_revision: 0,
         }))
     }
 
+    /// The native window with this memory's permissions installed, or
+    /// `None` where this memory runs on the interpreter.
     #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn native_window(
         &mut self,
     ) -> Result<
-        (
+        Option<(
             &crate::backing::CodeWindow,
             *const crate::recompiler::memory::Activation,
-        ),
+        )>,
         alloc::string::String,
     > {
         let Self::Flat(memory) = self else {
-            return Err("native execution requires native memory".into());
+            return Ok(None);
         };
         let FlatBytes::Native(bytes) = &mut memory.bytes else {
-            return Err("native execution requires native memory".into());
+            return Ok(None);
         };
-        bytes.sync_permissions(&mut memory.perms)?;
+        if !bytes.sync_permissions(&mut memory.perms)? {
+            return Ok(None);
+        }
         // Native stores bypass checked host writes. Invalidate cached value
         // commitments at every execution boundary, including fault boundaries.
         memory.value_revision = memory
             .value_revision
             .checked_add(1)
             .expect("memory revision cannot wrap in one invocation");
-        Ok((bytes.window(), bytes.activation()))
+        Ok(Some((bytes.window(), bytes.activation())))
     }
 
     /// Flat memory over `bytes` (zero-padded to whole pages), all pages RW.
     pub fn flat(bytes: Vec<u8>) -> Self {
         Self::Flat(FlatMem::new(bytes))
+    }
+
+    /// The pages of native memory resident in the host (`mincore` on its
+    /// host alias); `None` for any other memory.
+    #[cfg(all(test, feature = "std", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn resident_pages(&mut self) -> Option<usize> {
+        let pages = self.pages();
+        let Memory::Flat(FlatMem {
+            bytes: FlatBytes::Native(bytes),
+            ..
+        }) = self
+        else {
+            return None;
+        };
+        let mut resident = vec![0u8; pages];
+        // SAFETY: the host alias maps `pages` whole pages, page-aligned.
+        let status = unsafe {
+            libc::mincore(
+                bytes.host_ptr().cast(),
+                pages * PAGE,
+                resident.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(status, 0, "mincore on the host alias");
+        Some(resident.iter().filter(|&&page| page & 1 != 0).count())
+    }
+
+    /// Flat memory of `len` zero bytes, all pages RW, or an error when the
+    /// host cannot allocate them (where `vec![0; len]` aborts the process).
+    /// The bytes come zeroed from the allocator, as `vec![0; len]`'s do,
+    /// so the pages stay untouched until written.
+    pub fn try_flat_zeroed(len: usize) -> Result<Self, alloc::string::String> {
+        if len == 0 {
+            return Ok(Self::flat(Vec::new()));
+        }
+        let refused = || alloc::format!("cannot allocate {len} bytes of flat memory");
+        let layout = core::alloc::Layout::array::<u8>(len).map_err(|_| refused())?;
+        // SAFETY: `layout` has a nonzero size.
+        let pointer = unsafe { alloc::alloc::alloc_zeroed(layout) };
+        if pointer.is_null() {
+            return Err(refused());
+        }
+        // SAFETY: the global allocator gave `pointer` for `len` bytes of
+        // alignment 1, all initialized to zero.
+        let bytes = unsafe { Vec::from_raw_parts(pointer, len, len) };
+        Ok(Self::flat(bytes))
     }
 
     /// Sparse memory spanning `span` bytes (rounded up to whole pages),
@@ -1173,6 +1281,16 @@ impl Memory {
     /// The permission of `page`, or `None` outside the span.
     pub fn page_perm(&self, page: usize) -> Option<u8> {
         dispatch!(self, m => (page < m.perms.pages()).then(|| m.perms.get(page)))
+    }
+
+    /// How many pages of `[first, first + count)` are mapped (at least
+    /// read-only), the part of the range within the span.
+    pub fn mapped_pages(&self, first: usize, count: usize) -> usize {
+        let end = first.saturating_add(count).min(self.pages());
+        if first >= end {
+            return 0;
+        }
+        dispatch!(self, m => m.perms.count_at_least(first, end, super::PERM_RO))
     }
 
     /// Whether every page of `[first, first + count)` is mapped (at least
@@ -1218,10 +1336,7 @@ impl Memory {
             Memory::Flat(m) => (m.dirty.take(), &mut m.captured),
             Memory::Sparse(m) => (m.take_dirty(), &mut m.captured),
         };
-        captured.extend(pages.iter().cloned());
-        if captured.len() > 4096 {
-            *captured = coalesce(core::mem::take(captured));
-        }
+        captured.extend(&pages);
         pages
     }
 
@@ -1234,7 +1349,7 @@ impl Memory {
             Memory::Flat(m) => &mut m.captured,
             Memory::Sparse(m) => &mut m.captured,
         };
-        coalesce(core::mem::take(captured))
+        captured.take()
     }
 
     /// The permission slots changed since the last call, with each slot's
@@ -1297,16 +1412,31 @@ impl Memory {
         }
     }
 
-    /// Whether native write tracking has failed: the memory reports every
-    /// page from then on, and must not be reused.
-    pub(crate) fn tracking_failed(&self) -> bool {
+    /// The kernel mappings a native window's slot activations split off
+    /// its permission runs; 0 off a native window.
+    pub(crate) fn native_activation_splits(&self) -> usize {
         #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
         if let Memory::Flat(FlatMem {
             bytes: FlatBytes::Native(bytes),
             ..
         }) = self
         {
-            return bytes.tracking_failed();
+            return bytes.activation_splits();
+        }
+        0
+    }
+
+    /// Whether this memory must not be reused: its native write tracking
+    /// failed (it reports every page from then on), or its native window was
+    /// retired and it runs on the interpreter for good.
+    pub(crate) fn retired(&self) -> bool {
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        if let Memory::Flat(FlatMem {
+            bytes: FlatBytes::Native(bytes),
+            ..
+        }) = self
+        {
+            return bytes.retired();
         }
         false
     }
@@ -1666,6 +1796,44 @@ mod tests {
         flat.set_page_perms(perms.clone());
         sparse.set_page_perms(perms);
         (flat, sparse)
+    }
+
+    /// Scattered pages captured one at a time are coalesced a logarithmic
+    /// number of times, not on every capture past the floor (which, for
+    /// 20,000 captures, sorts the whole list about 16,000 times).
+    #[test]
+    fn scattered_captures_coalesce_rarely() {
+        let mut captured = Captured::default();
+        let mut coalescings = 0;
+        for page in 0..20_000u32 {
+            let before = captured.coalesced;
+            captured.extend(core::slice::from_ref(&(2 * page..2 * page + 1)));
+            coalescings += usize::from(captured.coalesced != before);
+        }
+        assert_eq!(coalescings, 3);
+        let ranges = captured.take();
+        assert_eq!(ranges.len(), 20_000);
+        assert!(ranges.windows(2).all(|pair| pair[0].end < pair[1].start));
+    }
+
+    /// Mapped pages are counted page by page, alike in both models.
+    #[test]
+    fn mapped_pages_are_counted_alike() {
+        let (flat, sparse) = pair();
+        for memory in [&flat, &sparse] {
+            assert_eq!(memory.mapped_pages(0, 6), 5);
+            assert_eq!(memory.mapped_pages(2, 2), 1);
+            assert_eq!(memory.mapped_pages(5, 100), 1);
+        }
+    }
+
+    /// Flat memory the host cannot allocate is an error, not an abort.
+    #[test]
+    fn flat_memory_past_the_host_is_refused() {
+        assert!(Memory::try_flat_zeroed(isize::MAX as usize).is_err());
+        let zeroed = Memory::try_flat_zeroed(2 * PAGE).unwrap();
+        assert_eq!(zeroed.span(), 2 * PAGE as u64);
+        assert_eq!(zeroed.read_u64_le(PAGE as u32), Ok(0));
     }
 
     #[test]

@@ -45,11 +45,10 @@ mod avx512;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 use avx512::V16;
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    not(target_feature = "avx512f")
-))]
+// AVX2's form is compiled wherever AVX2 is, so an AVX-512 build tests it
+// too; only one form serves `permute_x16`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg_attr(target_feature = "avx512f", allow(dead_code))]
 mod avx2;
 #[cfg(all(
     target_arch = "x86_64",
@@ -277,6 +276,44 @@ mod tests {
                 assert_eq!(got, expected, "lane {lane}");
             }
         }
+    }
+
+    /// `V`'s form of the permutation on 64 batches of sixteen lanes against
+    /// the reference, lane by lane.
+    #[allow(dead_code)]
+    fn vector_form_equals_the_reference<V: Vector>(seed: u64) {
+        let mut stream = words(seed);
+        for _ in 0..64 {
+            let input: States =
+                core::array::from_fn(|_| core::array::from_fn(|_| stream.next().unwrap()));
+            let mut vectors: [V; N_STATE] = core::array::from_fn(|i| V::load(&input[i]));
+            permute_vectors(&mut vectors);
+            let output: States = core::array::from_fn(|i| vectors[i].canonical().store());
+            for lane in 0..LANES {
+                let got: [u32; N_STATE] = core::array::from_fn(|i| output[i][lane]);
+                assert_eq!(got, reference(&input, lane), "lane {lane}");
+            }
+        }
+    }
+
+    // Each vector form the build compiles, whichever serves `permute_x16`.
+    // NEON's runs only on an aarch64 build (`docs/design/open.md`).
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn the_avx2_form_equals_the_reference_permutation() {
+        vector_form_equals_the_reference::<super::avx2::V16>(0xa2);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    #[test]
+    fn the_avx512_form_equals_the_reference_permutation() {
+        vector_form_equals_the_reference::<super::avx512::V16>(0x512);
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn the_neon_form_equals_the_reference_permutation() {
+        vector_form_equals_the_reference::<super::neon::V16>(0x4e);
     }
 
     #[test]

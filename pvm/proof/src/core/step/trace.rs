@@ -238,11 +238,14 @@ impl PvmStep {
 /// ([`crate::segment::segment_bounds_budgeted`]) and its windows built from
 /// ([`crate::segment::SegmentCursor`]): its timestamp, its memory accesses
 /// and, from the register file entering it, the full step a window proves.
-pub trait TraceStep: Clone {
+pub trait TraceStep: Clone + Send + Sync {
     fn timestamp(&self) -> u64;
     fn mem_read(&self) -> Option<&MemAccess>;
     fn mem_write(&self) -> Option<&MemAccess>;
     fn witness(&self) -> Option<&WitnessWrite>;
+    /// The gas left after the step, and the gas it charged: its block's
+    /// price at a block's first step, else 0.
+    fn gas(&self) -> (u64, u64);
     /// The register file leaving the step, `regs` the file entering it.
     fn regs_after(&self, regs: [u64; NUM_REGS]) -> [u64; NUM_REGS];
     /// The register file entering step `at` of `steps`, `threaded` the
@@ -257,6 +260,9 @@ pub trait TraceStep: Clone {
 impl TraceStep for PvmStep {
     fn timestamp(&self) -> u64 {
         self.timestamp
+    }
+    fn gas(&self) -> (u64, u64) {
+        (self.gas_after, self.gas_charged)
     }
     fn mem_read(&self) -> Option<&MemAccess> {
         self.mem_read.as_ref()
@@ -281,6 +287,9 @@ impl TraceStep for PvmStep {
 impl TraceStep for CompactStep {
     fn timestamp(&self) -> u64 {
         self.timestamp
+    }
+    fn gas(&self) -> (u64, u64) {
+        (self.gas_after, self.gas_charged)
     }
     fn mem_read(&self) -> Option<&MemAccess> {
         self.mem_read.as_ref()

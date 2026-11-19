@@ -84,6 +84,14 @@ impl Transcript {
     }
 
     /// Absorb `values` as one run.
+    ///
+    /// The run carries neither its length nor its kind: `[x]` and `[x, 0]`
+    /// absorb alike, as do a root and four field elements of the same words.
+    /// Every caller absorbs runs whose count and kind the verifier fixes (a
+    /// header, a format's roots, a shape's sampled values, the format's
+    /// public words), or one a later check pins (the recursion's outputs,
+    /// whose count its logup sum binds); a run whose length nothing else
+    /// pins needs that length absorbed before it.
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "M31's addition is modular: it neither overflows nor panics"
@@ -135,14 +143,21 @@ impl Transcript {
     }
 }
 
+/// The most bits of work a PoW check counts, 30. It counts a word's trailing
+/// zeros, the word below p = 2^31 − 1: at 31 bits only the word 0 passes, a
+/// chance of 1/p rather than 2^−31, and at more no fewer words pass, so a
+/// check of more than 30 bits is refused whatever the nonce.
+pub const MAX_POW_BITS: u32 = 30;
+
 /// Whether `nonce` passes over a PoW check's first eight words `prefix`
-/// (see [`Transcript::pow_prefix`]).
+/// (see [`Transcript::pow_prefix`]): `n_bits` of work, at most
+/// [`MAX_POW_BITS`].
 pub fn pow_passes(prefix: &Digest, n_bits: u32, nonce: u64, observer: &mut impl Observer) -> bool {
     let mut state = [M31::ZERO; N_STATE];
     state[..8].copy_from_slice(prefix);
     state[8..12].copy_from_slice(&u64_limbs(nonce));
     observed_permute(observer, PermKind::Pow, true, &mut state);
-    state[0].value().trailing_zeros() >= n_bits
+    n_bits <= MAX_POW_BITS && state[0].value().trailing_zeros() >= n_bits
 }
 
 /// A u64's four 16-bit limbs, little-endian: every value its own words, so no
@@ -191,6 +206,19 @@ mod tests {
         assert_ne!(transcript.squeeze(&mut ()), transcript.squeeze(&mut ()));
         transcript.absorb(&values, &mut ());
         assert_ne!(transcript.clone().squeeze(&mut ()), first);
+    }
+
+    /// A check of more bits than a word below p counts is refused whatever
+    /// the nonce; one of none passes any.
+    #[test]
+    fn a_pow_past_a_words_bits_is_refused() {
+        let prefix = Transcript::default().pow_prefix(31);
+        for nonce in 0..64 {
+            assert!(pow_passes(&prefix, 0, nonce, &mut ()));
+            for n_bits in [MAX_POW_BITS + 1, 32, 64, u32::MAX] {
+                assert!(!pow_passes(&prefix, n_bits, nonce, &mut ()));
+            }
+        }
     }
 
     #[test]

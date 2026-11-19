@@ -5,6 +5,11 @@ version.workspace = true
 license = "GPL-3.0-or-later"
 description = "A proved statement as a venue judges it: its types, its canonical encoding, its io-hash and id, and the venue's check of a final proof against it. no_std, with no dependency on VOS beyond the final verifier."
 
+# The gates that refuse each test-only feature in a production build
+# (`just check-no-leaks`).
+[package.metadata.vos]
+test-features = { model-judge = ["venue-model"], heap-peak = ["heap-peak"] }
+
 [features]
 # The model venue (`model`, under `model-judge`): a venue as plain data, whose pinned program
 # and state a judgement's input bytes carry, for the harnesses that judge

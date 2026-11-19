@@ -78,8 +78,10 @@ pub enum Column {
     HOutAfter,
     /// Closing-read timestamp, 8 LE limbs: a witness, bound to no final
     /// state; the ledger takes the one closing read as its group's last
-    /// row.
+    /// row. One value on every row, padding included (`#[mask_next_row]`):
+    /// every page closes at the same timestamp.
     #[size = 8]
+    #[mask_next_row]
     ClosingTs,
     /// 20-bit boolean decomposition of the page index (so `idx < 2^DEPTH`);
     /// constant across the page's 32 rows (`#[mask_next_row]` replication).
@@ -182,6 +184,7 @@ impl BuiltInComponent for MemoryPageChip {
         let hout_b = crate::trace::trace_eval!(trace_eval, Column::HOutBefore);
         let hout_a = crate::trace::trace_eval!(trace_eval, Column::HOutAfter);
         let closing_ts = crate::trace::trace_eval!(trace_eval, Column::ClosingTs);
+        let closing_ts_next = crate::trace::trace_eval_next_row!(trace_eval, Column::ClosingTs);
         let idx_bits = crate::trace::trace_eval!(trace_eval, Column::IdxBits);
         let idx_bits_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IdxBits);
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
@@ -213,6 +216,11 @@ impl BuiltInComponent for MemoryPageChip {
         eval.add_constraint(is_real[0].clone() * (is_real[0].clone() - one.clone()));
         for b in &idx_bits {
             eval.add_constraint(b.clone() * (b.clone() - one.clone()));
+        }
+
+        // ── One closing timestamp on every row (degree 1) ─────────
+        for (next, ts) in closing_ts_next.iter().zip(&closing_ts) {
+            eval.add_constraint(next.clone() - ts.clone());
         }
 
         // ── Gate helper definitions (degree 2) ────────────────────

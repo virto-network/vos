@@ -205,6 +205,13 @@ impl BuiltInComponent for WordMemoryChip {
         let adv_hi = crate::trace::trace_eval!(trace_eval, Column::AdvHiH);
         let order_bits = crate::trace::trace_eval!(trace_eval, Column::OrderBits);
 
+        // A row's address is held to its group's by 16-bit halves, not limb
+        // by limb: two addresses agree here when their halves do, so the
+        // ledger rests on every producer's limbs being bytes, each by its own
+        // carry identity (the CPU's `memory_access`, BLAKE2b's and
+        // Poseidon2's `Addresses`, the witness input's range checks and
+        // `address + 1` carries). A new producer of `MemoryAccess` tuples
+        // must bind its own.
         let b256 = E::F::from(BaseField::from(256u32));
         let half = |lo: &E::F, hi: &E::F| lo.clone() + hi.clone() * b256.clone();
         let lo_diff = half(&address_next[0], &address_next[1]) - half(&address[0], &address[1]);

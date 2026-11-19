@@ -31,17 +31,27 @@ type Functions = Vec<(u32, String)>;
 type Registered = HashMap<[u8; 32], Functions>;
 
 /// Name compiled code in `/tmp/perf-<pid>.map` from now on: what perf reads
-/// for this process. The file is emptied first, as a process that had this
-/// pid before may have left one, and is not opened through a symbolic link.
+/// for this process. The file is created afresh, only by this process and
+/// never through a symbolic link: one a process that had this pid before
+/// left is removed first, and one another user owns is an error.
 pub fn enable() -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let path = format!("/tmp/perf-{}.map", std::process::id());
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let create = || {
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+    };
+    let file = match create() {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&path)?;
+            create()?
+        }
+        opened => opened?,
+    };
     enable_into(Box::new(file));
     Ok(())
 }

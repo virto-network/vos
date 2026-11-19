@@ -8,7 +8,14 @@
 pub const REGIONS: usize = 4;
 pub const FIRST_WRITABLE: usize = 2;
 
+/// The pages `[first, end)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageRange {
+    pub first: u32,
+    pub end: u32,
+}
+
 #[cfg(feature = "prover")]
 mod host;
 #[cfg(feature = "prover")]
-pub use host::{MemoryLayout, PageRange, Permission};
+pub use host::{MemoryLayout, Permission};

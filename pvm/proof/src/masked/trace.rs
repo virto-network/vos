@@ -20,8 +20,8 @@ use crate::chip_idx;
 use crate::framework::MachineProverComponent;
 use crate::lookups::AllLookupElements;
 use crate::prove::{
-    SegmentError, generate_component_traces, prepare_side_note_for_verification,
-    validate_memory_witnesses,
+    SegmentError, check_run_length, check_transfers, generate_component_traces,
+    prepare_side_note_for_verification, steps_fit, validate_memory_witnesses,
 };
 use crate::side_note::SideNote;
 use crate::trace::component::ComponentTrace;
@@ -37,6 +37,29 @@ pub struct ChipTraces {
     /// The per-program CPU the first chip is, its cut columns zeroed in its
     /// trace; `None` for the full CPU.
     cpu: Option<crate::chips::ProgramCpuChip>,
+}
+
+/// `column`'s values overwritten with zeros by volatile writes, which the
+/// compiler keeps though nothing reads them after: a witness's column, once
+/// it is no longer needed. The allocator gets the zeros back.
+#[allow(unsafe_code)]
+pub fn wipe_column(column: &mut BaseColumn) {
+    use stwo::prover::backend::simd::m31::PackedBaseField;
+    for packed in &mut column.data {
+        // SAFETY: `packed` is a valid, aligned, exclusive reference.
+        unsafe { core::ptr::write_volatile(packed, PackedBaseField::zero()) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Each chip's main columns, the witness, wiped when the traces are
+/// dropped ([`wipe_column`]); the preprocessed columns are the program's.
+impl Drop for ChipTraces {
+    fn drop(&mut self) {
+        for trace in &mut self.traces {
+            trace.original_trace.iter_mut().for_each(wipe_column);
+        }
+    }
 }
 
 /// A run's chips, traced as the device's segment (`crate::device`).
@@ -100,6 +123,8 @@ pub fn masked_device_trace(
     if chips.len() != log_sizes.len() {
         return Err(SegmentError::MalformedShape);
     }
+    check_run_length(side_note)?;
+    check_transfers(side_note)?;
     validate_memory_witnesses(side_note)?;
     prepare_side_note_for_verification(side_note);
     side_note.device = Some(alloc::sync::Arc::new(crate::device::DeviceRun::of(
@@ -112,7 +137,21 @@ pub fn masked_device_trace(
         .collect();
     let cpu = shape.program_cpu();
     side_note.cpu_rows_local = cpu.is_some();
-    let mut traces = generate_component_traces(side_note, &components, log_sizes);
+    let pinned = matches!(sizes, DeviceSizes::Pinned(_));
+    // A run is refused at its first chip past its size, before any later
+    // chip is traced: the CPU, a row a step, before any.
+    if pinned && chips.first() == Some(&chip_idx::CPU) && !steps_fit(side_note, log_sizes[0]) {
+        return Err(SegmentError::Shape {
+            chip: chip_idx::CPU,
+            overflow: true,
+        });
+    }
+    let mut traces = generate_component_traces(side_note, &components, log_sizes, pinned).map_err(
+        |(position, log_size)| SegmentError::Shape {
+            chip: chips[position],
+            overflow: log_size > log_sizes[position],
+        },
+    )?;
     if let Some(cpu) = &cpu {
         assert_eq!(
             chips.first(),
@@ -155,7 +194,9 @@ pub fn masked_device_trace(
 /// `code` its kernel's side note (no run needed), at the shape `shape`,
 /// `log_sizes`: what its program id's preprocessed root commits. Refused
 /// as [`SegmentError::Shape`] when a table (the code, the jump table, the
-/// data) needs more rows than its chip's log size.
+/// data, a fixed table's entries, [`crate::shape::FIXED_TABLES`]) needs more
+/// rows than its chip's log size: a release artifact's sizes are held to
+/// them before any column is generated.
 pub fn device_preprocessed(
     code: &SideNote,
     layout: &crate::device::DeviceLayout,
@@ -166,6 +207,7 @@ pub fn device_preprocessed(
     if chips.len() != log_sizes.len() {
         return Err(SegmentError::MalformedShape);
     }
+    check_transfers(code)?;
     let mut side_note = SideNote::new(Vec::new(), code.code.to_vec(), code.bitmask.to_vec())
         .with_jump_table(code.jump_table.to_vec());
     side_note.device = Some(alloc::sync::Arc::new(crate::device::DeviceRun::empty(
@@ -173,11 +215,15 @@ pub fn device_preprocessed(
     )));
     use crate::device::device_chip;
     for (&chip, &log_size) in chips.iter().zip(log_sizes) {
+        let fixed = crate::shape::FIXED_TABLES
+            .iter()
+            .find(|&&(table, _)| table == chip)
+            .map_or(0, |&(_, least)| u32::from(least));
         let table = match chip {
             device_chip::PROGRAM_MEMORY => crate::chips::program_memory::table_log_size(&side_note),
             device_chip::JUMP_TABLE => crate::chips::jump_table::table_log_size(&side_note),
             device_chip::DATA_TABLE => crate::chips::word_memory::data::table_log_size(&side_note),
-            _ => 0,
+            _ => fixed,
         };
         if table > log_size {
             return Err(SegmentError::Shape {

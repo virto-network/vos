@@ -78,6 +78,11 @@ pub enum KernelTraceError {
     /// It read fewer bytes than the input holds: it is not the run the
     /// input was recorded from.
     Unread,
+    /// The run took more steps than its trace is held to
+    /// ([`trace_kernel_within`]; [`crate::MAX_RUN_STEPS`], the most a proof
+    /// orders, for [`trace_kernel`] and [`trace_program`]): stopped there,
+    /// before its trace grows past them.
+    Steps,
 }
 
 /// Program `blob` loaded as the agent loads it, on `arguments` with `gas`:
@@ -177,7 +182,30 @@ pub fn kernel_side_note(blob: &[u8]) -> Result<SideNote, KernelTraceError> {
 /// is held to the kernel contract: a nonempty output is readable
 /// ([`KernelTraceError::Output`]); an empty one is empty whatever φ7.
 pub fn trace_kernel(blob: &[u8], input: &[u8], gas: u64) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, &[], input, gas, Contract::Kernel, |_| {})
+    trace_kernel_within(blob, input, gas, crate::MAX_RUN_STEPS)
+}
+
+/// [`trace_kernel`] held to `max_steps` steps: a run that takes more is
+/// stopped at them and refused ([`KernelTraceError::Steps`]). The trace's
+/// memory is in its steps, about a hundred bytes each beside the calls'
+/// records, and the steps a gas are the gas model's (a block's price is
+/// its pipeline's cycles, several instructions a cycle): `max_steps` bounds
+/// it whatever `gas` is.
+pub fn trace_kernel_within(
+    blob: &[u8],
+    input: &[u8],
+    gas: u64,
+    max_steps: usize,
+) -> Result<KernelTrace, KernelTraceError> {
+    trace(
+        blob,
+        &[],
+        Some(input),
+        gas,
+        max_steps,
+        Contract::Kernel,
+        |_| {},
+    )
 }
 
 /// [`trace_kernel`] with the machine's memory changed by `forge` before
@@ -191,12 +219,22 @@ pub fn trace_forged_kernel(
     gas: u64,
     forge: impl FnOnce(&mut Memory),
 ) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, &[], input, gas, Contract::Kernel, forge)
+    trace(
+        blob,
+        &[],
+        Some(input),
+        gas,
+        crate::MAX_RUN_STEPS,
+        Contract::Kernel,
+        forge,
+    )
 }
 
 /// Run standard program `blob` with `gas` on `arguments`, mapped read-only
 /// in its argument window, with no witness input: φ7 the window and φ8
-/// its length. Its output is Gray Paper Ψ_M's
+/// its length. The witness-input call is not served, as the refine host
+/// serves it to no machine of its own: a run that makes it stops there and
+/// is refused ([`KernelTraceError::Exit`]). Its output is Gray Paper Ψ_M's
 /// (`vos_pvm::refine::halt_output`): empty for a zero length whatever φ7,
 /// and for a range any byte of which is unreadable.
 pub fn trace_program(
@@ -204,7 +242,15 @@ pub fn trace_program(
     arguments: &[u8],
     gas: u64,
 ) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, arguments, &[], gas, Contract::Gray, |_| {})
+    trace(
+        blob,
+        arguments,
+        None,
+        gas,
+        crate::MAX_RUN_STEPS,
+        Contract::Gray,
+        |_| {},
+    )
 }
 
 /// [`trace_kernel`] run to whatever exit it reaches, a trap included: its
@@ -216,7 +262,7 @@ pub fn trace_kernel_to_exit(
     input: &[u8],
     gas: u64,
 ) -> Result<(SideNote, ExitReason), KernelTraceError> {
-    let (mut tracer, image, permissions) = start(blob, &[], input, gas, |_| {})?;
+    let (mut tracer, image, permissions) = start(blob, &[], Some(input), gas, |_| {})?;
     let exit = tracer.run_with_precompiles();
     let side_note = tracer
         .into_side_note()
@@ -225,12 +271,12 @@ pub fn trace_kernel_to_exit(
     Ok((side_note, exit))
 }
 
-/// `blob` loaded on `arguments` and `input` with `gas`, `forge` applied, its
-/// tracer at its first step.
+/// `blob` loaded on `arguments` with `gas`, `forge` applied, its tracer at
+/// its first step, serving the witness-input call from `input` when given.
 fn start(
     blob: &[u8],
     arguments: &[u8],
-    input: &[u8],
+    input: Option<&[u8]>,
     gas: u64,
     forge: impl FnOnce(&mut Memory),
 ) -> Result<
@@ -242,9 +288,13 @@ fn start(
     KernelTraceError,
 > {
     let (machine, image, permissions) = load(blob, arguments, gas, forge)?;
-    let tracer = TracingPvm::new(machine)
-        .with_witness_input(input.to_vec())
-        .ok_or(KernelTraceError::Input)?;
+    let tracer = TracingPvm::new(machine);
+    let tracer = match input {
+        Some(input) => tracer
+            .with_witness_input(input.to_vec())
+            .ok_or(KernelTraceError::Input)?,
+        None => tracer,
+    };
     Ok((tracer, image, permissions))
 }
 
@@ -262,13 +312,16 @@ enum Contract {
 fn trace(
     blob: &[u8],
     arguments: &[u8],
-    input: &[u8],
+    input: Option<&[u8]>,
     gas: u64,
+    max_steps: usize,
     contract: Contract,
     forge: impl FnOnce(&mut Memory),
 ) -> Result<KernelTrace, KernelTraceError> {
     let (mut tracer, image, permissions) = start(blob, arguments, input, gas, forge)?;
-    let exit = tracer.run_with_precompiles();
+    let exit = tracer
+        .run_with_precompiles_within(max_steps)
+        .ok_or(KernelTraceError::Steps)?;
     if exit != ExitReason::Halt {
         return Err(KernelTraceError::Exit);
     }
@@ -396,6 +449,36 @@ mod tests {
                 "{address:#x}+{len}"
             );
         }
+    }
+
+    /// The witness-input call is served to a kernel alone: a standard
+    /// program's trace stops at it and is refused, as the refine host
+    /// serves it to no machine of its own and the call reaches its
+    /// embedder.
+    #[test]
+    fn a_standard_program_is_served_no_witness_input() {
+        let mut asm = Assembler::new();
+        asm.set_stack_pages(1);
+        asm.load_imm(Reg::A1, 0)
+            .ecalli(vos_pvm::precompile::WITNESS_INPUT as u32)
+            .load_imm(Reg::A0, 0)
+            .load_imm(Reg::A1, 0)
+            .jump_ind(Reg::RA, 0);
+        let blob = asm.build();
+        const GAS: u64 = 1_000_000;
+        assert!(trace_kernel(&blob, &[], GAS).is_ok());
+        assert_eq!(
+            trace_program(&blob, &[], GAS).err(),
+            Some(KernelTraceError::Exit)
+        );
+        let live = vos_pvm::refine_host::RefineContext::load(&blob, &[], GAS)
+            .unwrap()
+            .try_run()
+            .unwrap();
+        assert_eq!(
+            live.exit,
+            vos_pvm::ExitReason::HostCall(vos_pvm::precompile::WITNESS_INPUT)
+        );
     }
 
     /// An installed kernel is its program's one encoding: the same program

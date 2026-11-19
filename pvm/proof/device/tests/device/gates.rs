@@ -267,6 +267,40 @@ fn a_table_past_its_chips_log_size_is_refused_at_install() {
     );
 }
 
+/// A fixed table at fewer rows than its entries is refused at install, as a
+/// release artifact naming it would be, before any column is generated: a
+/// table under its entries would neither commit nor prove.
+#[test]
+fn a_fixed_table_short_of_its_entries_is_refused_at_install() {
+    // Masks of 2^5 rows: floors under the 2^8 tables.
+    let format = small_format(ChannelKind::Poseidon2M31, 5, 4);
+    let kernel = blob();
+    let (active, log_sizes) =
+        device_shape(&format, &kernel, &mut run(&kernel, &witness(1))).expect("a shape");
+    let program = install::<P2>(&format, &kernel, active, &log_sizes).expect("installs");
+    let floors = vos_pvm_device::masked::device_floors(&format, program.shape()).expect("floors");
+    let mut short = 0;
+    for (position, chip) in device_chips_of_mask(active).enumerate() {
+        let Some(&(_, least)) = vos_pvm_proof::shape::FIXED_TABLES
+            .iter()
+            .find(|(table, _)| *table == chip)
+        else {
+            continue;
+        };
+        if floors[position] < u32::from(least) {
+            short += 1;
+            let mut sizes = log_sizes.clone();
+            sizes[position] = u32::from(least) - 1;
+            assert_eq!(
+                install::<P2>(&format, &kernel, active, &sizes).map(|_| ()),
+                Err(vos_pvm_device::Error::Sizes),
+                "chip {chip}"
+            );
+        }
+    }
+    assert!(short > 0, "a fixed table above its floor: {floors:?}");
+}
+
 /// A chip the code reaches and the run never uses proves at its program's
 /// log size, every row padding: a kernel whose multiplication follows its
 /// halt.

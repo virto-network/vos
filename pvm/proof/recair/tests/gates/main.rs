@@ -16,6 +16,8 @@
 //!   to the prover, which the static check refuses any circuit to read;
 //! - [`boundary_bytes`]: a leaf's boundary byte of 256 or more where the
 //!   leaf does not range-check it;
+//! - [`degenerate_point`]: a DEEP sample point whose `y` lies in CM31, at
+//!   every point of the leaf's and the child's plans;
 //! - [`pins`]: no circuit is committed but through the static check.
 
 #[path = "../common/mod.rs"]
@@ -24,6 +26,7 @@ mod common;
 mod forge;
 
 mod boundary_bytes;
+mod degenerate_point;
 mod lanes;
 mod multiplicities;
 mod one_of;

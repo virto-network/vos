@@ -1,5 +1,6 @@
 use super::*;
 use crate::PVM_HALT_ADDR;
+use crate::test_support::backends;
 
 fn compact_blob(code: &[u8], starts: &[usize]) -> Vec<u8> {
     let mut packed = vec![0u8; code.len().div_ceil(8)];
@@ -61,7 +62,10 @@ fn preparation_cache_is_exact_process_wide_and_revalidates_each_entry() {
 #[test]
 fn preparation_cache_cap_and_default_bypass_do_not_change_admission() {
     let blob = host_then_trap();
+    // Past the cache's ceiling is past a VOS host's budget too: the
+    // Gray Paper's rules take any valid program.
     let mut machines = InnerMachines::new();
+    machines.set_profile(Profile::GrayPaper);
     let warm = machines.create(&blob, 0).unwrap();
     let warm = machines.machines[&warm].execution.clone();
     // A canonical program larger than the cache ceiling still creates
@@ -271,6 +275,113 @@ fn invoke_resumes_after_host_call_then_panics_on_trap() {
     assert_eq!(machines.expunge(id), Ok(0));
 }
 
+/// A machine of `n` one-byte `load_imm`s and a `trap`, one block, run
+/// with ample gas under `profile`, then again with `gas`: the gas the
+/// first run used, and the second run's outcome.
+fn run_again_after_a_panic(
+    backend: PvmBackend,
+    profile: Profile,
+    n: usize,
+    gas: Gas,
+) -> (Gas, InvokeOutcome) {
+    let mut code = vec![51u8; n];
+    code.push(0);
+    let mut machines = InnerMachines::with_backend(backend);
+    machines.set_profile(profile);
+    let program = vos_pvm_program::build_compact_code_blob(&vos_pvm_program::CodeBlob {
+        jump_table: vec![],
+        bitmask: vec![1; code.len()],
+        code,
+    })
+    .unwrap();
+    let id = machines.create(&program, 0).unwrap();
+    let ample = 100_000_000;
+    let first = machines
+        .invoke(
+            id,
+            InvokeState {
+                gas: ample,
+                registers: [0; PVM_REGISTER_COUNT],
+            },
+        )
+        .unwrap();
+    assert_eq!(first.exit, InnerExit::Panic, "{backend:?}, {profile:?}");
+    let again = machines
+        .invoke(
+            id,
+            InvokeState {
+                gas,
+                registers: [0; PVM_REGISTER_COUNT],
+            },
+        )
+        .unwrap();
+    (ample - first.state.gas, again)
+}
+
+/// On a VOS host a machine that panicked restarts with its first block
+/// unfunded: invoked again with no gas it is out of gas, and with gas it
+/// pays the whole block again. (Under the Gray Paper's text, the same
+/// machine given no gas panics again, its block of a million instructions
+/// run for nothing.)
+#[test]
+fn a_panicked_machine_pays_its_first_block_again_on_a_vos_host() {
+    const N: usize = 100_000;
+    for backend in backends() {
+        let (block, again) = run_again_after_a_panic(backend, Profile::Vos, N, 0);
+        assert_eq!(block, N as Gas / 4 + 2, "{backend:?}: the block's price");
+        assert_eq!(again.exit, InnerExit::OutOfGas, "{backend:?}");
+        assert_eq!(again.state.gas, 0, "{backend:?}");
+        let (_, again) = run_again_after_a_panic(backend, Profile::Vos, N, block);
+        assert_eq!(again.exit, InnerExit::Panic, "{backend:?}");
+        assert_eq!(again.state.gas, 0, "{backend:?}: the block paid again");
+    }
+}
+
+/// Under the Gray Paper's text a machine that panicked keeps its funded
+/// flag, so its next `invoke` runs the block it restarts at unpaid: the
+/// JAM-only host's rule, kept literal there.
+#[test]
+fn a_panicked_machine_reruns_its_first_block_unpaid_under_the_gray_paper() {
+    for backend in backends() {
+        let (_, again) = run_again_after_a_panic(backend, Profile::GrayPaper, 10_000, 0);
+        assert_eq!(again.exit, InnerExit::Panic, "{backend:?}");
+        assert_eq!(again.state.gas, 0, "{backend:?}");
+    }
+}
+
+/// A machine that halted restarts as a panicked one does, under each
+/// profile.
+#[test]
+fn a_halted_machine_restarts_as_a_panicked_one() {
+    let halt = compact_blob(&[50, 0], &[0]);
+    for backend in backends() {
+        for (profile, second) in [
+            (Profile::Vos, InnerExit::OutOfGas),
+            (Profile::GrayPaper, InnerExit::Halt),
+        ] {
+            let mut machines = InnerMachines::with_backend(backend);
+            machines.set_profile(profile);
+            let id = machines.create(&halt, 0).unwrap();
+            let mut registers = [0; PVM_REGISTER_COUNT];
+            registers[0] = PVM_HALT_ADDR;
+            let first = machines
+                .invoke(
+                    id,
+                    InvokeState {
+                        gas: 1_000,
+                        registers,
+                    },
+                )
+                .unwrap();
+            assert_eq!(first.exit, InnerExit::Halt);
+            let again = machines
+                .invoke(id, InvokeState { gas: 0, registers })
+                .unwrap();
+            assert_eq!(again.exit, second, "{backend:?}, {profile:?}");
+        }
+    }
+}
+
 #[test]
 fn a_reused_slot_has_a_new_identity() {
     let mut machines = InnerMachines::new();
@@ -347,9 +458,9 @@ fn invoke_reports_halt_fault_and_out_of_gas() {
 #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn recompiled_inner_matches_reference_when_reusing_terminal_machines() {
-    // A terminal exit resets the inner PC, but does not discard the
-    // interpreter's funded gas block. Reusing the same machine must not
-    // silently charge it again under a different execution backend.
+    // A terminal exit resets the inner PC; under the Gray Paper's rules it
+    // keeps the funded flag, under a VOS host's it clears it. Reusing the
+    // same machine charges alike on either execution backend.
     let cases = [
         ("host then trap", vec![10, 42, 0], vec![0, 2], 0),
         (
@@ -365,9 +476,13 @@ fn recompiled_inner_matches_reference_when_reusing_terminal_machines() {
         ("final fallthrough", vec![1], vec![0], 0),
     ];
     for (name, code, starts, return_address) in cases {
-        for initial_gas in [0, 1, 100, 1_000] {
+        for (initial_gas, profile) in [0, 1, 100, 1_000]
+            .into_iter()
+            .flat_map(|gas| [(gas, Profile::Vos), (gas, Profile::GrayPaper)])
+        {
             let run = |backend| {
                 let mut machines = InnerMachines::with_backend(backend);
+                machines.set_profile(profile);
                 let id = machines
                     .create(&compact_blob(&code, &starts), 0)
                     .unwrap_or_else(|error| panic!("{name}, {backend:?}: {error:?}"));
@@ -389,7 +504,7 @@ fn recompiled_inner_matches_reference_when_reusing_terminal_machines() {
             assert_eq!(
                 run(PvmBackend::ForceRecompiler),
                 run(PvmBackend::ForceInterpreter),
-                "{name}, initial gas {initial_gas}"
+                "{name}, initial gas {initial_gas}, {profile:?}"
             );
         }
     }
@@ -397,12 +512,18 @@ fn recompiled_inner_matches_reference_when_reusing_terminal_machines() {
 
 #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn recompiled_inner_invalid_entry_preserves_existing_funding() {
+fn recompiled_inner_invalid_entry_matches_reference_under_each_profile() {
     for pc in [1, 4, u32::MAX] {
-        for funded in [false, true] {
+        for (funded, profile) in [false, true]
+            .into_iter()
+            .flat_map(|funded| [(funded, Profile::Vos), (funded, Profile::GrayPaper)])
+        {
+            // A VOS host restarts a panicked machine unfunded.
+            let kept = funded && profile == Profile::GrayPaper;
             for gas in [0, 1_000] {
                 let run = |backend| {
                     let mut machines = InnerMachines::with_backend(backend);
+                    machines.set_profile(profile);
                     let id = machines.create(&host_then_trap(), 0).unwrap();
                     let vm = machines.machines.get_mut(&id).unwrap().vm().unwrap();
                     vm.pc = pc;
@@ -418,7 +539,7 @@ fn recompiled_inner_invalid_entry_preserves_existing_funding() {
                         if step == 0 {
                             assert_eq!(outcome.exit, InnerExit::Panic);
                             assert_eq!(outcome.state.gas, gas);
-                            assert_eq!(vm.gas_charged, funded);
+                            assert_eq!(vm.gas_charged, kept);
                         }
                         observations.push((outcome.clone(), vm.pc, vm.gas_charged));
                         state = outcome.state;
@@ -428,7 +549,7 @@ fn recompiled_inner_invalid_entry_preserves_existing_funding() {
                 assert_eq!(
                     run(PvmBackend::ForceRecompiler),
                     run(PvmBackend::ForceInterpreter),
-                    "invalid pc {pc}, funded {funded}, gas {gas}"
+                    "invalid pc {pc}, funded {funded}, gas {gas}, {profile:?}"
                 );
             }
         }
@@ -619,12 +740,12 @@ fn memory_sized_gas_is_exact_at_every_rate() {
     assert_eq!(linear(u64::MAX, 1, 1), None);
 }
 
-/// An inner machine's code past the interpreter's preparation bound is a
+/// An inner machine's code past the host's preparation bound is a
 /// valid program the host refuses as its resource: `Backend`, never the
 /// guest's `HUH`, while `deblob` accepts it.
 #[test]
 fn code_past_the_interpreters_bound_is_a_backend_refusal() {
-    let code = vec![0; crate::backend::MAX_INTERPRETED_CODE + 1];
+    let code = vec![0; crate::backend::MAX_PREPARED_CODE + 1];
     let mut packed = vec![0xffu8; code.len().div_ceil(8)];
     *packed.last_mut().unwrap() = 0x01;
     let mut blob = vec![0, 1];
@@ -633,5 +754,169 @@ fn code_past_the_interpreters_bound_is_a_backend_refusal() {
     blob.extend_from_slice(&packed);
     assert!(crate::spi::deblob(&blob, 0).is_some());
     let mut machines = InnerMachines::new();
+    machines.set_profile(Profile::GrayPaper);
     assert_eq!(machines.create(&blob, 0), Err(InnerError::Backend));
+    // A VOS host refuses it before any backend sees it.
+    machines.set_profile(Profile::Vos);
+    assert_eq!(machines.create(&blob, 0), Err(InnerError::Budget));
+}
+
+/// A valid compact code blob of exactly `len` bytes: `trap`s, an
+/// instruction start every 25 bytes so preparing it stays cheap.
+fn blob_of_len(len: usize) -> Vec<u8> {
+    let blob = |code_len: usize| {
+        let code = vec![0; code_len];
+        let mut bitmask = vec![0; code_len];
+        for start in (0..code_len).step_by(25) {
+            bitmask[start] = 1;
+        }
+        vos_pvm_program::build_compact_code_blob(&vos_pvm_program::CodeBlob {
+            code,
+            bitmask,
+            jump_table: Vec::new(),
+        })
+        .unwrap()
+    };
+    // The header and the packed bitmask take about a ninth of the blob.
+    let mut code_len = len * 8 / 9;
+    while blob(code_len).len() < len {
+        code_len += 1;
+    }
+    while blob(code_len).len() > len {
+        code_len -= 1;
+    }
+    let made = blob(code_len);
+    assert_eq!(made.len(), len, "a blob of {len} bytes");
+    made
+}
+
+/// A VOS host bounds what one invocation's programs make it prepare and
+/// hold, counted in blob bytes before any backend sees them, so both
+/// backends refuse alike; the Gray Paper's rules take any valid program.
+/// (Unbounded, four 4 MiB programs hold about 1 GiB of host memory for
+/// about 2 M gas, and each distinct blob is prepared anew.)
+#[test]
+fn a_vos_host_bounds_the_programs_an_invocation_prepares_and_holds() {
+    let big = blob_of_len(budget::MACHINE_BLOB + 1);
+    let half = blob_of_len(budget::LIVE_BLOBS / 2);
+    for backend in backends() {
+        let mut machines = InnerMachines::with_backend(backend);
+        assert_eq!(machines.create(&big, 0), Err(InnerError::Budget));
+        let first = machines.create(&half, 0).unwrap();
+        machines.create(&half, 0).unwrap();
+        assert_eq!(
+            machines.create(&compact_blob(&[0], &[0]), 0),
+            Err(InnerError::Budget),
+            "{backend:?}: the live machines hold the whole budget"
+        );
+        machines.expunge(first).unwrap();
+        let mut prepared = 2 * half.len();
+        loop {
+            let created = machines.create(&half, 0);
+            prepared += half.len();
+            if prepared > budget::PREPARED_BLOBS {
+                assert_eq!(created, Err(InnerError::Budget), "{backend:?}");
+                break;
+            }
+            machines.expunge(created.unwrap()).unwrap();
+        }
+    }
+    let mut literal = InnerMachines::with_backend(PvmBackend::ForceInterpreter);
+    literal.set_profile(Profile::GrayPaper);
+    assert!(literal.create(&big, 0).is_ok());
+}
+
+/// A VOS host bounds the pages an invocation's machines hold mapped,
+/// counted from the mappings the guest asks for, alike on both backends.
+/// (Unbounded, a page becomes resident for about 130 gas: a refine's gas
+/// commits over 100 GiB.)
+#[test]
+fn a_vos_host_bounds_the_pages_an_invocation_maps() {
+    let first = INNER_FIRST_MAPPABLE_PAGE;
+    let half = (budget::MAPPED_PAGES / 2) as u32;
+    for backend in backends() {
+        let mut machines = InnerMachines::with_backend(backend);
+        let a = machines.create(&host_then_trap(), 0).unwrap();
+        let b = machines.create(&host_then_trap(), 0).unwrap();
+        machines
+            .pages(a, first, half, PageMode::AllocateReadWrite)
+            .unwrap();
+        // Mapping mapped pages again, or changing their access, maps none.
+        machines
+            .pages(a, first, half, PageMode::AllocateReadOnly)
+            .unwrap();
+        machines
+            .pages(a, first, half, PageMode::SetReadWrite)
+            .unwrap();
+        machines
+            .pages(b, first, half, PageMode::AllocateReadWrite)
+            .unwrap();
+        assert_eq!(
+            machines.pages(b, first + half, 1, PageMode::AllocateReadOnly),
+            Err(InnerError::Budget),
+            "{backend:?}"
+        );
+        machines.pages(a, first, 1, PageMode::Free).unwrap();
+        machines
+            .pages(b, first + half, 1, PageMode::AllocateReadOnly)
+            .unwrap();
+        machines.expunge(a).unwrap();
+        machines
+            .pages(b, first + half + 1, half - 1, PageMode::AllocateReadOnly)
+            .unwrap();
+
+        let mut literal = InnerMachines::with_backend(backend);
+        literal.set_profile(Profile::GrayPaper);
+        let c = literal.create(&host_then_trap(), 0).unwrap();
+        literal
+            .pages(c, first, 2 * half + 1, PageMode::AllocateReadOnly)
+            .unwrap();
+    }
+}
+
+/// The address space has 2^20 pages on every host, a 32-bit one too.
+#[test]
+fn the_address_space_has_two_to_the_twenty_pages() {
+    assert_eq!(INNER_ADDRESS_PAGES, 1 << 20);
+    let mut machines = InnerMachines::new();
+    let id = machines.create(&host_then_trap(), 0).unwrap();
+    let last = INNER_ADDRESS_PAGES - 1;
+    assert_eq!(
+        machines.pages(id, last - 1, 1, PageMode::AllocateReadOnly),
+        Ok(())
+    );
+    assert_eq!(
+        machines.pages(id, last, 1, PageMode::AllocateReadOnly),
+        Err(InnerError::Invalid)
+    );
+}
+
+/// `instantiate` takes no installed program whose code is past what
+/// `machine` takes on a VOS host, so neither call names a program one
+/// backend refuses: `FULL` on both, before any machine is laid out.
+#[cfg(feature = "std")]
+#[test]
+fn a_vos_host_instantiates_no_program_past_the_machine_bound() {
+    let code = blob_of_len(budget::MACHINE_BLOB + 1);
+    let code = vos_pvm_program::parse_compact_code_blob(&code).unwrap();
+    let blob = vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
+        ro_data: vec![],
+        rw_data: vec![],
+        heap_pages: 0,
+        stack_size: 4096,
+        code,
+    })
+    .unwrap();
+    let pool = Arc::new(crate::pool::MachinePool::new());
+    let program = pool.program(&pool.install(&blob).unwrap()).unwrap();
+    for backend in backends() {
+        let mut machines = InnerMachines::with_backend(backend);
+        machines.set_pool(Arc::clone(&pool));
+        assert_eq!(
+            machines.instantiate(&program, 0),
+            Err(InnerError::Budget),
+            "{backend:?}"
+        );
+    }
+    assert_eq!(pool.idle(), 0, "no machine laid out");
 }

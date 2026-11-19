@@ -183,8 +183,9 @@ impl<V: Value> ChildValues<V> {
 /// transcript through the interaction root as [`crate::verify`] runs it,
 /// then Stwo's protocol replayed ([`vos_pvm_proof::replay_stark`]).
 ///
-/// # Panics
-/// When the proof does not verify natively.
+/// # Errors
+/// [`WitnessError::Unverified`] when the proof does not verify natively; a
+/// shape mismatch first.
 pub fn recursion_data(
     shape: &ChildShape,
     proof: &RecairProof,
@@ -192,7 +193,8 @@ pub fn recursion_data(
     shape.check(proof)?;
     let stark = &proof.stark_proof;
     let root = stark.commitments[0];
-    crate::verify(proof.clone(), &circuit_hash_of(&proof.log_sizes, &root)).expect("a valid proof");
+    crate::verify(proof.clone(), &circuit_hash_of(&proof.log_sizes, &root))
+        .map_err(|_| WitnessError::Unverified)?;
     let config = FORMAT.pcs_config();
     let recorder = Rc::new(RefCell::new(Vec::new()));
     let channel = &mut Poseidon2M31Channel::recording(recorder.clone());
@@ -205,7 +207,7 @@ pub fn recursion_data(
         prefix(proof, &trace_log_sizes),
         |channel| check_interaction_pow(channel, FORMAT, proof.interaction_pow),
     )
-    .expect("verified");
+    .map_err(|_| WitnessError::Unverified)?;
     let components = Components::new(&relation, &proof.log_sizes, &proof.claimed_sums);
     let dyns: Vec<&dyn Component> = components.as_dyn().to_vec();
     Ok(vos_pvm_proof::replay_stark(
@@ -219,11 +221,11 @@ pub fn recursion_data(
 }
 
 impl ChildValues<SecureField> {
-    /// The values of `proof`, a valid proof of `shape`.
+    /// The values of `proof`, a valid proof of `shape`: the builder lays
+    /// out a valid proof's values, which a test may then tamper.
     ///
-    /// # Panics
-    /// When the proof does not verify natively: the builder lays out a valid
-    /// proof's values, which a test may then tamper.
+    /// # Errors
+    /// As [`recursion_data`].
     pub fn from_proof(shape: &ChildShape, proof: &RecairProof) -> Result<Self, WitnessError> {
         let data = recursion_data(shape, proof)?;
         let stark = &proof.stark_proof;

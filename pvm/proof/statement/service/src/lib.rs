@@ -49,6 +49,7 @@
 //! slice, an `unwrap`, a `panic!` or an arithmetic that can overflow is a
 //! lint error outside its tests.
 
+#![forbid(unsafe_code)]
 #![no_std]
 #![cfg_attr(
     not(test),

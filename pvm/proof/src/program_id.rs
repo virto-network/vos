@@ -270,12 +270,19 @@ fn byte_limbs(bytes: &[u8]) -> impl Iterator<Item = BaseField> + '_ {
 
 impl KernelProgram {
     /// Whether it is one a venue may pin: a well-formed shape, a segment
-    /// format the registry knows, and a root per class in its channel.
+    /// format the registry knows, each class's proofs meeting its security
+    /// floor (in a prover build, which builds the leaves), and a root per
+    /// class in its channel. A program it accepts builds its leaves without
+    /// a panic.
     pub fn check(&self) -> Result<(), KernelError> {
         self.shape.check().map_err(KernelError::Shape)?;
         let format = crate::format::lookup(self.format)
             .filter(|format| format.kind == crate::format::ProofKind::Segment)
             .ok_or(KernelError::Format)?;
+        #[cfg(feature = "prover")]
+        self.shape
+            .check_security(format)
+            .map_err(KernelError::Shape)?;
         if self.preprocessed_roots.len() != self.shape.classes.len() {
             return Err(KernelError::Roots);
         }
@@ -411,12 +418,26 @@ mod tests {
         }
     }
 
+    /// [`program`] with its sizes raised to a shape a venue pins: the CPU
+    /// at its class's steps, each fixed table at its entries.
+    fn checkable(mut program: KernelProgram) -> KernelProgram {
+        let components = program.shape.components;
+        for class in &mut program.shape.classes {
+            class.log_sizes[0] = class.log_sizes[0].max(class.log_steps);
+            for (chip, least) in crate::shape::FIXED_TABLES {
+                let position = (components & ((1 << chip) - 1)).count_ones() as usize;
+                class.log_sizes[position] = class.log_sizes[position].max(least);
+            }
+        }
+        program
+    }
+
     /// The kernel digest's words, word by word, and the id's golden
     /// vector.
     #[test]
     fn the_program_id_is_pinned() {
         let program = program();
-        program.check().unwrap();
+        checkable(program.clone()).check().unwrap();
         let words: Vec<u32> = program.kernel_words().iter().map(|word| word.0).collect();
         let chips = program.shape.components.count_ones() as usize;
         assert_eq!(chips, 18);
@@ -523,16 +544,16 @@ mod tests {
     /// the classes', or a format that proves no segments is refused.
     #[test]
     fn a_malformed_program_is_refused() {
-        let mut blake = program();
+        let mut blake = checkable(program());
         blake.preprocessed_roots[0] = Commitment::Blake2sM31(Default::default());
         assert_eq!(blake.check(), Err(KernelError::Channel));
-        let mut short = program();
+        let mut short = checkable(program());
         short.preprocessed_roots.pop();
         assert!(short.check().is_err());
-        let mut leaf = program();
+        let mut leaf = checkable(program());
         leaf.format = crate::format::LEAF_FOLD.number;
         assert!(leaf.check().is_err());
-        let mut leaves = program();
+        let mut leaves = checkable(program());
         leaves.leaf_circuits = LeafCircuits::Hashes(vec![P2Hash::default()]);
         assert_eq!(leaves.check(), Err(KernelError::LeafCircuits));
     }
@@ -552,7 +573,7 @@ mod tests {
             .collect();
         let kernel = program.kernel_digest();
         program.leaf_circuits = LeafCircuits::Hashes(hashes.clone());
-        program.check().unwrap();
+        checkable(program.clone()).check().unwrap();
         assert_eq!(program.kernel_digest(), kernel);
         let words: Vec<u32> = program
             .id_preimage()

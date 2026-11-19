@@ -334,6 +334,9 @@ impl BuiltInComponent for Poseidon2Chip {
             carry: out_carry,
             inc: out_inc,
         };
+        // The addresses' limbs are bytes by their carry identity
+        // (`Addresses`, as BLAKE2b's), which the word ledger's group test by
+        // 16-bit halves rests on (`word_memory`).
         let access = |address: [E::F; 4], value: &E::F, is_write: bool| -> Vec<E::F> {
             let mut tuple = address.to_vec();
             tuple.push(value.clone());

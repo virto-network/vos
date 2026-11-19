@@ -20,6 +20,9 @@ pub enum Error {
     /// The chips a release artifact names are not the ones the kernel's
     /// code reaches.
     Chips,
+    /// The kernel's code names the BLAKE2b precompile, which no device
+    /// kernel calls: its shape holds no BLAKE2b.
+    Precompile,
     /// A run does not reach its halt within its gas, or its output is not
     /// readable where its registers name it: the kernel's, or the reference
     /// program's.
@@ -29,6 +32,10 @@ pub enum Error {
     Arguments,
     /// The reference program returns more than the arguments alone.
     Reference,
+    /// A run longer than its trace is held to: the kernel's reference run
+    /// past the device format's CPU, or the reference program's past
+    /// `REFERENCE_STEPS`.
+    Steps,
     /// The reference run does not trace over the device chips.
     Trace,
     /// A log size more or fewer than the program's chips, or a table (the
@@ -64,9 +71,11 @@ impl Error {
             Self::IdMismatch
             | Self::Layout
             | Self::Chips
+            | Self::Precompile
             | Self::Halt
             | Self::Arguments
             | Self::Reference
+            | Self::Steps
             | Self::Trace
             | Self::Sizes
             | Self::Floor { .. }
@@ -86,9 +95,11 @@ impl core::fmt::Display for Error {
             Self::IdMismatch => f.write_str("the release's program id is not its program's"),
             Self::Layout => f.write_str("the kernel is not a standard program"),
             Self::Chips => f.write_str("the chips are not the kernel's code's"),
+            Self::Precompile => f.write_str("the kernel's code names the BLAKE2b precompile"),
             Self::Halt => f.write_str("the run does not halt within its gas"),
             Self::Arguments => f.write_str("the arguments are not the ones the run reads"),
             Self::Reference => f.write_str("the reference returns no arguments alone"),
+            Self::Steps => f.write_str("the run is longer than its trace is held to"),
             Self::Trace => f.write_str("the reference run does not trace over the device chips"),
             Self::Sizes => f.write_str("a log size more or fewer than the chips"),
             Self::Floor { chip } => write!(f, "chip {chip} under its floor"),
@@ -131,6 +142,9 @@ pub enum Refusal {
     Logup,
     /// The STARK does not verify.
     Stark,
+    /// The verifier panicked on the bytes, a refusal as any other
+    /// ([`crate::Verifier::verify`]).
+    Panic,
 }
 
 impl Refusal {
@@ -163,6 +177,7 @@ impl core::fmt::Display for Refusal {
             Self::Program => "the proof is of another program",
             Self::Logup => "the claimed sums do not cancel against the claim",
             Self::Stark => "the STARK does not verify",
+            Self::Panic => "the verifier panicked on the bytes",
         })
     }
 }

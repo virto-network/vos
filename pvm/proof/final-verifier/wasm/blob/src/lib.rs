@@ -117,8 +117,14 @@ fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
 
 // ── Exports ─────────────────────────────────────────────────────────────
 
+/// The `len` bytes the host wrote at `ptr`: none for an empty input or a
+/// null pointer, from which no slice may be made.
 fn input<'a>(ptr: u32, len: u32) -> &'a [u8] {
-    // SAFETY: the host wrote `len` bytes at `ptr` in this instance's memory.
+    if ptr == 0 || len == 0 {
+        return &[];
+    }
+    // SAFETY: the host wrote `len` bytes at `ptr`, not null, in this
+    // instance's memory.
     unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) }
 }
 

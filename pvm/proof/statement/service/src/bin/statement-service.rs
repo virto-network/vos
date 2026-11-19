@@ -8,10 +8,14 @@
 //!   proof from the item's first extrinsic (`fetch` kind 4), and returns
 //!   the verdict's encoding then the gas it took by its own count (8,
 //!   little-endian).
-//! - **Accumulate** reads `E(t, s, n)`, fetches each input (`fetch` kind
-//!   15), applies the operands (`vos_statement_service::accumulate`) with
-//!   `read` and `write`, and writes the gas it took by its own count under
-//!   `state::keys::GAS`.
+//! - **Accumulate** reads `E(t, s, n)`, then takes the inputs one at a
+//!   time: it fetches an input's operand up to its authorizer's trace,
+//!   which it never reads (`fetch` kind 15, twice: the head, then up to
+//!   the result's end), applies it (`vos_statement_service::accumulate::
+//!   take`) with `read` and `write`, calls `checkpoint`, so a later item
+//!   that runs the invocation out of gas or memory reverts from there, and
+//!   frees what the item allocated. Then it drops the rows past their hour
+//!   and writes the gas it took by its own count under `state::keys::GAS`.
 //!
 //! The deployment's constants are [`CONFIG`], a block of read-only data
 //! `vos_statement_service::config::configure` fills in the linked program.
@@ -42,10 +46,10 @@ mod runtime;
 
 use alloc::vec::Vec;
 
-use runtime::{Call, FetchKind, NONE, Output, STACK_BYTES, gas_left};
-use vos_abi::jam::RefineArgs;
+use runtime::{Call, FetchKind, HEAP, NONE, Output, STACK_BYTES, gas_left};
+use vos_abi::jam::{Operand, RefineArgs};
 use vos_pvm_program::read_nat;
-use vos_statement_service::accumulate::{accumulate, operand};
+use vos_statement_service::accumulate::{finish, take, time};
 use vos_statement_service::config::{self, Config};
 use vos_statement_service::refine::{Extrinsics, refine, refine_unconfigured, venue};
 use vos_statement_service::state::{Storage, keys};
@@ -96,10 +100,54 @@ fn fetch_exact(kind: FetchKind, index: u64, len: usize) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// The whole of a value `fetch` of `kind` and index `index` serves: none
+/// The first `len` bytes of the value `fetch` of `kind` and index `index`
+/// serves, or all of a shorter one, and the whole value's length: none
 /// when there is none.
-fn fetch(kind: FetchKind, index: u64) -> Option<Vec<u8>> {
-    fetch_exact(kind, index, fetch_len(kind, index)?)
+fn fetch_prefix(kind: FetchKind, index: u64, len: usize) -> Option<(Vec<u8>, usize)> {
+    let mut bytes: Vec<u8> = Vec::with_capacity(len);
+    let whole = hostcall!(
+        Call::Fetch,
+        [
+            bytes.as_mut_ptr() as u64,
+            0,
+            len as u64,
+            kind as u64,
+            index,
+            0
+        ]
+    );
+    let whole = usize::try_from(whole).ok().filter(|_| whole != NONE)?;
+    // SAFETY: the host wrote the value's first `min(len, whole)` bytes.
+    unsafe { bytes.set_len(len.min(whole)) };
+    Some((bytes, whole))
+}
+
+/// Accumulate's input `index` as the operand it holds, its authorizer's
+/// trace not fetched: none for a deferred transfer, or for bytes that are
+/// no input.
+fn input_operand(index: u64) -> Option<Operand> {
+    // The input's kind byte, then its operand's head; the rest up to the
+    // result's end, which the input must hold.
+    let (head, whole) = fetch_prefix(FetchKind::Input, index, 1 + Operand::HEAD)?;
+    if *head.first()? != 0 {
+        return None;
+    }
+    let end = Operand::untraced_len(head.get(1..)?)?.checked_add(1)?;
+    if end > whole {
+        return None;
+    }
+    let bytes = if end <= head.len() {
+        head
+    } else {
+        fetch_prefix(FetchKind::Input, index, end)?.0
+    };
+    Operand::decode_untraced(bytes.get(1..end)?)
+}
+
+/// `checkpoint`: what the invocation wrote so far stands should a later
+/// part of it run out of gas or trap.
+fn checkpoint() {
+    hostcall!(Call::Checkpoint, [0; 6]);
 }
 
 /// The length of the value `fetch` of `kind` and index `index` serves,
@@ -158,8 +206,9 @@ impl Storage for Service {
 
     /// A write the host refuses (`FULL`: the service's balance below the
     /// threshold the write would raise, or anything but a length or `NONE`)
-    /// traps, so the whole accumulate reverts: no outcome lands without
-    /// the rows it reports.
+    /// traps, so the accumulate reverts from the last checkpoint, the item
+    /// being applied and those after it: no outcome lands without the rows
+    /// it reports.
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) {
         let value = value.unwrap_or_default();
         let answer = hostcall!(
@@ -239,12 +288,21 @@ unsafe extern "C" fn accumulate_main(args: *const u8, len: u64) -> Output {
         Some((slot, u32::try_from(service).ok()?, count))
     });
     if let (Some(config), Some((slot, service, count))) = (config(), parsed) {
-        let operands: Vec<_> = (0..count)
-            .filter_map(|index| fetch(FetchKind::Input, index))
-            .filter_map(|input| operand(&input))
-            .collect();
         let venue = venue(&config, service);
-        accumulate(&config, venue, slot, &operands, &mut Service);
+        let now = time(&config, slot);
+        let mut taken = 0usize;
+        for index in 0..count {
+            let mark = HEAP.mark();
+            if let Some(operand) = input_operand(index) {
+                take(&mut Service, venue, now, &operand);
+                taken = taken.saturating_add(1);
+            }
+            checkpoint();
+            // SAFETY: what the item allocated was dropped with it, and
+            // nothing allocated before it was freed.
+            unsafe { HEAP.reset(mark) };
+        }
+        finish(&mut Service, now, taken);
     }
     let gas = start.saturating_sub(gas_left());
     Service.write(keys::GAS, Some(&gas.to_le_bytes()));

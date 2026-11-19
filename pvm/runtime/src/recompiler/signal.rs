@@ -5,6 +5,13 @@
 //! trigger SIGSEGV, which this handler intercepts and redirects to the
 //! existing exit sequence via ucontext modification (no longjmp).
 //!
+//! A fault is the guest's only when its instruction is exactly a guest
+//! access's (a trap-table entry) and its address lies in the guest window,
+//! `[base, base + 2^32)`. Any other fault in compiled code is a backend
+//! failure: the handler restores the stack pointer the entry recorded and
+//! returns through the epilogue alone, with no guest-visible exit, and the
+//! machine is never run again.
+//!
 //! A write to a guest-writable page of a slot that does not track writes
 //! yet is not a guest fault: the handler starts tracking the slot and
 //! returns, so the store retries (`Activation`).
@@ -12,19 +19,18 @@
 //! It assumes it stays the process's SIGSEGV handler once installed (no
 //! later `sigaction` replaces it while compiled code runs), and that any
 //! handler installed before it is one it may chain to for a fault outside
-//! compiled code. Every fault whose instruction pointer lies in compiled
-//! code is taken as the guest's: a host bug faulting there is reported as
-//! a guest page fault, not as a crash.
+//! compiled code.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ptr::null_mut;
-use std::sync::Once;
+use std::sync::OnceLock;
 
 use super::JitContext;
 use super::codegen::{EXIT_PAGE_FAULT, EXIT_TRACKING_FAILED};
 use super::memory::{Activated, Activation};
 
-/// Per-thread state accessible from the signal handler.
+/// Per-thread state accessible from the signal handler. It lives on the
+/// host's stack, away from every mapping native code addresses.
 #[repr(C)]
 pub struct SignalState {
     /// Start of native code region (absolute address).
@@ -33,6 +39,11 @@ pub struct SignalState {
     pub code_end: usize,
     /// Absolute address of exit_label in native code.
     pub exit_label_addr: usize,
+    /// Absolute address of the epilogue alone, where a backend failure
+    /// returns.
+    pub abort_label_addr: usize,
+    /// The guest window's base: guest address 0.
+    pub window_base: usize,
     /// Pointer to JitContext (for writing exit_reason/exit_arg/pc).
     pub ctx_ptr: *mut JitContext,
     /// Trap table: sorted by native_offset. (native_offset, pvm_pc).
@@ -46,6 +57,18 @@ pub struct SignalState {
     /// Write-tracking activation for the guest window, or null when the
     /// window does not track writes.
     pub(crate) activation: *const Activation,
+    /// The stack pointer after the entry's prologue, which native code
+    /// writes here (its second argument) as it starts.
+    pub entry_rsp: u64,
+    /// Set by the handler when native code faulted outside a guest access.
+    pub backend_fault: Cell<bool>,
+}
+
+impl SignalState {
+    /// Whether the handler aborted the last run as a backend failure.
+    pub fn backend_faulted(&self) -> bool {
+        self.backend_fault.get()
+    }
 }
 
 // SAFETY: SignalState is only accessed by the owning thread (set before JIT call,
@@ -56,99 +79,136 @@ thread_local! {
     pub static SIGNAL_STATE: Cell<*mut SignalState> = const { Cell::new(null_mut()) };
 }
 
-static INIT: Once = Once::new();
+static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
 
 thread_local! {
-    static ALTERNATE_STACK: Cell<bool> = const { Cell::new(false) };
+    /// This thread's alternate signal stack, once installed: the handler
+    /// runs on it, and it is unmapped when the thread exits.
+    static ALTERNATE_STACK: RefCell<Option<AlternateStack>> = const { RefCell::new(None) };
 }
+
 // SAFETY: sigaction is a POD struct — zero-initialized is a valid (SIG_DFL) state.
-// Accessed only inside Once::call_once (write) and from the signal handler (read)
-// after initialization is complete.
+// Written once inside INSTALLED's initialization, read by the signal handler
+// only after it.
 static mut PREV_SIGSEGV: libc::sigaction = unsafe { std::mem::zeroed() };
 
 /// Ensure the SIGSEGV handler is installed (once per process) and this
-/// thread has an alternate signal stack (once per thread).
-pub fn ensure_installed() {
-    if !ALTERNATE_STACK.with(Cell::get) {
-        // SAFETY: sigaltstack and mmap configure only the calling thread.
-        unsafe { install_sigaltstack() };
-        ALTERNATE_STACK.with(|installed| installed.set(true));
-    }
-    // SAFETY: sigaction is a process-wide OS API; Once::call_once runs it
+/// thread has an alternate signal stack (once per thread). An error when
+/// either cannot be: native code must not run then.
+pub fn ensure_installed() -> Result<(), String> {
+    ALTERNATE_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if stack.is_none() {
+            *stack = Some(AlternateStack::install()?);
+        }
+        Ok::<_, String>(())
+    })?;
+    // SAFETY: sigaction is a process-wide OS API; the OnceLock runs it
     // exactly once across all threads.
-    INIT.call_once(|| unsafe { install_handler() });
+    INSTALLED
+        .get_or_init(|| unsafe { install_handler() })
+        .clone()
 }
 
 /// # Safety
 ///
-/// Replaces the process's SIGSEGV disposition: called once (`INIT`), and
-/// before any other thread reads `PREV_SIGSEGV`.
-unsafe fn install_handler() {
+/// Replaces the process's SIGSEGV disposition: called once (`INSTALLED`),
+/// and before any other thread reads `PREV_SIGSEGV`.
+unsafe fn install_handler() -> Result<(), String> {
     // SAFETY: sigaction() is called with a properly initialized sigaction struct.
     // The handler pointer is a valid extern "C" fn with the correct signature.
-    // PREV_SIGSEGV is written once here (protected by Once) and only read afterward.
+    // PREV_SIGSEGV is written once here and only read afterward.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
         sa.sa_sigaction = sigsegv_handler as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
-        let r = libc::sigaction(libc::SIGSEGV, &sa, &raw mut PREV_SIGSEGV);
-        assert_eq!(
-            r,
-            0,
-            "sigaction(SIGSEGV) failed: {}",
-            std::io::Error::last_os_error()
-        );
+        if libc::sigaction(libc::SIGSEGV, &sa, &raw mut PREV_SIGSEGV) != 0 {
+            return Err(format!(
+                "sigaction(SIGSEGV): {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The smallest alternate stack the handler runs on.
+const MIN_STACK: usize = 64 * 4096;
+
+/// An alternate signal stack this module mapped for its thread, or none
+/// when the thread already had an adequate one of its own.
+struct AlternateStack {
+    /// The mapping, a guard page below the stack, and its length.
+    mapping: Option<(*mut libc::c_void, usize)>,
+}
+
+impl AlternateStack {
+    /// Give the calling thread an alternate signal stack, unless it has an
+    /// adequate one.
+    fn install() -> Result<Self, String> {
+        let error = |what: &str| format!("{what}: {}", std::io::Error::last_os_error());
+        // SAFETY: sigaltstack reads and writes valid stack_t structs and
+        // configures only the calling thread; the mapping is fresh, and
+        // unmapped on every failure.
+        unsafe {
+            let mut old: libc::stack_t = std::mem::zeroed();
+            if libc::sigaltstack(std::ptr::null(), &mut old) != 0 {
+                return Err(error("sigaltstack"));
+            }
+            if old.ss_flags & libc::SS_DISABLE == 0 && old.ss_size >= MIN_STACK {
+                return Ok(Self { mapping: None });
+            }
+            let page_size: usize = 4096;
+            let len = page_size + MIN_STACK; // guard page + stack
+            let ptr = libc::mmap(
+                null_mut(),
+                len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            if ptr == libc::MAP_FAILED {
+                return Err(error("mapping an alternate signal stack"));
+            }
+            // The stack above its guard page.
+            let stack = ptr.cast::<u8>().add(page_size).cast::<libc::c_void>();
+            let new_stack = libc::stack_t {
+                ss_sp: stack,
+                ss_flags: 0,
+                ss_size: MIN_STACK,
+            };
+            if libc::mprotect(stack, MIN_STACK, libc::PROT_READ | libc::PROT_WRITE) != 0
+                || libc::sigaltstack(&new_stack, null_mut()) != 0
+            {
+                let failure = error("installing an alternate signal stack");
+                libc::munmap(ptr, len);
+                return Err(failure);
+            }
+            Ok(Self {
+                mapping: Some((ptr, len)),
+            })
+        }
     }
 }
 
-/// # Safety
-///
-/// Changes the calling thread's alternate signal stack: called on the
-/// thread that runs compiled code, before it does.
-unsafe fn install_sigaltstack() {
-    // SAFETY: mmap allocates a fresh anonymous mapping with a guard page at the
-    // bottom (PROT_NONE) and stack space above (PROT_READ|PROT_WRITE).
-    // The allocation is intentionally leaked — it lives for the process lifetime.
-    // sigaltstack() is called with a valid stack pointer and size.
-    unsafe {
-        // Check if an adequate alternate stack already exists.
-        let mut old: libc::stack_t = std::mem::zeroed();
-        libc::sigaltstack(std::ptr::null(), &mut old);
-        const MIN_STACK: usize = 64 * 4096; // 256KB
-        if old.ss_flags & libc::SS_DISABLE == 0 && old.ss_size >= MIN_STACK {
-            return; // Already have a sufficient stack.
+impl Drop for AlternateStack {
+    fn drop(&mut self) {
+        if let Some((ptr, len)) = self.mapping {
+            let disable = libc::stack_t {
+                ss_sp: null_mut(),
+                ss_flags: libc::SS_DISABLE,
+                ss_size: 0,
+            };
+            // SAFETY: the thread is exiting, so no handler runs on the
+            // stack; once disabled, the mapping is this owner's alone.
+            unsafe {
+                if libc::sigaltstack(&disable, null_mut()) == 0 {
+                    libc::munmap(ptr, len);
+                }
+            }
         }
-
-        let page_size: usize = 4096;
-        let alloc_size = page_size + MIN_STACK; // guard page + stack
-        let ptr = libc::mmap(
-            null_mut(),
-            alloc_size,
-            libc::PROT_NONE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        assert_ne!(ptr, libc::MAP_FAILED, "mmap for sigaltstack failed");
-
-        // Make the stack portion (after the guard page) read-write.
-        let stack_ptr = (ptr as usize + page_size) as *mut libc::c_void;
-        libc::mprotect(stack_ptr, MIN_STACK, libc::PROT_READ | libc::PROT_WRITE);
-
-        let new_stack = libc::stack_t {
-            ss_sp: stack_ptr,
-            ss_flags: 0,
-            ss_size: MIN_STACK,
-        };
-        let r = libc::sigaltstack(&new_stack, null_mut());
-        assert_eq!(
-            r,
-            0,
-            "sigaltstack failed: {}",
-            std::io::Error::last_os_error()
-        );
-        // Intentionally leak the allocation — it lives for the process lifetime.
     }
 }
 
@@ -189,13 +249,35 @@ unsafe extern "C" fn sigsegv_handler(
             return;
         }
 
+        // The guest's fault only at a guest access's own instruction, on
+        // an address in its window; anything else is the backend's.
+        let fault_host = (*_siginfo).si_addr() as usize;
+        let fault_offset = fault_host.wrapping_sub(state.window_base);
+        let native_offset = (pc - state.code_start) as u32;
+        let trap_table = std::slice::from_raw_parts(state.trap_table_ptr, state.trap_table_len);
+        let attributed = trap_table
+            .binary_search_by_key(&native_offset, |&(off, _)| off)
+            .ok()
+            .filter(|_| fault_offset < 1 << 32);
+        let Some(entry) = attributed else {
+            // A second fault while aborting, or one before the entry
+            // recorded its frame, has no frame to return through.
+            if state.backend_fault.get() || state.entry_rsp == 0 {
+                delegate_to_previous(signum, _siginfo, ucontext);
+                return;
+            }
+            state.backend_fault.set(true);
+            cx.uc_mcontext.gregs[libc::REG_RSP as usize] = state.entry_rsp as i64;
+            cx.uc_mcontext.gregs[libc::REG_RIP as usize] = state.abort_label_addr as i64;
+            return;
+        };
+        let pvm_pc = trap_table[entry].1;
+
         // A write may be the first into a slot that does not track writes
         // yet. The x86 page-fault error code's bit 1 marks a write.
         let ctx = &mut *state.ctx_ptr;
-        let fault_host = (*_siginfo).si_addr() as usize;
-        let fault_offset = fault_host.wrapping_sub(ctx.flat_buf as usize);
         let write = cx.uc_mcontext.gregs[libc::REG_ERR as usize] & 2 != 0;
-        if write && !state.activation.is_null() && fault_offset < 1 << 32 {
+        if write && !state.activation.is_null() {
             // Starting tracking makes system calls; keep the interrupted
             // code's errno.
             let errno = *libc::__errno_location();
@@ -214,21 +296,6 @@ unsafe extern "C" fn sigsegv_handler(
                 Activated::NotTracking => {}
             }
         }
-
-        // Binary search the trap table for this native offset.
-        // If the faulting PC is in JIT code, always handle it as a guest fault —
-        // never delegate to the previous handler (which would crash the host process).
-        let native_offset = (pc - state.code_start) as u32;
-        let trap_table = std::slice::from_raw_parts(state.trap_table_ptr, state.trap_table_len);
-        let pvm_pc = match trap_table.binary_search_by_key(&native_offset, |&(off, _)| off) {
-            Ok(idx) => trap_table[idx].1,
-            Err(idx) => {
-                // PC is in JIT code but not at a registered trap site.
-                // Use the nearest preceding trap entry's PVM PC as a best-effort
-                // location, or 0 if no preceding entry exists.
-                if idx > 0 { trap_table[idx - 1].1 } else { 0 }
-            }
-        };
 
         // Guest fault address = faulting host address (si_addr) relative to
         // the guest memory base, masked to the page base. si_addr identifies
@@ -286,5 +353,37 @@ unsafe fn delegate_to_previous(
             let handler: extern "C" fn(libc::c_int) = std::mem::transmute(prev.sa_sigaction);
             handler(signum);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A thread's alternate signal stack is unmapped when the thread exits,
+    /// so threads that ran native code leave no mapping behind.
+    #[test]
+    fn a_threads_alternate_stack_leaves_with_it() {
+        let stack = std::thread::spawn(|| {
+            ensure_installed().unwrap();
+            // SAFETY: sigaltstack writes the current stack into a valid struct.
+            let mut current: libc::stack_t = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::sigaltstack(null_mut(), &mut current) }, 0);
+            assert_eq!(current.ss_flags & libc::SS_DISABLE, 0);
+            current.ss_sp as usize
+        })
+        .join()
+        .unwrap();
+        let mut pipe = [0; 2];
+        // SAFETY: pipe fills a valid array; write reads one byte at `stack`
+        // in the kernel, which reports an unmapped address as EFAULT.
+        let wrote = unsafe {
+            assert_eq!(libc::pipe(pipe.as_mut_ptr()), 0);
+            let wrote = libc::write(pipe[1], stack as *const libc::c_void, 1);
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+            wrote
+        };
+        assert_eq!(wrote, -1, "the exited thread's stack is unmapped");
     }
 }

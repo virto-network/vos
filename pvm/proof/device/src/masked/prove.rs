@@ -36,7 +36,8 @@ pub fn device_shape(
     reference: &mut SideNote,
 ) -> Result<(u32, Vec<u32>), Error> {
     let layout = DeviceLayout::of_program(blob).ok_or(Error::Layout)?;
-    let active = device_chips_of_code(&reference.code, &reference.bitmask);
+    let active =
+        device_chips_of_code(&reference.code, &reference.bitmask).ok_or(Error::Precompile)?;
     let shape = DeviceShape {
         chips: active,
         cpu: CpuColumns::of_code(&reference.code, &reference.bitmask),
@@ -90,12 +91,21 @@ where
         active: u32,
         log_sizes: &[u32],
     ) -> Result<Self, Error> {
+        vos_pvm_proof::on_prover_pool(|| Self::installed(format, blob, active, log_sizes))
+    }
+
+    fn installed(
+        format: &Format,
+        blob: &[u8],
+        active: u32,
+        log_sizes: &[u32],
+    ) -> Result<Self, Error> {
         let layout = DeviceLayout::of_program(blob).ok_or(Error::Layout)?;
         if !layout.is_disjoint() {
             return Err(Error::Layout);
         }
         let code = vos_pvm_proof::kernel::kernel_side_note(blob).map_err(|_| Error::Layout)?;
-        if active != device_chips_of_code(&code.code, &code.bitmask) {
+        if active != device_chips_of_code(&code.code, &code.bitmask).ok_or(Error::Precompile)? {
             return Err(Error::Chips);
         }
         let shape = DeviceShape {
@@ -157,16 +167,18 @@ where
         side_note: &mut SideNote,
         rng: MaskRng,
     ) -> Result<(DeviceProof<MC::H>, MaskStats), Error> {
-        prove_device_with::<MC>(
-            &self.format,
-            &self.program,
-            Some(&self.committed),
-            side_note,
-            rng,
-            |_| {},
-            |_, _| {},
-            Checks::ALL,
-        )
+        vos_pvm_proof::on_prover_pool(|| {
+            prove_device_with::<MC>(
+                &self.format,
+                &self.program,
+                Some(&self.committed),
+                side_note,
+                rng,
+                |_| {},
+                |_, _| {},
+                Checks::ALL,
+            )
+        })
     }
 }
 
@@ -183,16 +195,18 @@ pub fn prove_device<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    prove_device_with::<MC>(
-        format,
-        program,
-        None,
-        side_note,
-        rng,
-        |_| {},
-        |_, _| {},
-        Checks::ALL,
-    )
+    vos_pvm_proof::on_prover_pool(|| {
+        prove_device_with::<MC>(
+            format,
+            program,
+            None,
+            side_note,
+            rng,
+            |_| {},
+            |_, _| {},
+            Checks::ALL,
+        )
+    })
 }
 
 /// [`prove_device`], the trace through `tamper` before it is committed,

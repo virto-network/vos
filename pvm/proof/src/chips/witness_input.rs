@@ -186,6 +186,9 @@ impl BuiltInComponent for WitnessInputChip {
                 &call,
             ));
         }
+        // The address limbs are bytes (range-checked below, and each next
+        // address by its carries), which the word ledger's group test by
+        // 16-bit halves rests on (`word_memory`).
         let mut write: Vec<E::F> = Vec::with_capacity(15);
         write.extend_from_slice(&addr);
         write.push(value[0].clone());

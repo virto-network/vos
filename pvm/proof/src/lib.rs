@@ -98,6 +98,9 @@
 //! [into_run]: crate::core::tracing::TracingPvm::into_run
 //! [into_side_note]: crate::core::tracing::TracingPvm::into_side_note
 
+// One volatile wipe (`masked::wipe_column`) is this crate's only unsafe
+// code; it is allowed there alone.
+#![deny(unsafe_code)]
 #![cfg_attr(not(feature = "prover"), no_std)]
 // In verifier-only builds (--no-default-features), prover-only modules are
 // gated out, so many helper fns / structs / consts in always-compiled
@@ -381,7 +384,8 @@ pub use sparse_memory::{SPARSE_MEMORY_PAGE_SIZE, SparseMemoryImage, SparseMemory
 // over the chips its steps select: `prove` / `prove_format`.
 #[cfg(feature = "prover")]
 pub use prove::{
-    KernelSegment, SegmentError, program_commitment_for_shape, prove, prove_format, prove_kernel,
+    KernelPlan, KernelSegment, MAX_RUN_STEPS, PlannedSegment, SEGMENT_GAS, SegmentError,
+    max_segments, plan_kernel, program_commitment_for_shape, prove, prove_format, prove_kernel,
     prove_shaped,
 };
 // Advanced / internal prove surface: the profiling variants and the
@@ -392,7 +396,8 @@ pub use prove::prove_with_explicit_components;
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use prove::{
-    ProveProfile, install_thread_pool, prepare_side_note_for_verification, prove_profiled,
+    ProveProfile, install_thread_pool, on_prover_pool, prepare_side_note_for_verification,
+    prove_profiled,
 };
 #[cfg(feature = "debug-internals")]
 pub use prove::{debug_assert_constraints_explicit, prove_chip_isolated_format};

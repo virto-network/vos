@@ -21,7 +21,7 @@ pub use vos_pvm_program::{
 /// is its standard program alone, so its whole blob is what counts.
 pub const MAX_SERVICE_CODE: usize = 4_000_000;
 
-const _: () = assert!(MAX_SERVICE_CODE <= crate::backend::MAX_INTERPRETED_CODE);
+const _: () = assert!(MAX_SERVICE_CODE <= crate::backend::MAX_PREPARED_CODE);
 
 /// Whether `blob`, a service's whole code, is within [`MAX_SERVICE_CODE`]:
 /// the admission of a service, apart from what any one backend prepares
@@ -63,10 +63,7 @@ pub fn validate_code_blob(program: &CodeBlob, initial_pc: u64) -> bool {
         let Some(opcode) = Opcode::from_byte(code[pc]) else {
             return false;
         };
-        let next = (1..=25)
-            .map(|delta| pc + delta)
-            .find(|&candidate| candidate >= code.len() || bitmask[candidate] == 1)
-            .unwrap_or(pc + 25);
+        let next = pc + 1 + crate::skip(bitmask, pc);
         if next > code.len() {
             return false;
         }
@@ -113,10 +110,7 @@ pub fn inspect_standard_program_host_calls(blob: &[u8]) -> Option<Vec<u64>> {
         if opcode != Opcode::Ecalli {
             continue;
         }
-        let next = ((pc + 1)..code.len())
-            .find(|candidate| bitmask[*candidate] == 1)
-            .unwrap_or(code.len());
-        let skip = next.checked_sub(pc + 1)?;
+        let skip = crate::skip(bitmask, pc);
         let Args::Imm { imm } = decode_args(code, pc, skip, opcode.category()) else {
             return None;
         };

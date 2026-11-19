@@ -4,11 +4,15 @@
 use super::{CompiledCode, JitContext, prepare_external_entry, signal};
 use crate::{ExitReason, Interpreter, PendingHostCall};
 
+/// Run one slice of `vm` natively: `None` where its memory runs on the
+/// interpreter, which then runs the slice over the same state.
 pub(crate) fn run_standard(
     compiled: &CompiledCode,
     vm: &mut Interpreter,
-) -> Result<ExitReason, String> {
-    let (window, activation) = vm.memory_mut().native_window()?;
+) -> Result<Option<ExitReason>, String> {
+    let Some((window, activation)) = vm.memory_mut().native_window()? else {
+        return Ok(None);
+    };
     let context_pointer = window.ctx_ptr().cast::<JitContext>();
     let flat_buf = window.base();
     let flat_perms = window.perms();
@@ -36,43 +40,65 @@ pub(crate) fn run_standard(
         flat_perms,
         fast_reentry: 0,
     };
+    // Native code writes the context page while it runs, so no reference
+    // to it lives across the run: it is written, borrowed to prepare the
+    // entry, and read back by value.
     // SAFETY: native_window reserves an aligned, writable context page; the
     // guest alias excludes it. All metadata pointers remain owned throughout
     // this synchronous execution and host access holds exclusive ownership.
-    let context = unsafe {
-        context_pointer.write(context);
-        &mut *context_pointer
-    };
-    if prepare_external_entry(
-        context,
+    unsafe { context_pointer.write(context) };
+    // SAFETY: as above; the borrow ends with the call.
+    let prepared = prepare_external_entry(
+        unsafe { &mut *context_pointer },
         &compiled.fault_resume_offsets,
         &compiled.gas_block_start_by_pc,
         &compiled.block_gas_costs,
-    )
-    .is_none()
-    {
-        signal::ensure_installed();
+    );
+    if prepared.is_none() {
+        if let Err(error) = signal::ensure_installed() {
+            // Nothing native ran: the interpreter takes the slice.
+            tracing::debug!(%error, "interpreting without a fault handler");
+            return Ok(None);
+        }
+        let code_start = compiled.native_code.ptr as usize;
         let mut state = signal::SignalState {
-            code_start: compiled.native_code.ptr as usize,
-            code_end: compiled.native_code.ptr as usize + compiled.native_code.len,
-            exit_label_addr: compiled.native_code.ptr as usize
-                + compiled.exit_label_offset as usize,
+            code_start,
+            code_end: code_start + compiled.native_code.len,
+            exit_label_addr: code_start + compiled.exit_label_offset as usize,
+            abort_label_addr: code_start + compiled.abort_label_offset as usize,
+            window_base: flat_buf as usize,
             ctx_ptr: context_pointer,
             trap_table_ptr: compiled.trap_table.as_ptr(),
             trap_table_len: compiled.trap_table.len(),
             fault_resume_offsets_ptr: compiled.fault_resume_offsets.as_ptr(),
             fault_resume_offsets_len: compiled.fault_resume_offsets.len(),
             activation,
+            entry_rsp: 0,
+            backend_fault: Default::default(),
         };
+        // The handler and native code reach the state only through this
+        // pointer while native code runs.
+        let state_pointer = &raw mut state;
+        // SAFETY: a field of the live state, through its one pointer.
+        let entry_rsp = unsafe { &raw mut (*state_pointer).entry_rsp };
         // Preserve a prior owner even when embedders nest native execution.
-        let previous = signal::SIGNAL_STATE.with(|cell| cell.replace(&mut state));
+        let previous = signal::SIGNAL_STATE.with(|cell| cell.replace(state_pointer));
         // SAFETY: code is immutable executable preparation; context and guest
         // mapping follow the existing recompiler ABI and signal-state lifetime.
         unsafe {
-            compiled.native_code.entry()(context_pointer);
+            compiled.native_code.entry()(context_pointer, entry_rsp);
         }
         signal::SIGNAL_STATE.with(|cell| cell.set(previous));
+        if state.backend_faulted() {
+            // The machine's state is not meaningful: its memory reports
+            // every page from now on, and it is never run again.
+            // SAFETY: the activation belongs to the window, live here.
+            unsafe { (*activation).fail() };
+            return Err("native code faulted outside a guest access".into());
+        }
     }
+    // SAFETY: native code has returned, and nothing else refers to the page.
+    let context = unsafe { context_pointer.read() };
     vm.registers = context.regs;
     vm.gas = context.gas;
     vm.pc = context.pc;
@@ -84,7 +110,7 @@ pub(crate) fn run_standard(
             resume_pc: context.host_resume_pc,
         }),
     );
-    Ok(match context.exit_reason {
+    Ok(Some(match context.exit_reason {
         0 => ExitReason::Halt,
         1 => ExitReason::Panic,
         2 => ExitReason::OutOfGas,
@@ -96,6 +122,9 @@ pub(crate) fn run_standard(
         super::codegen::EXIT_TRACKING_FAILED => {
             return Err("native write tracking failed".into());
         }
+        super::codegen::EXIT_INVALID_ENTRY => {
+            return Err("native entry past the dispatch table".into());
+        }
         _ => return Err("invalid native exit reason".into()),
-    })
+    }))
 }

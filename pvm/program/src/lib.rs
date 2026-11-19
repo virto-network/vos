@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![no_std]
 
 //! Portable standard-PVM program bytes and initial memory layout.

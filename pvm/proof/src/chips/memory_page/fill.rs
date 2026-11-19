@@ -93,7 +93,6 @@ impl BuiltInProverComponent for MemoryPageChip {
                 trace.fill_columns_bytes(row, &outs_b[block], Column::HOutBefore);
                 trace.fill_columns_bytes(row, &outs_a[block], Column::HOutAfter);
 
-                trace.fill_columns(row, closing_ts, Column::ClosingTs);
                 trace.fill_columns_base_field(row, &idx_bits, Column::IdxBits);
                 trace.fill_columns(row, true, Column::IsReal);
                 trace.fill_columns(row, block != BLOCKS_PER_PAGE - 1, Column::ChainGateH);
@@ -106,7 +105,11 @@ impl BuiltInProverComponent for MemoryPageChip {
                 trace.fill_columns_base_field(row, &bits(to_end), Column::ToEndBits);
             }
         }
-        // Padding rows keep IsReal = 0 and all helpers 0.
+        // Padding rows keep IsReal = 0 and all helpers 0; every row, the
+        // padding's too, carries the one closing timestamp.
+        for row in 0..trace.num_rows() {
+            trace.fill_columns(row, closing_ts, Column::ClosingTs);
+        }
 
         trace.finalize_bit_reversed()
     }

@@ -22,6 +22,7 @@
 //! `no_std`: `vos-pvm-proof` without its `prover` feature pulls no `vos_pvm`
 //! and no rayon, and builds for `wasm32-unknown-unknown`.
 
+#![forbid(unsafe_code)]
 #![no_std]
 
 extern crate alloc;

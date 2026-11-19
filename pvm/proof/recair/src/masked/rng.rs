@@ -75,15 +75,42 @@ impl MaskRng {
 }
 
 /// `bytes` overwritten with zeros by volatile writes, which the compiler
-/// keeps though nothing reads them after: the attempt's entropy and seed
-/// arrays, once its stream is keyed. The stream holds its key until it is
-/// dropped, and the hasher's and the key's copies are not wiped.
-fn wipe(bytes: &mut [u8; 32]) {
+/// keeps though nothing reads them after: an attempt's entropy and seed
+/// arrays once its stream is keyed, a column's seed once its stream is.
+/// The hasher's copies are not wiped.
+pub(crate) fn wipe(bytes: &mut [u8; 32]) {
     for byte in bytes.iter_mut() {
         // SAFETY: `byte` is a valid, aligned, exclusive reference.
         unsafe { core::ptr::write_volatile(byte, 0) };
     }
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Each of `seeds` wiped ([`wipe`]).
+pub(crate) fn wipe_seeds(seeds: &mut [[u8; 32]]) {
+    seeds.iter_mut().for_each(wipe);
+}
+
+/// `stream`'s state, its key and its buffered words, overwritten by a
+/// stream of the zero key, by a volatile write: an attempt's or a column's
+/// stream once it has drawn.
+pub(crate) fn wipe_stream(stream: &mut ChaCha20Rng) {
+    // SAFETY: `stream` is a valid, aligned, exclusive reference, and a
+    // ChaCha20 stream holds no resource a drop releases.
+    unsafe { core::ptr::write_volatile(stream, ChaCha20Rng::from_seed([0; 32])) };
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Each of `polys`' coefficients wiped (`vos_pvm_proof::masked::wipe_column`):
+/// a witness's unmasked columns once they are masked.
+pub(crate) fn wipe_polys(
+    polys: &mut [stwo::prover::poly::circle::CircleCoefficients<
+        stwo::prover::backend::simd::SimdBackend,
+    >],
+) {
+    for poly in polys {
+        vos_pvm_proof::masked::wipe_column(&mut poly.coeffs);
+    }
 }
 
 /// What a masked proof states beside its columns: the hedge binds it.
