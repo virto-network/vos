@@ -2,4 +2,4 @@
 # the prover's: the masked wraps here draw fresh masks, so each is held
 # within 2% of its pin; `VOS_PINS=write` on the test that measures it
 # writes it (`just repin`). JAM gas on the JAM-only host (`final-verify.elf`).
-predicate-wrap-verify-gas 62376080
+predicate-wrap-verify-gas 62190473
