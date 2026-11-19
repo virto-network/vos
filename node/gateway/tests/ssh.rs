@@ -1158,19 +1158,19 @@ async fn the_onions_ssh_serves_the_screens_marked_onion_and_limited_per_circuit(
         matches!(answer, Response::Ran { .. }),
         "the onion's mark reached the node: {answer:?}"
     );
-    // A second channel takes the circuit's other place: its request finds
-    // none left.
+    // A second channel takes the circuit's other place; its requests count
+    // among the circuit's in flight, not its channels, and are served.
     let mut full = subsystem(&handle).await;
     full.data(&query(73)[..]).await.unwrap();
-    let (kind, _, body) = Answers { buffer: Vec::new() }
+    let (kind, _, answer) = Answers { buffer: Vec::new() }
         .next(&mut full)
         .await
         .unwrap();
-    assert_eq!(kind, FRAME_ERROR);
-    assert_eq!(
-        FrameError::decode_exact(&body),
-        Some(FrameError::Unavailable)
-    );
+    assert_eq!(kind, Kind::Query as u16, "the circuit's second channel");
+    assert!(matches!(
+        Response::decode_exact(&answer),
+        Some(Response::Ran { .. })
+    ));
     // A further connection on the circuit is served no channel; another
     // circuit's is.
     let second = over_circuit(&onion, 7).await.unwrap();
