@@ -180,7 +180,9 @@ impl Machines {
     }
 
     /// Run the agent's accumulate on one work result over `state`: the
-    /// writes to apply, one per key, if it halts.
+    /// writes to apply, one per key, if it halts. Any other end applies
+    /// none: the host reverts its storage to its last checkpoint (Ω_C),
+    /// and the agent makes none, so that is its start.
     pub fn accumulate(
         &self,
         state: &dyn StateReader,
@@ -234,6 +236,15 @@ fn serve(id: u64, machine: &mut Machine, programs: &AgentPrograms) -> Result<(),
         }
     }
 }
+
+/// The longest key the agent stores, a hashed table's key at its cap
+/// escaped whole behind the table's prefix ([`vos_abi::keys::row`]): one
+/// `state_read` and `state_scan` serve, so no row the agent writes is past
+/// its reads.
+const _: () = assert!(
+    vos_abi::keys::TABLE_PREFIX + 16 + 2 * vos_abi::abi::cap::KEY + 2
+        <= vos_pvm::refine_host::MAX_STATE_KEY as usize
+);
 
 /// Accumulate's view of storage: the host's rows, under the writes it
 /// made, which its later reads see.

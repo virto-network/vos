@@ -3,7 +3,7 @@
 //! from the node's blob store. A store read that fails panics, which the
 //! executor turns into an infrastructure fault.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use vos_abi::ids::AgentId;
 use vos_exec::{ProgramStore, StateReader, value_window};
@@ -17,12 +17,23 @@ pub(crate) use vos_exec::{Machines, decode};
 pub(crate) struct AgentState {
     snapshot: Arc<Snapshot>,
     agent: AgentId,
+    /// The row a scan pulled last, read with its key: the scan's read of
+    /// its value takes it rather than reading the store again.
+    scanned: Mutex<Option<(Vec<u8>, Vec<u8>)>>,
 }
 
 impl AgentState {
     /// `agent`'s state at `snapshot`.
     pub(crate) fn of(snapshot: Arc<Snapshot>, agent: AgentId) -> Self {
-        Self { snapshot, agent }
+        Self {
+            snapshot,
+            agent,
+            scanned: Mutex::new(None),
+        }
+    }
+
+    fn scanned(&self) -> std::sync::MutexGuard<'_, Option<(Vec<u8>, Vec<u8>)>> {
+        self.scanned.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// `agent`'s state at `snapshot`, for a refine.
@@ -33,12 +44,19 @@ impl AgentState {
 
 impl StateReader for AgentState {
     fn read(&self, key: &[u8], offset: usize, max: usize) -> Option<(usize, Vec<u8>)> {
+        if let Some((_, value)) = self
+            .scanned()
+            .take_if(|(scanned, _)| scanned.as_slice() == key)
+        {
+            return Some(value_window(&value, offset, max));
+        }
         let value = self.snapshot.get(self.agent, key).expect("a store read")?;
         Some(value_window(&value, offset, max))
     }
 
-    /// The store's scan reads each row's value with its key: a row's length
-    /// is its value's, read whole.
+    /// The store's scan reads each row's value with its key: the last row
+    /// pulled is kept for the scan's read of it, the snapshot's value of
+    /// that key whenever it is read.
     fn rows<'a>(
         &'a self,
         prefix: &'a [u8],
@@ -48,7 +66,11 @@ impl StateReader for AgentState {
             self.snapshot
                 .scan(self.agent, prefix, after)
                 .map(|row| row.expect("a store read"))
-                .map(|(key, value)| (key, value.len())),
+                .map(|(key, value)| {
+                    let len = value.len();
+                    *self.scanned() = Some((key.clone(), value));
+                    (key, len)
+                }),
         )
     }
 }

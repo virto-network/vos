@@ -290,6 +290,17 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **The non-repudiation side store:** a space that wants evidence keeps the
   proofs an ingress verified. Not built; ingress logs the proven origin
   only.
+- **Ingress without the prover:** a node computes each device release's
+  program from its kernel and reference run
+  (`vos_pvm_device::Program::from_kernel`), the installing node at the
+  install and every other replica at its first proof, so `vos-node` links
+  the device crate's prover. The verify-only build
+  (`Verifier::of_release`, `just check-device-verifier`) takes the
+  program's CPU words and preprocessed root as a prover build computed
+  them; it needs them carried with the install (the installing node's,
+  under the operator's signature, as its derivation is), a home for them
+  in each replica's state, and the guard's release held to the artifact's
+  kernel. Until then the plain node keeps the prover's dependency edge.
 - **Tree syncing, its last clients:** the device library keeps each
   credential tree whole from its feed (`light-node.md` §6.7), so no query
   names the member and its proofs are against the newest root it read;
