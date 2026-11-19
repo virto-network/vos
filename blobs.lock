@@ -1,9 +1,9 @@
 # Every pinned guest blob's SHA-256, its symbols and relocations stripped,
 # as `just build-blobs` builds it: `just blobs-lock` writes it, `just
 # check-blobs` checks it (the justfile's `_blob-hashes` says which blobs).
-d35498cde318e9a4c9cda826d5058c611646f24d2ebaf101ad1bbb9b6181d9ca  target/riscv64em-vos/release/final-verify.elf
-a6129d9755bb9df24ffa7b25158ad0cfd910305a85164421fe8127baf0489ddd  target/riscv64em-vos/release/statement-service.elf
-53fc6bde8425b3779539ccea1b2a00cf8bb2fdf66b1871bba6377cc368d10695  agent/programs/target/riscv64em-vos/release/vos-agent.elf
+bf5d23e443567cefd61b8f378bbbfd409a218cb26f13492be06dff79e651d98b  target/riscv64em-vos/release/final-verify.elf
+f37969a9fdb612449b1af7e36d9fd6bcc179ab25378bd5da1d59f4e27bafbd04  target/riscv64em-vos/release/statement-service.elf
+e352eb9bf04c13a38c6a9891f81acfd040f739ff5fcf78d6471f06a644ddc58a  agent/programs/target/riscv64em-vos/release/vos-agent.elf
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 103a4c6edaced84091565a8d49526d464848ccc83fb51b03df6b95296fd853df  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
 48822e5724c9dcea75642065f664bb1c89b033237d64b781ce2da63e9b9f076d  agent/programs/target/riscv64em-vos/release/vos-personal.elf
@@ -11,7 +11,7 @@ c22adad542dee9377afd36821d759496b8fbf0af75bdbd710e5f307297dae006  agent/programs
 de18b058851c1d2ba85cc939e71da397f761ba70a2b9231418a3f8775f751aa1  agent/programs/target/riscv64em-vos/release/vos-homes.elf
 6b52f19b437273a58c0cb425b8f9d91a95c7f3e6583428041ee456ff0374c0e1  agent/programs/target/riscv64em-vos/release/vos-credential-book.elf
 e88eb723620c8ee3d0363b853c55391e09204e54628d325eec6c19ccf03a6a91  agent/programs/target/riscv64em-vos/release/vos-device-book.elf
-8b3f3252ffbbb127e7b6903cc02a95c5f002bd762eb67b4e2f9f92fff78ec6bf  pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
+837573e8638918d55e33aed08b5b5204b74defa6b5d1f1acf60105e31176417d  pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
 c6c983460680fb909acc277561589751aca307d18285d40a796f4744b38fed44  agent/test-actors/target/riscv64em-vos/release/accounts.elf
 ab61a2bfa43cf70c9beaf0b572b300709e65c8eda1974985bba53c2a831b33fd  agent/test-actors/target/riscv64em-vos/release/ample.elf
 2f8a279ecb76c743aa3cbc3bbca2d41c94f67d0f6cae64c50f7b5bb8f9c54027  agent/test-actors/target/riscv64em-vos/release/balance.elf
