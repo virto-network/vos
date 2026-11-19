@@ -58,7 +58,10 @@ pub(crate) const STATE_READ_BYTE_GAS: Gas = 1;
 
 /// The longest key, prefix or cursor `state_read` and `state_scan` read
 /// from the guest; a longer one answers `HUH`, having cost the base price.
-pub const MAX_STATE_KEY: u64 = 1024;
+/// 4 KiB: past the longest key a VOS agent stores, about 2 KiB (a hashed
+/// table's key at its cap, every byte doubled by the escape, behind the
+/// table's prefix), whose cursor a scan reads back.
+pub const MAX_STATE_KEY: u64 = 4096;
 
 impl RefineContext {
     /// `state_read`: copy part of the value under the key at φ7/φ8 to φ9,
