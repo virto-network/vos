@@ -15,11 +15,12 @@ use vos_abi::Decode;
 use vos_abi::ids::{MethodId, ProgramHash};
 use vos_abi::records::Kernel;
 use vos_abi::result::{Attest, KernelReturn};
-use vos_pvm_proof::SideNote;
 use vos_pvm_proof::core::step::CompactStep;
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::{KernelTrace, KernelTraceError, trace_kernel};
 use vos_pvm_proof::program_id::{KernelEntry, KernelProgram};
+use vos_pvm_proof::shape::KernelShape;
+use vos_pvm_proof::{KernelPlan, SegmentError, SideNote};
 use vos_pvm_recair::tree::{Stats, TreeError};
 use vos_venue::vos_statement::ProgramId;
 
@@ -187,7 +188,9 @@ impl MaskedProver {
         Ok((proof, internals))
     }
 
-    /// `kernel` re-run on `attest`'s witness and its run proved by `prove`.
+    /// `kernel` re-run on `attest`'s witness, its run planned ([`plan`]),
+    /// and proved by `prove`: a run past what its gas buys is refused
+    /// before the kernel's program is computed or anything proved.
     fn proved(
         &self,
         kernel: &[u8],
@@ -198,21 +201,55 @@ impl MaskedProver {
             &SideNote<CompactStep>,
         ) -> Result<(Vec<u8>, Stats), TreeError>,
     ) -> Result<(Vec<u8>, Stats), StatementError> {
+        let trace = self.rerun(kernel, attest)?;
+        plan(kernel, &trace.side_note)?;
         let program = self.kernel(kernel)?;
         let (program, entry) = &*program;
-        let trace = self.rerun(kernel, attest)?;
-        prove(program, entry, &trace.side_note).map_err(|error| {
-            use vos_pvm_proof::SegmentError;
-            match error {
-                // The run does not fit its kernel's shape: no proof of it
-                // can be made.
-                TreeError::Empty
-                | TreeError::Segment(SegmentError::Shape { .. } | SegmentError::MalformedShape) => {
-                    StatementError::Kernel("the run does not fit its kernel's shape")
-                }
-                error => StatementError::Failed(failed(&error)),
+        prove(program, entry, &trace.side_note).map_err(|error| match error {
+            TreeError::Segment(error) => not_proved(&error),
+            // The run does not fit its kernel's shape: no proof of it can
+            // be made.
+            TreeError::Empty => StatementError::Kernel("the run does not fit its kernel's shape"),
+            error @ (TreeError::Witness(_) | TreeError::Prove(_) | TreeError::Bytes) => {
+                StatementError::Failed(failed(&error))
             }
         })
+    }
+}
+
+/// The price of a statement's proof, and its bound: the attest that made
+/// the record paid `price::ATTEST` and its kernel's gas, which buy the
+/// run's first segment and one more for each
+/// [`vos_pvm_proof::SEGMENT_GAS`] of the gas
+/// ([`vos_pvm_proof::max_segments`]). `kernel`'s run `run` is planned
+/// ([`vos_pvm_proof::plan_kernel`], cut by its class of the most steps, as
+/// the prover cuts it) before anything is proved: its segments, or a
+/// refusal for good of a run that takes more than its gas buys, or more
+/// steps than a proof orders. Planning traces nothing; it builds each
+/// window's side note and page multiproof.
+pub fn plan(kernel: &[u8], run: &SideNote<CompactStep>) -> Result<KernelPlan, StatementError> {
+    let record = kernel_record(kernel).map_err(StatementError::Kernel)?;
+    let shape = KernelShape::try_from(&record.shape)
+        .map_err(|_| StatementError::Kernel("the kernel's shape is not an install's"))?;
+    vos_pvm_proof::plan_kernel(run, &shape, vos_pvm_recair::tree::cut_class(&shape))
+        .map_err(|error| not_proved(&error))
+}
+
+/// Why a run's segments do not prove, by the prover's refusal: a run its
+/// kernel's shape or its gas cannot hold, refused for good, or the prover's
+/// own failure, tried again.
+fn not_proved(error: &SegmentError) -> StatementError {
+    use StatementError::{Failed, Kernel, Rerun};
+    match error {
+        SegmentError::Shape { .. } | SegmentError::MalformedShape => {
+            Kernel("the run does not fit its kernel's shape")
+        }
+        SegmentError::Transfer => Kernel("the kernel transfers to the halt address"),
+        SegmentError::Segments => Rerun("the run takes more segments than its gas buys"),
+        SegmentError::RunLength => Rerun("the run is past a proof's steps"),
+        SegmentError::Stwo(_) => Failed("a segment does not prove"),
+        SegmentError::FormatNotAdmitted(_) => Failed("the segment format is not admitted"),
+        SegmentError::NoMemoryLayout => Failed("a segment has no memory layout"),
     }
 }
 
