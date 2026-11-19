@@ -422,7 +422,6 @@ async fn nothing_is_proved_before_enrollment_or_for_an_unknown_operation() {
 /// service's address is refused, never resolved.
 #[test]
 fn a_first_contact_with_an_onion_goes_over_tor() {
-    use std::io::Read as _;
     use std::os::fd::OwnedFd;
 
     let world = world();
@@ -439,9 +438,7 @@ fn a_first_contact_with_an_onion_goes_over_tor() {
         )
         .unwrap();
     assert_eq!(pinned, None, "no key pinned at first contact");
-    let mut banner = [0; 8];
-    ours.read_exact(&mut banner).unwrap();
-    assert_eq!(&banner, b"SSH-2.0-");
+    gateways_banner(&mut ours);
     let seen = world.state.lock().unwrap().seen.clone();
     assert_eq!(seen.len(), 1);
     assert_eq!(
@@ -495,9 +492,7 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
             port: gateway().port,
         };
         node.screens(target, OwnedFd::from(theirs)).inspect(|_| {
-            let mut banner = [0; 8];
-            ours.read_exact(&mut banner).unwrap();
-            assert_eq!(&banner, b"SSH-2.0-");
+            gateways_banner(&mut ours);
         })
     };
     let before = world.state.lock().unwrap().seen.len();
@@ -577,7 +572,6 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
 /// none do.
 #[test]
 fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
-    use std::io::Read as _;
     use std::os::fd::OwnedFd;
 
     const OTHER: u32 = 6;
@@ -615,9 +609,7 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
             port: gateway().port,
         };
         let key = node.screens(target, OwnedFd::from(theirs)).unwrap();
-        let mut banner = [0; 8];
-        ours.read_exact(&mut banner).unwrap();
-        assert_eq!(&banner, b"SSH-2.0-");
+        gateways_banner(&mut ours);
         let last = world
             .state
             .lock()
@@ -893,4 +885,14 @@ async fn a_window_without_this_apps_programs_is_refused_before_proving() {
         asked.iter().all(|&asked| asked == (AGENT, CREDENTIALS)),
         "{asked:?}"
     );
+}
+
+/// The gateway's SSH version line on `ours`, s4's own sent first as s4
+/// sends it: over Tor, the gateway's line leaves once the client's arrives.
+fn gateways_banner(ours: &mut std::os::unix::net::UnixStream) {
+    use std::io::{Read as _, Write as _};
+    ours.write_all(b"SSH-2.0-s4\r\n").unwrap();
+    let mut banner = [0; 8];
+    ours.read_exact(&mut banner).unwrap();
+    assert_eq!(&banner, b"SSH-2.0-");
 }

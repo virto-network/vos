@@ -2,11 +2,15 @@
 //! pinned, the client authenticated by an ed25519 key drawn for this
 //! connection alone, the node API's frames multiplexed over the channel.
 
+use std::io;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
 use russh::client;
 use russh::keys::{PublicKeyOrCertificate, ssh_key};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use vos_api::client::{Answer, Multiplexed};
@@ -34,6 +38,55 @@ impl client::Handler for Pinned {
     ) -> Result<bool, Self::Error> {
         Ok(matches!(key, PublicKeyOrCertificate::PublicKey { key, .. }
             if key.key_data().ed25519().is_some_and(|key| key.0 == self.host_key)))
+    }
+}
+
+/// `stream`, each write flushed before it counts as written. A Tor stream
+/// holds what is written until it is flushed, and russh writes its version
+/// line without flushing it, then waits for the gateway's: unflushed, the
+/// line never leaves, and the gateway drops the connection at its handshake
+/// deadline.
+struct Flushed {
+    stream: Stream,
+    /// The bytes of a write taken but not yet flushed.
+    unflushed: Option<usize>,
+}
+
+impl AsyncRead for Flushed {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Flushed {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let written = match self.unflushed {
+            Some(written) => written,
+            None => {
+                let written = ready!(Pin::new(&mut self.stream).poll_write(cx, buf))?;
+                self.unflushed = Some(written);
+                written
+            }
+        };
+        ready!(Pin::new(&mut self.stream).poll_flush(cx))?;
+        self.unflushed = None;
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 
@@ -74,6 +127,10 @@ impl Connection {
             inactivity_timeout: None,
             ..client::Config::default()
         });
+        let stream = Flushed {
+            stream,
+            unflushed: None,
+        };
         let mut handle = client::connect_stream(config, stream, Pinned { host_key })
             .await
             .map_err(OpenError::Ssh)?;
