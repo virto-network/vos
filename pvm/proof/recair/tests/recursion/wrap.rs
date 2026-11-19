@@ -237,7 +237,7 @@ fn the_wrap_circuit_is_pinned() {
             ("circle", [0, 3_124, 0]),
             ("context", [0, 2, 0]),
             ("deep", [0, 7_216, 2_024]),
-            ("deep once", [0, 1_108, 0]),
+            ("deep once", [0, 1_111, 0]),
             ("fri", [9_724, 4_400, 0]),
             ("logup", [0, 24, 0]),
             ("merkle", [6_028, 0, 0]),
@@ -251,7 +251,7 @@ fn the_wrap_circuit_is_pinned() {
             ("wrap: run", [0, 3, 0]),
         ]
     );
-    assert_eq!(context.finalized_rows(), [16_083, 21_489, 2_024]);
+    assert_eq!(context.finalized_rows(), [16_083, 21_492, 2_024]);
     let topology = wrap.topology();
     assert_eq!(
         topology.circuit.log_sizes(),

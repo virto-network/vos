@@ -412,9 +412,9 @@ attribution). Its full design is `recursion-air.md`.
   - A kernel that does not fit is refused (§3.3).
 - **Built** [measured, x86 dev machine, 2026-10-18; `vos-pvm-recair`'s
   `fold`]:
-  - a child's verification is 16,065 / 21,394 / 2,024 rows (its lifting
+  - a child's verification is 16,065 / 21,397 / 2,024 rows (its lifting
     height 2^19, 17 FRI layers, 486 sampled values at 3 points), and the
-    fold's own work 37 `p2` and 74 `qm31` rows: **32,167 / 42,896 /
+    fold's own work 37 `p2` and 74 `qm31` rows: **32,167 / 42,902 /
     4,048** finalized, 49.1% / 32.7% / 6.2% of the padded shape, the
     model's 47% / 32% / 5%;
   - it proves in **1.5 s at 942 MiB** of heap, a leaf's time and memory,

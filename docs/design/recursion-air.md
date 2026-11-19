@@ -68,7 +68,7 @@ verifier, and the gates its build passed.
    about an eighth of a DEEP row a sample.
 6. **The fold converges at once.** Verifying two children of the padded shape
    needs 30,619 / 41,480 / 3,588 rows, 47% / 32% / 5% of the shape [model];
-   built, **32,167 / 42,896 / 4,048** finalized, 49.1% / 32.7% / 6.2%
+   built, **32,167 / 42,902 / 4,048** finalized, 49.1% / 32.7% / 6.2%
    [measured, §6]. The leaf sets the shape; a fold alone
    would settle at 2^15 / 2^16 / 2^12.
 7. **The final wrap** verifies the root fold in 2^14 / 2^15 / 2^11 rows
@@ -660,14 +660,14 @@ multiverifier structure (`UP/circuit_multiverifier/src/verify.rs:52-90`):
   **2^19, not 2^20**: the largest component, `qm31` at 2^17, bounds the
   composition at 2^18, split once and blown up by 4. So 17 FRI layers,
   not 18, and 486 sampled values (514 DEEP samples with the periodicity
-  ones) at **3 points**: 16,065 / 21,394 / 2,024 rows a child, against
+  ones) at **3 points**: 16,065 / 21,397 / 2,024 rows a child, against
   the model's 15,291 / 20,686 / 1,794.
 - **The fold's own work** (A.3's re-hash of each preimage, the circuit
   hash from the child's preprocessed root, the one-hot choice among the
   program's four leaf-circuit hashes and W, the program id from its
   44-word preimage, adjacency, continuity, the output): 37 `p2` and 74
   `qm31` rows, against the model's 37 and 110.
-- **The fold:** **32,167 / 42,896 / 4,048** finalized, 49.1% / 32.7% /
+- **The fold:** **32,167 / 42,902 / 4,048** finalized, 49.1% / 32.7% /
   6.2% of the padded shape; proved in 1.5 s at 942 MiB of heap, as a leaf,
   over the window kernel's leaves and over two folds. The fixed point is
   reached at once: the fold of two children of the padded shape fits the
@@ -721,7 +721,7 @@ and fold layout of §1.1 is unchanged.
   verification is a fold child's (`fold::verify_node`), plus the program id
   from its 44-word preimage, the one-hot choice among the program's leaf
   circuits and `H_fold` (a constant), `W = H_fold`, the three lanes of the
-  run, and the 24 public words a lane each: **16,083 / 21,489 / 2,024**
+  run, and the 24 public words a lane each: **16,083 / 21,492 / 2,024**
   rows finalized, **2^14 / 2^15 / 2^11** (the model's), `p2` 98.2% full.
   A run of one segment has no fold: its leaf is the root, and the circuit
   set admits it. Proved in **5.45 s at a 2.5 GiB heap** (the window
@@ -835,7 +835,7 @@ its gate [measured].
 | 3 | **The in-AIR verifier's pieces:** channel, lifted Merkle with `expand_decommitment`, FRI (fold step 1), DEEP with `h8`, OODS, logup sums | each against the native code on recorded data; transcript equality with `Poseidon2M31Channel`'s recorder | every piece accepts real data and refuses each tamper | passed (§4.8) |
 | 4 | **COMPARE's leaf**, and **the window kernel leaf's topology** (`Context<NoValue>`, no proof) | a COMPARE proof verified in circuit, the circuit proved and verified natively; tampered OODS sample, queried value, sibling, FRI value and nonce refused; the topology's rows pinned per term of the model (the Appendix), not only in total | accepted; rows within 15% of 8,644 / 10,352 / 280 (40 queries); ≤ 1 s; the topology within 2^16 / 2^17 / 2^16 | 7,732 / 10,279 / 240, 0.21–0.24 s; the topology 57,655 / 101,638 / 46,000 (55,455 / 99,485 / 44,040 on the current segment format) |
 | 5 | **The window kernel's leaf**, and the solvency predicate's: boundary states mixed as bytes, entry and exit digests, the flags, the A.3 output | a real segment on the Poseidon2 channel; in-circuit and native transcripts equal; a tampered boundary byte refused | rows within the padded shape; ≤ 4 GiB; ≤ 1× the segment's proving (target 0.13–0.5×) | 57,700 / 102,227 / 46,000, 1.5 s at 942 MiB, 0.22× its segment (§4.8) |
-| 6 | **The fold and the fixed point** | a fold of two leaves, a fold of two folds within the constant shape; a tree over four segments; refusals: wrong program, gap, broken continuity, prefix, mid-start, wrong child circuit, a child carrying a foreign word, a leaf carrying a wrong program id | the fold verifies two folds in the shape; memory and time of a leaf | 32,167 / 42,896 / 4,048, 1.5 s, 942 MiB |
+| 6 | **The fold and the fixed point** | a fold of two leaves, a fold of two folds within the constant shape; a tree over four segments; refusals: wrong program, gap, broken continuity, prefix, mid-start, wrong child circuit, a child carrying a foreign word, a leaf carrying a wrong program id | the fold verifies two folds in the shape; memory and time of a leaf | 32,167 / 42,902 / 4,048, 1.5 s, 942 MiB |
 | 7 | **The final wrap:** Blake2b-256 Merkle and channel in our Stwo fork, fold step 3 admitted, the wrap circuit, `vos-pvm-final-verifier` | the fork's review; tamper tests on fold step 3 and Blake2b; Wasm and JAM-only host verification | ≤ 150M gas unmasked on the JAM-only host; ≤ 2^17 rows; ≤ 8 GiB unmasked | 96.4M gas, 2^15 tallest, 2.5 GiB heap, 5.45 s |
 | 8 | **End to end:** `vos-statement`, the window statement and the solvency predicate, golden fixtures (A.6) | every venue judges the fixtures alike | both statements verified natively, in Wasm and on JAM | eleven fixtures judged alike natively, in Wasm (PVF and client) and on the JAM-only host; both statements accepted at all three |
 
