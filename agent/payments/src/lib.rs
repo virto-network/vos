@@ -26,15 +26,7 @@ use cipher_clerk::{
 };
 use vos_sdk::prelude::*;
 
-/// An account's name: 1 to [`MAX_NAME`] ASCII letters, digits, `.`, `_` or
-/// `-`, shown verbatim.
-pub type Name = Vec<u8>;
-
-/// An owner digest: eight M31 words, as little-endian `u32`s.
-pub type Owner = [u8; 32];
-
-/// The longest a name may be: its row's `user_data`.
-pub const MAX_NAME: usize = 32;
+pub use vos_wire::payments::{Holding, MAX_NAME, Name, Owner, PaymentError};
 
 /// The space's one journal and currency.
 const JOURNAL: JournalId = JournalId([1; 16]);
@@ -48,14 +40,6 @@ const ISSUER: Owner = [0xfe; 32];
 /// The issuance, debit-normal: what the space minted.
 const ISSUANCE: AccountId = AccountId([0xff; 16]);
 
-/// An account as its owner and the operators read it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct Holding {
-    pub owner: Owner,
-    pub balance: u64,
-    pub frozen: bool,
-}
-
 /// The account an owner digest holds, and whether its debits are refused
 /// until a rekey.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -68,51 +52,6 @@ pub struct Held {
 pub struct Invitation {
     pub owner: Owner,
     pub expires_ms: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum PaymentError {
-    /// A name empty, past [`MAX_NAME`] bytes, or of another character.
-    #[codec(index = 0)]
-    BadName,
-    /// An account of that name, or of that owner, exists.
-    #[codec(index = 1)]
-    Exists,
-    /// No account of that name.
-    #[codec(index = 2)]
-    NoAccount,
-    /// No invitation of that name names that owner.
-    #[codec(index = 3)]
-    NotInvited,
-    /// The invitation expired before the account was opened.
-    #[codec(index = 4)]
-    Expired,
-    /// The digest the caller proved holds no account.
-    #[codec(index = 5)]
-    NotOwner,
-    /// The payer's account is frozen: no debit until a rekey.
-    #[codec(index = 6)]
-    Frozen,
-    /// The payer's account holds less than the amount.
-    #[codec(index = 7)]
-    Insufficient,
-    /// An account's total credits or debits would pass `u64::MAX`: the
-    /// issuance's debits cap all that is ever minted.
-    #[codec(index = 8)]
-    Overflow,
-    /// The kernel refused the transfer for another reason: its
-    /// `EventStatus` number.
-    #[codec(index = 9)]
-    Refused(u32),
-    /// An owner that is not a digest: a word at or above `p`.
-    #[codec(index = 10)]
-    BadOwner,
-    /// A payment to the payer's own account.
-    #[codec(index = 11)]
-    SamePayee,
-    /// A transfer or a mint of nothing.
-    #[codec(index = 12)]
-    NoAmount,
 }
 
 #[actor]
@@ -142,13 +81,6 @@ fn id(count: u64) -> [u8; 16] {
     let mut id = [0; 16];
     id[..8].copy_from_slice(&(count + 1).to_le_bytes());
     id
-}
-
-/// Whether `owner` is a digest, each word below `p = 2^31 - 1`.
-fn canonical(owner: &Owner) -> bool {
-    owner
-        .chunks_exact(4)
-        .all(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]) < 0x7fff_ffff)
 }
 
 fn refused(status: EventStatus) -> PaymentError {
@@ -299,7 +231,7 @@ impl Payments {
         expires_ms: u64,
     ) -> Result<(), PaymentError> {
         named(&name)?;
-        if !canonical(&owner) {
+        if vos_sdk::credentials::words(&owner).is_none() {
             return Err(PaymentError::BadOwner);
         }
         if self.names.get(&name).is_some() || self.owners.get(&owner).is_some() {
@@ -450,7 +382,7 @@ impl Payments {
     /// a freeze: a lost secret's recovery, once its member enrolled again.
     #[msg(role = "operator")]
     pub async fn rekey(&mut self, name: Name, owner: Owner) -> Result<(), PaymentError> {
-        if !canonical(&owner) {
+        if vos_sdk::credentials::words(&owner).is_none() {
             return Err(PaymentError::BadOwner);
         }
         let (id, mut account) = self.named_account(&name).ok_or(PaymentError::NoAccount)?;
