@@ -9,6 +9,7 @@ import android.os.BatteryManager;
 import android.os.Binder;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.Parcel;
 import android.os.ParcelFileDescriptor;
 import android.os.PowerManager;
 import android.os.Process;
@@ -69,6 +70,8 @@ public final class VosNode {
 
   private final Context context;
   private final long handle;
+  /** The uid each transaction of the two interfaces comes from. */
+  private final Callers callers;
   private final IVosNode.Stub binder = new Served();
   private final IVosPersonal.Stub personal = new Personal();
   /** The sessions each UI token opened, closed when its process dies or it releases them. */
@@ -88,6 +91,7 @@ public final class VosNode {
 
   private VosNode(Context context) {
     this.context = context;
+    this.callers = Binder::getCallingUid;
     System.loadLibrary(LIBRARY);
     File store = new File(context.getNoBackupFilesDir(), "credentials");
     File tor = new File(context.getFilesDir(), "tor");
@@ -119,9 +123,24 @@ public final class VosNode {
     return personal;
   }
 
-  /** Only this app's own processes are served. */
-  private static void caller() {
-    if (Binder.getCallingUid() != Process.myUid()) {
+  /** A facility that opened nothing, its transactions' uid read from {@code callers}. */
+  VosNode(Callers callers) {
+    this.context = null;
+    this.handle = 0;
+    this.callers = callers;
+  }
+
+  /** Where a transaction's uid is read. */
+  interface Callers {
+    int uid();
+  }
+
+  /**
+   * Only this app's own processes are served: each interface's every transaction, whatever its
+   * code, refused before its dispatch when it comes from another uid.
+   */
+  private void caller() {
+    if (callers.uid() != Process.myUid()) {
       throw new SecurityException("the VOS facility serves this app alone");
     }
   }
@@ -251,8 +270,14 @@ public final class VosNode {
   /** s4's interface, for this app's own processes alone. */
   private final class Served extends IVosNode.Stub {
     @Override
-    public void hold(IBinder client) {
+    public boolean onTransact(int code, Parcel data, Parcel reply, int flags)
+        throws RemoteException {
       caller();
+      return super.onTransact(code, data, reply, flags);
+    }
+
+    @Override
+    public void hold(IBinder client) {
       int pid = Binder.getCallingPid();
       synchronized (held) {
         if (held.containsKey(client)) {
@@ -270,19 +295,16 @@ public final class VosNode {
 
     @Override
     public void release(IBinder client) {
-      caller();
       released(client);
     }
 
     @Override
     public boolean supported() {
-      caller();
       return nativeSupported(handle);
     }
 
     @Override
     public long open(Gateway gateway, Refusal refused) {
-      caller();
       long session = nativeOpenSession(handle, gateway, refused);
       if (session != 0) {
         opened(session);
@@ -292,7 +314,6 @@ public final class VosNode {
 
     @Override
     public boolean granted(long session, Refusal refused) {
-      caller();
       grants.put(session, SystemClock.elapsedRealtime());
       Log.i(TAG, "session granted");
       return nativeGranted(handle, session, refused);
@@ -300,7 +321,6 @@ public final class VosNode {
 
     @Override
     public void close(long session) {
-      caller();
       grants.remove(session);
       closed(session);
       nativeClose(handle, session);
@@ -309,14 +329,12 @@ public final class VosNode {
     @Override
     public Enrolled enroll(
         long session, EnrollRequest request, IVosPrompts prompts, Refusal refused) {
-      caller();
       return nativeEnroll(handle, session, request, prompts, refused);
     }
 
     @Override
     public SignedIn signIn(
         long session, SignInRequest request, IVosPrompts prompts, Refusal refused) {
-      caller();
       Announced announced = announced(prompts, "sign-in", grants.get(session));
       SignedIn signed = nativeSignIn(handle, session, request, announced, refused);
       Log.i(
@@ -329,7 +347,6 @@ public final class VosNode {
 
     @Override
     public Paid pay(long session, PayRequest request, IVosPrompts prompts, Refusal refused) {
-      caller();
       Announced announced = announced(prompts, "payment", grants.get(session));
       Paid paid = nativePay(handle, session, request, announced, refused);
       Log.i(
@@ -342,36 +359,26 @@ public final class VosNode {
 
     @Override
     public boolean refresh(long session, Refusal refused) {
-      caller();
       return nativeRefresh(handle, session, refused);
     }
 
     @Override
     public void foreground(boolean foreground) {
-      caller();
       nativeForeground(handle, foreground, new Refusal());
     }
 
     @Override
     public EnrolledSpace[] enrollments(Refusal refused) {
-      caller();
       return nativeEnrollments(handle, EnrolledSpace.class, refused);
     }
 
     @Override
     public JobRun[] runs(Refusal refused) {
-      caller();
       return VosNode.this.runs(refused);
     }
 
     @Override
     public byte[] screens(StreamTarget gateway, ParcelFileDescriptor end, Refusal refused) {
-      try {
-        caller();
-      } catch (RuntimeException refusedCaller) {
-        closeQuietly(end);
-        throw refusedCaller;
-      }
       if (end == null) {
         refused.code = ErrorCode.ARGUMENTS;
         refused.message = "the screens need the UI's end of a socket pair";
@@ -383,7 +390,6 @@ public final class VosNode {
 
     @Override
     public boolean clearnet(byte[] hostKey, Refusal refused) {
-      caller();
       return nativeClearnet(handle, hostKey, refused);
     }
   }
@@ -391,208 +397,181 @@ public final class VosNode {
   /** The facility's own interface, for this app's own processes alone. */
   private final class Personal extends IVosPersonal.Stub {
     @Override
-    public Synced sync(Refusal refused) {
+    public boolean onTransact(int code, Parcel data, Parcel reply, int flags)
+        throws RemoteException {
       caller();
+      return super.onTransact(code, data, reply, flags);
+    }
+
+    @Override
+    public Synced sync(Refusal refused) {
       return VosNode.this.sync(refused);
     }
 
     @Override
     public Synced syncPersonal(Refusal refused) {
-      caller();
       return VosNode.this.syncPersonal(refused);
     }
 
     @Override
     public boolean bridges(String[] lines, Refusal refused) {
-      caller();
       return nativeBridges(handle, lines, refused);
     }
 
     @Override
     public boolean bootstrap(Refusal refused) {
-      caller();
       return nativeBootstrap(handle, refused);
     }
 
     @Override
     public boolean optOut(byte[] space, boolean optedOut, Refusal refused) {
-      caller();
       return nativeOptOut(handle, space, optedOut, refused);
     }
 
     @Override
     public PersonalStatus status(Refused refused) {
-      caller();
       return nativeStatus(handle, refused);
     }
 
     @Override
     public Claimed claim(ClaimRequest request, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeClaim(handle, request, prompts, refused);
     }
 
     @Override
     public PairCode pairOffer(IVosPrompts prompts, Refused refused) {
-      caller();
       return nativePairOffer(handle, prompts, refused);
     }
 
     @Override
     public Paired pairAwait(IVosPrompts prompts, Refused refused) {
-      caller();
       return nativePairAwait(handle, prompts, refused);
     }
 
     @Override
     public void pairCancel() {
-      caller();
       nativePairCancel(handle, new Refused());
     }
 
     @Override
     public Paired pairJoin(byte[] code, String label, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativePairJoin(handle, code, label, prompts, refused);
     }
 
     @Override
     public Membership[] memberships(Refused refused) {
-      caller();
       return nativeMemberships(handle, Membership.class, refused);
     }
 
     @Override
     public boolean enrollDevice(Membership membership, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeEnrollDevice(handle, membership, prompts, refused);
     }
 
     @Override
     public boolean confirmDevice(Membership membership, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeConfirmDevice(handle, membership, prompts, refused);
     }
 
     @Override
     public boolean dropEnrollment(Membership membership, Refused refused) {
-      caller();
       return nativeDropEnrollment(handle, membership, refused);
     }
 
     @Override
     public int revoke(long device, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeRevoke(handle, device, prompts, refused);
     }
 
     @Override
     public Device[] devices(Refused refused) {
-      caller();
       return nativeDevices(handle, Device.class, refused);
     }
 
     @Override
     public Notice[] operations(Refused refused) {
-      caller();
       return nativeOperations(handle, Notice.class, refused);
     }
 
     @Override
     public Posted remove(long device, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeRemove(handle, device, prompts, refused);
     }
 
     @Override
     public Posted veto(long index, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeVeto(handle, index, prompts, refused);
     }
 
     @Override
     public Posted cosign(long index, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeCosign(handle, index, prompts, refused);
     }
 
     @Override
     public Posted resolve(long index, boolean upheld, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeResolve(handle, index, upheld, prompts, refused);
     }
 
     @Override
     public Posted rotateKit(byte kit, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeRotateKit(handle, kit, prompts, refused);
     }
 
     @Override
     public Posted replaceAdmin(byte kit, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeReplaceAdmin(handle, kit, prompts, refused);
     }
 
     @Override
     public byte[] adminOffer(IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeAdminOffer(handle, prompts, refused);
     }
 
     @Override
     public Posted replaceAdminOf(byte[] code, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeReplaceAdminOf(handle, code, prompts, refused);
     }
 
     @Override
     public Posted regroup(IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeRegroup(handle, prompts, refused);
     }
 
     @Override
     public boolean update(IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeUpdate(handle, prompts, refused);
     }
 
     @Override
     public Posted restore(ClaimRequest request, byte old, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeRestore(handle, request, old, prompts, refused);
     }
 
     @Override
     public KitView kitView(Home home, byte kit, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeKitView(handle, home, kit, prompts, refused);
     }
 
     @Override
     public Posted removeByKit(
         Home home, byte kit, long device, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeRemoveByKit(handle, home, kit, device, prompts, refused);
     }
 
     @Override
     public Posted resolveByKit(
         Home home, byte kit, long index, boolean upheld, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeResolveByKit(handle, home, kit, index, upheld, prompts, refused);
     }
 
     @Override
     public Claimed restored(byte kit, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeRestored(handle, kit, prompts, refused);
     }
 
     @Override
     public Claimed moveHome(ClaimRequest request, IVosPrompts prompts, Refused refused) {
-      caller();
       return nativeMoveHome(handle, request, prompts, refused);
     }
   }
@@ -702,17 +681,6 @@ public final class VosNode {
 
   private static native JobRun[] nativeRuns(
       long handle, Class<JobRun> element, Refusal refused);
-
-  private static void closeQuietly(ParcelFileDescriptor descriptor) {
-    if (descriptor == null) {
-      return;
-    }
-    try {
-      descriptor.close();
-    } catch (java.io.IOException ignored) {
-      // Closing a descriptor no one reads.
-    }
-  }
 
   private static native byte[] nativeScreens(
       long handle, StreamTarget gateway, int descriptor, Refusal refused);
