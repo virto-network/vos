@@ -109,29 +109,6 @@ impl Places {
     }
 }
 
-/// A read's place among those waiting, given back when it ends, however it
-/// ends: a client that hangs up mid-wait goes unnoticed, so its read holds
-/// its place until its wait ends.
-struct Waiting<'a>(&'a AtomicUsize);
-
-impl<'a> Waiting<'a> {
-    /// A place among `waiting`, if fewer than `most` hold one.
-    fn take(waiting: &'a AtomicUsize, most: usize) -> Option<Self> {
-        waiting
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-                (held < most).then_some(held + 1)
-            })
-            .ok()
-            .map(|_| Waiting(waiting))
-    }
-}
-
-impl Drop for Waiting<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// Credentialed calls' bodies past a call's limit held at once, from the
 /// socket and QUIC together, apart from the installs' large bodies. A
 /// credentialed call gives its place back once its proof is verified, so
@@ -350,7 +327,7 @@ impl Api {
         }
         let settings = &self.inner.settings;
         let place = (read.wait_ms > 0)
-            .then(|| Waiting::take(&self.waiting, settings.workflow_waits))
+            .then(|| crate::Held::take(&self.waiting, settings.workflow_waits))
             .flatten();
         let wait = match place {
             Some(_) => Duration::from_millis(read.wait_ms).min(settings.workflow_wait),

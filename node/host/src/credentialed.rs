@@ -37,7 +37,7 @@
 //! runs.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -191,25 +191,7 @@ struct Front {
 /// verification ends, however it ends: it goes with the executor's job, so
 /// a request cancelled while its proof is verified holds its place until
 /// the job is done.
-pub(crate) struct Verifying(Arc<AtomicUsize>);
-
-impl Verifying {
-    /// A place, if fewer than `most` verifications are in flight.
-    fn take(in_flight: &Arc<AtomicUsize>, most: usize) -> Option<Self> {
-        in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-                (held < most).then_some(held + 1)
-            })
-            .ok()
-            .map(|_| Verifying(Arc::clone(in_flight)))
-    }
-}
-
-impl Drop for Verifying {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
+pub(crate) type Verifying = crate::Held<Arc<AtomicUsize>>;
 
 /// A proven call that passed every check but the proof's: the program and
 /// io-hash it is verified against, and the input the log carries once it
@@ -311,8 +293,10 @@ impl Inner {
             Ok(checked) => checked,
             Err(refused) => return refused.into(),
         };
-        let Some(place) = Verifying::take(&self.calls.verifying, self.settings.verifications)
-        else {
+        let Some(place) = Verifying::take(
+            Arc::clone(&self.calls.verifying),
+            self.settings.verifications,
+        ) else {
             return Response::Busy;
         };
         let stats = Arc::clone(&self.stats);
@@ -692,6 +676,7 @@ fn ring(snapshot: &Snapshot, agent: AgentId) -> Result<Option<Ring>, Fault> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     /// The device formats a node admits are one or two, distinct, each one
     /// this binary verifies; the release's are.
@@ -721,15 +706,18 @@ mod tests {
     #[test]
     fn the_verification_budget_is_held_and_given_back() {
         let in_flight = Arc::new(AtomicUsize::new(0));
-        let first = Verifying::take(&in_flight, 2).expect("a place");
-        let second = Verifying::take(&in_flight, 2).expect("a place");
-        assert!(Verifying::take(&in_flight, 2).is_none(), "the budget spent");
+        let first = Verifying::take(Arc::clone(&in_flight), 2).expect("a place");
+        let second = Verifying::take(Arc::clone(&in_flight), 2).expect("a place");
+        assert!(
+            Verifying::take(Arc::clone(&in_flight), 2).is_none(),
+            "the budget spent"
+        );
         drop(first);
-        assert!(Verifying::take(&in_flight, 2).is_some());
+        assert!(Verifying::take(Arc::clone(&in_flight), 2).is_some());
         drop(second);
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
         assert!(
-            Verifying::take(&in_flight, 0).is_none(),
+            Verifying::take(Arc::clone(&in_flight), 0).is_none(),
             "no budget, no place"
         );
     }

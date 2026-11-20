@@ -31,28 +31,6 @@ const FLOOR: Duration = Duration::from_secs(5);
 /// How long a replica tries to learn a read index from its leader.
 const READING: Duration = Duration::from_secs(10);
 
-/// A query's place among those waiting for their floor, given back
-/// however its wait ends.
-struct FloorWait<'a>(&'a std::sync::atomic::AtomicUsize);
-
-impl<'a> FloorWait<'a> {
-    fn take(waiting: &'a std::sync::atomic::AtomicUsize, most: usize) -> Option<Self> {
-        use std::sync::atomic::Ordering;
-        waiting
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-                (held < most).then_some(held + 1)
-            })
-            .ok()
-            .map(|_| FloorWait(waiting))
-    }
-}
-
-impl Drop for FloorWait<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 /// A query as its caller asked it.
 pub(crate) struct Asked {
     pub(crate) caller: Principal,
@@ -153,7 +131,7 @@ impl Inner {
         }
         // A place among the queries waiting for a floor: past them, one is
         // answered at once, and its client asks another replica.
-        let Some(_place) = FloorWait::take(&self.floor_waits, self.settings.floor_waits) else {
+        let Some(_place) = crate::Held::take(&self.floor_waits, self.settings.floor_waits) else {
             return Err(Response::Rejected(Rejection::Behind));
         };
         let applied = run
