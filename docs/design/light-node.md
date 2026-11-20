@@ -3771,7 +3771,7 @@ device's crates faster); its size argument is small.
   it first as a pairing does); "Commit now" from a matured removal's
   notice carries it and revokes the removed device in every space its
   handles name in one flow (`commitRemovals`, one prompt a signature); a
-  phone leaves its personal space by signing its own removal with its
+  phone past its probation leaves its personal space by signing its own removal with its
   own admin key, which another device's commit carries, its pass then
   reading it through to `Out`. One test
   double for all of it: `vos_light::testing` (`Phone`, `World`,
