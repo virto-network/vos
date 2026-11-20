@@ -140,19 +140,17 @@ struct PersonalArgs {
 }
 
 impl PersonalArgs {
-    fn request(&self, seed: u64) -> Option<(PathBuf, PathBuf, u32, u64, u32)> {
-        (self.personal > 0).then(|| {
-            (
-                self.personal_elf.clone().unwrap_or_else(|| {
-                    guest("agent/programs/target/riscv64em-vos/release/vos-personal.elf")
-                }),
-                self.home_elf.clone().unwrap_or_else(|| {
-                    guest("agent/test-actors/target/riscv64em-vos/release/home.elf")
-                }),
-                self.personal,
-                seed,
-                self.personal_creators,
-            )
+    fn request(&self, seed: u64) -> Option<personal::Request> {
+        (self.personal > 0).then(|| personal::Request {
+            count: self.personal,
+            personal: self.personal_elf.clone().unwrap_or_else(|| {
+                guest("agent/programs/target/riscv64em-vos/release/vos-personal.elf")
+            }),
+            home: self.home_elf.clone().unwrap_or_else(|| {
+                guest("agent/test-actors/target/riscv64em-vos/release/home.elf")
+            }),
+            seed,
+            creators: self.personal_creators,
         })
     }
 }
@@ -437,17 +435,8 @@ fn make_agents(inventory: &Inventory, args: &AgentsArgs, run: Option<&Run>) -> R
             creators: args.creators,
         },
     )?;
-    if let Some((personal, home, count, seed, creators)) = args.personal.request(args.seed) {
-        personal::create(
-            inventory,
-            &personal::Request {
-                count,
-                personal: &personal,
-                home: &home,
-                seed,
-                creators,
-            },
-        )?;
+    if let Some(request) = args.personal.request(args.seed) {
+        personal::create(inventory, &request)?;
     }
     if let Some(run) = run {
         keep_agents(inventory, run)?;

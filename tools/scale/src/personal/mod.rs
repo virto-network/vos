@@ -14,7 +14,7 @@ mod load;
 mod onion;
 mod summary;
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -157,11 +157,11 @@ pub fn policy() -> Policy {
 }
 
 /// What `agents --personal` makes.
-pub struct Request<'a> {
+pub struct Request {
     /// The agents the load wakes; one more is made for the fill.
     pub count: u32,
-    pub personal: &'a Path,
-    pub home: &'a Path,
+    pub personal: PathBuf,
+    pub home: PathBuf,
     pub seed: u64,
     pub creators: u32,
 }
@@ -239,8 +239,8 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Personals, Str
     let operators = operators(inventory, &deployed)?;
     let weights = inventory.placement_weights();
     let mut mix = Mix(request.seed ^ 0x9e75_0a1a);
-    let personal = read_elf(request.personal)?;
-    let home_elf = read_elf(request.home)?;
+    let personal = read_elf(&request.personal)?;
+    let home_elf = read_elf(&request.home)?;
     let created_from_ms = crate::now_ms();
     let replicas = place(&weights, &mut mix);
     let home = created(operators[usize::from(replicas[0]) - 1].create_agent(replicas.clone()))?;
