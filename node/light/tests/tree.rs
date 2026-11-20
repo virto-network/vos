@@ -7,127 +7,29 @@
 //! held, never a place an answer wrote; and a keeper off the real feed
 //! starting over.
 
-use std::collections::BTreeMap;
+mod common;
 
 use scale::{Decode, Encode};
-use vos_abi::credentials::{self, DEPTH, EMPTY, P, Words, compress, leaf};
+use vos_abi::credentials::{self, EMPTY, P, Words, leaf};
 use vos_abi::ids::{AgentId, MethodId};
 use vos_abi::result::Outcome;
 use vos_light::{DeviceError, Digest, Synced, TreeKeeper, derive_secret, member, wire};
-use vos_wire::credentials::{Change, Feed, RootEntry};
+use vos_wire::credentials::Feed;
 use vos_wire::ingress::QueryCall;
 use vos_wire::ingress::Response;
 
-/// A sparse tree rebuilt from its leaves at every read: the reference.
-#[derive(Clone, Default)]
-struct Tree {
-    leaves: BTreeMap<u32, Words>,
-}
+use common::tree::{Writes, serve_feed};
 
-impl Tree {
-    fn node(&self, level: usize, index: u64) -> Words {
-        let first = index << level;
-        let last = (first + (1u64 << level) - 1).min(u64::from(u32::MAX));
-        if self
-            .leaves
-            .range(first as u32..=last as u32)
-            .next()
-            .is_none()
-        {
-            return EMPTY[level];
-        }
-        if level == 0 {
-            return self.leaves[&(index as u32)];
-        }
-        compress(
-            &self.node(level - 1, 2 * index),
-            &self.node(level - 1, 2 * index + 1),
-        )
+/// The credential actor's answer over `writes` to `request`, a query of
+/// `feed(from)` or of `feed_after(root)`: a page of at most four changes.
+fn serve(writes: &Writes, request: &[u8]) -> Vec<u8> {
+    let (_, query) = <(AgentId, QueryCall)>::decode_exact(&request[2..]).unwrap();
+    let body = serve_feed(&writes.changes, &query, 4).expect("a query of the feed");
+    Response::Ran {
+        outcome: Outcome::Done(body),
+        at: 1,
     }
-
-    fn root(&self) -> [u8; 32] {
-        credentials::digest(&self.node(DEPTH, 0))
-    }
-
-    fn siblings(&self, slot: u32) -> [Digest; DEPTH] {
-        core::array::from_fn(|level| Digest(self.node(level, u64::from(slot >> level ^ 1))))
-    }
-}
-
-/// The feed of a sequence of writes, and the reference after each.
-struct Writes {
-    tree: Tree,
-    changes: Vec<Change>,
-}
-
-impl Writes {
-    fn new() -> Self {
-        Self {
-            tree: Tree::default(),
-            changes: Vec::new(),
-        }
-    }
-
-    /// A write at `time` setting `leaves` (an empty leaf revokes).
-    fn write(&mut self, time: u64, leaves: &[(u32, Words)]) {
-        let mut set: Vec<(u32, [u8; 32])> = Vec::new();
-        for &(slot, leaf) in leaves {
-            if leaf == EMPTY[0] {
-                self.tree.leaves.remove(&slot);
-            } else {
-                self.tree.leaves.insert(slot, leaf);
-            }
-            set.push((slot, credentials::digest(&leaf)));
-        }
-        set.sort_unstable_by_key(|(slot, _)| *slot);
-        self.changes.push(Change {
-            leaves: set,
-            root: RootEntry {
-                root: self.tree.root(),
-                since: time,
-            },
-        });
-    }
-
-    /// The page of the changes `from..to`.
-    fn page(&self, from: usize, to: usize) -> Feed {
-        Feed {
-            from: from as u64,
-            changes: self.changes[from..to].to_vec(),
-            length: self.changes.len() as u64,
-        }
-    }
-}
-
-impl Writes {
-    /// The credential actor's answer over these writes to `request`, a
-    /// query of `feed(from)` or of `feed_after(root)`: a page of at most
-    /// four changes.
-    fn serve(&self, request: &[u8]) -> Vec<u8> {
-        let (_, query) = <(AgentId, QueryCall)>::decode_exact(&request[2..]).unwrap();
-        let length = self.changes.len();
-        let page = |from: usize| Feed {
-            from: from as u64,
-            changes: self.changes[from.min(length)..(from + 4).min(length)].to_vec(),
-            length: length as u64,
-        };
-        let body = if query.method == vos_wire::credentials::method::FEED {
-            page(u64::decode_exact(&query.arguments).unwrap() as usize).encode()
-        } else {
-            assert_eq!(query.method, vos_wire::credentials::method::FEED_AFTER);
-            let root = <[u8; 32]>::decode_exact(&query.arguments).unwrap();
-            self.changes
-                .iter()
-                .rposition(|change| change.root.root == root)
-                .map(|last| page(last + 1))
-                .encode()
-        };
-        Response::Ran {
-            outcome: Outcome::Done(body),
-            at: 1,
-        }
-        .encode()
-    }
+    .encode()
 }
 
 /// `keeper`'s next query, as the gateway reads it: its method and
@@ -168,7 +70,7 @@ fn secret_member() -> Digest {
 /// The writes of a space: enrollments one by one and many at once, the
 /// member among them, revocations and a freed slot taken again.
 fn writes(mine: &Digest) -> Writes {
-    let mut writes = Writes::new();
+    let mut writes = Writes::default();
     for slot in 0..5 {
         writes.write(1, &[(slot, leaf(&other(slot)))]);
     }
@@ -216,7 +118,7 @@ fn the_tree_kept_from_the_feed_gives_the_members_path() {
     }
     let witness = keeper.witness().expect("the member's leaf is in the tree");
     assert_eq!(witness.slot, 17);
-    assert_eq!(witness.root.to_bytes(), writes.tree.root());
+    assert_eq!(witness.root.to_bytes(), writes.tree.root().to_bytes());
     assert_eq!(witness.siblings, writes.tree.siblings(17));
     assert!(witness.proves(&mine));
 
@@ -228,7 +130,7 @@ fn the_tree_kept_from_the_feed_gives_the_members_path() {
     keeper.apply(&more.page(at, end)).unwrap();
     assert_eq!(keeper.slot(), None);
     assert_eq!(keeper.witness(), None);
-    assert_eq!(keeper.root().root, more.tree.root());
+    assert_eq!(keeper.root().root, more.tree.root().to_bytes());
 }
 
 /// A change leaving another root than it names, a leaf that is no digest,
@@ -289,7 +191,7 @@ fn a_page_that_does_not_check_is_refused_whole() {
     assert_eq!(keeper.slot(), held);
 
     keeper.apply(&rest).unwrap();
-    assert_eq!(keeper.root().root, writes.tree.root());
+    assert_eq!(keeper.root().root, writes.tree.root().to_bytes());
     assert!(keeper.witness().unwrap().proves(&mine));
     assert_eq!(
         wire::feed_answer(&[0xff]).map(|_| ()),
@@ -369,18 +271,18 @@ fn the_feed_is_read_on_its_own_timer() {
 fn a_page_past_the_feeds_bounds_is_refused() {
     let mine = secret_member();
     let mut keeper = TreeKeeper::new(mine);
-    let mut sparse = Writes::new();
+    let mut sparse = Writes::default();
     sparse.write(1, &[(0, leaf(&other(1)))]);
     sparse.write(1, &[(1 << 30, leaf(&other(2)))]);
     assert_eq!(keeper.apply(&sparse.page(0, 2)), Err(DeviceError::Witness));
-    let mut revoked = Writes::new();
+    let mut revoked = Writes::default();
     revoked.write(1, &[(0, EMPTY[0])]);
     assert_eq!(keeper.apply(&revoked.page(0, 1)), Err(DeviceError::Witness));
-    let mut many = Writes::new();
+    let mut many = Writes::default();
     let leaves: Vec<_> = (0..257).map(|slot| (slot, leaf(&other(slot)))).collect();
     many.write(1, &leaves);
     assert_eq!(keeper.apply(&many.page(0, 1)), Err(DeviceError::Witness));
-    let mut long = Writes::new();
+    let mut long = Writes::default();
     for slot in 0..700 {
         long.write(1, &[(slot, leaf(&other(slot)))]);
     }
@@ -426,8 +328,10 @@ fn a_padded_feed_leaves_no_mark_in_the_next_query() {
     honest.apply(&writes.page(0, end)).unwrap();
 
     let mut padded = writes.page(0, end - 1);
-    let mut tree = Writes::new();
-    tree.changes = padded.changes.clone();
+    let mut tree = Writes {
+        changes: padded.changes.clone(),
+        ..Writes::default()
+    };
     for change in &padded.changes {
         for (slot, leaf) in &change.leaves {
             let leaf = credentials::words(leaf).unwrap();
@@ -459,7 +363,7 @@ fn a_padded_feed_leaves_no_mark_in_the_next_query() {
     assert_eq!(query_of(&marked), query_of(&honest));
 
     let read = marked.ingest(
-        &writes.serve(&marked.request(4, &[0x1d; 32], 2, 900).unwrap()),
+        &serve(&writes, &marked.request(4, &[0x1d; 32], 2, 900).unwrap()),
         0,
     );
     assert_eq!(read.unwrap().applied, 0);
@@ -475,11 +379,11 @@ fn a_padded_feed_leaves_no_mark_in_the_next_query() {
 fn a_keeper_off_the_feed_starts_over() {
     let mine = secret_member();
     let ours = writes(&mine);
-    let mut shorter = Writes::new();
+    let mut shorter = Writes::default();
     shorter.write(1, &[(0, leaf(&other(50)))]);
     shorter.write(1, &[(1, leaf(&mine.0))]);
     shorter.write(2, &[(2, leaf(&other(51)))]);
-    let mut longer = Writes::new();
+    let mut longer = Writes::default();
     for slot in 0..19 {
         longer.write(1 + u64::from(slot), &[(slot, leaf(&other(60 + slot)))]);
     }
@@ -492,12 +396,12 @@ fn a_keeper_off_the_feed_starts_over() {
         let mut reset = false;
         for _ in 0..12 {
             let request = keeper.request(4, &[0x1d; 32], 2, 900).unwrap();
-            if let Ok(read) = keeper.ingest(&real.serve(&request), 0) {
+            if let Ok(read) = keeper.ingest(&serve(&real, &request), 0) {
                 reset |= read.reset;
             }
         }
         assert!(reset);
-        assert_eq!(keeper.root().root, real.tree.root());
+        assert_eq!(keeper.root().root, real.tree.root().to_bytes());
         assert!(
             keeper
                 .witness()
@@ -531,7 +435,10 @@ fn a_feed_held_back_meets_the_grace_and_one_read_proves_again() {
         assert!(honest.due(now), "read {read} later than the longest gap");
         let request = honest.request(4, &[0x1d; 32], 2, 900).unwrap();
         assert_eq!(
-            honest.ingest(&quiet.serve(&request), now).unwrap().applied,
+            honest
+                .ingest(&serve(&quiet, &request), now)
+                .unwrap()
+                .applied,
             0
         );
     }
@@ -553,7 +460,7 @@ fn a_feed_held_back_meets_the_grace_and_one_read_proves_again() {
     let mut keeper = TreeKeeper::new(mine);
     keeper.ingest(&answer(&cut), superseded).unwrap();
     let old = keeper.witness().expect("a path at the root it was left at");
-    assert_ne!(old.root.to_bytes(), writes.tree.root());
+    assert_ne!(old.root.to_bytes(), writes.tree.root().to_bytes());
     assert_eq!(
         ring.accepts(&old.root.to_bytes(), superseded + ROOT_GRACE_MS),
         Ok(())
@@ -569,11 +476,14 @@ fn a_feed_held_back_meets_the_grace_and_one_read_proves_again() {
     assert!(keeper.due(now + TreeKeeper::UNKNOWN_SPREAD_MS));
     let request = keeper.request(4, &[0x1d; 32], 2, 900).unwrap();
     let read = keeper
-        .ingest(&writes.serve(&request), now + TreeKeeper::UNKNOWN_SPREAD_MS)
+        .ingest(
+            &serve(&writes, &request),
+            now + TreeKeeper::UNKNOWN_SPREAD_MS,
+        )
         .unwrap();
     assert_eq!(read.applied, 1);
     let fresh = keeper.witness().expect("the newest root's path");
-    assert_eq!(fresh.root.to_bytes(), writes.tree.root());
+    assert_eq!(fresh.root.to_bytes(), writes.tree.root().to_bytes());
     assert!(fresh.proves(&mine));
     assert_eq!(ring.accepts(&fresh.root.to_bytes(), u64::MAX), Ok(()));
 }

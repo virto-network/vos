@@ -5,14 +5,15 @@
 //! `RootUnknown` answer proving anew at the new root, and the stock
 //! kernels' programs from their release artifacts.
 
-use std::collections::BTreeMap;
+mod common;
+
 use std::sync::OnceLock;
 
 use blake2::{Blake2b512, Digest as _};
 use ed25519_dalek::{Signature, VerifyingKey};
 use scale::{Decode, Encode};
 use sha2::Sha256;
-use vos_abi::credentials::{self, DEPTH, EMPTY, P, Tag, Words, compress, leaf};
+use vos_abi::credentials::{self, P, Tag, Words, compress};
 use vos_abi::ids::{AgentId, InstanceId, MethodId, derive_id};
 use vos_abi::result::Outcome;
 use vos_api::Kind;
@@ -27,6 +28,8 @@ use vos_wire::ingress::{
     query_message,
 };
 
+use common::tree::Tree;
+
 const HANDLE: [u8; 32] = [7; 32];
 const NAME: &[u8] = b"login";
 /// `scope([0x51; 32], 4, 2, "login")`'s bytes, the name in SCALE.
@@ -34,54 +37,6 @@ const SCOPE_VECTOR: [u8; 32] = [
     176, 47, 24, 3, 211, 3, 208, 103, 92, 44, 198, 75, 144, 255, 58, 99, 210, 27, 59, 25, 235, 172,
     49, 126, 162, 142, 147, 35, 82, 189, 54, 43,
 ];
-
-/// A sparse tree of depth 32 over `C`, rebuilt from its leaves: the
-/// credential actor's, as `proving.md` §8 defines it.
-#[derive(Default)]
-struct Tree {
-    leaves: BTreeMap<u32, Words>,
-}
-
-impl Tree {
-    fn enroll(&mut self, slot: u32, member: &Digest) {
-        self.leaves.insert(slot, leaf(&member.0));
-    }
-
-    fn node(&self, level: usize, index: u64) -> Words {
-        let first = index << level;
-        let last = first + (1u64 << level) - 1;
-        if self
-            .leaves
-            .range(first as u32..=last.min(u64::from(u32::MAX)) as u32)
-            .next()
-            .is_none()
-        {
-            return EMPTY[level];
-        }
-        if level == 0 {
-            return self.leaves[&(index as u32)];
-        }
-        compress(
-            &self.node(level - 1, 2 * index),
-            &self.node(level - 1, 2 * index + 1),
-        )
-    }
-
-    fn root(&self) -> Digest {
-        Digest(self.node(DEPTH, 0))
-    }
-
-    /// The path of the member at `slot`, at the tree's root.
-    fn witness(&self, slot: u32) -> AuthWitness {
-        AuthWitness {
-            root: self.root(),
-            slot,
-            siblings: core::array::from_fn(|level| {
-                Digest(self.node(level, u64::from(slot >> level ^ 1)))
-            }),
-        }
-    }
-}
 
 fn secret(seed: u8) -> vos_light::DeviceSecret {
     derive_secret(&[seed; 32], &HANDLE)

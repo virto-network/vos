@@ -1,10 +1,11 @@
 //! What the light node's test binaries share: the release artifacts from
-//! this tree's guests, and a device's light node with one local actor
-//! installed.
+//! this tree's guests, a device's light node with one local actor
+//! installed, and the reference credential tree with its feed.
 
 #![allow(dead_code)]
 
 pub mod device;
+pub mod tree;
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

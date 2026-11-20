@@ -7,6 +7,7 @@
 //! (`StreamPrefs::set_isolation`) is the one line the capture does not
 //! reach; the onion example exercises it over the live network.
 
+mod common;
 #[path = "../src/testing/held.rs"]
 mod held;
 
@@ -20,7 +21,7 @@ use russh::keys::{PublicKeyOrCertificate, ssh_key};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use vos_abi::credentials::{self, DEPTH, EMPTY, Words};
+use vos_abi::credentials;
 use vos_abi::ids::AgentId;
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode};
@@ -31,9 +32,10 @@ use vos_light::tor::{
     onion_address,
 };
 use vos_light::{DeviceError, TreeKeeper, wire};
-use vos_wire::credentials::{Change, Feed, Onion, RootEntry};
+use vos_wire::credentials::{Change, Onion};
 use vos_wire::ingress::{QueryCall, Response};
 
+use common::tree::{Writes, serve_feed};
 use held::Held;
 
 /// What the gateway's capture holds of one connection.
@@ -123,26 +125,7 @@ impl Gateway {
             return self.onions.lock().unwrap().encode();
         };
         let feed = self.feed.lock().unwrap();
-        let page = |from: u64| {
-            let start = (from as usize).min(feed.len());
-            let end = (start + 3).min(feed.len());
-            Feed {
-                from,
-                changes: feed[start..end].to_vec(),
-                length: feed.len() as u64,
-            }
-        };
-        if query.method == vos_wire::credentials::method::FEED {
-            page(u64::decode_exact(&query.arguments).expect("a place")).encode()
-        } else if query.method == vos_wire::credentials::method::FEED_AFTER {
-            let root = <[u8; 32]>::decode_exact(&query.arguments).expect("a root");
-            feed.iter()
-                .rposition(|change| change.root.root == root)
-                .map(|last| page(last as u64 + 1))
-                .encode()
-        } else {
-            self.onions.lock().unwrap().encode()
-        }
+        serve_feed(&feed, &query, 3).unwrap_or_else(|| self.onions.lock().unwrap().encode())
     }
 
     fn fault(&self, faults: &[Fault]) {
@@ -936,37 +919,16 @@ async fn a_new_screen_session_ends_the_last() {
     assert_isolated(&seen);
 }
 
-/// The root of a tree holding `leaves`, rebuilt from them.
-fn root_of(leaves: &[Words], level: usize, index: usize) -> Words {
-    let first = index << level;
-    if first >= leaves.len() {
-        return EMPTY[level];
-    }
-    if level == 0 {
-        return leaves[index];
-    }
-    credentials::compress(
-        &root_of(leaves, level - 1, 2 * index),
-        &root_of(leaves, level - 1, 2 * index + 1),
-    )
-}
-
 /// `count` enrollments at slots `0..count`, one change each.
 fn enrollments(count: u32) -> Vec<Change> {
-    let mut leaves = Vec::new();
-    (0..count)
-        .map(|slot| {
-            let leaf = credentials::leaf(&[slot + 1; 8]);
-            leaves.push(leaf);
-            Change {
-                leaves: vec![(slot, credentials::digest(&leaf))],
-                root: RootEntry {
-                    root: credentials::digest(&root_of(&leaves, DEPTH, 0)),
-                    since: u64::from(slot),
-                },
-            }
-        })
-        .collect()
+    let mut writes = Writes::default();
+    for slot in 0..count {
+        writes.write(
+            u64::from(slot),
+            &[(slot, credentials::leaf(&[slot + 1; 8]))],
+        );
+    }
+    writes.changes
 }
 
 /// The tree is read on the space's one feed connection: the time and every
