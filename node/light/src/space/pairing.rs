@@ -4,9 +4,7 @@
 
 use vos_abi::Encode;
 use vos_wire::books::DeviceHandle;
-use vos_wire::personal::{
-    AdminClass, DeviceView, InboxItem, Overview, PersonalError, Status, method,
-};
+use vos_wire::personal::{AdminClass, InboxItem, Overview, PersonalError, method};
 use zeroize::Zeroizing;
 
 use super::link::Signer;
@@ -14,7 +12,7 @@ use super::{
     Acked, CREDENTIAL_BOOK, Error, Held, Host, Kept, POLL, Paired, Personal, Prompts, answered,
     failed, link, secret, store_failed, unreached,
 };
-use crate::group::{DeviceGroup, Prepared};
+use crate::group::{Course, DeviceGroup, Prepared};
 use crate::memberships;
 use crate::pairing::{Code, Hello, Joined, Joiner, Offer, Opened, Opener};
 use crate::route::Purpose;
@@ -23,10 +21,13 @@ use crate::route::Purpose;
 /// from a new slot.
 pub(super) enum Pairing {
     Opener {
-        opener: Opener,
+        opener: Box<Opener>,
         offer: Offer,
         expires: u64,
     },
+    /// Declined: its slot left open for the joiner to read the decline,
+    /// closed when the next offer opens one.
+    Declined { slot: vos_wire::personal::Scope },
 }
 
 /// The code a pairing offer shows: the QR code's bytes, which hold the
@@ -69,6 +70,13 @@ impl<H: Host> Personal<H> {
         }
         let item_bytes = group.policy().inbox_item_bytes;
         let ttl = group.policy().slot_ttl_ms;
+        if let Some(Pairing::Declined { slot }) = held.pairing.take() {
+            // Gone already if it expired: the agent answers `NoSlot`.
+            self.with_link(&mut held, Purpose::Personal, |link, _| {
+                Ok(link.call::<u64>(method::CLOSE_SLOT, slot.encode()))
+            })?
+            .ok();
+        }
         self.book(&held.light, me);
         let offered = memberships::handles_of(&held.light, CREDENTIAL_BOOK, me)
             .map(|held| held.into_iter().map(|(membership, _)| membership).collect())
@@ -91,7 +99,7 @@ impl<H: Host> Personal<H> {
             kept.onions.clone(),
         );
         held.pairing = Some(Pairing::Opener {
-            opener,
+            opener: Box::new(opener),
             offer,
             expires,
         });
@@ -121,13 +129,16 @@ impl<H: Host> Personal<H> {
 
     fn opened(&self, prompts: &dyn Prompts) -> Result<Paired, Error> {
         let mut held = self.held();
-        let Some(Pairing::Opener {
-            mut opener,
-            offer,
-            expires,
-        }) = held.pairing.take()
-        else {
-            return Err(Error::NoPairing);
+        let (mut opener, offer, expires) = match held.pairing.take() {
+            Some(Pairing::Opener {
+                opener,
+                offer,
+                expires,
+            }) => (opener, offer, expires),
+            declined => {
+                held.pairing = declined;
+                return Err(Error::NoPairing);
+            }
         };
         let mut prepared = None;
         let shaken = self.handshake(
@@ -196,8 +207,14 @@ impl<H: Host> Personal<H> {
                     self.put(held, &put.arguments())?;
                     // Nothing more, the offer included, leaves until the
                     // user confirms the new device shows this check.
+                    // Declined, the joiner reads it in the slot, which
+                    // stays open for it.
                     if !prompts.confirm_pairing(&check) {
-                        self.close_slot(held, opener)?;
+                        let put = opener.decline().map_err(failed)?;
+                        held.pairing = Some(Pairing::Declined {
+                            slot: opener.slot(),
+                        });
+                        self.put(held, &put.arguments())?;
                         return Err(Error::Declined);
                     }
                     let put = opener.offer().map_err(failed)?;
@@ -325,29 +342,23 @@ impl<H: Host> Personal<H> {
     fn joining(&self, prompts: &dyn Prompts, code: &[u8], label: &str) -> Result<Paired, Error> {
         let code = Code::from_bytes(code).ok_or(Error::NotAPairingCode)?;
         let mut held = self.held();
-        // A device of that personal space pairs again only once out of it:
-        // refused while the set holds it live; once its removal matured the
-        // agent admits its key no more, and it leaves at the offer.
-        if held
-            .group
-            .as_ref()
-            .is_some_and(|group| group.agent().identity == code.identity)
-        {
-            let sync = held.light.sync_key().verifying_key().to_bytes();
-            let listed = self.with_link(&mut held, Purpose::Personal, |link, _| {
-                link.query::<Vec<DeviceView>>(method::DEVICES, ())
-                    .map_err(unreached)
-            })?;
-            match listed {
-                Ok(views)
-                    if views.iter().any(|view| {
-                        view.device.keys.sync == sync && view.device.status == Status::Live
-                    }) =>
-                {
-                    return Err(Error::InSetAlready);
-                }
-                Ok(_) | Err(PersonalError::NotAdmitted) => {}
-                Err(error) => return Err(Error::AgentRefused(error)),
+        // A device of that personal space pairs again only once out of it
+        // on the log it verifies (its removal read through: the agent
+        // serves a removed device's key that far), or if never added (its
+        // add's candidate void); while in the set it is refused, whatever a
+        // refusal says. Out, it leaves at the offer.
+        let in_set = |held: &Held| {
+            held.group.as_ref().is_some_and(|group| {
+                group.agent().identity == code.identity
+                    && group.id().is_some()
+                    && group.course() != Course::Out
+            })
+        };
+        if in_set(&held) {
+            // Unreached, it stays as it was: in the set.
+            let _ = self.follow(&mut held);
+            if in_set(&held) {
+                return Err(Error::InSetAlready);
             }
         }
         // The rest of the home comes in the offer.
@@ -387,10 +398,13 @@ impl<H: Host> Personal<H> {
                     .map_err(unreached)?
                 {
                     Ok(items) => items,
-                    // The slot's key admitted no more before it expired:
-                    // the opener closed it, declining.
-                    Err(PersonalError::NotAdmitted) if self.host.now() <= until => {
-                        return Err(Error::PairingDeclined);
+                    // The slot's key admitted no more: closed, or a word
+                    // nobody signed. Only the opener's decline over the
+                    // channel ends the pairing; until the slot expires, it
+                    // is read again.
+                    Err(PersonalError::NotAdmitted) => {
+                        self.host.sleep(POLL);
+                        continue;
                     }
                     Err(error) => return Err(Error::AgentRefused(error)),
                 }
@@ -404,6 +418,7 @@ impl<H: Host> Personal<H> {
                         return Err(Error::Declined);
                     }
                 }
+                Joined::Declined => return Err(Error::PairingDeclined),
                 Joined::Offer(offer) => {
                     // The code is the opener's: the space this device holds
                     // is left, and it pairs as a fresh install.

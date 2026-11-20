@@ -40,7 +40,9 @@
 //! than a few items spans pages). A side lives in memory. A pairing cut
 //! short (an error, the slot's expiry, the user's no, the opener's
 //! restart) is started again from a new slot: the opener closes the old
-//! one (`close_slot` of [`Opener::slot`]), and once it paired the joiner,
+//! one (`close_slot` of [`Opener::slot`]; a declined one when the next
+//! offer opens, so the joiner reads the decline [`Opener::decline`] put
+//! there, the one end of a pairing a joiner takes), and once it paired the joiner,
 //! abandons the commit adding it ([`crate::group::DeviceGroup::abandon`]),
 //! never sending it.
 //!
@@ -173,6 +175,18 @@ pub struct Membership {
 pub struct Offer {
     pub home: Home,
     pub memberships: Vec<Membership>,
+}
+
+/// The opener's first message over the channel, once its user saw the
+/// check: its offer, or its decline, which the joiner authenticates as the
+/// opener's as it does the offer (the operators, who do not hold the
+/// channel's keys, can only withhold either).
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+enum Verdict {
+    #[codec(index = 0)]
+    Offer(Offer),
+    #[codec(index = 1)]
+    Declined,
 }
 
 /// The joiner's word over the channel: its keys (its "home" nullifier
@@ -509,14 +523,31 @@ impl Opener {
         else {
             return Err(PairError::Order);
         };
-        let offer = self.offer.encode();
-        if offer.len() + TAG > NOISE_MAX.min(self.item_bytes) {
+        let put = self.verdict(&mut channel, Verdict::Offer(self.offer.clone()))?;
+        self.state = Opening::Offered(channel);
+        Ok(put)
+    }
+
+    /// The decline, once the user saw a check the joiner does not show:
+    /// the item to leave in the slot, which the joiner reads as the
+    /// pairing's end. The slot stays open until it expires, so the joiner
+    /// can read it.
+    pub fn decline(&mut self) -> Result<Put, PairError> {
+        let Opening::Checked(mut channel) = core::mem::replace(&mut self.state, Opening::Done)
+        else {
+            return Err(PairError::Order);
+        };
+        self.verdict(&mut channel, Verdict::Declined)
+    }
+
+    fn verdict(&self, channel: &mut Channel, verdict: Verdict) -> Result<Put, PairError> {
+        let bytes = verdict.encode();
+        if bytes.len() + TAG > NOISE_MAX.min(self.item_bytes) {
             return Err(PairError::Decode);
         }
-        let sealed = channel.seal(&offer)?;
+        let sealed = channel.seal(&bytes)?;
         let put = self.put(channel.written, sealed);
         channel.written += 1;
-        self.state = Opening::Offered(channel);
         Ok(put)
     }
 
@@ -629,6 +660,8 @@ pub enum Joined {
     Check(String),
     /// The opener's offer: send [`Joiner::hello`].
     Offer(Offer),
+    /// The opener's user declined the check: the pairing's end.
+    Declined,
     /// The handover, whole: join with it
     /// ([`crate::group::DeviceGroup::join`]), and leave the
     /// acknowledgement in the slot.
@@ -641,6 +674,7 @@ impl core::fmt::Debug for Joined {
             Joined::Waiting => f.write_str("Waiting"),
             Joined::Check(check) => f.debug_tuple("Check").field(check).finish(),
             Joined::Offer(offer) => f.debug_tuple("Offer").field(offer).finish(),
+            Joined::Declined => f.write_str("Declined"),
             Joined::Handover(..) => f.write_str("Handover(..)"),
         }
     }
@@ -722,9 +756,11 @@ impl Joiner {
                     return Ok((Joining::Checked(channel), Joined::Waiting));
                 };
                 let plain = channel.open(&item.item.bytes)?;
-                let offer = Offer::decode_exact(&plain).ok_or(PairError::Decode)?;
                 channel.read += 1;
-                (Joining::Offered(channel), Joined::Offer(offer))
+                match Verdict::decode_exact(&plain).ok_or(PairError::Decode)? {
+                    Verdict::Offer(offer) => (Joining::Offered(channel), Joined::Offer(offer)),
+                    Verdict::Declined => (Joining::Done, Joined::Declined),
+                }
             }
             Joining::Greeted(mut channel, mut length, mut bytes) => loop {
                 let Some(item) = find(items, &self.slot, Side::Opener, channel.read) else {

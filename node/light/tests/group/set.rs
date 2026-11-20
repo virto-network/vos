@@ -364,7 +364,8 @@ fn a_restore_starts_a_new_group_under_its_new_kit() {
         signed(std::slice::from_ref(&events));
         assert!(events.contains(&Event::Removed), "{events:?}");
         assert_eq!(
-            home.log(phone.sync_key(), 0).map(|_| ()),
+            home.query::<Overview>(phone.sync_key(), "overview", Vec::new())
+                .map(|_| ()),
             Err(PersonalError::NotAdmitted)
         );
     }

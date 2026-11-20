@@ -177,6 +177,22 @@ impl Personal {
         }
     }
 
+    /// How far a removed device's sync key reads the log: through the
+    /// entry that logged its removal, and on to the end of the confirming
+    /// window after its maturity; any other key is not admitted.
+    pub(crate) fn gone_reach(&self, caller: Principal) -> Result<(u64, u64), PersonalError> {
+        let Principal::Client(key) = caller else {
+            return Err(PersonalError::NotAdmitted);
+        };
+        let gone = self.gone.get(&key).ok_or(PersonalError::NotAdmitted)?;
+        let removal = self
+            .removals
+            .get(&gone.device)
+            .ok_or(PersonalError::NotAdmitted)?;
+        let window = self.policy().confirm_window_ms;
+        Ok((gone.logged, removal.at.saturating_add(window)))
+    }
+
     /// The device whose sync key calls, in probation or active.
     pub(crate) fn sync_caller(
         &self,

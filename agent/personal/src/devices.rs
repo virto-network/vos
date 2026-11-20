@@ -23,7 +23,7 @@ use vos_wire::personal::{
     Verdict, Void,
 };
 
-use crate::rows::{Before, By, Due, Kind, Recovery};
+use crate::rows::{Before, By, Due, Gone, Kind, Recovery};
 use crate::{KIT_ENTRIES, Personal};
 
 /// The steps a call settles before it runs: with the one maturity its own
@@ -1026,7 +1026,14 @@ impl Personal {
             },
         );
         self.frozen.remove(&target);
-        self.append(now, Body::Matured { device: target });
+        let logged = self.append(now, Body::Matured { device: target });
+        self.gone.insert(
+            &device.keys.sync,
+            &Gone {
+                device: target,
+                logged,
+            },
+        );
         self.silence(target, at);
         if let Some(candidate) = self.group().candidate
             && candidate.set.contains(&target)

@@ -704,9 +704,17 @@ fn two_attacker_devices_are_removed_by_one_commit() {
     owners[1].alive(&mut home);
     for attacker in attackers.iter_mut() {
         assert_eq!(
-            home.log(attacker.sync_key(), 0).map(|_| ()),
+            home.query::<Overview>(attacker.sync_key(), "overview", Vec::new())
+                .map(|_| ()),
             Err(PersonalError::NotAdmitted),
             "the agent refuses a matured removal's keys"
+        );
+        assert!(
+            home.log(attacker.sync_key(), 0)
+                .unwrap()
+                .iter()
+                .any(|(_, entry)| matches!(entry.body, Body::Matured { .. })),
+            "but the log its removal rests on"
         );
         let signature = attacker.sync.sign(b"nack").to_bytes();
         let reply = home.call(&attacker.sync, "nack", (3u64, signature).encode());

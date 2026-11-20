@@ -1126,3 +1126,65 @@ fn an_open_removal_is_keyed_by_its_maturity_its_signer_and_its_kind() {
         Some(removal.encode())
     );
 }
+
+/// The whole log `reader` reads, page by page.
+fn log_read(home: &Home, reader: Principal) -> Result<Vec<(u64, Entry)>, PersonalError> {
+    let mut log: Vec<(u64, Entry)> = Vec::new();
+    loop {
+        let from = log.last().map_or(0, |(index, _)| index + 1);
+        let page: Vec<(u64, Entry)> = home.query(reader, "log", from)?;
+        if page.is_empty() {
+            return Ok(log);
+        }
+        log.extend(page);
+    }
+}
+
+/// A removed device's sync key reads the log through its removal's entry
+/// and on within the confirming window after its maturity, where the
+/// evidence its removal rests on is, so the device leaves on the log it
+/// verifies; past the window nothing, and nothing else at all. A key never
+/// admitted reads nothing.
+#[test]
+fn a_removed_device_reads_the_log_its_removal_rests_on() {
+    let mut home = seasoned(3);
+    home.operate(admin(0), "remove", 2u32).unwrap();
+    home.pass(3 * MINUTE);
+    home.call::<Recorded>(sync(0), "alive", ()).unwrap();
+    assert_eq!(standing(&home, sync(0), 2), Standing::Removed);
+    let removed = log_read(&home, sync(2)).unwrap();
+    assert!(
+        removed
+            .iter()
+            .any(|(_, entry)| entry.body == Body::Matured { device: 2 }),
+        "its removal's entry"
+    );
+    assert_eq!(removed, log_read(&home, sync(0)).unwrap());
+    assert_eq!(
+        home.query::<Overview>(sync(2), "overview", ()),
+        Err(PersonalError::NotAdmitted)
+    );
+    assert_eq!(
+        home.query::<Vec<(u64, Entry)>>(admin(2), "log", 0u64),
+        Err(PersonalError::NotAdmitted),
+        "its admin key reads nothing"
+    );
+
+    home.pass(4 * MINUTE);
+    let later = home.operate(admin(0), "remove", 1u32).unwrap();
+    assert_eq!(
+        log_read(&home, sync(2)).unwrap(),
+        removed,
+        "nothing past the window"
+    );
+    assert!(
+        log_read(&home, sync(0))
+            .unwrap()
+            .iter()
+            .any(|(index, _)| *index == later)
+    );
+    assert_eq!(
+        home.query::<Vec<(u64, Entry)>>(Principal::Client([0x77; 32]), "log", 0u64),
+        Err(PersonalError::NotAdmitted)
+    );
+}

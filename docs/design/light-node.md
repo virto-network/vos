@@ -1856,16 +1856,34 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   kept; one of each scope's own pushes audited (`audit`); the device set
   read. A device stuck or
   out reads the log, the overview and the device set and leaves its
-  scopes alone. A device added once whose key the agent admits no more
-  (`NotAdmitted`) is turned away (`Course::TurnedAway`,
-  `DeviceGroup::turned_away`), which the chrome shows as removed: its
-  removal matured and was settled while it was off (the kit's, another
-  device's, a restore), and a removed device reads no log. That rests on
-  the agent's word, unsigned (B6), so nothing is dropped: the operators
-  could say it of a live device, and a later pass the agent serves again
-  follows on. `Removed` (a removal due, not yet settled, which what falls
-  due before it may still cancel) turns no device away (a removed
-  device's course on the signed log: `open.md`). A post the agent refuses as held already (`Voted`,
+  scopes alone. **A device is removed on the log it verifies, never on a
+  refusal** [decided 2026-11-20, built]: an agent's answer is signed by
+  nobody, so a gateway on the route could make up `NotAdmitted` for a
+  live device, and a device that took it as its removal would show a
+  removal that never happened. So a refusal (`NotAdmitted`, `Removed`)
+  stops a pass as any failure does, the device still in the set, and the
+  next pass tries again. A removal that matured while the device was off
+  (the kit's, another device's, a regroup, a restore) is read on the
+  log: the agent serves a removed device's sync key the log through the
+  entry that logged its removal (`Matured`) and on while the entries are
+  within the confirming window after its maturity (`Personal::log`, the
+  table `gone`), where any evidence the maturity rests on is (a cosign's
+  or a resolution's, posted after the call that matured it); the device
+  follows it as any device does, verifying each operation's and
+  confirmation's signature against the keys its own log gave it (B6), and
+  is out (`Course::Out`) once that evidence supports its removal, which
+  the chrome shows as removed. Its other reads and calls stay refused,
+  and past the window it reads nothing more: the same window bounds what
+  any device accepts as a maturity's evidence. The choice over a signed
+  refusal: the agent holds no key the operators do not (its state is
+  replicated on their nodes, and an actor has no secret of its own), so
+  an agent's signature would only be the operators' word, while the
+  log's evidence is the user's devices' and kit's signatures, which no
+  operator or gateway can make. The cost: a removed device's key reads up
+  to a confirming window of the log past its removal (the devices' public
+  keys an add in that window brings, the set's operations), which before
+  it read none of. What a gateway can still do is withhold, which any
+  route can: it cannot remove a device it does not show a removal of. A post the agent refuses as held already (`Voted`,
   `Evidenced`) or as decided meanwhile (`NoCandidate`, `NotConfirming`) is
   done, the log read on; a page withheld is read again once. A pass that
   stops on an error hands back what it found (`Stopped`), its alarms with
@@ -1968,7 +1986,13 @@ skip expired items, each write deletes a few; no timer).
    written and read, both devices show a six-digit check derived from the
    whole handshake's hash, and A's user confirms that B shows the same
    before A sends anything more (its offer is the channel's first message);
-   declined, A closes the slot. Someone who photographed the QR and answered
+   declined, A sends its decline over the channel instead (its first
+   message there, as the offer would be), which B authenticates as A's, and
+   leaves the slot open until it expires, so B can read it (A's next
+   offer closes it). A refusal of B's slot reads (`NotAdmitted`, as a
+   closed slot's are, and which nobody signs) does not end B's pairing: B
+   reads the slot again until its expiry [decided 2026-11-20, built].
+   Someone who photographed the QR and answered
    first holds a handshake of its own, which A's last message ends: B
    cannot read that message and shows no check. No side has a check before
    that message, which A writes after the one it answers, so no answer is
@@ -3670,8 +3694,9 @@ device's crates faster); its size argument is small.
   asked first for all it could refuse (its open claim, an agent to give,
   no agent under the device's nullifier); a pairing
   leaves first when the device holds another personal space, or this
-  one's while the set no longer holds it live (the agent admits its key
-  no more), and is refused while the set holds it live. The light node's
+  one's once it is out of it on the log it verifies (its removal read
+  through, the log followed first) or was never added, and is refused
+  while it is in the set, whatever a refusal says. The light node's
   store is laid out anew (`LAYOUT` 8): a phone of an earlier build clears
   the facility's data and claims or pairs again.
 - **One engine, the flows in `vos-light`** [built, `vos_light::space`]:
@@ -3903,7 +3928,9 @@ replayed one is a duplicate; a replayed commit breaks the epoch rule.
 **B6. The operators forge device-set operations.** *Mitigation:* every
 device verifies every operation's and confirmation's signature itself,
 from the evidence stored beside it; an operation without evidence moves no
-device.
+device. Nor does a refusal: a removed device is out on its removal's
+evidence, which the agent serves its key (§3.6, the pass), and a refusal
+the route makes up stops a pass, never removes a device (`NotAdmitted`).
 
 **B7. The operators advance the agent's clock,** maturing a hostile
 removal or a restore early. *Known limit:* delays trust the operators'

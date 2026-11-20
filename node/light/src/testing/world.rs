@@ -147,6 +147,8 @@ enum Fate {
     /// Answered as taken, never applied: the operators answer a call and
     /// never log it.
     Forge,
+    /// Answered with the agent's refusal, made up on the route.
+    Refuse(vos_wire::personal::PersonalError),
 }
 
 /// The device's clock, in milliseconds: the world runs on it, offset.
@@ -309,6 +311,9 @@ pub struct State {
     /// The next call each phone asks of a step, answered as taken and never
     /// applied ([`World::forge`]).
     forging: HashMap<u8, Step>,
+    /// Each phone's requests of a step the route answers with a refusal of
+    /// the agent's it made up, and how many more ([`World::refuse`]).
+    made_up: HashMap<u8, (Step, vos_wire::personal::PersonalError, usize)>,
     /// The next request each phone asks of a step, the world's time moved
     /// on before it is taken ([`World::pass_at`]).
     passing: HashMap<u8, (Step, u64)>,
@@ -701,6 +706,23 @@ impl World {
         self.state.lock().unwrap().forging.insert(tag, step);
     }
 
+    /// The phone tagged `tag`'s next `times` requests of `step` answered by
+    /// the route with `refusal`, as if the agent refused them, never taken:
+    /// a gateway forging an answer nobody signs.
+    pub fn refuse(
+        &self,
+        tag: u8,
+        step: Step,
+        refusal: vos_wire::personal::PersonalError,
+        times: usize,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .made_up
+            .insert(tag, (step, refusal, times));
+    }
+
     /// The world's time moves on by `ms` as the phone tagged `tag` asks its
     /// next request of `step`, before the world takes it: what fell due
     /// meanwhile settles at that request.
@@ -772,6 +794,13 @@ impl World {
         if state.forging.get(&tag) == Some(&step) {
             state.forging.remove(&tag);
             return Fate::Forge;
+        }
+        if let Some((refused, refusal, times)) = state.made_up.get_mut(&tag)
+            && *refused == step
+            && *times > 0
+        {
+            *times -= 1;
+            return Fate::Refuse(*refusal);
         }
         if let Some(kill) = state.kills.get_mut(&tag) {
             if kill.fired {
@@ -1192,6 +1221,14 @@ impl ssh::Connection for Connection {
         self.seen(|seen| seen.carried(kind, body));
         let answer = match fate {
             Fate::Forge => self.world.forged(body),
+            Fate::Refuse(refusal) => Response::Ran {
+                outcome: Outcome::Failed {
+                    code: vos_abi::abi::Failure::Handler,
+                    detail: refusal.encode(),
+                },
+                at: 1,
+            }
+            .encode(),
             _ => self.world.answer(kind, body, self.index),
         };
         if matches!(fate, Fate::TakeAndDrop) {

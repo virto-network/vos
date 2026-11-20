@@ -489,10 +489,6 @@ are under "Identity and privacy" above.
   call's arguments do not name the control log's head it was made
   against, so a device cannot check that an operation was signed against
   the log it was shown.
-- **A removed device's course** [open, the owner's]: a device turned away
-  (`Course::TurnedAway`) rests on the agent's unsigned word; a removed
-  device could reach `Out` on the signed log were the agent to serve it
-  the log up to its removal's entry.
 - **Messaging between members** on `vos-mls` [E12], in a space or across
   spaces, the personal agent's inbox its door (`light-node.md` §3.7,
   §3.10). MLS virtual clients share a virtual leaf's signature and HPKE

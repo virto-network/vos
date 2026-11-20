@@ -282,3 +282,11 @@ impl Before for By {
         }))
     }
 }
+
+/// A removed device's sync key, which reads the log its removal rests on:
+/// the device, and the index of the entry that logged its removal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Gone {
+    pub device: DeviceId,
+    pub logged: u64,
+}

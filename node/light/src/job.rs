@@ -25,9 +25,12 @@
 //!
 //! **A device that cannot follow** (stuck, or out of the group) reads the
 //! log, the overview and the device set, and leaves its scopes alone: it
-//! is removed and pairs again, or regroups, first. One the agent turns
-//! away, once added, is out ([`DeviceGroup::turned_away`]). A pass that stops on an error hands back
-//! what it had found ([`Stopped`]), its alarms with it.
+//! is removed and pairs again, or regroups, first. A removed device reads
+//! the log through its removal (the agent serves a removed sync key that
+//! far) and is out once its own reading of the evidence says so; a
+//! refusal alone (`NotAdmitted`, unsigned) turns no device away, the pass
+//! stopping on it as on any failure. A pass that stops on an error hands
+//! back what it had found ([`Stopped`]), its alarms with it.
 //!
 //! **What the chrome raises** ([`Pass::notices`]): the device set's open
 //! operations, each a local notification while it can be vetoed; a
@@ -294,7 +297,7 @@ impl Pass {
             });
         }
         match self.course {
-            group::Course::Out | group::Course::TurnedAway => notices.push(Notice::Removed),
+            group::Course::Out => notices.push(Notice::Removed),
             group::Course::Stuck { .. } => notices.push(Notice::Stuck),
             group::Course::Following => {}
         }
@@ -331,19 +334,7 @@ pub fn run<L: Control>(
     now: u64,
 ) -> Result<Pass, Stopped<L::Error>> {
     let mut pass = Pass::default();
-    // A device turned away follows on, unless the agent turns it away
-    // again.
-    let mut done = group
-        .turned_away(false)
-        .map_err(SyncError::Group)
-        .and_then(|_| passing(light, group, link, instances, now, &mut pass));
-    let refused = matches!(done, Err(SyncError::Refused(PersonalError::NotAdmitted)));
-    match group.turned_away(refused) {
-        // Turned away though once added: its removal settled unread.
-        Ok(true) if refused => done = Ok(()),
-        Ok(_) => {}
-        Err(error) => done = done.and(Err(SyncError::Group(error))),
-    }
+    let done = passing(light, group, link, instances, now, &mut pass);
     pass.course = group.course();
     pass.operations = group.operations();
     pass.commit = owed_commit(group);
@@ -572,6 +563,11 @@ fn follow<L: Control>(
                     continue;
                 }
             };
+            // A device out has no voice: what it read is kept, and its
+            // removal's refusals are not asked for.
+            if group.course() == group::Course::Out {
+                continue;
+            }
             // Taken before (a kill between the post and its answer), or its
             // candidate decided meanwhile: the log says which, read on. An
             // evidence the agent refuses is posted no more, and the pass

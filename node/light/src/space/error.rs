@@ -91,7 +91,8 @@ pub enum Error {
     CommittedMeanwhile,
     /// The pairing's slot expired.
     SlotExpired,
-    /// The other device declined the pairing, which closed its slot.
+    /// The other device declined the pairing, as it said over the
+    /// pairing's channel.
     PairingDeclined,
     /// The device is in that personal space already.
     InSetAlready,

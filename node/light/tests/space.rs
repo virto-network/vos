@@ -474,6 +474,55 @@ fn a_phone_the_kit_removed_while_off_reads_its_removal() {
     assert_eq!(again.stopped, None);
 }
 
+/// A refusal made up on the route (`NotAdmitted`, which nobody signs) of a
+/// phone in the set: its pass stops on it as on any failure, the phone
+/// stays in the set and says nothing of a removal, and the next pass,
+/// which the route serves, goes on.
+#[test]
+fn a_refusal_on_the_route_turns_no_phone_away() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let first = device(&world, 0x86);
+    first.claim(&world, home);
+    world.refuse(
+        0x86,
+        Step::query(method::LOG),
+        PersonalError::NotAdmitted,
+        1,
+    );
+    let refused = first.space.pass(vos_light::testing::wall()).unwrap();
+    assert!(refused.stopped.is_some(), "{refused:?}");
+    assert!(
+        !refused.notices.contains(&vos_light::job::Notice::Removed),
+        "{:?}",
+        refused.notices
+    );
+    assert_eq!(first.space.status().unwrap().phase, Phase::Held);
+    let passed = first.space.pass(vos_light::testing::wall()).unwrap();
+    assert_eq!(passed.stopped, None);
+    assert_eq!(first.space.status().unwrap().phase, Phase::Held);
+}
+
+/// A joiner whose slot reads are refused on the route (`NotAdmitted`, as
+/// a closed slot's are) reads the slot again: only the opener's decline,
+/// which it authenticates over the channel, ends its pairing.
+#[test]
+fn a_refused_slot_read_on_the_route_does_not_end_a_pairing() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let first = device(&world, 0x87);
+    first.claim(&world, home);
+    let joiner = device(&world, 0x88);
+    world.refuse(
+        0x88,
+        Step::query(method::INBOX),
+        PersonalError::NotAdmitted,
+        2,
+    );
+    let id = first.pair(&joiner);
+    assert_eq!(joiner.space.status().unwrap().device, Some(id));
+}
+
 /// A joiner whose acknowledgement never left (its process killed at the
 /// put) pairs again on the same phone from a new code: the group it joined
 /// at that agent, never added, is left at the new offer.
@@ -508,8 +557,9 @@ fn a_joiner_cut_short_pairs_again_on_the_same_phone() {
 
 /// The pairing's check: both phones show the same, and an opener whose
 /// user does not confirm it puts nothing in the slot but the handshake's
-/// last message, which carries nothing, and closes it, which the joiner
-/// reads as the pairing declined; confirmed, the pairing runs to its end.
+/// last message, which carries nothing, and its decline over the channel,
+/// which the joiner reads as the pairing declined; confirmed (the
+/// declined slot closed at the next offer), the pairing runs to its end.
 #[test]
 fn a_pairing_hands_nothing_over_until_its_check_is_confirmed() {
     let world = world();
@@ -538,7 +588,10 @@ fn a_pairing_hands_nothing_over_until_its_check_is_confirmed() {
         .into_iter()
         .filter(|step| *step == Step::call(method::PUT))
         .count();
-    assert_eq!(puts, 1, "the handshake's last message alone, no offer");
+    assert_eq!(
+        puts, 2,
+        "the handshake's last message and the decline, no offer"
+    );
     let checks = |phone: &Phone| phone.checks.lock().unwrap().clone();
     assert_eq!(checks(&first.phone), checks(&joiner.phone));
     assert_eq!(checks(&first.phone)[0].len(), 7, "six digits");
@@ -553,7 +606,7 @@ fn a_pairing_hands_nothing_over_until_its_check_is_confirmed() {
 /// A cosign whose evidence post dies on the way is held past the maturity
 /// it caused: the devices take that maturity only with the cosign's
 /// evidence, which the cosigner's next pass posts, and the commit carries
-/// the removal.
+/// the removal; the removed phone, on again, reads it so too.
 #[test]
 fn a_cosigns_lost_evidence_is_posted_after_the_maturity_it_caused() {
     let world = world_of(Policy {
@@ -586,6 +639,14 @@ fn a_cosigns_lost_evidence_is_posted_after_the_maturity_it_caused() {
     assert_eq!(first.standing(target), Some(Standing::Removed));
     let passed = second.pass();
     assert!(passed.alarms.is_empty(), "{:?}", passed.alarms);
+    // The removed phone reads the log through the cosign's evidence, past
+    // its removal's entry, and is out on it.
+    let removed = third.pass();
+    assert!(
+        removed.notices.contains(&vos_light::job::Notice::Removed),
+        "{removed:?}"
+    );
+    assert_eq!(third.space.status().unwrap().phase, Phase::Removed);
 }
 
 /// A phone whose admin key is a software key (a keystore with no Ed25519

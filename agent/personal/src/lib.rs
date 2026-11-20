@@ -8,7 +8,8 @@
 //!   request only through the onion. A key admitted no more keeps its
 //!   sessions until they expire, so every handler checks its caller
 //!   against the device set as well, and every query answers only keys it
-//!   admits.
+//!   admits, bar `log`: a removed device's sync key reads it through its
+//!   removal, so the device leaves on the log it verifies.
 //! - **Admin calls** (commits and device-set operations) are client calls
 //!   signed by a device's admin key, verified at ingress; the agent checks
 //!   the origin, `Principal::Client(key)`, against the device set and
@@ -56,7 +57,8 @@ use vos_wire::personal::{
 };
 
 use rows::{
-    By, Candidate, Charge, Due, Group, Head, Kind, Lease, Recovery, Share, Slot, Stored, Usage,
+    By, Candidate, Charge, Due, Gone, Group, Head, Kind, Lease, Recovery, Share, Slot, Stored,
+    Usage,
 };
 
 /// The layout's version, which `version` answers: the keeper upgrades
@@ -87,6 +89,8 @@ pub struct Personal {
     live: Table<DeviceId, (), Ordered>,
     /// Each device's matured removal, then carried.
     removals: Table<DeviceId, Removal>,
+    /// Each removed device's sync key: the log it reads.
+    gone: Table<[u8; 32], Gone>,
     /// The device-set operations, by their log index.
     operations: Table<u64, Operation>,
     /// The operations pending or contested.
@@ -1019,17 +1023,32 @@ impl Personal {
         })
     }
 
-    /// The control log from `from`, as much as one answer holds.
+    /// The control log from `from`, as much as one answer holds. A removed
+    /// device's sync key reads it through its removal's entry and on while
+    /// the entries are within the confirming window after the maturity,
+    /// where the evidence its removal rests on is (a cosign's or a
+    /// resolution's, posted after the call that matured it): so the device
+    /// leaves on the log it verifies, not on a refusal.
     #[msg]
     pub async fn log(
         &self,
         ctx: &Query<Self>,
         from: u64,
     ) -> Result<Vec<(u64, Entry)>, PersonalError> {
-        self.reader(ctx.caller(), ctx.now())?.device_or_kit()?;
         let next = self.head.get_or_default().next;
         let rows = (from..next).filter_map(|index| Some((index, self.log.get(&index)?)));
-        Ok(rules::bounded(rows, |row| row.encode().len()))
+        match self.reader(ctx.caller(), ctx.now()) {
+            Ok(reader) => {
+                reader.device_or_kit()?;
+                Ok(rules::bounded(rows, |row| row.encode().len()))
+            }
+            Err(PersonalError::NotAdmitted) => {
+                let (logged, until) = self.gone_reach(ctx.caller())?;
+                let rows = rows.take_while(|(index, entry)| *index <= logged || entry.at <= until);
+                Ok(rules::bounded(rows, |row| row.encode().len()))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// `scope`'s envelopes after `position`, in order, as much as one answer
