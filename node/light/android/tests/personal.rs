@@ -847,7 +847,7 @@ fn signs_in(phone: &Held) {
             login.clone(),
             Arc::clone(&phone.hand) as Arc<dyn vos_facility::node::Prompts>,
         ) {
-            Err(refusal) if refusal.code == Code::NoPath => {
+            Err(refusal) if matches!(refusal.code, Code::NoPath | Code::Unclaimed) => {
                 phone.node.sync().unwrap();
             }
             signed => {

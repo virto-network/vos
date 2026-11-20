@@ -82,7 +82,10 @@ final class RestoreScreen extends Screen {
               device.label
                   + ": "
                   + Words.standing(device.standing)
-                  + (device.removed ? " (removed)" : "")));
+                  // Its standing says it when it is removed.
+                  + (device.removed && device.standing != Words.REMOVED
+                      ? ", its removal matured"
+                      : "")));
       if (!device.removed) {
         into.addView(
             button(

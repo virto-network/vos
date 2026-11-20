@@ -237,6 +237,7 @@ fn an_alarm_stands_after_the_pass_that_raised_it() {
     );
     let stopped = node.sync_personal().unwrap();
     assert_eq!(stopped.failed, 1);
+    assert_eq!(stopped.failures, "the agent refused", "why it stopped");
     assert_eq!(
         shown(stopped),
         [(Pending::Remove, false), (Pending::Alarm, false)],

@@ -55,12 +55,15 @@ fn every_type_crosses_its_parcelable_unchanged() {
                         contested: true,
                         alarm: Alarm::Rollback,
                         remedy: Remedy::RePair,
+                        targeted: true,
+                        kit_only: true,
                     })
                     .collect(),
                 seen: vec![Seen {
                     device: u32::MAX,
                     at: 1_700_000_000_000,
                 }],
+                failures: "the agent refused: NotAdmitted".into(),
             },
         );
         round_trip(env, Synced::default());

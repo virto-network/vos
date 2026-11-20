@@ -9,7 +9,8 @@ import team.virto.vos.personal.Seen;
 /**
  * One pass of the facility's sync, the background job's: the enrollments synced and failed (the
  * personal space's pass counted with them), the bytes its connections read and wrote, its length,
- * what the chrome raises, and each of the person's devices' last call at the personal agent.
+ * what the chrome raises, each of the person's devices' last call at the personal agent, and why
+ * each failure failed ({@code ; } between them, no secret in it).
  */
 parcelable Synced {
     int enrollments;
@@ -20,4 +21,5 @@ parcelable Synced {
     long millis;
     Notice[] notices;
     Seen[] seen;
+    String failures;
 }

@@ -337,7 +337,7 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     let signed = loop {
         shown.will_confirm(&[]);
         match node.sign_in(signing, login.clone(), prompts()) {
-            Err(refusal) if refusal.code == Code::NoPath => {
+            Err(refusal) if matches!(refusal.code, Code::NoPath | Code::Unclaimed) => {
                 shown.confirms.lock().unwrap().clear();
                 std::thread::sleep(Duration::from_millis(200));
             }

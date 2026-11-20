@@ -23,9 +23,11 @@
 //! - **What it raises** ([`Notice`]): each a local notification the job
 //!   posts, `fresh` when no earlier run raised it, so a notice alerts once
 //!   while it stands and again if it comes back. An operation stands while
-//!   a pass reads it open; a pending restore and an alarm, which a pass
-//!   raises once, stand for [`STANDS_MS`] after it, whatever later passes
-//!   read; a pass that reached nothing keeps every notice. The device
+//!   a pass reads it open; a restore stopped and an alarm, which a pass
+//!   raises once, stand for [`STANDS_MS`] after it, unless they are of an
+//!   operation (the restore, the kit's signature on one) a later pass
+//!   reads open no more, which they go with; one clock alarm stands, the
+//!   latest skew's; a pass that reached nothing keeps every notice. The device
 //!   group's alarms a pass found are acknowledged to it
 //!   ([`Personal::acknowledge`]) once the run that raised them is kept:
 //!   the group raises them no more, and the run's notices hold them.
@@ -204,6 +206,8 @@ impl Row {
                         contested: stood.contested,
                         alarm,
                         remedy,
+                        // Kept are those raised once, none of a contest.
+                        ..Notice::default()
                     },
                     since: stood.since,
                 })
@@ -283,13 +287,28 @@ pub fn now_ms() -> u64 {
 
 /// A notice's key among the raised: what it is, and where.
 fn key(notice: &Notice) -> (u8, u64, u8, u32, bool) {
+    // One clock alarm stands, the latest skew's.
+    let clock =
+        notice.pending == Pending::Alarm && notice.alarm == crate::personal::contract::Alarm::Clock;
     (
         notice.pending as u8,
-        notice.index,
+        if clock { 0 } else { notice.index },
         notice.alarm as u8,
         notice.by,
         notice.by_kit,
     )
+}
+
+/// The operation a notice raised once is of, by its log index: a restore
+/// stopped, or the kit's signature on an operation.
+fn operation_of(notice: &Notice) -> Option<u64> {
+    match notice.pending {
+        Pending::Restoring => Some(notice.index),
+        Pending::Alarm if notice.alarm == crate::personal::contract::Alarm::Kit => {
+            Some(notice.index)
+        }
+        _ => None,
+    }
 }
 
 /// The background job: its runs, the personal space once the device holds
@@ -363,8 +382,9 @@ impl Job {
             Part::Spaces => {
                 synced = runtime
                     .block_on(facility.sync())
-                    .unwrap_or_else(|_| Synced {
+                    .unwrap_or_else(|refusal| Synced {
                         failed: 1,
+                        failures: refusal.to_string(),
                         ..Synced::default()
                     })
             }
@@ -378,20 +398,25 @@ impl Job {
                     synced.enrollments = 1;
                     match personal.pass(now, runtime.handle()) {
                         Ok(passed) => {
-                            if passed.stopped.is_none() {
-                                synced.synced = 1;
-                            } else {
+                            match passed.stopped {
+                                None => synced.synced = 1,
                                 // Stopped: what it found is the device
                                 // group's own state (its operations, its
                                 // course) and the alarms raised so far.
-                                synced.failed = 1;
+                                Some(why) => {
+                                    synced.failed = 1;
+                                    synced.failures = why;
+                                }
                             }
                             synced.seen = passed.seen;
                             found = Some(passed.notices);
                             alarms = passed.alarms;
                             acknowledging = Some(personal);
                         }
-                        Err(_) => synced.failed = 1,
+                        Err(why) => {
+                            synced.failed = 1;
+                            synced.failures = why;
+                        }
                     }
                 }
             }
@@ -467,11 +492,20 @@ fn standing(before: Vec<Raised>, found: Option<Vec<Notice>>, now: u64) -> Vec<Ra
             }
         })
         .collect();
+    // An operation the pass found open is raised as one; a notice raised
+    // once of an operation found open no more goes with it.
+    let open = |index: u64| {
+        after.iter().any(|found| {
+            found.notice.index == index
+                && !matches!(found.notice.pending, Pending::Alarm | Pending::Restoring)
+        })
+    };
     let mut kept: Vec<Raised> = before
         .into_iter()
         .filter(|raised| {
             once(&raised.notice)
                 && now.saturating_sub(raised.since) < STANDS_MS
+                && operation_of(&raised.notice).is_none_or(open)
                 && !after
                     .iter()
                     .any(|now| key(&now.notice) == key(&raised.notice))
@@ -506,6 +540,8 @@ pub(crate) fn notice(raised: vos_light::job::Notice) -> Notice {
             matures,
             contested,
             at,
+            targeted,
+            kit_only,
         } => Notice {
             pending: match kind {
                 Kind::Add => Pending::Add,
@@ -524,9 +560,14 @@ pub(crate) fn notice(raised: vos_light::job::Notice) -> Notice {
             },
             by_kit: matches!(by, vos_wire::personal::Signer::Kit(_)),
             contested,
+            targeted,
+            kit_only,
             ..Notice::default()
         },
-        Found::Restore => plain(Pending::Restoring),
+        Found::Restore { index } => Notice {
+            index,
+            ..plain(Pending::Restoring)
+        },
         Found::Removed => plain(Pending::Removed),
         Found::Stuck => plain(Pending::Stuck),
         Found::Commit(vos_light::job::Commit::Removals) => plain(Pending::Commit),
@@ -588,6 +629,57 @@ fn alarm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::personal::contract::Alarm as Kind;
+
+    fn raised(notice: Notice, since: u64) -> Raised {
+        Raised { notice, since }
+    }
+
+    /// A restore stopped and the kit's alarm of it, raised once: they stand
+    /// while a pass reads the restore open, and go with it once a pass
+    /// reads it open no more.
+    #[test]
+    fn a_closed_operations_notices_go() {
+        let restoring = Notice {
+            pending: Pending::Restoring,
+            index: 18,
+            ..Notice::default()
+        };
+        let kit = Notice {
+            pending: Pending::Alarm,
+            alarm: Kind::Kit,
+            index: 18,
+            ..Notice::default()
+        };
+        let before = vec![raised(restoring.clone(), 1), raised(kit.clone(), 1)];
+        let open = Notice {
+            pending: Pending::Restore,
+            index: 18,
+            by_kit: true,
+            ..Notice::default()
+        };
+        let stood = standing(before.clone(), Some(vec![open]), 2);
+        assert_eq!(stood.len(), 3, "{stood:?}");
+        let gone = standing(before.clone(), Some(Vec::new()), 2);
+        assert!(gone.is_empty(), "{gone:?}");
+        let unreached = standing(before, None, 2);
+        assert_eq!(unreached.len(), 2, "a pass that reached nothing keeps them");
+    }
+
+    /// A clock alarm of another skew stands in the place of the last one.
+    #[test]
+    fn one_clock_alarm_stands() {
+        let clock = |skew| Notice {
+            pending: Pending::Alarm,
+            alarm: Kind::Clock,
+            index: skew,
+            ..Notice::default()
+        };
+        let stood = standing(vec![raised(clock(4026), 1)], Some(vec![clock(18194)]), 2);
+        assert_eq!(stood.len(), 1, "{stood:?}");
+        assert_eq!(stood[0].notice.index, 18194);
+        assert!(!stood[0].notice.fresh);
+    }
 
     /// An alarm is raised as its kind, its place and its remedy.
     #[test]

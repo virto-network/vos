@@ -63,7 +63,7 @@ fn login() -> SignIn {
 fn signed_in(node: &Node, session: u64) {
     loop {
         match node.sign_in(session, login(), client(false)) {
-            Err(refusal) if refusal.code == Code::NoPath => {
+            Err(refusal) if matches!(refusal.code, Code::NoPath | Code::Unclaimed) => {
                 node.sync().unwrap();
             }
             signed => {

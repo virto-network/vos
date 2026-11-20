@@ -408,6 +408,7 @@ pub fn refusal(error: Error) -> Refused {
         Error::CommitVoid => why(Why::CommitVoid),
         Error::CommittedMeanwhile => why(Why::CommittedMeanwhile),
         Error::SlotExpired => why(Why::SlotExpired),
+        Error::PairingDeclined => why(Why::PairingDeclined),
         Error::InSetAlready => why(Why::InSetAlready),
         Error::NotInAgentSet => why(Why::NotInAgentSet),
         Error::Regrouped { by } => Refused {

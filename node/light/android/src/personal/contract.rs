@@ -296,6 +296,8 @@ byte_enum! {
         /// This device is a delayed admin: a pairing is opened on a strong
         /// admin's device.
         DelayedAdmin = 49 as DELAYED_ADMIN,
+        /// The other device declined the pairing.
+        PairingDeclined = 50 as PAIRING_DECLINED,
     }
 }
 
@@ -306,8 +308,9 @@ parcel! {
     /// One pass of the facility's sync, a background job's: of the
     /// enrollments kept, how many synced and how many failed (the personal
     /// space's pass counted with them); the bytes its connections read and
-    /// wrote, its length; what the chrome raises; and each of the person's
-    /// devices' last call at the personal agent.
+    /// wrote, its length; what the chrome raises; each of the person's
+    /// devices' last call at the personal agent; and why each failure
+    /// failed, `; ` between them, as the log says (no secret in it).
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
     pub struct Synced {
         pub enrollments: u32 => int,
@@ -318,12 +321,15 @@ parcel! {
         pub millis: u64 => long,
         pub notices: Vec<Notice> => Notice[],
         pub seen: Vec<Seen> => Seen[],
+        pub failures: String => String,
     }
 
     /// One thing the chrome raises: an operation's at its log `index`,
     /// taken at `at` (the agent's time, 0 when this pass did not read it)
     /// and maturing at `matures` unless vetoed, signed by device `by` or by
-    /// the kit (`by_kit`), `contested` by another; or an alarm of its kind,
+    /// the kit (`by_kit`), `contested` by another (a contest this device
+    /// cannot resolve when `targeted`, the kit alone when `kit_only`); a
+    /// restore stopped, at its log `index`; or an alarm of its kind,
     /// `index` its place (its log index, epoch, position or skew) and its
     /// `remedy`. `fresh` when no pass raised it before, so its
     /// notification alerts.
@@ -339,6 +345,8 @@ parcel! {
         pub contested: bool => boolean,
         pub alarm: Alarm => enum Alarm,
         pub remedy: Remedy => enum Remedy,
+        pub targeted: bool => boolean,
+        pub kit_only: bool => boolean,
     }
 
     /// The personal space's state, read without a request: its phase (a
@@ -526,7 +534,7 @@ impl From<Refusal> for Refused {
             Code::Arguments => Why::Arguments,
             Code::Declined => Why::Declined,
             Code::NotEnrolled => Why::NotEnrolled,
-            Code::NoPath => Why::NoLeaf,
+            Code::NoPath | Code::Unclaimed => Why::NoLeaf,
             Code::Source => Why::Source,
             Code::Api => Why::Unreachable,
             Code::Prove => Why::Prove,

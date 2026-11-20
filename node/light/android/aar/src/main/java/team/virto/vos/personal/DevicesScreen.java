@@ -6,7 +6,7 @@ package team.virto.vos.personal;
 import android.widget.LinearLayout;
 
 /**
- * The device set: each device's standing and last sync, a phone retired (removed, then its
+ * The device set: each device's standing and last call, a phone retired (removed, then its
  * memberships revoked), the changes open (veto, cosign, a contest resolved), the memberships a
  * pairing left, the recovery kit's rotation, this phone's admin key replaced, a regroup, and a
  * commit now. Each change is the admin key's, behind its strong biometric.
@@ -84,7 +84,7 @@ final class DevicesScreen extends Screen {
                   + (device.removed ? ", its removal matured" : "")
                   + ", admin key "
                   + (device.strong ? "strong" : "weak")
-                  + ", last sync "
+                  + ", last call at your agent "
                   + Words.ago(device.seen, now)));
       if (device.me) {
         continue;
@@ -115,13 +115,19 @@ final class DevicesScreen extends Screen {
     }
     long now = System.currentTimeMillis();
     for (Notice notice : open) {
-      into.addView(
-          text(
-              Words.notice(notice)
-                  + (notice.matures > 0
-                      ? ", it takes effect " + Words.until(notice.matures, now)
-                      : "")));
-      if (notice.contested) {
+      into.addView(text(Words.notice(notice) + Words.when(notice, now)));
+      if (notice.contested && notice.kitOnly) {
+        into.addView(
+            text(
+                "Too few of your devices are left outside this contest to resolve it: only your"
+                    + " recovery kit can, from "Resolve it with the kit"."));
+        into.addView(
+            button("Resolve it with the kit", v -> app.open(new RestoreScreen(app))));
+      } else if (notice.contested && notice.targeted) {
+        into.addView(
+            text("This phone is one of its targets, so it cannot resolve it: your other devices"
+                + " do, or your recovery kit."));
+      } else if (notice.contested) {
         into.addView(
             buttons(
                 button("Uphold it", v -> posted("Upholding…", notice, true)),

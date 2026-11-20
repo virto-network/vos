@@ -77,7 +77,7 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
     let forms = chrome.shown.lock().unwrap().len();
     let refused = loop {
         match session.ask("sign_in", &login, &chrome).await.unwrap_err() {
-            refused if refused.code == Code::NoPath => {
+            refused if matches!(refused.code, Code::NoPath | Code::Unclaimed) => {
                 tokio::time::sleep(Duration::from_millis(50)).await
             }
             refused => break refused,
@@ -105,7 +105,7 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
         chrome.will(confirm(&[]));
         match session.ask("sign_in", &login, &chrome).await {
             Ok(signed) => break signed,
-            Err(error) if error.code == Code::NoPath => {
+            Err(error) if matches!(error.code, Code::NoPath | Code::Unclaimed) => {
                 chrome.answers.lock().unwrap().clear();
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -776,6 +776,50 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
     }
 }
 
+/// A sign-in before the claim, the tree read to its end and no leaf of
+/// the member's in it, is refused as unclaimed, not as a path still being
+/// read; once the member is claimed and the tree read again, it signs in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_before_the_claim_says_to_claim_first() {
+    let world = world();
+    let directory = tempfile::tempdir().unwrap();
+    let source = Arc::new(Phone::new(9));
+    let facility = facility(&world, directory.path(), source as Arc<dyn Source>);
+    let session = facility.session(gateway());
+    let chrome = Scripted::default();
+    chrome.will(confirm(&[]));
+    chrome.will(confirm(&[]));
+    let enrolled = session.ask("enroll", &enrollment(), &chrome).await.unwrap();
+    let member: [u8; 32] = bytes(field(&enrolled, "member")).try_into().unwrap();
+    let session = facility.session(gateway());
+    session.granted();
+    let login = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(POLL)),
+        ("method", Value::from("login")),
+        ("arguments", Value::Bytes(Vec::new())),
+    ]);
+    let refused = loop {
+        match session.ask("sign_in", &login, &chrome).await.unwrap_err() {
+            refused if refused.code == Code::NoPath => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            refused => break refused,
+        }
+    };
+    assert_eq!(refused.code, Code::Unclaimed, "{refused:?}");
+    assert!(
+        refused.message.contains("claim your invitation first"),
+        "{refused:?}"
+    );
+    world.enroll(AGENT, &member);
+    let signed = signed_in(&session, &login, &chrome).await.unwrap();
+    assert!(matches!(
+        Response::decode_exact(&bytes(field(&signed, "answer"))),
+        Some(Response::Ran { .. })
+    ));
+}
+
 /// `request` signed in, confirmed in `chrome`, once the device holds its
 /// path: a refusal for a path not read yet is asked again.
 async fn signed_in(
@@ -786,7 +830,7 @@ async fn signed_in(
     loop {
         chrome.will(confirm(&[]));
         match session.ask("sign_in", request, chrome).await {
-            Err(error) if error.code == Code::NoPath => {
+            Err(error) if matches!(error.code, Code::NoPath | Code::Unclaimed) => {
                 chrome.answers.lock().unwrap().clear();
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -870,7 +914,7 @@ async fn a_window_without_this_apps_programs_is_refused_before_proving() {
         chrome.will(confirm(&[]));
         match session.ask("sign_in", &login, &chrome).await {
             Ok(_) => break,
-            Err(error) if error.code == Code::NoPath => {
+            Err(error) if matches!(error.code, Code::NoPath | Code::Unclaimed) => {
                 chrome.answers.lock().unwrap().clear();
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }

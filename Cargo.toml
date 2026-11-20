@@ -209,7 +209,7 @@ opt-level = 3
 # s4, by git revision: the gateway's SSH port. The facility and the demo,
 # outside the workspace, name the same revision (`just pin-s4 <rev>`
 # moves every one; the facility's `tests/pin.rs` holds them equal).
-s4-server = { git = "https://codeberg.org/Virto/s4", rev = "b9a877675dfce4946a867e919cb85653e3904457" }
+s4-server = { git = "https://codeberg.org/Virto/s4", rev = "3ef73f547d79e46b323905957dc7ff6ba417df28" }
 # Exact: the workspace nightly is a 1.90 pre-release, which a later fjall
 # release may outgrow. At least 3.1.13: before it, a database's drop could
 # block for good on a full queue of close messages its workers had all

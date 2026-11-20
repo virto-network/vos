@@ -136,7 +136,7 @@ final class OverviewScreen extends Screen {
                     + (device.me ? " (this phone)" : "")
                     + ": "
                     + Words.standing(device.standing)
-                    + ", last sync "
+                    + ", last call at your agent "
                     + Words.ago(device.seen, now)));
       }
     }

@@ -56,4 +56,5 @@ enum Why {
     ARGUMENTS = 47,
     FAILED = 48,
     DELAYED_ADMIN = 49,
+    PAIRING_DECLINED = 50,
 }

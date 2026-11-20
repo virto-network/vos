@@ -164,7 +164,9 @@ abstract class Screen {
       phrase.setText("A recovery phrase: 24 words you write down");
       phrase.setId(View.generateViewId());
       RadioButton key = new RadioButton(screen.app);
-      key.setText("A security key (FIDO2, with a PIN): its card you write down");
+      key.setText(
+          "A separate hardware security key (FIDO2, plugged in by USB or held to NFC, with its"
+              + " PIN), not this phone's own: its card you write down");
       key.setId(View.generateViewId());
       group.addView(phrase);
       group.addView(key);

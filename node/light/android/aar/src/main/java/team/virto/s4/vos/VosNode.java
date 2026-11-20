@@ -142,9 +142,15 @@ public final class VosNode {
             + synced.enrollments
             + " synced, "
             + synced.failed
-            + " failed");
+            + " failed"
+            + why(synced));
     Notices.post(context, synced);
     return synced;
+  }
+
+  /** Why a sync's failures failed, after a colon; nothing when none did. */
+  private static String why(Synced synced) {
+    return synced.failures == null || synced.failures.isEmpty() ? "" : ": " + synced.failures;
   }
 
   /**
@@ -158,7 +164,7 @@ public final class VosNode {
       Log.i(TAG, "personal sync refused: " + refused.message);
       return null;
     }
-    Log.i(TAG, "personal sync done: " + synced.failed + " failed");
+    Log.i(TAG, "personal sync done: " + synced.failed + " failed" + why(synced));
     Notices.post(context, synced);
     return synced;
   }

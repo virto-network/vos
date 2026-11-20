@@ -18,6 +18,9 @@ public final class Words {
 
   private Words() {}
 
+  /** The standing of a device removed, as {@code Device.standing} holds it. */
+  public static final byte REMOVED = 2;
+
   /** A device's standing, as {@code Device.standing} holds it. */
   public static String standing(byte standing) {
     switch (standing) {
@@ -44,6 +47,17 @@ public final class Words {
       return "just now";
     }
     return span(since) + " ago";
+  }
+
+  /**
+   * When an open operation takes effect, after its words: a contested one waits for a resolution,
+   * whatever its maturity.
+   */
+  public static String when(Notice notice, long now) {
+    if (notice.contested) {
+      return ": it waits for a resolution";
+    }
+    return notice.matures > 0 ? ", it takes effect " + until(notice.matures, now) : "";
   }
 
   /** How long until {@code at}, against {@code now}. */
@@ -78,7 +92,8 @@ public final class Words {
       case Pending.RESTORE:
         return "A restore by the kit removes every device";
       case Pending.RESTORING:
-        return "A restore is pending: rotate your recovery kit";
+        return "Your recovery kit opened a restore, which this phone stopped: if you did not"
+            + " open it, rotate your kit";
       case Pending.REMOVED:
         return "This device was removed";
       case Pending.STUCK:
@@ -253,7 +268,10 @@ public final class Words {
         return "this phone's admin key is not kept in hardware: open the pairing on a phone"
             + " whose key is";
       case Why.SOURCE:
-        return "the phone's key failed";
+        // The source's own words name the key: the phone's, or a security key.
+        return refused.detail == null || refused.detail.isEmpty()
+            ? "the key failed"
+            : refused.detail;
       case Why.NO_OPEN_CLAIM:
         return "that home serves no claim";
       case Why.OPEN_CLAIM_REFUSED:
@@ -287,6 +305,8 @@ public final class Words {
         return "your devices have not decided yet";
       case Why.SLOT_EXPIRED:
         return "the pairing's code expired";
+      case Why.PAIRING_DECLINED:
+        return "the pairing was declined on your other device";
       case Why.IN_SET_ALREADY:
         return "this phone is in that personal space already";
       case Why.NOT_IN_AGENT_SET:

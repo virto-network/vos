@@ -295,15 +295,20 @@ impl Facility {
             enrollments: all.len() as u32,
             ..Synced::default()
         };
+        let mut failures = Vec::new();
         for enrollment in all {
             self.inner.net.pin(enrollment.routes(), pinned(&enrollment));
             let Some(tree) = self.inner.tree_of(&enrollment) else {
                 synced.failed += 1;
+                failures.push("an enrollment's tree is not kept".to_owned());
                 continue;
             };
             match read_once(&self.inner.net, &tree, &enrollment).await {
                 Ok(()) => synced.synced += 1,
-                Err(_) => synced.failed += 1,
+                Err(error) => {
+                    synced.failed += 1;
+                    failures.push(format!("a space's tree: {error}"));
+                }
             }
             // The registrar's onion set, once a day: a space whose onions
             // rotate stays reachable. A failure keeps the set pinned.
@@ -315,6 +320,7 @@ impl Facility {
                     .await;
             }
         }
+        synced.failures = failures.join("; ");
         Ok(synced)
     }
 
@@ -1086,6 +1092,33 @@ impl Session {
         self.tree()?.keeper.lock().await.witness()
     }
 
+    /// Why the member has no path: its tree read to the feed's end holds
+    /// no leaf of its (its invitation not claimed yet, or claimed since
+    /// that read: the tree's own timer reads it again within a minute, no
+    /// read made now, so none follows the sign-in); or the tree is not read
+    /// to its end yet.
+    async fn pathless(&self) -> Refusal {
+        let leafless = match self.tree() {
+            Some(tree) => {
+                let keeper = tree.keeper.lock().await;
+                keeper.caught_up() && keeper.slot().is_none()
+            }
+            None => false,
+        };
+        if leafless {
+            refused(
+                Code::Unclaimed,
+                "claim your invitation first: the space's tree holds no leaf of this device's \
+                 member (claimed just now? the device reads the tree again within a minute)",
+            )
+        } else {
+            refused(
+                Code::NoPath,
+                "the device is still reading its space's tree: try again in a few seconds",
+            )
+        }
+    }
+
     /// `sign_in`: a pinned auth-guarded call, proved.
     pub async fn sign_in(&self, request: SignIn, chrome: &dyn Chrome) -> Result<SignedIn, Refusal> {
         let enrollment = self.enrolled()?;
@@ -1113,10 +1146,7 @@ impl Session {
             .admits(&enrollment, &self.inner.stock.auth)
             .await?;
         let Some(witness) = self.witness().await else {
-            return Err(refused(
-                Code::NoPath,
-                "the device is still reading its space's tree: try again in a few seconds",
-            ));
+            return Err(self.pathless().await);
         };
         self.apart(Learned::SignedIn)?;
         let form = Form {
