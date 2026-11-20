@@ -127,9 +127,12 @@ pub fn world() -> Arc<World> {
 }
 
 /// The client every request of a facility under `directory` goes through,
-/// over `world`'s gateway. On the test's runtime.
+/// over `world`'s gateway, the app in the foreground (its sessions keep
+/// spares). On the test's runtime.
 pub fn net(world: &Arc<World>, directory: &std::path::Path) -> Arc<vos_facility::net::Net> {
-    Arc::new(vos_facility::net::Net::new(world.dial(), directory))
+    let net = Arc::new(vos_facility::net::Net::new(world.dial(), directory));
+    net.set_foreground(true);
+    net
 }
 
 /// A facility under `directory`, its source `source`, over `world`, its

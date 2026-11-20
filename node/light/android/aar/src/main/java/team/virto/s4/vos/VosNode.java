@@ -13,6 +13,7 @@ import android.os.ParcelFileDescriptor;
 import android.os.PowerManager;
 import android.os.Process;
 import android.os.RemoteException;
+import android.os.SystemClock;
 import android.util.Log;
 import java.io.File;
 import java.util.HashMap;
@@ -74,6 +75,8 @@ public final class VosNode {
   private final Map<IBinder, Set<Long>> held = new HashMap<>();
   /** The token each UI process last held, by its pid. */
   private final Map<Integer, IBinder> tokens = new HashMap<>();
+  /** When each session was granted, by the monotonic clock: how long it was open, the logs say. */
+  private final Map<Long, Long> grants = new java.util.concurrent.ConcurrentHashMap<>();
 
   /** The process's facility, opened on first use. */
   public static synchronized VosNode get(Context context) {
@@ -290,12 +293,15 @@ public final class VosNode {
     @Override
     public boolean granted(long session, Refusal refused) {
       caller();
+      grants.put(session, SystemClock.elapsedRealtime());
+      Log.i(TAG, "session granted");
       return nativeGranted(handle, session, refused);
     }
 
     @Override
     public void close(long session) {
       caller();
+      grants.remove(session);
       closed(session);
       nativeClose(handle, session);
     }
@@ -311,26 +317,26 @@ public final class VosNode {
     public SignedIn signIn(
         long session, SignInRequest request, IVosPrompts prompts, Refusal refused) {
       caller();
-      Log.i(TAG, "sign-in started");
-      SignedIn signed = nativeSignIn(handle, session, request, announced(prompts), refused);
+      Announced announced = announced(prompts, "sign-in", grants.get(session));
+      SignedIn signed = nativeSignIn(handle, session, request, announced, refused);
       Log.i(
           TAG,
           signed == null
-              ? "sign-in refused: " + refused.code
-              : "sign-in done: proved in " + signed.provingMs + " ms");
+              ? "sign-in refused: " + refused.code + Announced.at(announced)
+              : "sign-in done: proved in " + signed.provingMs + " ms" + Announced.at(announced));
       return signed;
     }
 
     @Override
     public Paid pay(long session, PayRequest request, IVosPrompts prompts, Refusal refused) {
       caller();
-      Log.i(TAG, "payment started");
-      Paid paid = nativePay(handle, session, request, announced(prompts), refused);
+      Announced announced = announced(prompts, "payment", grants.get(session));
+      Paid paid = nativePay(handle, session, request, announced, refused);
       Log.i(
           TAG,
           paid == null
-              ? "payment refused: " + refused.code
-              : "payment done: proved in " + paid.provingMs + " ms");
+              ? "payment refused: " + refused.code + Announced.at(announced)
+              : "payment done: proved in " + paid.provingMs + " ms" + Announced.at(announced));
       return paid;
     }
 
@@ -592,19 +598,51 @@ public final class VosNode {
   }
 
   /**
-   * The UI's prompts, saying when a key was used: the proof starts then, with nothing more asked of
-   * the UI.
+   * The UI's prompts, saying when a key was used (the proof starts then, with nothing more asked of
+   * the UI), and logging each stage of a sign-in or a payment with the milliseconds since it was
+   * asked: the form shown and answered, the key asked and answered, then done. A late form is the
+   * reads before it; a gap from the form's answer to the key's ask is the node's time read; a long
+   * wait from the key's answer to done, past the proof, is the send. Nothing of the form's values
+   * or the key's output is logged.
    */
   private static final class Announced extends IVosPrompts.Stub {
     private final IVosPrompts prompts;
+    private final String what;
+    private final long start = SystemClock.elapsedRealtime();
+    /** The last stage's time, since the start. */
+    private volatile long last;
 
-    Announced(IVosPrompts prompts) {
+    Announced(IVosPrompts prompts, String what, Long granted) {
       this.prompts = prompts;
+      this.what = what;
+      Log.i(
+          TAG,
+          what
+              + " started"
+              + (granted == null ? "" : ", the session open " + (start - granted) + " ms"));
+    }
+
+    private void stage(String stage) {
+      long now = SystemClock.elapsedRealtime() - start;
+      Log.i(TAG, what + " " + stage + " at +" + now + " ms (+" + (now - last) + ")");
+      last = now;
+    }
+
+    /** The end's time, for the done or refused line. */
+    static String at(Announced announced) {
+      if (announced == null) {
+        return "";
+      }
+      long now = SystemClock.elapsedRealtime() - announced.start;
+      return " at +" + now + " ms (+" + (now - announced.last) + " since the last stage)";
     }
 
     @Override
     public Answer confirm(Form form) throws RemoteException {
-      return prompts.confirm(form);
+      stage("form shown");
+      Answer answer = prompts.confirm(form);
+      stage("form answered");
+      return answer;
     }
 
     @Override
@@ -619,7 +657,9 @@ public final class VosNode {
 
     @Override
     public KeyResult evaluateKey(byte kind, byte[] key, byte[] input) throws RemoteException {
+      stage("key asked");
       KeyResult result = prompts.evaluateKey(kind, key, input);
+      stage("key answered");
       if (result != null && result.status == KeyStatus.DONE) {
         Log.i(TAG, "proof started");
       }
@@ -627,8 +667,8 @@ public final class VosNode {
     }
   }
 
-  private static IVosPrompts announced(IVosPrompts prompts) {
-    return prompts == null ? null : new Announced(prompts);
+  private static Announced announced(IVosPrompts prompts, String what, Long granted) {
+    return prompts == null ? null : new Announced(prompts, what, granted);
   }
 
   private static native long nativeOpen(

@@ -296,8 +296,10 @@ pub struct Net {
     client: Client,
     /// What the client dials through, for a stream of the client's own.
     dial: Arc<dyn Dial>,
-    /// The space a spare connection is kept for.
-    spare: Mutex<Option<SpaceId>>,
+    /// The space spare connections are kept for, the session (a facility
+    /// session's number) they are kept for, and the client's number for
+    /// that keeping.
+    spare: Mutex<Option<(SpaceId, u64, u64)>>,
     count: Count,
     directory: PathBuf,
     /// The facility's database, and the routes read from it; or why it
@@ -448,7 +450,8 @@ impl Net {
     }
 
     /// The app came to the foreground, or left it: the client counts what
-    /// it opens from now on as the foreground's, or the background's.
+    /// it opens from now on as the foreground's, or the background's, and
+    /// keeps spares only in the foreground.
     pub fn set_foreground(&self, foreground: bool) {
         self.client.set_foreground(foreground);
     }
@@ -462,15 +465,37 @@ impl Net {
         let _ = write_private(&directory.join(RENDEZVOUS), lines.as_bytes());
     }
 
-    /// Send `request` to `space` under `purpose`: its answer's body.
+    /// Send `request` to `space` under `purpose`: its answer's body. No
+    /// spare carries it.
     pub async fn request(
         &self,
         space: SpaceId,
         purpose: Purpose,
         request: &[u8],
     ) -> Result<Vec<u8>, NetError> {
+        self.request_for(space, purpose, request, None).await
+    }
+
+    /// The same for the facility session `session`: the spares kept for it,
+    /// and only those, may carry it.
+    pub async fn request_for(
+        &self,
+        space: SpaceId,
+        purpose: Purpose,
+        request: &[u8],
+        session: Option<u64>,
+    ) -> Result<Vec<u8>, NetError> {
+        // The client takes a spare only under the keeping named, so a
+        // session kept spares since takes this one's none.
+        let spare = session.and_then(|session| {
+            self.spare
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .filter(|(kept, by, _)| (*kept, *by) == (space, session))
+                .map(|(_, _, epoch)| epoch)
+        });
         self.client
-            .request(space, purpose, request)
+            .request_with(space, purpose, request, spare)
             .await
             .map(|(_, body)| body)
             .map_err(|error| error.to_string())
@@ -543,21 +568,34 @@ impl Net {
         self.client.set_dormant(dormant);
     }
 
-    /// Keep a spare connection for `space`'s next proven call: the space
-    /// the user is signed in to.
-    pub fn keep_spare(&self, space: SpaceId) {
-        *self.spare.lock().unwrap_or_else(|e| e.into_inner()) = Some(space);
-        self.client.keep_spare(Some(space));
+    /// Keep spare connections for `space`'s next proven call and next
+    /// fetch, for the session `session` alone: the spares another session
+    /// was kept are closed, so no connection opened in one session's time
+    /// carries another's request (`light-node.md` §6.2).
+    pub fn keep_spare(&self, space: SpaceId, session: u64) {
+        let mut spare = self.spare.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.is_some_and(|(kept, by, _)| (kept, by) == (space, session)) {
+            return;
+        }
+        let epoch = self
+            .client
+            .keep_spares(Some(space), &[Purpose::Proven, Purpose::Fetch]);
+        *spare = Some((space, session, epoch));
     }
 
-    /// No spare for `space` any more: the last session there closed. A
-    /// spare kept for another space stays.
-    pub fn drop_spare(&self, space: SpaceId) {
+    /// No spares for `session` any more: it closed. Spares kept for
+    /// another session stay.
+    pub fn drop_spare(&self, space: SpaceId, session: u64) {
         let mut spare = self.spare.lock().unwrap_or_else(|e| e.into_inner());
-        if *spare == Some(space) {
+        if spare.is_some_and(|(kept, by, _)| (kept, by) == (space, session)) {
             *spare = None;
-            self.client.keep_spare(None);
+            self.client.keep_spares(None, &[]);
         }
+    }
+
+    /// Whether the app is in the foreground, as last told.
+    pub fn foreground(&self) -> bool {
+        self.client.is_foreground()
     }
 
     /// The bridges pasted in the chrome: arti built anew through them

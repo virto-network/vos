@@ -847,6 +847,13 @@ async fn signed_in(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_window_without_this_apps_programs_is_refused_before_proving() {
     let world = world();
+    // The space's window is ahead of the app from the start: the grant's
+    // read of it finds it so.
+    let mut ahead = world.stock.window();
+    for kernel in &mut ahead.kernels {
+        kernel.programs[0].id = [0x77; 32];
+    }
+    world.state.lock().unwrap().window = Some(ahead.clone());
     let directory = tempfile::tempdir().unwrap();
     let source = Arc::new(Phone::new(9));
     let facility = facility(
@@ -880,16 +887,11 @@ async fn a_window_without_this_apps_programs_is_refused_before_proving() {
         ("amount", Value::from(20u64)),
     ]);
 
-    let mut ahead = world.stock.window();
-    for kernel in &mut ahead.kernels {
-        kernel.programs[0].id = [0x77; 32];
-    }
     let (forms, uses, sent) = (
         chrome.shown.lock().unwrap().len(),
         *source.uses.lock().unwrap(),
         world.state.lock().unwrap().credentialed.len(),
     );
-    world.state.lock().unwrap().window = Some(ahead.clone());
     for (operation, request) in [("sign_in", &login), ("pay", &pay)] {
         let refused = session.ask(operation, request, &chrome).await.unwrap_err();
         assert_eq!(refused.code, Code::Refused, "{operation}");
@@ -939,4 +941,112 @@ fn gateways_banner(ours: &mut std::os::unix::net::UnixStream) {
     let mut banner = [0; 8];
     ours.read_exact(&mut banner).unwrap();
     assert_eq!(&banner, b"SSH-2.0-");
+}
+
+/// A call's expiry is set from the node's time as its own session read it,
+/// on a fetch of its own: a gateway that answers each connection's time
+/// marked (here, five seconds ahead a connection) finds in a proof's expiry
+/// one reading alone, made in that session's time on a connection that
+/// carried nothing else, never another session's nor the feed's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proofs_expiry_carries_its_own_sessions_reading_alone() {
+    const SKEW_MS: u64 = 5_000;
+    let world = world();
+    let directory = tempfile::tempdir().unwrap();
+    let source = Arc::new(Phone::new(9));
+    let facility = facility(
+        &world,
+        directory.path(),
+        Arc::clone(&source) as Arc<dyn Source>,
+    );
+    let chrome = Scripted::default();
+    let enrolling = facility.session(gateway());
+    chrome.will(confirm(&[]));
+    chrome.will(confirm(&[]));
+    let enrolled = enrolling
+        .ask("enroll", &enrollment(), &chrome)
+        .await
+        .unwrap();
+    world.enroll(
+        AGENT,
+        &<[u8; 32]>::try_from(bytes(field(&enrolled, "member"))).unwrap(),
+    );
+    world.skew_times(SKEW_MS);
+
+    // The connection whose marked time the last proof's expiry carries,
+    // the call having been set within three seconds of `from`, the tap.
+    let marked = |from: u64| -> usize {
+        let expires = world.last_credentialed().1.expires_ms - 60_000;
+        let connections = world.state.lock().unwrap().seen.len();
+        // Past 60 connections a mark is minutes off, and refused.
+        assert!(connections < 50, "{connections} connections");
+        let found: Vec<usize> = (0..connections)
+            .filter(|&index| {
+                let set = expires.checked_sub(SKEW_MS * index as u64);
+                set.is_some_and(|set| (from.saturating_sub(1_000)..=from + 3_000).contains(&set))
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "one reading: {found:?}");
+        found[0]
+    };
+    let pay = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(PAYMENTS)),
+        ("method", Value::from("transfer")),
+        ("payee", Value::from("shop")),
+        ("amount", Value::from(20u64)),
+    ]);
+    let login = object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(POLL)),
+        ("method", Value::from("login")),
+        ("arguments", Value::Bytes(Vec::new())),
+    ]);
+
+    // Session A pays; session B, opened after, signs in.
+    let paying = facility.session(gateway());
+    let opened_a = world.state.lock().unwrap().seen.len();
+    paying.granted();
+    chrome.will(confirm(&["shop", "20"]));
+    let from = wall();
+    paying.ask("pay", &pay, &chrome).await.unwrap();
+    let a = marked(from);
+
+    let signing = facility.session(gateway());
+    let opened_b = world.state.lock().unwrap().seen.len();
+    signing.granted();
+    let b = loop {
+        chrome.will(confirm(&[]));
+        let from = wall();
+        match signing.ask("sign_in", &login, &chrome).await {
+            Ok(_) => break marked(from),
+            Err(error) if matches!(error.code, Code::NoPath | Code::Unclaimed) => {
+                chrome.answers.lock().unwrap().clear();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("{error:?}"),
+        }
+    };
+    // A second payment in A carries A's reading still.
+    chrome.will(confirm(&["shop", "21"]));
+    let from = wall();
+    paying.ask("pay", &pay, &chrome).await.unwrap();
+    assert_eq!(marked(from), a, "a session's calls share its reading");
+
+    let seen = world.state.lock().unwrap().seen.clone();
+    assert_ne!(a, b);
+    for (reading, opened) in [(a, opened_a), (b, opened_b)] {
+        assert!(reading >= opened, "read in its session's time");
+        let kinds: Vec<u16> = seen[reading]
+            .requests
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [ApiKind::Time as u16],
+            "a connection that carried it alone"
+        );
+    }
+    assert!(b >= opened_b && a < opened_b, "B's reading is B's own");
 }

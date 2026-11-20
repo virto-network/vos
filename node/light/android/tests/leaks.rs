@@ -301,6 +301,9 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     let stderr = Stderr::capture(&stderr_path);
     ARMED.store(true, Ordering::SeqCst);
     let node = node(&world, &store, Arc::clone(&shown) as Arc<dyn Device>);
+    // The app in the foreground, as while s4 shows a session: the client
+    // stays awake between calls, so the tree's reads go on between them.
+    node.foreground(true);
     let session = node.open_session(gateway());
 
     // Enrollment, its digests the secret's.
@@ -392,11 +395,15 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
             .map(Outcome::SignedIn),
         Code::Source,
     );
+    // A session's reading of the node's clock is its own: a new one reads
+    // the bad time.
     world.state.lock().unwrap().bad_time = true;
+    let late = node.open_session(gateway());
+    node.granted(late).unwrap();
     shown.will_confirm(&["shop", "21"]);
     failed(
         "a node's bad time",
-        node.pay(session, pay, prompts()).map(Outcome::Paid),
+        node.pay(late, pay, prompts()).map(Outcome::Paid),
         Code::Api,
     );
     world.state.lock().unwrap().bad_time = false;

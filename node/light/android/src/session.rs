@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -61,9 +61,32 @@ const UNAVAILABLE: &str = "the space's node cannot read its device window yet: t
 type WindowKey = ([u8; 32], u32, u32);
 /// How long a space's device window is taken as read.
 const WINDOW_TTL: Duration = Duration::from_secs(600);
+/// A window this old is read again by the tree's refresher, so a sign-in
+/// or a payment never waits for it.
+const WINDOW_RENEW: Duration = Duration::from_secs(400);
 /// The furthest the node's time may be from the device's: past it, a relay
 /// that lies about the time could keep a confirmed proof for later.
 const CLOCK_SKEW_MS: u64 = 300_000;
+/// How long a session uses its reading of the node's clock. A reading
+/// is an offset from the device's clock, which drifts a few milliseconds
+/// in that time; what makes it wrong is a step of the device's clock,
+/// which [`CLOCK_STEP_MS`] catches. The bound is PG5's: each reading is a
+/// fetch, a rendezvous, so a session reads again every 4 to 12 minutes
+/// ([`CLOCK_EVERY`]), about seven an hour.
+const CLOCK_LIFE: Duration = Duration::from_secs(15 * 60);
+/// How often a session reads the node's clock again, about: each reading
+/// draws its renewal between half and one and a half of it.
+const CLOCK_EVERY: Duration = Duration::from_secs(8 * 60);
+/// The most the device's clock may move apart from its monotonic clock
+/// while a reading is used: past it the clock was set, or the device
+/// slept, and the node's clock is read again.
+const CLOCK_STEP_MS: u64 = 2_000;
+/// The spread of a session's first reading after its grant.
+const CLOCK_SPREAD: Duration = Duration::from_secs(2);
+/// How often a session's clock task looks at its reading.
+const CLOCK_TICK: Duration = Duration::from_secs(5);
+/// Each session's number, which its spares are kept under.
+static SESSIONS: AtomicU64 = AtomicU64::new(1);
 /// The least time between two `refresh` requests the facility honours, and
 /// the spread of the read one schedules.
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
@@ -117,6 +140,9 @@ pub(crate) struct Inner {
     /// last, and when: read before a proof, and kept for [`WINDOW_TTL`]
     /// while it admits this app's programs.
     windows: Mutex<HashMap<WindowKey, (Instant, DeviceWindow)>>,
+    /// Held while a space's window is read, so a call waits for the read
+    /// its session's grant started rather than making another.
+    window_reads: Mutex<HashMap<WindowKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// What an enrollment asks of the device's personal space.
@@ -152,6 +178,10 @@ struct Tree {
     /// The feed's reads made: a sign-in whose root was refused waits for
     /// the next.
     reads: AtomicUsize,
+    /// The member's path at the newest root the keeper holds, as its last
+    /// read left it: a sign-in takes it without waiting for a read in
+    /// flight.
+    witness: Mutex<Option<AuthWitness>>,
 }
 
 #[derive(Clone)]
@@ -162,6 +192,13 @@ struct Payment {
 }
 
 impl Tree {
+    /// The keeper told its root is unknown to the node, and the witness
+    /// kept as the keeper now has it.
+    fn unknown(&self, keeper: &mut TreeKeeper) {
+        keeper.unknown(now_ms());
+        *self.witness.lock().expect("witness poisoned") = keeper.witness();
+    }
+
     fn stop(&self) {
         if let Some(refresher) = self.refresher.lock().expect("refresher poisoned").take() {
             refresher.abort();
@@ -230,6 +267,7 @@ impl Facility {
                 trees: Mutex::new(HashMap::new()),
                 paired: Mutex::new(None),
                 windows: Mutex::new(HashMap::new()),
+                window_reads: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -444,6 +482,8 @@ impl Facility {
     /// named its application.
     pub fn session(&self, gateway: Gateway) -> Session {
         Session {
+            id: SESSIONS.fetch_add(1, Ordering::Relaxed),
+            clock: Arc::default(),
             inner: Arc::clone(&self.inner),
             origin: Origin {
                 host: gateway.fingerprint.clone(),
@@ -506,52 +546,78 @@ impl Inner {
     ) -> Result<(), Refusal> {
         let shipped = <Release as vos_abi::Decode>::decode_exact(kernel)
             .ok_or_else(|| refused(Code::Prove, "a stock kernel's artifact does not decode"))?;
-        let actor = enrollment.credentials;
-        let key = (enrollment.handle, actor.agent, actor.instance);
-        let held = self
-            .windows
-            .lock()
-            .expect("windows poisoned")
-            .get(&key)
-            .filter(|(at, _)| at.elapsed() < WINDOW_TTL)
-            .map(|(_, window)| window.clone());
-        let window = match held {
-            Some(window) => window,
-            None => {
-                let answer = self
-                    .net
-                    .request(
-                        enrollment.routes(),
-                        Purpose::Fetch,
-                        &wire::devices_request(actor.agent, actor.instance),
-                    )
-                    .await
-                    .map_err(|error| {
-                        refused(Code::Api, format!("the space's device window: {error}"))
-                    })?;
-                let window = wire::devices_answer(&answer)
-                    .map_err(|error| {
-                        refused(Code::Api, format!("the space's device window: {error}"))
-                    })?
-                    .ok_or_else(|| refused(Code::Refused, "the space holds no such instance"))?;
-                self.windows
-                    .lock()
-                    .expect("windows poisoned")
-                    .insert(key, (Instant::now(), window.clone()));
-                window
-            }
-        };
+        let window = self.window(enrollment, WINDOW_TTL).await?;
         // A window that admits none of them is read again next time: the
         // space, or the app, may have moved meanwhile.
         let chosen = vos_light::choose(std::slice::from_ref(&shipped), &window, shipped.method);
         if chosen.is_err() {
-            self.windows.lock().expect("windows poisoned").remove(&key);
+            self.forget_window(enrollment);
         }
         match chosen {
             Ok(_) => Ok(()),
             Err(DeviceError::Unavailable) => Err(refused(Code::Api, UNAVAILABLE)),
             Err(_) => Err(refused(Code::Refused, WINDOW)),
         }
+    }
+
+    /// `enrollment`'s device window, as read within `fresh`, or read now on
+    /// the space's feed connection: the window names nothing of the member's
+    /// and enters no request's bytes (it only gates which program is
+    /// proved), so the connection every member reads the same feed on
+    /// carries it, and it costs no rendezvous.
+    async fn window(
+        &self,
+        enrollment: &Enrollment,
+        fresh: Duration,
+    ) -> Result<DeviceWindow, Refusal> {
+        let actor = enrollment.credentials;
+        let key = (enrollment.handle, actor.agent, actor.instance);
+        let held = || {
+            self.windows
+                .lock()
+                .expect("windows poisoned")
+                .get(&key)
+                .filter(|(at, _)| at.elapsed() < fresh)
+                .map(|(_, window)| window.clone())
+        };
+        if let Some(window) = held() {
+            return Ok(window);
+        }
+        let lock = Arc::clone(
+            self.window_reads
+                .lock()
+                .expect("windows poisoned")
+                .entry(key)
+                .or_default(),
+        );
+        let _reading = lock.lock().await;
+        if let Some(window) = held() {
+            return Ok(window);
+        }
+        let answer = self
+            .net
+            .request(
+                enrollment.routes(),
+                Purpose::Feed,
+                &wire::devices_request(actor.agent, actor.instance),
+            )
+            .await
+            .map_err(|error| refused(Code::Api, format!("the space's device window: {error}")))?;
+        let window = wire::devices_answer(&answer)
+            .map_err(|error| refused(Code::Api, format!("the space's device window: {error}")))?
+            .ok_or_else(|| refused(Code::Refused, "the space holds no such instance"))?;
+        self.windows
+            .lock()
+            .expect("windows poisoned")
+            .insert(key, (Instant::now(), window.clone()));
+        Ok(window)
+    }
+
+    /// `enrollment`'s window read again at the next call.
+    fn forget_window(&self, enrollment: &Enrollment) {
+        let actor = enrollment.credentials;
+        let key = (enrollment.handle, actor.agent, actor.instance);
+        self.windows.lock().expect("windows poisoned").remove(&key);
     }
 
     /// Every enrolled kernel, the programs of others dropped.
@@ -642,6 +708,7 @@ impl Inner {
                 .ok()
                 .and_then(|bytes| TreeKeeper::restore(member, &bytes).ok())
                 .unwrap_or_else(|| TreeKeeper::new(member));
+            let witness = Mutex::new(keeper.witness());
             Arc::new(Tree {
                 space: enrollment.routes(),
                 keeper: tokio::sync::Mutex::new(keeper),
@@ -652,6 +719,7 @@ impl Inner {
                 refresher: Mutex::new(None),
                 sessions: AtomicUsize::new(0),
                 reads: AtomicUsize::new(0),
+                witness,
             })
         })))
     }
@@ -681,21 +749,132 @@ fn live(inner: &Weak<Inner>, cancelled: &AtomicBool) -> Option<Arc<Inner>> {
     inner.upgrade()
 }
 
-/// The node's time, read as a fetch of its own, refused when it is further
-/// from the device's clock than [`CLOCK_SKEW_MS`].
-pub(crate) async fn node_time(net: &Net, space: [u8; 32]) -> Result<u64, String> {
+/// The node's clock as a session read it: its offset from the device's
+/// clock, and when it was read, by the device's clock and its monotonic
+/// one.
+#[derive(Clone, Copy, Debug)]
+struct Clock {
+    offset_ms: i64,
+    wall_ms: u64,
+    at: Instant,
+    /// When the session reads it again.
+    renew: Duration,
+}
+
+impl Clock {
+    /// The node's time now: its time at the reading, moved on by the
+    /// monotonic clock, which a step of the device's clock does not move;
+    /// none past [`CLOCK_LIFE`], or once the device's clock moved apart from
+    /// the monotonic one (it was set, or the device slept, which the
+    /// monotonic clock does not count).
+    fn now(&self) -> Option<u64> {
+        let elapsed = self.at.elapsed();
+        if elapsed >= CLOCK_LIFE {
+            return None;
+        }
+        let elapsed_ms = elapsed.as_millis() as u64;
+        let moved = now_ms() as i64 - self.wall_ms as i64;
+        if moved.abs_diff(elapsed_ms as i64) > CLOCK_STEP_MS {
+            return None;
+        }
+        self.wall_ms
+            .checked_add_signed(self.offset_ms)?
+            .checked_add(elapsed_ms)
+    }
+
+    fn due(&self) -> bool {
+        self.now().is_none() || self.at.elapsed() >= self.renew
+    }
+}
+
+/// A session's reading of the node's clock, its own: the time a gateway
+/// answered reaches every expiry set from it, so a reading is shared only
+/// among the calls of the one session that asked them, which its server
+/// joins anyway (`light-node.md` §6.2).
+#[derive(Default)]
+struct SessionClock {
+    reading: Mutex<Option<Clock>>,
+    /// Held while the clock is read, so a call waits for a read in flight
+    /// rather than making another.
+    read: tokio::sync::Mutex<()>,
+    /// The task reading it again while the session is open.
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// A read made while a form is read.
+    meanwhile: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl SessionClock {
+    fn current(&self) -> Option<u64> {
+        self.reading
+            .lock()
+            .expect("clock poisoned")
+            .as_ref()
+            .and_then(Clock::now)
+    }
+
+    /// The node's time now: this session's reading, or one read now.
+    async fn now(&self, net: &Net, space: [u8; 32], session: u64) -> Result<u64, String> {
+        if let Some(now) = self.current() {
+            return Ok(now);
+        }
+        self.renew(net, space, session).await?;
+        self.current()
+            .ok_or_else(|| "the device's clock moved while the node's time was read".into())
+    }
+
+    /// The clock read again, if its reading is due.
+    async fn renew(&self, net: &Net, space: [u8; 32], session: u64) -> Result<(), String> {
+        let _reading = self.read.lock().await;
+        let due = self
+            .reading
+            .lock()
+            .expect("clock poisoned")
+            .as_ref()
+            .is_none_or(Clock::due);
+        if due {
+            let clock = read_clock(net, space, session).await?;
+            *self.reading.lock().expect("clock poisoned") = Some(clock);
+        }
+        Ok(())
+    }
+
+    fn stop(&self) {
+        for task in [&self.task, &self.meanwhile] {
+            if let Some(task) = task.lock().expect("clock poisoned").take() {
+                task.abort();
+            }
+        }
+    }
+}
+
+/// The node's clock, read on a fetch of its own (the session's fetch spare
+/// if one is built), refused when it is further from the device's than
+/// [`CLOCK_SKEW_MS`]. The device's clock is taken as the answer arrives, so
+/// the reading errs early by the trip and an expiry set from it never
+/// later than the node's time says.
+async fn read_clock(net: &Net, space: [u8; 32], session: u64) -> Result<Clock, String> {
     let answer = net
-        .request(space, Purpose::Fetch, &wire::time_request())
+        .request_for(space, Purpose::Fetch, &wire::time_request(), Some(session))
         .await?;
-    let now = wire::time_answer(&answer).map_err(|error| error.to_string())?;
-    if now.abs_diff(now_ms()) > CLOCK_SKEW_MS {
+    let (wall_ms, at) = (now_ms(), Instant::now());
+    let node = wire::time_answer(&answer).map_err(|error| error.to_string())?;
+    if node.abs_diff(wall_ms) > CLOCK_SKEW_MS {
         return Err("the node's time is minutes off this device's".into());
     }
-    Ok(now)
+    Ok(Clock {
+        offset_ms: node as i64 - wall_ms as i64,
+        wall_ms,
+        at,
+        renew: jittered(CLOCK_EVERY),
+    })
 }
 
 /// The facility on one connection.
 pub struct Session {
+    /// Its number, which its spares are kept under.
+    id: u64,
+    /// Its reading of the node's clock.
+    clock: Arc<SessionClock>,
     inner: Arc<Inner>,
     origin: Origin,
     gateway: Gateway,
@@ -720,15 +899,16 @@ enum Learned {
 }
 
 impl Drop for Session {
-    /// The last session holding a tree stops its refresher, and the spare
-    /// kept for its space.
+    /// Its clock's task stops and its spares close; the last session
+    /// holding a tree stops its refresher.
     fn drop(&mut self) {
+        self.clock.stop();
         let Some(tree) = self.held.lock().expect("held poisoned").take() else {
             return;
         };
+        self.inner.net.drop_spare(tree.space, self.id);
         if tree.sessions.fetch_sub(1, Ordering::SeqCst) == 1 {
             tree.stop();
-            self.inner.net.drop_spare(tree.space);
         }
     }
 }
@@ -758,8 +938,12 @@ impl Session {
     /// The user granted the facility for this session. The enrolled
     /// member's tree is kept from then on, while a session holds it: its
     /// refresher starts at a drawn delay, on the space's feed connection,
-    /// and later sessions do not restart it; a spare connection is kept
-    /// for the space's next proof. Nothing is read before a grant.
+    /// reading the space's device window first, and later sessions do not
+    /// restart it; the session reads the node's clock at a drawn delay and
+    /// keeps it read; spare connections are kept for the session's next
+    /// proof and next fetch. So a sign-in or a payment asked a few seconds
+    /// on reads nothing before its form, and sends one request after its
+    /// confirm. Nothing is read before a grant.
     pub fn granted(&self) {
         if let Ok(Some(enrollment)) = self.inner.store.get(&self.origin) {
             self.keep(enrollment);
@@ -1087,9 +1271,55 @@ impl Session {
             })
     }
 
-    /// The member's path at the newest root its tree holds.
-    async fn witness(&self) -> Option<AuthWitness> {
-        self.tree()?.keeper.lock().await.witness()
+    /// The member's path at the newest root its tree holds, as its last
+    /// read left it.
+    fn witness(&self) -> Option<AuthWitness> {
+        self.tree()?
+            .witness
+            .lock()
+            .expect("witness poisoned")
+            .clone()
+    }
+
+    /// The node's time now, by this session's reading of its clock, or
+    /// read now on a fetch of its own.
+    async fn node_now(&self, enrollment: &Enrollment) -> Result<u64, Refusal> {
+        self.clock
+            .now(&self.inner.net, enrollment.routes(), self.id)
+            .await
+            .map_err(|error| refused(Code::Api, error))
+    }
+
+    /// The node's clock read while the user reads the form, if this
+    /// session holds no reading: the call after the confirm then waits for
+    /// that read, not a new one.
+    fn read_clock_meanwhile(&self, enrollment: &Enrollment) {
+        if self.clock.current().is_some() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (clock, net, space, id) = (
+            Arc::clone(&self.clock),
+            Arc::clone(&self.inner.net),
+            enrollment.routes(),
+            self.id,
+        );
+        let task = runtime.spawn({
+            let clock = Arc::clone(&clock);
+            async move {
+                let _ = clock.renew(&net, space, id).await;
+            }
+        });
+        if let Some(last) = clock
+            .meanwhile
+            .lock()
+            .expect("clock poisoned")
+            .replace(task)
+        {
+            last.abort();
+        }
     }
 
     /// Why the member has no path: its tree read to the feed's end holds
@@ -1145,10 +1375,11 @@ impl Session {
         self.inner
             .admits(&enrollment, &self.inner.stock.auth)
             .await?;
-        let Some(witness) = self.witness().await else {
+        let Some(witness) = self.witness() else {
             return Err(self.pathless().await);
         };
         self.apart(Learned::SignedIn)?;
+        self.read_clock_meanwhile(&enrollment);
         let form = Form {
             title: if *once {
                 format!("Spend your one {}?", method.name)
@@ -1285,15 +1516,19 @@ impl Session {
         let answer = self
             .inner
             .net
-            .request(enrollment.routes(), Purpose::Proven, request)
+            .request_for(enrollment.routes(), Purpose::Proven, request, Some(self.id))
             .await
             .map_err(|error| refused(Code::Api, error))?;
         if root_refused(&answer).is_some()
             && let Some(tree) = self.inner.tree_of(enrollment)
         {
-            tree.keeper.lock().await.unknown(now_ms());
+            tree.unknown(&mut *tree.keeper.lock().await);
         }
-        update_refused(&answer)?;
+        if let Err(refusal) = update_refused(&answer) {
+            // The window that admitted this format is the space's no more.
+            self.inner.forget_window(enrollment);
+            return Err(refusal);
+        }
         Ok(answer)
     }
 
@@ -1313,6 +1548,7 @@ impl Session {
             .admits(&enrollment, &self.inner.stock.owner)
             .await?;
         self.apart(Learned::Named)?;
+        self.read_clock_meanwhile(&enrollment);
         let (mut payee, mut amount) = (request.payee.clone(), request.amount.to_string());
         let mut notice = None;
         let (payee, amount) = loop {
@@ -1369,9 +1605,7 @@ impl Session {
         // The same payment asked again while its last proof may still run
         // (a relay that withheld it, then asked anew) is that proof again:
         // its binding runs once.
-        let now = node_time(&self.inner.net, enrollment.routes())
-            .await
-            .map_err(|error| refused(Code::Api, error))?;
+        let now = self.node_now(&enrollment).await?;
         let tree = self.tree();
         let again = tree.as_ref().and_then(|tree| {
             tree.payment
@@ -1410,16 +1644,14 @@ impl Session {
     }
 
     /// A call of `method` with `arguments`, its expiry from the node's time
-    /// read now on a connection of its own.
+    /// by this session's reading of its clock.
     async fn call_for(
         &self,
         enrollment: &Enrollment,
         method: &Method,
         arguments: Vec<u8>,
     ) -> Result<Call, Refusal> {
-        let now = node_time(&self.inner.net, enrollment.routes())
-            .await
-            .map_err(|error| refused(Code::Api, error))?;
+        let now = self.node_now(enrollment).await?;
         self.call_at(enrollment, method, arguments, now)
     }
 
@@ -1442,7 +1674,8 @@ impl Session {
     }
 
     /// Hold `enrollment`'s tree for this session, its refresher started
-    /// if none runs, and a spare kept for its space's proofs.
+    /// if none runs, the session's clock kept read, and spares kept for its
+    /// proofs and fetches.
     fn keep(&self, enrollment: Enrollment) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
@@ -1458,28 +1691,68 @@ impl Session {
                 *held = Some(Arc::clone(&tree));
             }
         }
-        self.inner.net.keep_spare(enrollment.routes());
+        self.inner.net.keep_spare(enrollment.routes(), self.id);
+        self.keep_clock(&runtime, enrollment.routes());
         let mut refresher = tree.refresher.lock().expect("refresher poisoned");
         if refresher.as_ref().is_some_and(|task| !task.is_finished()) {
             return;
         }
-        let (weak, tick, net) = (
+        let (weak, facility, tick, net) = (
             Arc::downgrade(&tree),
+            Arc::downgrade(&self.inner),
             self.inner.tick,
             Arc::clone(&self.inner.net),
         );
         *refresher = Some(runtime.spawn(async move {
             // The first read at a drawn delay, not at the grant.
             tokio::time::sleep(below(tick)).await;
+            let mut window_due = Instant::now();
             loop {
                 let Some(tree) = weak.upgrade() else {
                     return;
                 };
+                // The window read again before a call would find it old,
+                // and no more often, whatever a call made of it.
+                if Instant::now() >= window_due
+                    && let Some(facility) = facility.upgrade()
+                {
+                    let read = facility.window(&enrollment, WINDOW_RENEW).await;
+                    window_due = Instant::now() + if read.is_ok() { WINDOW_RENEW } else { RETRY };
+                }
                 let wait = match read_once(&net, &tree, &enrollment).await {
                     Ok(()) => jittered(tick),
                     Err(_) => RETRY,
                 };
                 drop(tree);
+                tokio::time::sleep(wait).await;
+            }
+        }));
+    }
+
+    /// The session's clock read at a drawn delay after its grant, and again
+    /// as each reading falls due, while the app is in the foreground: the
+    /// reads are fetches, each its own connection (its fetch spare's when
+    /// one is built).
+    fn keep_clock(&self, runtime: &tokio::runtime::Handle, space: [u8; 32]) {
+        let mut task = self.clock.task.lock().expect("clock poisoned");
+        if task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let (clock, net, id) = (
+            Arc::clone(&self.clock),
+            Arc::clone(&self.inner.net),
+            self.id,
+        );
+        *task = Some(runtime.spawn(async move {
+            tokio::time::sleep(below(CLOCK_SPREAD)).await;
+            loop {
+                let wait = match net.foreground() {
+                    false => CLOCK_TICK,
+                    true => match clock.renew(&net, space, id).await {
+                        Ok(()) => jittered(CLOCK_TICK),
+                        Err(_) => RETRY,
+                    },
+                };
                 tokio::time::sleep(wait).await;
             }
         }));
@@ -1497,7 +1770,7 @@ async fn read_once(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<()
         let mut unknown = tree.unknown_at.lock().expect("refresh poisoned");
         if unknown.is_some_and(|at| Instant::now() >= at) {
             *unknown = None;
-            keeper.unknown(now_ms());
+            tree.unknown(&mut keeper);
             *tree.last_refresh.lock().expect("refresh poisoned") = Some(Instant::now());
         }
     }
@@ -1513,6 +1786,7 @@ async fn read_once(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<()
     if after != before {
         write_private(&tree.file, &after)?;
     }
+    *tree.witness.lock().expect("witness poisoned") = keeper.witness();
     tree.reads.fetch_add(1, Ordering::Release);
     Ok(())
 }
