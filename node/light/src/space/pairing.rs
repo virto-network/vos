@@ -389,12 +389,7 @@ impl<H: Host> Personal<H> {
                 return Err(Error::Cancelled);
             }
             let items: Vec<InboxItem> = {
-                let mut link = self.link(&kept,
-                    Purpose::Personal,
-                    agent,
-                    &slot,
-                    &mut slot_signer,
-                );
+                let mut link = self.link(&kept, Purpose::Personal, agent, &slot, &mut slot_signer);
                 match link
                     .query(method::INBOX, Option::<(u64, [u8; 16])>::None)
                     .map_err(unreached)?
@@ -505,22 +500,28 @@ impl<H: Host> Personal<H> {
     /// The log followed until the opener's commit adding this device is
     /// confirmed (until then its sync key is not admitted, the group names
     /// no device and a pass stops at its keys) and a follow leaves this
-    /// device complete (its vote posted, the epoch decided, the archive
-    /// and recovery kept), or the wait ends with it added; two more left
-    /// for after the pairing returns ([`Personal::follow_behind`]).
+    /// device complete (its vote posted, the archive and recovery kept),
+    /// two more follows at most after the one that found it added; two
+    /// more left for after the pairing returns
+    /// ([`Personal::follow_behind`]).
     fn joined(&self, held: &mut Held) -> Result<(), Error> {
         let until = std::time::Instant::now() + self.wait();
-        while !self.follow(held).unwrap_or(false) {
-            if std::time::Instant::now() > until {
-                // Added, not complete yet: the follows left finish it.
-                if held.group.as_ref().and_then(DeviceGroup::id).is_none() {
-                    return Err(Error::NotJoinedYet);
+        loop {
+            let followed = self.follow(held);
+            if held.group.as_ref().and_then(DeviceGroup::id).is_some() {
+                // Added: complete now, or within the follows it made
+                // before, each failure its own.
+                if !followed? {
+                    self.follow_until_complete(held, 2)?;
                 }
                 break;
             }
+            if std::time::Instant::now() > until {
+                return Err(Error::NotJoinedYet);
+            }
             self.host.sleep(POLL);
         }
-        self.behind.store(2, std::sync::atomic::Ordering::SeqCst);
+        self.leave_behind(held, 2);
         Ok(())
     }
 
@@ -542,12 +543,7 @@ impl<H: Host> Personal<H> {
             let kept = Kept::reached(acked.handle, acked.onions.clone());
             let slot = ed25519_dalek::SigningKey::from_bytes(&acked.slot);
             let mut signer = Signer::new(slot.verifying_key().to_bytes());
-            let mut link = self.link(&kept,
-                Purpose::Personal,
-                acked.agent,
-                &slot,
-                &mut signer,
-            );
+            let mut link = self.link(&kept, Purpose::Personal, acked.agent, &slot, &mut signer);
             match link
                 .call::<u64>(method::PUT, acked.ack.clone())
                 .map_err(unreached)?

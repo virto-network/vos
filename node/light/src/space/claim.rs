@@ -19,8 +19,8 @@ use super::{
 };
 use crate::home::{self, Claim as Claiming, Home};
 use crate::route::Purpose;
-use vos_wire::defaults::ROOT_GRACE_MS;
 use crate::{AuthWitness, Call, Digest, TreeKeeper, wire};
+use vos_wire::defaults::ROOT_GRACE_MS;
 
 /// The open claim's work, on this many threads.
 const WORK_THREADS: usize = 2;
@@ -79,7 +79,10 @@ struct Ahead {
 /// What the kit shown before a new one says: the home refused the backup
 /// for `why`, so its words are void.
 fn voided(why: &str) -> String {
-    format!("The home refused the backup ({why}): the words shown before are void; write these new ones.")
+    format!(
+        "The home refused the backup ({why}): the words shown before are void; write these new \
+         ones."
+    )
 }
 /// The pages of a home's feed one read of its tree follows.
 const FEED_PAGES: usize = 64;
@@ -169,24 +172,31 @@ impl<H: Host> Personal<H> {
     /// session's spares are built): the open claim of `member` for
     /// `terms`; the home's tree read from its feed; the node's time read
     /// on a fetch of its own, the proof's expiry's; and the connection
-    /// the proof goes on opened ahead. Nothing after a refused open claim.
+    /// the proof goes on opened ahead. Nothing after a refused open claim,
+    /// nor once the user declined the kit (`cancelled`).
     fn behind_the_kit(
         &self,
         home: &Home,
         member: &[u8; 32],
         terms: &Open,
         written: &AtomicBool,
+        cancelled: &AtomicBool,
     ) -> Ahead {
         let mut ahead = Ahead {
             open: self.claim_open(home, member, terms),
             tree: None,
             clock: None,
         };
-        if ahead.open.is_err() {
+        // Nothing more for a kit the user declined, nor after a refusal.
+        let stop = || cancelled.load(Ordering::SeqCst);
+        if ahead.open.is_err() || stop() {
+            return ahead;
+        }
+        self.pause(written);
+        if stop() {
             return ahead;
         }
         if let Some(digest) = Digest::from_bytes(member) {
-            self.pause(written);
             let mut keeper = TreeKeeper::new(digest);
             let mut feed = None;
             if self.read_tree(home, &mut keeper, &mut feed).is_ok() {
@@ -194,10 +204,15 @@ impl<H: Host> Personal<H> {
             }
         }
         self.pause(written);
+        if stop() {
+            return ahead;
+        }
         ahead.clock = self.reading(home, Purpose::Fetch).ok();
         self.pause(written);
-        self.host
-            .prepare(&To::Home(home.handle).routes(), Purpose::Proven);
+        if !stop() {
+            self.host
+                .prepare(&To::Home(home.handle).routes(), Purpose::Proven);
+        }
         ahead
     }
 
@@ -412,13 +427,13 @@ impl<H: Host> Personal<H> {
             }
         };
         let member = crate::member(&secret).to_bytes();
-        let mut secret = Some(secret);
+        let mut derived = Some(secret);
         // Why the kit shown last is void: the home refused the backup after
         // it was shown.
         let mut void: Option<String> = None;
         let mut kits = 0;
         let (agent, claim) = loop {
-            let secret = match secret.take() {
+            let secret = match derived.take() {
                 Some(secret) => secret,
                 None => {
                     let source = self.source(prompts, held)?;
@@ -432,11 +447,20 @@ impl<H: Host> Personal<H> {
                 }
                 None => {
                     kits += 1;
-                    match self.kit_and_open(held, prompts, &request, &secret, &member, void.as_deref())
-                    {
+                    match self.kit_and_open(
+                        held,
+                        prompts,
+                        &request,
+                        &secret,
+                        &member,
+                        void.as_deref(),
+                    ) {
                         Ok((claim, ahead)) => (claim, Some(ahead)),
-                        Err(Error::OpenClaimRefused(why)) if kits < KITS => {
+                        // Once: a refusal of the member's own claim that
+                        // stands is no kit's to cure.
+                        Err(Error::OpenClaimRefused(why)) if kits == 1 => {
                             void = Some(voided(&why));
+                            derived = Some(secret);
                             continue;
                         }
                         Err(error) => return Err(error),
@@ -461,12 +485,18 @@ impl<H: Host> Personal<H> {
                         .abandon(held.light.store(), next.rows())
                         .map_err(store_failed)?;
                     self.adopt(held, next);
-                    if kits == 0 || kits >= KITS {
+                    // Only an agent taken meanwhile, or a kit key another
+                    // agent holds, is cured by a new agent and a new kit.
+                    let cured = matches!(error, HomesError::Taken | HomesError::KitTaken);
+                    if kits == 0 || kits >= KITS || !cured {
                         return Err(Error::HomeRefused(error));
                     }
                     // Shown this time: the home refused it, so new words.
                     self.pin(&kept);
-                    void = Some(voided(&format!("{error:?}")));
+                    void = Some(voided(match error {
+                        HomesError::Taken => "the agent it was sealed to was taken meanwhile",
+                        _ => "its kit's key is another's",
+                    }));
                 }
             }
         };
@@ -507,10 +537,12 @@ impl<H: Host> Personal<H> {
         let terms = self.opening(home)?;
         let agent = self.pooled(home)?;
         let device = self.device(held, prompts, home, secret, &request.label)?;
-        let written = AtomicBool::new(false);
+        let (written, cancelled) = (AtomicBool::new(false), AtomicBool::new(false));
         let (kit, ahead) = std::thread::scope(|scope| {
-            let behind = scope.spawn(|| self.behind_the_kit(home, member, &terms, &written));
+            let behind =
+                scope.spawn(|| self.behind_the_kit(home, member, &terms, &written, &cancelled));
             let kit = new_kit(prompts, request.kit, kept, void);
+            cancelled.store(kit.is_err(), Ordering::SeqCst);
             written.store(true, Ordering::SeqCst);
             (kit, behind.join())
         });

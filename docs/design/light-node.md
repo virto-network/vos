@@ -1743,14 +1743,19 @@ the one taken]:
 - **A flow is done at its first complete follow** [built, the owner's
   choice D3, `job::complete`]: a pairing (the joiner's), a commit now and
   a restore's finish return once a follow leaves this device in the set
-  and following, no candidate pending (its vote posted, the epoch
-  decided), the archive and the recovery envelopes kept with nothing
-  stale and no scope's reading waiting; the follows the flow made after
-  that before (two for a joiner, up to three after a commit) run after it
-  returns, on the facility's thread, each holding the space alone, the
-  status read meanwhile answered as the flow left it. One that fails
-  stands as a notice (`Pending::Unfinished`) until a pass of the
-  personal space runs to its end.
+  and following, its vote on a pending candidate posted (the epoch may
+  still wait for the other devices'), the archive and the recovery
+  envelopes kept with nothing stale and no scope's reading waiting. The
+  extra follows each flow used to make before returning (two for a
+  joiner, what is left of three after a commit) run after it returns, on
+  one thread of the facility's at a time, each holding the space alone,
+  the status read meanwhile answered as the flow left it; an embedder
+  other than the facility runs them itself (`Personal::follow_behind`)
+  or leaves them to the next pass. One that fails stands as a notice
+  (`Pending::Unfinished`) until a pass of the personal space runs to its
+  end. A page asked ahead that ends a scope short of where another
+  scope's writer said it had read is read once more before the
+  partition alarm counts it.
 - **Not built here:** re-reading an envelope passed
   over once a later archive brings a key that opens it, and garbage
   collection of covered envelopes and of earlier epochs' archives

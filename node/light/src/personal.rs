@@ -621,11 +621,19 @@ impl<'a, L: Link> SealedSync<'a, L> {
         drop(Zeroizing::new(self.group.key(scope)?));
         let mut caught = Caught::default();
         let mut scan = Scan::new(self.tracked()?);
+        // A page read ahead of its turn may be from before a writer's
+        // envelope another scope's reading showed it had read past: read
+        // once more before the end of the scope counts.
+        let mut again = true;
         loop {
             let from = self.light.cursor(instance)?.unwrap_or(0);
             let page = self.since(scope, from)?;
             if page.is_empty() {
                 let watch = self.watch(&mut scan, scope)?;
+                if watch.claimed > from && watch.claimed > watch.alarmed && again {
+                    again = false;
+                    continue;
+                }
                 if watch.claimed > from && watch.claimed > watch.alarmed {
                     watch.alarmed = watch.claimed;
                     let position = watch.claimed;

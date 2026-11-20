@@ -131,7 +131,10 @@ fn behind_done(node: &Node, flow: &str) {
     let before = node.status().unwrap();
     let start = Instant::now();
     while node.space().unwrap().behind() {
-        assert!(start.elapsed() < Duration::from_secs(120), "{flow}: follows left running");
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "{flow}: follows left running"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     let after = node.status().unwrap();

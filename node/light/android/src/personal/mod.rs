@@ -628,6 +628,12 @@ impl Space {
         Ok(self.0.follow_behind()?)
     }
 
+    /// The follows left for after a flow dropped: the next pass makes
+    /// them.
+    pub fn drop_behind(&self) {
+        self.0.drop_behind();
+    }
+
     /// The personal space's state as the device holds it, the facility's
     /// parts (Tor, the notices standing) left for the node to fill.
     pub fn status(&self) -> Result<PersonalStatus, Refused> {

@@ -770,7 +770,9 @@ async fn a_sign_in_before_the_claim_waits_for_the_invitation() {
     };
     assert_eq!(refused.code, Code::Unclaimed, "{refused:?}");
     assert!(
-        refused.message.contains("the operator has not invited it yet"),
+        refused
+            .message
+            .contains("the operator has not invited it yet"),
         "{refused:?}"
     );
     assert!(

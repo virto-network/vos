@@ -491,9 +491,9 @@ impl Client {
                 drop(preparing.lock().await);
             }
             let (routes, route, version) = self.current(space, purpose)?;
-            let spare = self
-                .take_prepared(space, purpose, version)
-                .or_else(|| spare.and_then(|epoch| self.take_spare(space, purpose, version, epoch)));
+            let spare = self.take_prepared(space, purpose, version).or_else(|| {
+                spare.and_then(|epoch| self.take_spare(space, purpose, version, epoch))
+            });
             self.refill();
             match spare {
                 Some(spare) => spare,
@@ -557,13 +557,11 @@ impl Client {
         let connection = self.open(space, purpose, &routes, route, version).await?;
         let deadline = self.inner.config.request;
         let asked = async {
-            let (_, time) = tokio::time::timeout(
-                deadline,
-                connection.request(Kind::Time as u16, &[]),
-            )
-            .await
-            .map_err(|_| Error::Lost)?
-            .map_err(|_| Error::Lost)?;
+            let (_, time) =
+                tokio::time::timeout(deadline, connection.request(Kind::Time as u16, &[]))
+                    .await
+                    .map_err(|_| Error::Lost)?
+                    .map_err(|_| Error::Lost)?;
             let now = wire::time_answer(&time).map_err(Error::Answer)?;
             let request = query(now)?;
             let (kind, body) = request.split_at_checked(2).ok_or(Error::Malformed)?;
@@ -806,9 +804,8 @@ impl Client {
             .preparing
             .retain(|_, held| !Arc::ptr_eq(held, &opening));
         let connection = opened?;
-        let until = Instant::now()
-            + self.inner.config.spare_idle / 2
-            + below(self.inner.config.spare_idle);
+        let until =
+            Instant::now() + self.inner.config.spare_idle / 2 + below(self.inner.config.spare_idle);
         let held = Spare {
             held: Held {
                 version,
@@ -816,9 +813,27 @@ impl Client {
             },
             until,
         };
+        let kept = Arc::downgrade(&held.held.connection);
         if let Some(old) = self.state().prepared.insert((space, purpose), held) {
             old.held.connection.close();
         }
+        // Closed at its life's end unless a request took it.
+        let client = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(until.into()).await;
+            let (Some(inner), Some(connection)) = (client.upgrade(), kept.upgrade()) else {
+                return;
+            };
+            let mut state = inner.state.lock().expect("the client's state");
+            let unused = state
+                .prepared
+                .get(&(space, purpose))
+                .is_some_and(|prepared| Arc::ptr_eq(&prepared.held.connection, &connection));
+            if unused {
+                state.prepared.remove(&(space, purpose));
+                connection.close();
+            }
+        });
         Ok(())
     }
 
@@ -1155,7 +1170,6 @@ fn rand_u64() -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-/// A uniform draw below `period`.
 /// Every one of `futures` run at once on the calling task: their outputs,
 /// in order.
 async fn all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
@@ -1184,6 +1198,7 @@ async fn all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
         .collect()
 }
 
+/// A uniform draw below `period`.
 fn below(period: Duration) -> Duration {
     Duration::from_micros(rand_u64() % (period.as_micros() as u64).max(1))
 }

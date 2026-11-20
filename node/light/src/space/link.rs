@@ -107,7 +107,10 @@ pub fn answer<T: Decode>(outcome: &Outcome) -> Result<Result<T, PersonalError>, 
 /// node's time once, however many links it makes. A one-shot purpose's
 /// reading is its own connection's alone, and is never kept here.
 #[derive(Default)]
-pub struct Clocks(std::sync::Mutex<std::collections::HashMap<([u8; 32], Purpose), (u64, Instant)>>);
+pub struct Clocks(std::sync::Mutex<std::collections::HashMap<([u8; 32], Purpose), Reading>>);
+
+/// The node's time as read, and when.
+type Reading = (u64, Instant);
 
 impl Clocks {
     /// The node's time now under `purpose` at `space`, by a reading young
@@ -473,12 +476,10 @@ impl<H: Host> Control for AgentLink<'_, H> {
         else {
             return;
         };
-        let answers = self
-            .host
-            .requests(&self.space, self.purpose, &requests);
+        let answers = self.host.requests(&self.space, self.purpose, &requests);
         for (mut ahead, answer) in asked.into_iter().zip(answers) {
-            ahead.answer = answer
-                .and_then(|body| wire::outcome(&body).map_err(|error| error.to_string()));
+            ahead.answer =
+                answer.and_then(|body| wire::outcome(&body).map_err(|error| error.to_string()));
             self.ahead.push(ahead);
         }
     }

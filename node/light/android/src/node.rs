@@ -174,6 +174,9 @@ pub struct Node {
     /// Whether the app is in the foreground, and the operations and jobs
     /// running: the client is dormant only when neither.
     waking: Arc<Mutex<(bool, usize)>>,
+    /// The thread making the follows a flow left for after it, one at a
+    /// time: joined before the node goes.
+    behind: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[derive(Default)]
@@ -301,6 +304,7 @@ impl Node {
             sessions: Mutex::new(Sessions::default()),
             warming: Mutex::new(Vec::new()),
             waking: Arc::new(Mutex::new((false, 0))),
+            behind: Mutex::new(None),
         })
     }
 
@@ -658,7 +662,9 @@ impl Node {
     /// for them, and one that fails stands as a notice until a pass
     /// finishes what it left.
     fn follow_behind(&self, space: &Arc<Space>) {
-        if !space.behind() {
+        let mut running = crate::lock(&self.behind);
+        // One thread at a time: one running makes these follows too.
+        if !space.behind() || running.as_ref().is_some_and(|thread| !thread.is_finished()) {
             return;
         }
         let (space, job, waking) = (
@@ -669,7 +675,7 @@ impl Node {
         let (facility, runtime) = (self.facility.clone(), self.runtime.handle().clone());
         crate::lock(&waking).1 += 1;
         facility.net().set_dormant(false);
-        std::thread::spawn(move || {
+        *running = Some(std::thread::spawn(move || {
             {
                 let _entered = runtime.enter();
                 match space.follow_behind() {
@@ -683,7 +689,7 @@ impl Node {
             if *waking == (false, 0) {
                 facility.net().set_dormant(true);
             }
-        });
+        }));
     }
 }
 
@@ -730,6 +736,14 @@ impl Drop for Awake<'_> {
 
 impl Drop for Node {
     fn drop(&mut self) {
+        // The follows left stop after the one running, before the runtime
+        // goes: the next pass makes the rest.
+        if let Some(Ok(space)) = &self.personal {
+            space.drop_behind();
+        }
+        if let Some(thread) = crate::lock(&self.behind).take() {
+            let _ = thread.join();
+        }
         for warming in crate::lock(&self.warming).iter() {
             warming.cancel();
         }

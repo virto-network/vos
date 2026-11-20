@@ -42,8 +42,9 @@ pub struct Status {
 
 impl<H: Host> Personal<H> {
     /// The personal space's state, from what the device holds alone; while
-    /// a follow a flow left for after it holds the space, the state as
-    /// last read, which those follows leave as it is.
+    /// the follows a flow left for after it run and the space is held, the
+    /// state that flow left (a follow that finds the device removed shows
+    /// at the next read after it).
     pub fn status(&self) -> Result<Status, super::Error> {
         let held = match self.held.try_lock() {
             Ok(held) => held,
@@ -62,7 +63,7 @@ impl<H: Host> Personal<H> {
     }
 }
 
-fn read(held: &Held) -> Result<Status, super::Error> {
+pub(super) fn read(held: &Held) -> Result<Status, super::Error> {
     let phase = phase(held)?;
     let store = held.light.store();
     let owed = memberships::enrollments(store).map_err(store_failed)?.len()

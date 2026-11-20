@@ -480,7 +480,11 @@ impl Net {
             .requests(space, purpose, requests)
             .await
             .into_iter()
-            .map(|answer| answer.map(|(_, body)| body).map_err(|error| error.to_string()))
+            .map(|answer| {
+                answer
+                    .map(|(_, body)| body)
+                    .map_err(|error| error.to_string())
+            })
             .collect()
     }
 

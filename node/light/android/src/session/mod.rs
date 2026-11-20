@@ -1237,7 +1237,11 @@ impl Session {
     /// sign-in made seconds after the first root holding a new leaf to the
     /// newest member, as it can a sign-in tapped again (`light-node.md`
     /// §6.2).
-    async fn listed(&self, enrollment: &Enrollment, chrome: &dyn Chrome) -> Result<AuthWitness, Refusal> {
+    async fn listed(
+        &self,
+        enrollment: &Enrollment,
+        chrome: &dyn Chrome,
+    ) -> Result<AuthWitness, Refusal> {
         if let Some(witness) = self.witness() {
             return Ok(witness);
         }

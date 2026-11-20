@@ -1012,17 +1012,25 @@ impl<H: Host> Personal<H> {
         })
     }
 
-    /// Up to `follows` follows, until one leaves the device complete: a
-    /// flow returns once it is, and leaves the rest of the `follows`
-    /// for after it ([`Personal::follow_behind`]). The follows made.
+    /// Up to `follows` follows, until one leaves the device complete
+    /// ([`crate::job::complete`]): the follows made.
     fn follow_until_complete(&self, held: &mut Held, follows: usize) -> Result<usize, Error> {
         for made in 1..=follows {
             if self.follow(held)? {
-                self.behind.store(follows - made, Ordering::SeqCst);
                 return Ok(made);
             }
         }
         Ok(follows)
+    }
+
+    /// `follows` left for after the flow holding `held` returns
+    /// ([`Personal::follow_behind`]), and the state it leaves kept for the
+    /// status read while they run.
+    fn leave_behind(&self, held: &Held, follows: usize) {
+        if let Ok(status) = status::read(held) {
+            *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
+        }
+        self.behind.store(follows, Ordering::SeqCst);
     }
 
     /// Whether a flow returned with follows left for after it.
@@ -1035,18 +1043,29 @@ impl<H: Host> Personal<H> {
     /// meanwhile waits for one follow at most. One that fails leaves the
     /// rest to the next pass.
     pub fn follow_behind(&self) -> Result<(), Error> {
-        // The state the flow left, for a read while the follows run.
-        self.status()?;
         while self.behind() {
             let followed = self.follow(&mut self.held());
-            let left = match followed {
-                Ok(_) => self.behind.load(Ordering::SeqCst).saturating_sub(1),
-                Err(_) => 0,
-            };
-            self.behind.store(left, Ordering::SeqCst);
-            followed?;
+            match followed {
+                Ok(_) => {
+                    let _ = self
+                        .behind
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                            Some(left.saturating_sub(1))
+                        });
+                }
+                Err(error) => {
+                    self.behind.store(0, Ordering::SeqCst);
+                    return Err(error);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The follows left for after a flow dropped: the next pass makes
+    /// them.
+    pub fn drop_behind(&self) {
+        self.behind.store(0, Ordering::SeqCst);
     }
 
     /// The device's keys at `home`: its sync key, its admin key (made now
@@ -1100,7 +1119,6 @@ impl To {
         }
     }
 }
-
 
 /// The secret for the space whose handle is `handle`, from `source` at its
 /// prompt.

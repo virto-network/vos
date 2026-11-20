@@ -57,12 +57,7 @@ impl<H: Host> Personal<H> {
             && let Some(restoring) = held.state.restoring.clone()
             && restoring.signed.is_some()
         {
-            let mut link = self.link(&kept,
-                Purpose::Personal,
-                agent,
-                &signing,
-                &mut session,
-            );
+            let mut link = self.link(&kept, Purpose::Personal, agent, &signing, &mut session);
             entries = logged(&mut link, 0)?;
             if restore_cancelled(&entries, &restoring.arguments) {
                 held.state.restoring = None;
@@ -126,12 +121,7 @@ impl<H: Host> Personal<H> {
                 agent
             }
         };
-        let mut link = self.link(&kept,
-            Purpose::Personal,
-            agent,
-            &signing,
-            &mut session,
-        );
+        let mut link = self.link(&kept, Purpose::Personal, agent, &signing, &mut session);
         let restoring = held.state.restoring.clone().ok_or(Error::NoSpace)?;
         if entries.is_empty() && restoring.signed.is_some() {
             entries = logged(&mut link, 0)?;
@@ -238,24 +228,14 @@ impl<H: Host> Personal<H> {
         let signing = kit.signing();
         let mut kit_signer = Signer::new(signing.verifying_key().to_bytes());
         {
-            let mut link = self.link(&kept,
-                Purpose::Personal,
-                agent,
-                &signing,
-                &mut kit_signer,
-            );
+            let mut link = self.link(&kept, Purpose::Personal, agent, &signing, &mut kit_signer);
             answered(link.wake())?;
         }
         let key = held.light.sync_key().clone();
         let (view, envelopes, overview, devices, policy) = {
             // The sync key's own session: a read that fails keeps what the
             // wakes before it used.
-            let mut link = self.link(&kept,
-                Purpose::Personal,
-                agent,
-                &key,
-                &mut held.sync,
-            );
+            let mut link = self.link(&kept, Purpose::Personal, agent, &key, &mut held.sync);
             answered(link.settle())?;
             let view: RecoveryView = answered(link.query(method::RECOVERY, ()))?;
             let mut envelopes = Vec::new();

@@ -922,7 +922,9 @@ the device never exports, evaluated once a use after the user's consent
     keeps the whole tree from `feed(from)`, whose query names only its
     place in the feed, read on a timer of its own (never just before a
     proof, but for a device's first sign-in, which waits for its leaf
-    reading the feed: `light-node.md` §6.2), and computes the member's path itself (`light-node.md` §6.7);
+    reading the feed, and a personal agent's claim, which reads its home's
+    tree while the kit is written down: `light-node.md` §6.2, §3.8), and
+    computes the member's path itself (`light-node.md` §6.7);
   - from each request's address and timing: a proof's connection shows
     the node or gateway that serves it where it came from and when, which
     links its nullifier to that address. So `Anonymous` hides the member

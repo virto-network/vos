@@ -95,7 +95,11 @@ impl Host for Reach {
         self.runtime
             .block_on(self.client.requests(*space, purpose, requests))
             .into_iter()
-            .map(|answer| answer.map(|(_, body)| body).map_err(|error| error.to_string()))
+            .map(|answer| {
+                answer
+                    .map(|(_, body)| body)
+                    .map_err(|error| error.to_string())
+            })
             .collect()
     }
 
@@ -105,9 +109,10 @@ impl Host for Reach {
         query: &mut dyn FnMut(u64) -> Result<Vec<u8>, String>,
     ) -> Result<Vec<u8>, String> {
         self.runtime
-            .block_on(self.client.fetch_timed(*space, |now| {
-                query(now).map_err(crate::tor::Error::Query)
-            }))
+            .block_on(
+                self.client
+                    .fetch_timed(*space, |now| query(now).map_err(crate::tor::Error::Query)),
+            )
             .map(|(_, body)| body)
             .map_err(|error| error.to_string())
     }

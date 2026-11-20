@@ -354,7 +354,9 @@ impl Job {
             fresh: true,
             ..Notice::default()
         };
-        state.raised.retain(|raised| raised.notice.pending != Pending::Unfinished);
+        state
+            .raised
+            .retain(|raised| raised.notice.pending != Pending::Unfinished);
         state.raised.push(Raised { notice, since: now });
         let _ = self.runs.write(&state);
     }
@@ -367,7 +369,9 @@ impl Job {
             return;
         };
         let before = state.raised.len();
-        state.raised.retain(|raised| raised.notice.pending != Pending::Unfinished);
+        state
+            .raised
+            .retain(|raised| raised.notice.pending != Pending::Unfinished);
         if state.raised.len() != before {
             let _ = self.runs.write(&state);
         }

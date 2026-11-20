@@ -382,13 +382,14 @@ pub fn run<L: Control>(
 }
 
 /// Whether a pass that ran to its end, `pass`, left `group` with nothing
-/// a flow waits for: in the set and following, no candidate pending (its
-/// vote posted and the epoch decided), the archive and the recovery
-/// envelopes kept with nothing stale, and no scope's reading waiting.
+/// a flow waits for of this device: in the set and following, its vote on
+/// a pending candidate posted ([`DeviceGroup::voted`]; the epoch may still
+/// wait for the other devices'), the archive and the recovery envelopes
+/// kept with nothing stale, and no scope's reading waiting.
 pub fn complete(group: &DeviceGroup, pass: &Pass) -> bool {
     group.course() == group::Course::Following
         && group.id().is_some()
-        && !group.pending()
+        && group.voted()
         && pass.kept
         && pass.waiting.is_empty()
 }
@@ -471,10 +472,7 @@ fn passing<L: Control>(
 /// log this device read: an overview asked beside a log page may be
 /// answered from before that page's last entry, which is no rollback; one
 /// read after the log is the agent's word.
-fn head<L: Control>(
-    group: &DeviceGroup,
-    link: &mut L,
-) -> Result<Overview, SyncError<L::Error>> {
+fn head<L: Control>(group: &DeviceGroup, link: &mut L) -> Result<Overview, SyncError<L::Error>> {
     onion(link)?;
     let overview = answer(link.overview())?;
     if overview.next >= group.cursor() {

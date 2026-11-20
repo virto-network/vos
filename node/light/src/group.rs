@@ -758,6 +758,17 @@ impl DeviceGroup {
         self.state.pending.is_some() || self.state.own.is_some()
     }
 
+    /// Whether this device owes no vote: no commit of its own waits to be
+    /// logged, and the candidate pending, if one is, holds its vote. The
+    /// epoch may still wait for the other devices'.
+    pub fn voted(&self) -> bool {
+        let me = self.id();
+        self.state.own.is_none()
+            && self.state.pending.as_ref().is_none_or(|pending| {
+                me.is_some_and(|me| pending.votes.iter().any(|(device, _)| *device == me))
+            })
+    }
+
     pub fn archive(&self) -> &Archive {
         &self.archive
     }

@@ -469,7 +469,8 @@ impl<H: Host> Personal<H> {
         // Done once a follow leaves the device complete (its vote on the
         // commit posted, the epoch decided, the archive and recovery
         // kept); the rest of the three after the flow returns.
-        self.follow_until_complete(&mut held, 3)?;
+        let made = self.follow_until_complete(&mut held, 3)?;
+        self.leave_behind(&held, 3 - made);
         Ok(())
     }
 
