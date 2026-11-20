@@ -786,13 +786,15 @@ fn a_contest_lifted_inside_the_delay_matures_at_its_own_time() {
 }
 
 /// B6: an admin call names its place, the log's head its signer read, and
-/// is taken there alone. One naming a head the log has moved past, a chain
+/// is taken at a place no earlier than the entry after the last admin call
+/// logged and no later than the head. One behind that call, naming a chain
 /// the log never had or a head ahead of it is refused `StaleHead`, and
 /// logs nothing: a call the log took cannot be taken again later, so a
-/// route that logs it again on a fork logs what no agent took. What fell
-/// due is settled ahead of a call placed at the head before it.
+/// route that logs it again on a fork logs what no agent took. Entries
+/// that are no admin call move no place on, and what fell due is settled
+/// ahead of a call placed before the batch settles it.
 #[test]
-fn an_admin_call_is_taken_only_at_the_head_it_names() {
+fn an_admin_call_is_taken_only_at_the_place_it_names() {
     let mut home = seasoned(3);
     let before = home.head(admin(0));
     let removal = home.unevidenced(admin(0), "remove", 2u32).unwrap();
@@ -822,17 +824,25 @@ fn an_admin_call_is_taken_only_at_the_head_it_names() {
         );
     }
     assert_eq!(home.head(admin(1)), head, "nothing logged");
-    // The removal falls due unevidenced: a call placed at the head before
-    // the batch settles it is taken after the cancellation.
+    // A lease renewed is no admin call: the veto signed before it is taken.
+    let run = home.run_as(HOMES, "renew", Vec::new());
+    answer::<Recorded>("renew", &run.outcome).unwrap();
+    let run = home.run_as(admin(1), "veto", head.arguments(&removal.encode()));
+    let veto = answer::<Recorded>("veto", &run.outcome).unwrap();
+    assert!(veto.index > head.next, "{veto:?} after {head:?}");
+    assert_eq!(home.logged(veto.index), head.arguments(&removal.encode()));
+    // A removal falls due unevidenced: a call placed before the batch
+    // settles it is taken after the cancellation.
+    let due = home.unevidenced(admin(0), "remove", 1u32).unwrap();
+    let place = home.head(admin(2));
     home.pass(3 * MINUTE + 1);
-    let run = home.run_as(admin(1), "remove", head.arguments(&0u32.encode()));
+    let run = home.run_as(admin(2), "remove", place.arguments(&0u32.encode()));
     let taken = answer::<Recorded>("remove", &run.outcome).unwrap();
-    assert!(taken.index > head.next, "{taken:?} after {head:?}");
+    assert!(taken.index > place.next, "{taken:?} after {place:?}");
     assert_eq!(
-        cancelled(state(&home, sync(0), removal)),
+        cancelled(state(&home, sync(0), due)),
         Some(Cancel::Unevidenced)
     );
-    assert_eq!(home.logged(taken.index), head.arguments(&0u32.encode()));
 }
 
 /// B6: every operation and veto is an admin call whose evidence its

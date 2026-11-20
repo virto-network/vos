@@ -157,10 +157,7 @@ impl DeviceGroup {
     /// a paired device's start, where it read no chain, the floor alone
     /// holds it: its pairing device read those entries.
     fn placed(&self, index: u64, body: &Body) -> Result<bool, GroupError> {
-        let (Body::Operation { call, .. }
-        | Body::Veto { call, .. }
-        | Body::Cosign { call, .. }
-        | Body::Resolve { call, .. }) = body
+        let Some(call) = admin_call(body).filter(|_| !matches!(body, Body::Candidate { .. }))
         else {
             return Ok(true);
         };

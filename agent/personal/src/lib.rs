@@ -16,7 +16,9 @@
 //!   verifies nothing. The device then posts the call's evidence, the
 //!   signed message and its signature, stored as data beside it. A
 //!   device-set call names its place first, the log's head its signer read,
-//!   and is taken only there (`StaleHead`), before what its batch settles.
+//!   and is taken only at a place no later than the head and no earlier
+//!   than the entry after the last admin call logged (`StaleHead`),
+//!   compared before what its batch settles.
 //! - **The commit log:** one candidate an epoch, the confirmed epoch plus
 //!   one; its confirming set (the devices seen by a call in the window,
 //!   less every matured removal) written into its log entry; the votes,
@@ -139,6 +141,9 @@ pub struct Personal {
     evidenced: Table<u64, u64>,
     log: Table<u64, Entry, Ordered>,
     head: Cell<Head>,
+    /// The index after the last admin call logged: no device-set call
+    /// names a place before it.
+    floor: Cell<u64>,
     group: Cell<Group>,
     lease: Cell<Lease>,
     policy: Cell<Policy>,

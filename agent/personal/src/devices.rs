@@ -229,12 +229,21 @@ impl Personal {
         Ok((now, call, by))
     }
 
-    /// Whether `place` is the log's head, before anything the call's batch
-    /// settles: an admin call is taken only where its signer read the log
-    /// to, so a device that read past it never takes it elsewhere.
+    /// Whether `place` is one the log had since its last admin call,
+    /// compared before anything the call's batch settles: at or after the
+    /// entry following that call, at or before the head, its chain the
+    /// log's there. A device takes a call only by the same rule, so a call
+    /// logged again past one that names a place before it is no device's.
     pub(crate) fn placed(&self, place: Place) -> Result<(), PersonalError> {
         let head = self.head.get_or_default();
-        if head.next != place.next || head.chain != place.chain {
+        let chain = match place.next.checked_sub(1) {
+            None => Some([0; 32]),
+            Some(before) => self.log.get(&before).map(|entry| entry.chain),
+        };
+        if place.next < self.floor.get_or_default()
+            || place.next > head.next
+            || chain != Some(place.chain)
+        {
             return Err(PersonalError::StaleHead);
         }
         Ok(())

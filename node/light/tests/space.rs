@@ -337,11 +337,12 @@ fn a_vetoed_removal_logged_again_on_the_route_turns_no_phone_away() {
     assert_eq!(first.standing(id), Some(Standing::Active));
 }
 
-/// An admin call refused for a head the log moved past (an entry logged
-/// between the reading and the call) is read and signed again, at most
-/// three signatures in all: then the refusal is the user's to see.
+/// An entry that is no admin call, logged between the reading and the
+/// call, moves no place on: the call is signed once and taken. One refused
+/// `StaleHead` is read and signed again, at most three signatures in all:
+/// then the refusal is the user's to see.
 #[test]
-fn an_admin_call_at_a_moved_head_is_signed_again() {
+fn an_admin_call_is_signed_again_only_for_its_place() {
     let world = world();
     let home = world.home(HOME, 2, 1);
     let first = device(&world, 0x55);
@@ -356,7 +357,7 @@ fn an_admin_call_at_a_moved_head_is_signed_again() {
     let removes = calls
         .iter()
         .filter(|step| **step == Step::call(method::REMOVE));
-    assert_eq!(removes.count(), 2, "signed again: {calls:?}");
+    assert_eq!(removes.count(), 1, "signed once: {calls:?}");
     world.refuse(
         0x55,
         Step::call(method::REMOVE),

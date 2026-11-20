@@ -58,13 +58,13 @@ mod state;
 
 use std::collections::BTreeMap;
 
-use vos_abi::ids::InstanceId;
+use vos_abi::ids::{InstanceId, MethodId};
 use vos_abi::{Decode, Encode};
 use vos_mls::{Mls, Namespace};
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
-    Attached, DeviceId, DeviceView, Effect, NewDevice, Op, Policy, Scope, Signer, Status, Vote,
-    welcome_hash,
+    Attached, DeviceId, DeviceView, Effect, NewDevice, Op, Place, Policy, Scope, Signer, Status,
+    Vote, welcome_hash,
 };
 use zeroize::Zeroize;
 
@@ -1037,14 +1037,36 @@ impl DeviceGroup {
     }
 
     /// The agent refused this device's admin call signed as `message`: it
-    /// is held no more.
+    /// is held no more, unless the log holds it (a refusal the route made
+    /// up), whose evidence is posted still.
     pub fn unsent(&mut self, message: &[u8]) -> Result<(), GroupError> {
         let before = self.state.sent.len();
-        self.state.sent.retain(|sent| sent.message != message);
+        self.state
+            .sent
+            .retain(|sent| sent.message != message || sent.index.is_some());
         if self.state.sent.len() < before {
             self.mls.write(rows(&self.state, None))?;
         }
         Ok(())
+    }
+
+    /// This device's admin call of `method` with `arguments` (its place
+    /// aside) that the log holds open with its evidence still to post: one
+    /// whose answer was lost. Its log index, its batch time, and the
+    /// message and signature its evidence carries.
+    pub fn taken(
+        &self,
+        method: MethodId,
+        arguments: &[u8],
+    ) -> Option<(u64, u64, Vec<u8>, [u8; 64])> {
+        self.state.sent.iter().find_map(|sent| {
+            let index = sent.index?;
+            let signed = CallMessage::parse(&sent.message)?;
+            let (_, unplaced) = Place::split(&signed.arguments)?;
+            let call = self.state.call_at(index)?;
+            (signed.method == method && unplaced == arguments)
+                .then(|| (index, call.at, sent.message.clone(), sent.signature))
+        })
     }
 
     /// The agent refused the evidence posted for the call at `index`, past

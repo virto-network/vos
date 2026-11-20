@@ -17,7 +17,7 @@ use vos_wire::personal::{
 };
 
 use super::link::{AgentLink, Key, Signer, answer};
-use super::set::{Device, evidence, placed};
+use super::set::{Device, call_placed, evidence};
 use super::{
     Error, Host, Kept, KitCall, Personal, Posted, Prompts, answered, entered_kit, link, logged,
 };
@@ -142,19 +142,17 @@ impl<H: Host> Personal<H> {
             }
             let sign = |message: &[u8]| Ok(signing.sign(message).to_bytes());
             let mut signer = Signer::new(origin);
-            let mut previous: Option<Vec<u8>> = None;
+            // Each signature kept: one signed again after a refusal the
+            // route made up may be the log's, and the next kit call posts
+            // its evidence, or drops it once the log does not hold it.
             let mut hold = |message: &[u8], signature: &[u8; 64]| {
-                self.keep_kit_call(
-                    identity,
-                    previous.replace(message.to_vec()),
-                    Some((message, signature)),
-                )
-                .map_err(|error| error.to_string())
+                self.keep_kit_call(identity, None, Some((message, signature)))
+                    .map_err(|error| error.to_string())
             };
             // Placed at the log's head as the agent answers it: the log just
             // read, then its overview for a call signed again.
             let mut read = Some(head(&entries));
-            let called = placed(
+            let called = call_placed(
                 link,
                 &mut Key::Lent(&mut signer, &sign),
                 method,

@@ -63,11 +63,6 @@ pub struct Home {
     readers: std::cell::RefCell<Vec<[u8; 32]>>,
 }
 
-/// The device-set admin calls, which name their place in the log first.
-const PLACED: [&str; 9] = [
-    "remove", "add", "replace", "rotate", "regroup", "restore", "veto", "cosign", "resolve",
-];
-
 /// The home's agent, whose `Homes` claims the agent.
 const HOME_AGENT: AgentId = AgentId(0x50);
 
@@ -184,7 +179,7 @@ impl Home {
     /// for a call now, not yet sent: a device-set admin call placed at the
     /// log's head first.
     pub fn sign(&mut self, key: &SigningKey, name: &str, arguments: Vec<u8>) -> Signed {
-        let arguments = if PLACED.contains(&name) {
+        let arguments = if vos_wire::personal::method::PLACED.contains(&self.method(name)) {
             self.head(key.verifying_key().to_bytes())
                 .arguments(&arguments)
         } else {

@@ -233,11 +233,6 @@ pub fn answer<T: Decode>(name: &str, outcome: &Outcome) -> Result<T, PersonalErr
     }
 }
 
-/// The device-set admin calls, which name their place in the log first.
-pub const PLACED: [&str; 9] = [
-    "remove", "add", "replace", "rotate", "regroup", "restore", "veto", "cosign", "resolve",
-];
-
 /// A personal agent in a [`World`]: `Personal` installed in its agent, the
 /// role `homes` granted, calls in one session per caller, each a batch at
 /// the world's clock. Over a world of its own, or a view of an agent of a
@@ -319,10 +314,10 @@ impl<W: Borrow<World>> Home<W> {
         self.world.borrow().method(self.agent, PERSONAL, name)
     }
 
-    /// The log's head, read as `caller` or, refused, as the first device
-    /// the agent answers: the start of the log before a claim.
+    /// The log's head, read as `caller` or, refused, as the kit or the
+    /// first device the agent answers: the start of the log before a claim.
     pub fn head(&self, caller: Principal) -> Place {
-        let readers = [caller].into_iter().chain((0..32).map(sync));
+        let readers = [caller, KIT].into_iter().chain((0..32).map(sync));
         readers
             .filter_map(|reader| self.query::<Overview>(reader, "overview", ()).ok())
             .map(|overview| Place {
@@ -339,7 +334,7 @@ impl<W: Borrow<World>> Home<W> {
     /// `arguments` of `name` as `caller` signs them: placed at the log's
     /// head first for a device-set admin call.
     pub fn placed(&self, caller: Principal, name: &str, arguments: &[u8]) -> Vec<u8> {
-        if PLACED.contains(&name) {
+        if vos_wire::personal::method::PLACED.contains(&self.method(name)) {
             self.head(caller).arguments(arguments)
         } else {
             arguments.to_vec()
@@ -347,10 +342,12 @@ impl<W: Borrow<World>> Home<W> {
     }
 
     /// The arguments of the admin call the log holds at `index`, as its
-    /// signer signed them.
+    /// signer signed them, read as the kit or the first device the agent
+    /// answers.
     pub fn logged(&self, index: u64) -> Vec<u8> {
-        let entry = (0..32)
-            .map(sync)
+        let entry = [KIT]
+            .into_iter()
+            .chain((0..32).map(sync))
             .find_map(|reader| self.query::<Vec<(u64, Entry)>>(reader, "log", index).ok())
             .and_then(|page| page.into_iter().next())
             .filter(|(at, _)| *at == index)
@@ -637,7 +634,7 @@ impl<W: BorrowMut<World>> Home<W> {
         r2: [u8; 32],
     ) -> Result<Recorded, PersonalError> {
         // A device-set call's arguments are as the log holds them, placed.
-        let arguments = match PLACED.contains(&name) {
+        let arguments = match vos_wire::personal::method::PLACED.contains(&self.method(name)) {
             true => self.logged(index),
             false => arguments.encode(),
         };

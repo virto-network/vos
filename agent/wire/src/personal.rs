@@ -57,6 +57,11 @@ pub mod method {
         ACKNOWLEDGEMENTS = "acknowledgements";
         FRONTIER = "frontier";
     }
+
+    /// The device-set calls, which name their place in the log first.
+    pub const PLACED: [vos_abi::ids::MethodId; 9] = [
+        ADD, REMOVE, REPLACE, ROTATE, REGROUP, RESTORE, VETO, COSIGN, RESOLVE,
+    ];
 }
 
 /// A sealed scope's id: opaque to the agent, `BLAKE2b-128("vos/personal/
@@ -587,12 +592,13 @@ impl core::fmt::Debug for Attached {
 /// Where a device-set admin call takes its place in the control log, the
 /// first of its arguments: the log's head as the device read it when it
 /// signed the call, the next index and the chain through the entry before
-/// it. The agent takes the call only at its head ([`PersonalError::
-/// StaleHead`]), before anything the call's batch settles, and a device
-/// only at or after the entry following the last admin call it read and at
-/// or before the call's own entry: a call logged again on a log a route
-/// forks names a place before the call it copies, which every device that
-/// read that call has passed.
+/// it. The agent and every device take the call only at a place at or
+/// after the entry following the last admin call before it and at or
+/// before the call's own entry, its chain the one the log had there
+/// ([`PersonalError::StaleHead`]; the agent compares it before anything
+/// the call's batch settles): a call logged again on a log a route forks
+/// names a place before the call it copies, which every device that read
+/// that call has passed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Place {
     pub next: u64,
@@ -600,9 +606,6 @@ pub struct Place {
 }
 
 impl Place {
-    /// Its encoding's bytes.
-    pub const BYTES: usize = 8 + 32;
-
     /// The place `arguments` name first, and the arguments after it.
     pub fn split(arguments: &[u8]) -> Option<(Place, &[u8])> {
         let (place, used) = Place::decode(arguments).ok()?;
@@ -1021,8 +1024,9 @@ pub enum PersonalError {
     /// evidence yet (or no `R2` where it carries one): post it first.
     #[codec(index = 45)]
     Unevidenced,
-    /// The log moved past the head the admin call names as its place:
-    /// read it again and sign the call there.
+    /// The place the admin call names is behind the last admin call
+    /// logged, past the head, or a chain the log never had: read the log
+    /// again and sign the call at its head.
     #[codec(index = 46)]
     StaleHead,
 }

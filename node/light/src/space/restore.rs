@@ -12,7 +12,7 @@ use vos_wire::personal::{
 };
 
 use super::link::{Key, Signer, answer};
-use super::set::{evidence, placed};
+use super::set::{call_placed, evidence};
 use super::{
     Claim, Claimed, Error, Held, Host, PERSONAL, Personal, Posted, Prompts, Restoring, answered,
     entered_kit, failed, link, logged, new_kit, secret,
@@ -172,7 +172,7 @@ impl<H: Host> Personal<H> {
                         .map_err(|error| error.to_string())
                 };
                 // Placed at the log's head as the agent answers it.
-                let called = placed(
+                let called = call_placed(
                     &mut link,
                     &mut Key::Lent(&mut kit_signer, &sign),
                     method::RESTORE,

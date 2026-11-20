@@ -123,10 +123,19 @@ impl Personal {
         self.lease.get().is_some_and(|lease| lease.until < now)
     }
 
-    /// Append `body` to the control log at `at`: its index.
+    /// Append `body` to the control log at `at`, an admin call's moving the
+    /// floor past it: its index.
     pub(crate) fn append(&mut self, at: u64, body: Body) -> u64 {
         let mut head: Head = self.head.get_or_default();
         let index = head.next;
+        let call = matches!(
+            body,
+            Body::Operation { .. }
+                | Body::Candidate { .. }
+                | Body::Veto { .. }
+                | Body::Cosign { .. }
+                | Body::Resolve { .. }
+        );
         let linked = chain(&head.chain, index, at, &body);
         self.log.insert(
             &index,
@@ -139,6 +148,9 @@ impl Personal {
         head.next += 1;
         head.chain = linked;
         self.head.set(&head);
+        if call {
+            self.floor.set(&head.next);
+        }
         index
     }
 

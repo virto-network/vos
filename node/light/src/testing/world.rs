@@ -912,20 +912,19 @@ impl World {
 }
 
 impl World {
-    /// Whether the call `body` is the one [`World::renew_before`] renews
-    /// its agent's lease before: renewed, if it is.
-    fn renewing(&self, tag: u8, kind: u16, body: &[u8]) -> bool {
+    /// The lease of the agent the call `body` goes to renewed, if it is
+    /// the call [`World::renew_before`] names.
+    fn renew_if(&self, tag: u8, kind: u16, body: &[u8]) {
         let now = self.now();
         let mut state = self.state.lock().unwrap();
         if state.renewing.get(&tag) != Some(&Step::of(kind, body)) {
-            return false;
+            return;
         }
         state.renewing.remove(&tag);
         let (agent, _) = <(AgentId, ingress::Call)>::decode_exact(body).expect("a call");
         if let Some(host) = state.personal.get_mut(&agent.0) {
             host.renew(now);
         }
-        true
     }
 
     /// The answer to a read of the control log or the overview by the
@@ -1369,6 +1368,9 @@ impl ssh::Connection for Connection {
             return Answer::Cut;
         }
         self.seen(|seen| seen.carried(kind, body));
+        if matches!(fate, Fate::Answer | Fate::TakeAndDrop) {
+            self.world.renew_if(self.tag, kind, body);
+        }
         let answer = match fate {
             Fate::Forge => self.world.forged(body),
             Fate::Refuse(refusal) => Response::Ran {
@@ -1380,9 +1382,6 @@ impl ssh::Connection for Connection {
             }
             .encode(),
             _ => match self.world.forked(self.tag, kind, body) {
-                None if self.world.renewing(self.tag, kind, body) => {
-                    self.world.answer(kind, body, self.index)
-                }
                 Some(forked) => forked,
                 None => self.world.answer(kind, body, self.index),
             },

@@ -1287,31 +1287,41 @@ host-verified]:
   (add, remove, replace, rotate, regroup, restore, veto, cosign, resolve)
   names first in its arguments the log's head its signer read before the
   prompt, `Place { next, chain }`: the next index and the chain through the
-  entry before it. The agent takes the call only at its head, compared
-  before anything the call's batch settles (`StaleHead` otherwise, nothing
-  logged); a device takes it only at or after its floor, the entry after
-  the last admin call it read (its start, for a device that read none; a
-  paired device takes its pairing device's), and at or before the call's
-  own entry, the chain there the one it read, and otherwise raises
-  `Alarm::Log` and reads no further, as for an entry that does not chain.
-  A call logged again elsewhere names a place before the call it copies,
-  which every device that read that call has passed: a route cannot log a
-  removal once signed, vetoed or cancelled a second time and mature it
-  there unvetoed. The device reads the log to its head just before the
-  prompt (one read, two when there is something new), and a call refused
-  `StaleHead` (another device's entry between the reading and the call) or
-  `Settling` (a wake first) is read and signed again, a prompt each time,
-  three signatures at most; the kit's and a restore's calls take the head
-  from the log they read or the agent's overview, the agent's word, which
-  binds the place, not its truth. Commits are not placed: an epoch and the
-  votes, which bind the voters' logs, place them. Why not the call
-  session's `t0` with a window, or the devices remembering each call's
-  message: the evidence is a separate later entry a route can withhold, so
-  a device that read an operation and its veto but never the message has
-  nothing to recognize the copy by; the place is checked at the call's own
-  entry. What is left is withholding: a device that has not read a veto
-  yet can be shown the operation without it, and its maturity at a time
-  the route claims (B7, B8).
+  entry before it. The agent and every device take the call only at a
+  place at or after their floor, the entry after the last admin call
+  before it (a device's start, for one that read none; a paired device
+  takes its pairing device's), and at or before the call's own entry, the
+  chain there the log's. The agent compares it before anything the call's
+  batch settles and refuses any other `StaleHead`, logging nothing; a
+  device raises `Alarm::Log` and reads no further, as for an entry that
+  does not chain. A call logged again elsewhere names a place before the
+  call it copies, which every device that read that call has passed: a
+  route cannot log a removal once signed, vetoed or cancelled a second
+  time and mature it there unvetoed. Entries that are no admin call
+  (evidence, votes, `alive`, a renewal, what a batch settles) move no
+  floor, so another device's background pass between the reading and the
+  call refuses nothing; the cost is that a signed call withheld stays
+  takeable until the next admin call is logged. The device reads the log
+  to its head just before the prompt (one read, two when there is
+  something new), and signs nothing when that log stops at an entry it
+  refuses or it is out of the set. The same call made before and taken,
+  its answer lost, has its evidence posted rather than being signed again.
+  A call refused `StaleHead` (another admin call between the reading and
+  the call) or `Settling` (a wake first) is read and signed again, a
+  prompt each time, three signatures at most; a route can make up either
+  refusal, which costs at most those prompts and takes no device out, and
+  a call it forwarded before making one up stays held, its evidence
+  posted. The kit's and a restore's calls take the head from the log they
+  read or the agent's overview, the agent's word, which binds the place,
+  not its truth. Commits are not placed: an epoch and the votes, which
+  bind the voters' logs, place them. Why not the call session's `t0` with
+  a window, or the devices remembering each call's message: the evidence
+  is a separate later entry a route can withhold, so a device that read an
+  operation and its veto but never the message has nothing to recognize
+  the copy by; the place is checked at the call's own entry. What is left
+  is withholding: a device that has not read a veto yet can be shown the
+  operation without it, and its maturity at a time the route claims (B7,
+  B8).
 - Delays run on the agent's batch time alone; a device whose clock
   disagrees with the agent's by more than an hour raises an alarm and
   otherwise acts as the log says. A restored device starts from the
@@ -1531,8 +1541,10 @@ where the rules above leave a choice, this is the one taken]:
   removal's signer removed first); the operations read as the last call
   left them.
 - **The place,** each device-set call's first argument (§3.5, "Admin
-  calls"): compared with the head at the start of every such handler,
-  before `settle`, so what its batch settles is logged ahead of the call.
+  calls"): compared at the start of every such handler, before `settle`,
+  against the head, the log's chains and `floor`, the index after the last
+  admin call logged, so what its batch settles is logged ahead of the
+  call.
 
 **The kit and its flows as built** [built, `vos_light::kit`, the device
 group and sealed sync, tested against `Personal` in
