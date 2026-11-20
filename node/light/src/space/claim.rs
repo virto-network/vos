@@ -260,7 +260,7 @@ impl<H: Host> Personal<H> {
                 next.home = Some(kept.clone());
                 next.agent = Some(agent);
                 next.label = request.label;
-                let claim = Claiming::prepare_with(
+                let claim = Claiming::prepare(
                     held.light.store(),
                     device,
                     vec![kit.key()],
@@ -283,7 +283,7 @@ impl<H: Host> Personal<H> {
                 let mut next = held.state.clone();
                 (next.home, next.agent) = (None, None);
                 claim
-                    .abandon_with(held.light.store(), next.rows())
+                    .abandon(held.light.store(), next.rows())
                     .map_err(store_failed)?;
                 self.adopt(held, next);
                 return Err(Error::HomeRefused(error));

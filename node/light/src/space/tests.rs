@@ -311,8 +311,15 @@ fn a_restore_is_refused_while_a_claim_waits() {
     {
         let held = space.held();
         let (device, _) = <(NewDevice, NewKit)>::decode_exact(&restoring.arguments).unwrap();
-        crate::home::Claim::prepare(held.light.store(), device, vec![restoring.next], 3, [4; 32])
-            .unwrap();
+        crate::home::Claim::prepare(
+            held.light.store(),
+            device,
+            vec![restoring.next],
+            3,
+            [4; 32],
+            Vec::new(),
+        )
+        .unwrap();
     }
     let refused = space
         .restore(

@@ -121,7 +121,7 @@ fn paired_phones_confirm_one_group() {
         .pair(stranger.keys.clone(), package, home.now())
         .unwrap();
     assert!(matches!(
-        DeviceGroup::join(&stranger.store, stranger.keys.clone(), pairing),
+        DeviceGroup::join(&stranger.store, stranger.keys.clone(), pairing, Vec::new()),
         Err(vos_light::group::GroupError::Scoped)
     ));
     phones[0].group().abandon().unwrap();

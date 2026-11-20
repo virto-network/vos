@@ -909,15 +909,10 @@ pub fn credential(device: &NewDevice) -> Vec<u8> {
 
 /// A restore's split of `keys`, the kit it carries, at `agent`: its `R`
 /// held in `store`'s archive until the restore matures and
-/// [`DeviceGroup::restore`] makes it the kit's. Only for a store with no
-/// device group.
-pub fn restoring(store: &Store, keys: &[KitKey], agent: &Agent) -> Result<Split, GroupError> {
-    restoring_with(store, keys, agent, |_| Vec::new())
-}
-
-/// [`restoring`], the rows `rows` makes of the split written in the same
-/// batch: what the restore makes the device's beside it.
-pub fn restoring_with(
+/// [`DeviceGroup::restore`] makes it the kit's, and the rows `rows` makes
+/// of the split written in the same batch: what the restore makes the
+/// device's beside it. Only for a store with no device group.
+pub fn restoring(
     store: &Store,
     keys: &[KitKey],
     agent: &Agent,
@@ -1082,16 +1077,11 @@ impl DeviceGroup {
 
     /// The paired device's group, from `pairing`: it follows the log from
     /// where the pairing device read it, and joins with the Welcome of the
-    /// commit that adds it. Its store's archive becomes the pairing's; a
-    /// store whose naming secret named a scope already is refused.
-    pub fn join(store: &Store, me: NewDevice, pairing: Pairing) -> Result<Self, GroupError> {
-        Self::join_with(store, me, pairing, Vec::new())
-    }
-
-    /// [`DeviceGroup::join`], `rows` of the group keyspace written in the
+    /// commit that adds it, `rows` of the group keyspace written in the
     /// batch that makes the group: what the pairing makes the device's
-    /// beside it.
-    pub fn join_with(
+    /// beside it. Its store's archive becomes the pairing's; a store whose
+    /// naming secret named a scope already is refused.
+    pub fn join(
         store: &Store,
         me: NewDevice,
         pairing: Pairing,

@@ -104,8 +104,10 @@ pub(super) fn open_restore(
     n: u8,
 ) -> (Phone, Split, u64) {
     let restoring = Phone::new(n);
-    let split =
-        vos_light::group::restoring(&restoring.store, &[next.key()], &home.agent()).unwrap();
+    let split = vos_light::group::restoring(&restoring.store, &[next.key()], &home.agent(), |_| {
+        Vec::new()
+    })
+    .unwrap();
     let signing = kit.signing();
     let index = operate(
         home,
@@ -622,8 +624,10 @@ fn a_restore_a_device_judges_invalid_is_answered_alive() {
     let (mut home, mut phones, _) = household_with(2, vec![leaked.key()]);
     let next = KitSecret::phrase().unwrap();
     let restoring = Phone::new(9);
-    let split =
-        vos_light::group::restoring(&restoring.store, &[next.key()], &home.agent()).unwrap();
+    let split = vos_light::group::restoring(&restoring.store, &[next.key()], &home.agent(), |_| {
+        Vec::new()
+    })
+    .unwrap();
     let signing = leaked.signing();
     let reply = home.call(
         &signing,

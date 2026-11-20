@@ -237,7 +237,8 @@ impl Phone {
             .pair(new.keys.clone(), package, home.now())
             .unwrap();
         let pairing = Pairing::from_bytes(&pairing.to_bytes()).unwrap();
-        new.group = Some(DeviceGroup::join(&new.store, new.keys.clone(), pairing).unwrap());
+        new.group =
+            Some(DeviceGroup::join(&new.store, new.keys.clone(), pairing, Vec::new()).unwrap());
         self.send(home, &prepared).unwrap()
     }
 }

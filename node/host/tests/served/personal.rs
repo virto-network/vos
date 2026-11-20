@@ -601,6 +601,7 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
         vec![phrase.key()],
         agent,
         identity,
+        Vec::new(),
     )
     .unwrap();
     let path = first
@@ -744,8 +745,15 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
     else {
         panic!("the handover")
     };
-    second.group =
-        Some(DeviceGroup::join(second.light.store(), second.keys.clone(), *pairing).unwrap());
+    second.group = Some(
+        DeviceGroup::join(
+            second.light.store(),
+            second.keys.clone(),
+            *pairing,
+            Vec::new(),
+        )
+        .unwrap(),
+    );
     memberships::expect(second.light.store(), &offered.memberships).unwrap();
     leave(&mut sockets, personal, &mut slot, &ack);
     assert!(matches!(
@@ -859,7 +867,8 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
             second.keys.clone(),
             vec![phrase.key()],
             agent,
-            identity
+            identity,
+            Vec::new()
         ),
         Err(ClaimError::Held)
     ));

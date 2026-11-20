@@ -343,7 +343,9 @@ fn a_restore_starts_a_new_group_under_its_new_kit() {
     let (mut home, mut phones) = household(2);
     let mut restored = Phone::new(9);
     let next = kit_key(1);
-    let split = vos_light::group::restoring(&restored.store, &[next], &home.agent()).unwrap();
+    let split =
+        vos_light::group::restoring(&restored.store, &[next], &home.agent(), |_| Vec::new())
+            .unwrap();
     operate(
         &mut home,
         &kit(0),

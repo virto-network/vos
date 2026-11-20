@@ -4054,8 +4054,8 @@ device's crates faster); Q9's size argument for it is small.
   (the kit's words and card, the source, the admin key), refusing with
   `space::Error`; the facility is their adapter. What the device keeps
   of its personal space is rows of the light store (`p/…`), each written
-  in the batch of the group change it describes (`Claim::prepare_with`,
-  `DeviceGroup::join_with`, `group::restoring_with`), with no state file
+  in the batch of the group change it describes (`Claim::prepare`,
+  `DeviceGroup::join`, `group::restoring`), with no state file
   and nothing to reconcile at open. The facility's enrollments, routes,
   bridges and jobs' runs are rows of its own database (`facility/`, its
   layout 1), SCALE of its own types, read strictly. `IVosPersonal.status`

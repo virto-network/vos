@@ -239,8 +239,15 @@ fn household(agent: &[u8]) -> (Personal, Phone, Phone) {
         .group()
         .pair(second.keys.device(), package, now)
         .unwrap();
-    second.group =
-        Some(DeviceGroup::join(second.light.store(), second.keys.device(), pairing).unwrap());
+    second.group = Some(
+        DeviceGroup::join(
+            second.light.store(),
+            second.keys.device(),
+            pairing,
+            Vec::new(),
+        )
+        .unwrap(),
+    );
     let (call, answer) = personal.call(&mut first.admin, "commit", prepared.arguments());
     first
         .group()

@@ -110,7 +110,7 @@ impl<H: Host> Personal<H> {
                 next.home = Some(kept.clone());
                 next.agent = Some(agent);
                 next.label = request.label;
-                crate::group::restoring_with(
+                crate::group::restoring(
                     held.light.store(),
                     &[kit.key()],
                     &GroupAgent {

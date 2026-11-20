@@ -477,7 +477,7 @@ impl<H: Host> Personal<H> {
         let mut rows = next.rows();
         rows.extend(memberships::expected(&offer.memberships));
         let group =
-            DeviceGroup::join_with(held.light.store(), device, *pairing, rows).map_err(failed)?;
+            DeviceGroup::join(held.light.store(), device, *pairing, rows).map_err(failed)?;
         held.group = Some(group);
         self.adopt(&mut held, next);
         held.sync = Signer::new(held.light.sync_key().verifying_key().to_bytes());

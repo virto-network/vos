@@ -221,7 +221,8 @@ fn pair_in(
     let Joined::Handover(pairing, ack) = joiner_reads(home, &code, &mut joining) else {
         panic!("the handover")
     };
-    joiner.group = Some(DeviceGroup::join(&joiner.store, joiner.keys.clone(), *pairing).unwrap());
+    joiner.group =
+        Some(DeviceGroup::join(&joiner.store, joiner.keys.clone(), *pairing, Vec::new()).unwrap());
     memberships::expect(&joiner.store, &offered.memberships).unwrap();
     leave(home, &code.slot_key(), &ack);
     assert!(matches!(
@@ -350,7 +351,8 @@ fn a_phone_is_paired_through_the_slot_and_reads_at_once() {
                 phone.keys.clone(),
                 vec![kit_key(5)],
                 8,
-                [0x08; 32]
+                [0x08; 32],
+                Vec::new()
             ),
             Err(ClaimError::Held)
         ));
@@ -669,6 +671,7 @@ fn a_claim_with_a_phrase_and_a_security_key_starts_the_group() {
         keys.clone(),
         7,
         home.identity,
+        Vec::new(),
     )
     .unwrap();
     assert!(matches!(
@@ -677,7 +680,8 @@ fn a_claim_with_a_phrase_and_a_security_key_starts_the_group() {
             phone.keys.clone(),
             keys.clone(),
             7,
-            home.identity
+            home.identity,
+            Vec::new()
         ),
         Err(ClaimError::Held)
     ));
@@ -687,7 +691,8 @@ fn a_claim_with_a_phrase_and_a_security_key_starts_the_group() {
             phone.keys.clone(),
             Vec::new(),
             7,
-            home.identity
+            home.identity,
+            Vec::new()
         ),
         Err(ClaimError::Kit)
     ));

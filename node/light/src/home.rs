@@ -192,21 +192,11 @@ impl Claim {
     /// The claim of the pooled `agent`, whose identity is `identity`, for
     /// `device` with the kit of `keys` (a phrase's, a security key's, or
     /// both): `R` split, `R1` sealed to each key at that agent, held in the
-    /// store before this returns. Refused for a store that holds a personal
-    /// space's archive or a claim already.
+    /// store before this returns, with `rows` of the group keyspace written
+    /// in the same batch: what the claim makes the device's beside it.
+    /// Refused for a store that holds a personal space's archive or a claim
+    /// already.
     pub fn prepare(
-        store: &Store,
-        device: NewDevice,
-        keys: Vec<KitKey>,
-        agent: u32,
-        identity: [u8; 32],
-    ) -> Result<Self, ClaimError> {
-        Self::prepare_with(store, device, keys, agent, identity, Vec::new())
-    }
-
-    /// [`Claim::prepare`], `rows` of the group keyspace written in the
-    /// same batch: what the claim makes the device's beside it.
-    pub fn prepare_with(
         store: &Store,
         device: NewDevice,
         keys: Vec<KitKey>,
@@ -265,13 +255,8 @@ impl Claim {
     /// Drop the claim `Homes` refused (`Taken`, `PoolEmpty`, `KitTaken`):
     /// the device prepares another, at the agent `pooled` answers then;
     /// after `KitTaken`, with another kit, since the same key indexes the
-    /// same agent again.
-    pub fn abandon(self, store: &Store) -> Result<(), ClaimError> {
-        self.abandon_with(store, Vec::new())
-    }
-
-    /// [`Claim::abandon`], `rows` written in the same batch.
-    pub fn abandon_with(self, store: &Store, rows: Vec<Change>) -> Result<(), ClaimError> {
+    /// same agent again. `rows` are written in the same batch.
+    pub fn abandon(self, store: &Store, rows: Vec<Change>) -> Result<(), ClaimError> {
         let mut writes = vec![(CLAIM_ROW.to_vec(), None)];
         writes.extend(rows);
         store.write_group_rows(writes)?;

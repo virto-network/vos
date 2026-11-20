@@ -264,7 +264,7 @@ pub(crate) fn household(root: &Path, size: usize) -> (Vec<Device>, Script) {
             .group
             .pair(device.clone(), package, script.now)
             .unwrap();
-        let group = DeviceGroup::join(light.store(), device, pairing).unwrap();
+        let group = DeviceGroup::join(light.store(), device, pairing, Vec::new()).unwrap();
         devices.push(Device {
             light,
             group,
