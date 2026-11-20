@@ -6,7 +6,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::inventory::Host;
@@ -314,6 +314,58 @@ pub fn wait_for(
         }
         std::thread::sleep(every);
     }
+}
+
+/// `each(&mut state, at)` for every `at` below `total`, `workers` threads at
+/// once, each with its own `state` from `setup(worker)`: the results by
+/// `at`. The first failure stops the rest, as an interrupt does (`None`);
+/// `done` hears each count finished.
+pub fn in_parallel<S, T: Send>(
+    total: u32,
+    workers: u32,
+    setup: impl Fn(u32) -> Result<S, String> + Sync,
+    each: impl Fn(&mut S, u32) -> Result<T, String> + Sync,
+    done: impl Fn(u32) + Sync,
+) -> Result<Option<Vec<T>>, String> {
+    let next = AtomicU32::new(0);
+    let made = AtomicU32::new(0);
+    let mut results: Vec<Option<T>> = (0..total).map(|_| None).collect();
+    std::thread::scope(|scope| -> Result<(), String> {
+        let workers: Vec<_> = (0..workers.max(1).min(total.max(1)))
+            .map(|worker| {
+                let (next, made, setup, each, done) = (&next, &made, &setup, &each, &done);
+                scope.spawn(move || -> Result<Vec<(u32, T)>, String> {
+                    let mut state = setup(worker)?;
+                    let mut mine = Vec::new();
+                    loop {
+                        let at = next.fetch_add(1, Ordering::Relaxed);
+                        if at >= total || interrupted() {
+                            return Ok(mine);
+                        }
+                        let one = each(&mut state, at)
+                            .inspect_err(|_| next.store(total, Ordering::Relaxed))?;
+                        mine.push((at, one));
+                        done(made.fetch_add(1, Ordering::Relaxed) + 1);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            for (at, one) in worker.join().expect("a worker")? {
+                results[at as usize] = Some(one);
+            }
+        }
+        Ok(())
+    })?;
+    if interrupted() {
+        return Ok(None);
+    }
+    Ok(Some(
+        results
+            .into_iter()
+            .map(|one| one.expect("every item made"))
+            .collect(),
+    ))
 }
 
 #[cfg(test)]

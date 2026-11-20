@@ -135,7 +135,7 @@ struct PersonalArgs {
     #[arg(long)]
     home_elf: Option<PathBuf>,
     /// Personal agents created at once.
-    #[arg(long, default_value_t = personal::CREATORS)]
+    #[arg(long, default_value_t = agents::CREATORS)]
     personal_creators: u32,
 }
 
