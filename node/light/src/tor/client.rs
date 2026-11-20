@@ -200,6 +200,26 @@ impl State {
         }
     }
 
+    /// Close every spare, and stop the one being built.
+    fn stop_spares(&mut self) {
+        self.drop_spares();
+        if let Some(task) = self.building.take() {
+            task.abort();
+        }
+    }
+
+    /// Close every connection, and stop the spare being built and the
+    /// reaper.
+    fn stop(&mut self) {
+        self.close(None);
+        for task in [self.building.take(), self.reaper.take()]
+            .into_iter()
+            .flatten()
+        {
+            task.abort();
+        }
+    }
+
     /// The space and the purpose the next spare is built for, if one is
     /// wanted: none while dormant or in the background.
     fn wanted(&self) -> Option<(SpaceId, Purpose)> {
@@ -240,14 +260,7 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        let state = self.state.get_mut().expect("the client's state");
-        state.close(None);
-        for task in [state.building.take(), state.reaper.take()]
-            .into_iter()
-            .flatten()
-        {
-            task.abort();
-        }
+        self.state.get_mut().expect("the client's state").stop();
     }
 }
 
@@ -322,10 +335,7 @@ impl Client {
     /// number, which [`Client::request_with`] takes a spare under.
     pub fn keep_spares(&self, space: Option<SpaceId>, purposes: &[Purpose]) -> u64 {
         let mut state = self.state();
-        state.drop_spares();
-        if let Some(task) = state.building.take() {
-            task.abort();
-        }
+        state.stop_spares();
         state.spare_epoch += 1;
         state.spare_for = space;
         state.spare_purposes = match space {
@@ -361,13 +371,7 @@ impl Client {
         state.dormant = dormant;
         state.awake += 1;
         if dormant {
-            state.close(None);
-            for task in [state.building.take(), state.reaper.take()]
-                .into_iter()
-                .flatten()
-            {
-                task.abort();
-            }
+            state.stop();
         }
         drop(state);
         self.inner.dial.set_dormant(dormant);
@@ -393,10 +397,7 @@ impl Client {
         }
         state.foreground = foreground;
         if !foreground {
-            state.drop_spares();
-            if let Some(task) = state.building.take() {
-                task.abort();
-            }
+            state.stop_spares();
         }
         drop(state);
         self.refill();
