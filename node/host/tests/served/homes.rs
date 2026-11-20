@@ -14,25 +14,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use vos_abi::abi::Failure;
 use vos_abi::credentials::Digest;
-use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_abi::ids::{AgentId, InstanceId, MethodId};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode, SpaceId, WindowClock};
 use vos_checker::Nodes;
-use vos_checker::calls::installed;
 use vos_checker::programs::{actor_elf, program_elf};
 use vos_keeper::{Home, Keeper, KeeperError};
-use vos_light::{
-    AuthWitness, Call, DeviceError, DeviceProgram, Prover, ProverConfig, Threads, method_id,
-};
+use vos_light::{Call, DeviceError, DeviceProgram, Prover, ProverConfig, Threads, method_id};
 use vos_node::client::{self, Client, Operator};
 use vos_wire::credentials::{CredentialError, Open, Path};
 use vos_wire::homes::{AgentsPage, Counts, HomesError, Standing, Terms};
 use vos_wire::ingress::{Credentialed, NodeId, Response};
 use vos_wire::personal::{AdminClass, Attestation, Kit, KitEntry, KitKind, NewDevice, Policy};
 
-use crate::harness::{Cluster, NODES, OPERATOR_SEED};
+use crate::harness::{Cluster, NODES, OPERATOR_SEED, done, witness};
 
 const SEED: u64 = 23;
 pub(crate) const CREDENTIALS: InstanceId = InstanceId(9);
@@ -57,15 +53,6 @@ fn member(n: u32) -> Digest {
     vos_light::member(&secret(n)).to_bytes()
 }
 
-pub(crate) fn witness(path: &Path) -> AuthWitness {
-    let digest = |bytes: &Digest| vos_light::Digest::from_bytes(bytes).expect("a digest");
-    AuthWitness {
-        root: digest(&path.root),
-        slot: path.slot,
-        siblings: path.siblings.0.map(|sibling| digest(&sibling)),
-    }
-}
-
 /// The home: its agent, the keeper's client there, the space and the
 /// stock `auth` kernel's program.
 pub(crate) struct Founded {
@@ -88,42 +75,14 @@ impl Founded {
     }
 
     fn on(cluster: Arc<Cluster>, policy: Policy) -> Self {
-        let agent = cluster
-            .node(1)
-            .unwrap()
-            .create_replicated((1..=NODES).collect())
-            .unwrap();
         let credentials = std::fs::read(program_elf("vos-credentials")).unwrap();
         let homes = std::fs::read(program_elf("vos-homes")).unwrap();
-        for (instance, elf, role) in [
-            (CREDENTIALS, &credentials, "registrar"),
-            (HOMES, &homes, "operator"),
-        ] {
-            let roles = vec![(role.as_bytes().to_vec(), ROLE)];
-            vos_checker::spaces::wait_in_process("an install", || {
-                match smol::block_on(cluster.leading(agent).install(
-                    agent,
-                    instance,
-                    elf,
-                    roles.clone(),
-                )) {
-                    Err(vos_node::CallError::NotLeader(_) | vos_node::CallError::TimedOut) => false,
-                    answer => {
-                        installed(answer);
-                        true
-                    }
-                }
-            });
-        }
-        let key = SigningKey::from_bytes(&OPERATOR_SEED);
-        let principal = Principal::Client(key.verifying_key().to_bytes());
-        installed(smol::block_on(cluster.leading(agent).set_role(
-            agent,
-            principal,
-            Some(ROLE),
-        )));
-        let leader = cluster.leader(agent).unwrap();
-        let caller = Client::new(cluster.target(leader), key).with_routes(cluster.routes());
+        let installs = [
+            (CREDENTIALS, &credentials[..], "registrar"),
+            (HOMES, &homes[..], "operator"),
+        ];
+        let (agent, caller) =
+            cluster.found_agent(&installs, ROLE, SigningKey::from_bytes(&OPERATOR_SEED));
         let space = cluster.space.id();
         let device = vos_light::release::device(&credentials, "auth").expect("the stock kernel");
         let founded = Self {
@@ -168,7 +127,7 @@ impl Founded {
                 &arguments.encode(),
             )
             .unwrap();
-        outcome(name, answer)
+        done(name, answer)
     }
 
     pub(crate) fn read<T: Decode>(
@@ -297,31 +256,13 @@ impl Founded {
                     at = at % NODES + 1;
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                answer => return outcome("claim", answer),
+                answer => return done("claim", answer),
             }
         }
     }
 }
 
 #[track_caller]
-fn outcome<T: Decode, E: Decode + std::fmt::Debug>(name: &str, answer: Response) -> Result<T, E> {
-    match answer {
-        Response::Ran {
-            outcome: Outcome::Done(bytes),
-            ..
-        } => Ok(T::decode_exact(&bytes).expect("the reply decodes")),
-        Response::Ran {
-            outcome:
-                Outcome::Failed {
-                    code: Failure::Handler,
-                    detail,
-                },
-            ..
-        } => Err(E::decode_exact(&detail).expect("the error decodes")),
-        other => panic!("{name}: {other:?}"),
-    }
-}
-
 fn kit(n: u32) -> Kit {
     let mut signing = [0xe1; 32];
     signing[..4].copy_from_slice(&n.to_le_bytes());

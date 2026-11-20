@@ -41,12 +41,11 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use vos_abi::credentials as tree;
 use vos_abi::credentials::{Tag, Words};
-use vos_abi::ids::{AgentId, InstanceId, Principal};
+use vos_abi::ids::{AgentId, InstanceId};
 use vos_abi::result::{InputRef, Outcome, Step, WorkResult};
 use vos_abi::{Decode, Encode, SpaceId, WindowClock};
 use vos_api::{Event, FRAME_ERROR, Frame, FrameError, Framing, Kind as ApiKind, Reader};
 use vos_checker::Nodes;
-use vos_checker::calls::installed;
 use vos_checker::carriers::{self, Audit, Kind, Logs, Reach};
 use vos_checker::processes::Front;
 use vos_checker::programs::{actor, actor_elf, method, program, program_elf};
@@ -62,7 +61,7 @@ use vos_wire::credentials::{AuthClaim, Path, Siblings, scope};
 use vos_wire::ingress::{CredentialRefusal, Credentialed, Response};
 use vos_wire::peer::NodeNumber;
 
-use crate::harness::{Cluster, NODES};
+use crate::harness::{Cluster, NODES, assert_done};
 
 /// The hub's seed: odd, so the operator's client reaches the nodes over
 /// the API's sockets.
@@ -180,47 +179,21 @@ struct Founded {
 impl Founded {
     fn new() -> Self {
         let cluster = Cluster::founded(SEED, Some(WindowClock::DEFAULT));
-        let agent = cluster
-            .node(1)
-            .unwrap()
-            .create_replicated((1..=NODES).collect())
-            .unwrap();
         let elf = |path: std::path::PathBuf| std::fs::read(path).unwrap();
-        for (instance, elf, role) in [
-            (
-                CREDENTIALS,
-                elf(program_elf("vos-credentials")),
-                "registrar",
-            ),
-            (POLL, elf(actor_elf("poll")), "operator"),
-            (PAYMENTS, elf(program_elf("vos-payments")), "operator"),
-            (DEVICE, elf(actor_elf("device")), "operator"),
-        ] {
-            let roles = vec![(role.as_bytes().to_vec(), ROLE)];
-            vos_checker::spaces::wait_in_process("an install", || {
-                match smol::block_on(cluster.leading(agent).install(
-                    agent,
-                    instance,
-                    &elf,
-                    roles.clone(),
-                )) {
-                    Err(vos_node::CallError::NotLeader(_) | vos_node::CallError::TimedOut) => false,
-                    answer => {
-                        installed(answer);
-                        true
-                    }
-                }
-            });
-        }
-        let key = SigningKey::from_bytes(&OPERATOR);
-        let principal = Principal::Client(key.verifying_key().to_bytes());
-        installed(smol::block_on(cluster.leading(agent).set_role(
-            agent,
-            principal,
-            Some(ROLE),
-        )));
-        let leader = cluster.leader(agent).unwrap();
-        let operator = Client::new(cluster.target(leader), key).with_routes(cluster.routes());
+        let elfs = [
+            elf(program_elf("vos-credentials")),
+            elf(actor_elf("poll")),
+            elf(program_elf("vos-payments")),
+            elf(actor_elf("device")),
+        ];
+        let installs = [
+            (CREDENTIALS, &elfs[0][..], "registrar"),
+            (POLL, &elfs[1][..], "operator"),
+            (PAYMENTS, &elfs[2][..], "operator"),
+            (DEVICE, &elfs[3][..], "operator"),
+        ];
+        let (agent, operator) =
+            cluster.found_agent(&installs, ROLE, SigningKey::from_bytes(&OPERATOR));
         let space = cluster.space.id();
         let founded = Self {
             cluster,
@@ -256,16 +229,7 @@ impl Founded {
                 &arguments.encode(),
             )
             .unwrap();
-        assert!(
-            matches!(
-                answer,
-                Response::Ran {
-                    outcome: Outcome::Done(_),
-                    ..
-                }
-            ),
-            "{name}: {answer:?}"
-        );
+        assert_done(name, &answer);
     }
 
     fn time(&self, at: NodeNumber) -> u64 {

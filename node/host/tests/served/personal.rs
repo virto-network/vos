@@ -14,13 +14,10 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use ed25519_dalek::{Signer as _, SigningKey};
-use vos_abi::abi::Failure;
-use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Session};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode};
 use vos_api::{Framing, Kind, Mark, marked};
-use vos_checker::Nodes;
-use vos_checker::calls::installed;
 use vos_checker::programs::program_elf;
 use vos_light::group::{DeviceGroup, Event};
 use vos_light::home::{self, Claim, ClaimError, Home as HomeSpace};
@@ -28,7 +25,7 @@ use vos_light::kit::KitSecret;
 use vos_light::memberships;
 use vos_light::pairing::{Code, Hello, Joined, Joiner, Membership, Offer, Opened, Opener, Put};
 use vos_light::wire::{self, Answer};
-use vos_light::{AuthWitness, Call, Config, DeviceProgram, Light, Prover, ProverConfig, Threads};
+use vos_light::{Call, Config, DeviceProgram, Light, Prover, ProverConfig, Threads};
 use vos_node::client::Client;
 use vos_wire::books::DeviceHandle;
 use vos_wire::credentials::{CredentialError, Open, Path};
@@ -39,8 +36,8 @@ use vos_wire::personal::{
     Policy, Recorded, Vote,
 };
 
-use crate::harness::{NODES, OPERATOR_SEED};
-use crate::homes::{CREDENTIALS, Founded, HANDLE, HOMES, PERSONAL, witness};
+use crate::harness::{NODES, OPERATOR_SEED, answer, assert_done, witness};
+use crate::homes::{CREDENTIALS, Founded, HANDLE, HOMES, PERSONAL};
 
 /// The other space's credential actor, and its handle.
 const CLUB: InstanceId = InstanceId(9);
@@ -146,18 +143,6 @@ impl Sockets {
             Answer::Ran { outcome, .. } => outcome,
             other => panic!("{other:?}"),
         }
-    }
-}
-
-/// A handler's answer from its outcome.
-pub(crate) fn answer<T: Decode, E: Decode + std::fmt::Debug>(outcome: &Outcome) -> Result<T, E> {
-    match outcome {
-        Outcome::Done(bytes) => Ok(T::decode_exact(bytes).expect("the reply decodes")),
-        Outcome::Failed {
-            code: Failure::Handler,
-            detail,
-        } => Err(E::decode_exact(detail).expect("the error decodes")),
-        other => panic!("{other:?}"),
     }
 }
 
@@ -523,10 +508,6 @@ pub(crate) fn open_claim(sockets: &mut Sockets, home: &HomeSpace, phone: &Phone)
     answer::<u32, CredentialError>(&outcome).unwrap()
 }
 
-pub(crate) fn auth(path: &Path) -> AuthWitness {
-    witness(path)
-}
-
 /// The pairing slot's items as `key` reads them.
 pub(crate) fn inbox(sockets: &mut Sockets, personal: Personal, key: &SigningKey) -> Vec<InboxItem> {
     personal
@@ -614,7 +595,7 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
         .unwrap();
     let call = claim.call(&space, expires(&mut sockets)).unwrap();
     let proof = prover
-        .prove_home(&first.secret(&HANDLE), &auth(&path), &call, &home.auth)
+        .prove_home(&first.secret(&HANDLE), &witness(&path), &call, &home.auth)
         .unwrap();
     let outcome = sockets.credentialed(&call, &proof);
     assert_eq!(answer::<u32, HomesError>(&outcome), Ok(agent));
@@ -888,7 +869,7 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
         )
         .unwrap();
     let proof = prover
-        .prove_home(&second.secret(&HANDLE), &auth(&path), &call, &home.auth)
+        .prove_home(&second.secret(&HANDLE), &witness(&path), &call, &home.auth)
         .unwrap();
     assert_eq!(
         answer::<u32, HomesError>(&sockets.credentialed(&call, &proof)),
@@ -905,36 +886,12 @@ struct Club {
 
 impl Club {
     fn found(home: &Founded) -> Self {
-        let cluster = &home.cluster;
-        let agent = cluster
-            .node(1)
-            .unwrap()
-            .create_replicated((1..=NODES).collect())
-            .unwrap();
         let credentials = std::fs::read(program_elf("vos-credentials")).unwrap();
-        vos_checker::spaces::wait_in_process("an install", || {
-            match smol::block_on(cluster.leading(agent).install(
-                agent,
-                CLUB,
-                &credentials,
-                vec![(b"registrar".to_vec(), 1)],
-            )) {
-                Err(vos_node::CallError::NotLeader(_) | vos_node::CallError::TimedOut) => false,
-                answer => {
-                    installed(answer);
-                    true
-                }
-            }
-        });
-        let key = SigningKey::from_bytes(&OPERATOR_SEED);
-        let principal = Principal::Client(key.verifying_key().to_bytes());
-        installed(smol::block_on(cluster.leading(agent).set_role(
-            agent,
-            principal,
-            Some(1),
-        )));
-        let leader = cluster.leader(agent).unwrap();
-        let caller = Client::new(cluster.target(leader), key).with_routes(cluster.routes());
+        let (agent, caller) = home.cluster.found_agent(
+            &[(CLUB, &credentials[..], "registrar")],
+            1,
+            SigningKey::from_bytes(&OPERATOR_SEED),
+        );
         let club = Self {
             agent,
             caller: std::sync::Mutex::new(caller),
@@ -956,12 +913,6 @@ impl Club {
                 &arguments.encode(),
             )
             .unwrap();
-        match answer {
-            Response::Ran {
-                outcome: Outcome::Done(_),
-                ..
-            } => {}
-            other => panic!("{name}: {other:?}"),
-        }
+        assert_done(name, &answer);
     }
 }
