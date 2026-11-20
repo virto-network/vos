@@ -195,11 +195,11 @@ struct State {
     source: Option<Vec<u8>>,
     /// The admin key's public half and its attestation, as its key in the
     /// UI's keystore answered them.
-    admin: Option<([u8; 32], bool, bool)>,
+    admin: Option<AdminKey>,
     label: String,
     /// The admin keys offered to replace this device's, the newest last,
     /// until the set shows one of them.
-    next_admin: Vec<([u8; 32], bool, bool)>,
+    next_admin: Vec<AdminKey>,
     /// A restore opened, from before its call until it matures.
     restoring: Option<Restoring>,
     /// A joiner's acknowledgement of its pairing's handover, kept before
@@ -414,16 +414,18 @@ struct Acked {
 
 impl State {
     /// The offered admin key `key`, if it is one.
-    fn next_admin(&self, key: &[u8; 32]) -> Option<([u8; 32], bool, bool)> {
-        self.next_admin.iter().find(|next| next.0 == *key).copied()
+    fn next_admin(&self, key: &[u8; 32]) -> Option<AdminKey> {
+        self.next_admin
+            .iter()
+            .find(|next| next.key == *key)
+            .copied()
     }
 
     /// `next` offered too: any key offered may be the one signed in, so
     /// the last few are kept.
     fn set_next_admin(&mut self, next: AdminKey) {
         const KEPT: usize = 4;
-        self.next_admin
-            .push((next.key, next.hardware, next.verified_boot));
+        self.next_admin.push(next);
         if self.next_admin.len() > KEPT {
             self.next_admin.remove(0);
         }
@@ -558,7 +560,7 @@ impl<H: Host> Personal<H> {
             state.acked = None;
         }
         let sync = Signer::new(light.sync_key().verifying_key().to_bytes());
-        let admin = Signer::new(state.admin.map(|(key, ..)| key).unwrap_or_default());
+        let admin = Signer::new(state.admin.map(|admin| admin.key).unwrap_or_default());
         let owed = (
             Mutex::new(light.store().clone()),
             Mutex::new(state.source.clone()),
@@ -965,29 +967,23 @@ impl<H: Host> Personal<H> {
         secret: &crate::DeviceSecret,
         label: &str,
     ) -> Result<NewDevice, Error> {
-        let (admin, hardware, verified_boot) = match held.state.admin {
+        let admin = match held.state.admin {
             Some(admin) => admin,
             None => {
                 let made = prompts.create_admin()?;
-                let admin = (made.key, made.hardware, made.verified_boot);
-                held.state.admin = Some(admin);
+                held.state.admin = Some(made);
                 held.admin = Signer::new(made.key);
                 self.keep(&held.light, &held.state)?;
-                admin
+                made
             }
         };
         Ok(NewDevice {
             sync: held.light.sync_key().verifying_key().to_bytes(),
-            admin,
-            class: AdminKey {
-                key: admin,
-                hardware,
-                verified_boot,
-            }
-            .class(),
+            admin: admin.key,
+            class: admin.class(),
             attestation: vos_wire::personal::Attestation {
-                hardware,
-                verified_boot,
+                hardware: admin.hardware,
+                verified_boot: admin.verified_boot,
             },
             nullifier: home.nullifier(secret),
             label: label.as_bytes().to_vec(),

@@ -51,9 +51,17 @@ fn every_field() -> State {
         home: Some(home),
         agent: Some((19, [20; 32])),
         source: Some(b"\x01vos.device.1".to_vec()),
-        admin: Some(([21; 32], true, true)),
+        admin: Some(AdminKey {
+            key: [21; 32],
+            hardware: true,
+            verified_boot: true,
+        }),
         label: "phone".into(),
-        next_admin: vec![([24; 32], false, true)],
+        next_admin: vec![AdminKey {
+            key: [24; 32],
+            hardware: false,
+            verified_boot: true,
+        }],
         restoring: Some(restoring),
         acked: Some(Acked {
             handle: [28; 32],

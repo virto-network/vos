@@ -11,8 +11,8 @@ use zeroize::Zeroizing;
 
 use super::link::Signer;
 use super::{
-    Acked, AdminKey, CREDENTIAL_BOOK, Error, Held, Host, Kept, POLL, Paired, Personal, Prompts,
-    answered, failed, link, secret, store_failed, unreached,
+    Acked, CREDENTIAL_BOOK, Error, Held, Host, Kept, POLL, Paired, Personal, Prompts, answered,
+    failed, link, secret, store_failed, unreached,
 };
 use crate::group::{DeviceGroup, Prepared};
 use crate::memberships;
@@ -63,15 +63,7 @@ impl<H: Host> Personal<H> {
         if held
             .state
             .admin
-            .is_some_and(|(key, hardware, verified_boot)| {
-                AdminKey {
-                    key,
-                    hardware,
-                    verified_boot,
-                }
-                .class()
-                    != AdminClass::Strong
-            })
+            .is_some_and(|admin| admin.class() != AdminClass::Strong)
         {
             return Err(Error::DelayedAdmin);
         }

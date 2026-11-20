@@ -159,12 +159,12 @@ impl<H: Host> Personal<H> {
             && held
                 .state
                 .admin
-                .is_some_and(|(key, ..)| key != view.device.keys.admin)
+                .is_some_and(|admin| admin.key != view.device.keys.admin)
             && let Some(next) = held.state.next_admin(&view.device.keys.admin)
         {
             held.state.admin = Some(next);
             held.state.next_admin.clear();
-            held.admin = Signer::new(next.0);
+            held.admin = Signer::new(next.key);
             self.keep(&held.light, &held.state)?;
         }
         Ok(())
@@ -329,7 +329,7 @@ impl<H: Host> Personal<H> {
             .ok_or(Error::NoSpace)?;
         let next = prompts.create_admin()?;
         let (_, identity) = held.state.agent.ok_or(Error::NoSpace)?;
-        let (admin, ..) = held.state.admin.ok_or(Error::NoSpace)?;
+        let admin = held.state.admin.ok_or(Error::NoSpace)?.key;
         held.state.set_next_admin(next);
         self.keep(&held.light, &held.state)?;
         let mut offer = AdminOffer {
@@ -477,7 +477,7 @@ impl<H: Host> Personal<H> {
         r2: Option<[u8; 32]>,
     ) -> Result<Posted, Error> {
         self.settle(held)?;
-        let admin = held.state.admin.ok_or(Error::NoSpace)?.0;
+        let admin = held.state.admin.ok_or(Error::NoSpace)?.key;
         let mut signer = held.admin;
         let sign = admin_sign(prompts, admin);
         let recorded = self.with_link(held, Purpose::Personal, |link, held| {
@@ -547,7 +547,7 @@ impl<H: Host> Personal<H> {
         prompts: &dyn Prompts,
         prepared: &Prepared,
     ) -> Result<Candidacy, Error> {
-        let admin = held.state.admin.ok_or(Error::NoSpace)?.0;
+        let admin = held.state.admin.ok_or(Error::NoSpace)?.key;
         let mut signer = held.admin;
         let prompted = admin_sign(prompts, admin);
         let group_sign = |message: &[u8]| prompted(message);
