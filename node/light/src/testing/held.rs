@@ -1,5 +1,5 @@
 //! A stream that holds its writes until flushed, as Tor's do: the testing
-//! world's streams, and the Tor client's tests' (which include this file).
+//! gateway's streams, at either end.
 
 /// A stream that holds what is written until it is flushed, as a Tor
 /// stream does at either end: the gateway's onion service and the phone's

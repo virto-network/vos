@@ -121,7 +121,7 @@ harness = false
 
 [[test]]
 name = "tor"
-required-features = ["tor"]
+required-features = ["testing"]
 
 [[test]]
 name = "tor_state"

@@ -8,25 +8,23 @@
 //! reach; the onion example exercises it over the live network.
 
 mod common;
-#[path = "../src/testing/held.rs"]
-mod held;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arti_client::isolation::Isolation;
 use russh::keys::{PublicKeyOrCertificate, ssh_key};
-use russh::server::{Auth, ChannelOpenHandle, Msg, Session, VerifiedPublicKey};
-use russh::{Channel, ChannelId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vos_abi::credentials;
 use vos_abi::ids::AgentId;
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode};
-use vos_api::{Event, Framing, Kind, Reader, Requests, frame};
+use vos_api::{Framing, Kind, frame};
 use vos_light::route::{Clearnet, Purpose, Refused, Route, Routes};
+use vos_light::testing::ssh::{self, Answer};
+use vos_light::testing::{Held, Seen};
 use vos_light::tor::{
     Circuit, Client, Config, Dial, Dialing, Error, Registrar, SSH_PORT, Stream, Target,
     onion_address,
@@ -36,20 +34,6 @@ use vos_wire::credentials::{Change, Onion};
 use vos_wire::ingress::{QueryCall, Response};
 
 use common::tree::{Writes, serve_feed};
-use held::Held;
-
-/// What the gateway's capture holds of one connection.
-#[derive(Clone, Debug)]
-struct Seen {
-    target: Target,
-    circuit: Circuit,
-    /// The ed25519 key it authenticated with.
-    key: Option<[u8; 32]>,
-    /// The kinds of the requests it carried.
-    kinds: Vec<u16>,
-    /// Its stream ended: its SSH session, or its `vos-api` channel.
-    ended: bool,
-}
 
 /// What a dial does instead of connecting.
 #[derive(Clone, Copy, Debug)]
@@ -140,13 +124,7 @@ impl Dial for Dialer {
         let gateway = Arc::clone(&self.0);
         let index = {
             let mut seen = gateway.seen.lock().unwrap();
-            seen.push(Seen {
-                target: target.clone(),
-                circuit,
-                key: None,
-                kinds: Vec::new(),
-                ended: false,
-            });
+            seen.push(Seen::new(target, circuit));
             seen.len() - 1
         };
         let fault = gateway.faults.lock().unwrap().pop_front();
@@ -165,26 +143,10 @@ impl Dial for Dialer {
                 }
                 None => {}
             }
+            let host_key = gateway.host_key.clone();
+            let ours = ssh::dialed(&host_key, Connection { gateway, index });
             // Each end holds its writes until flushed, as Tor's streams do.
-            let (ours, theirs) = tokio::io::duplex(1 << 20);
-            let (ours, theirs) = (Held::new(ours), Held::new(theirs));
-            let config = Arc::new(russh::server::Config {
-                keys: vec![gateway.host_key.clone()],
-                ..russh::server::Config::default()
-            });
-            let handler = Handler {
-                gateway: Arc::clone(&gateway),
-                index,
-                channels: HashMap::new(),
-            };
-            let ended = Arc::clone(&gateway);
-            tokio::spawn(async move {
-                if let Ok(session) = russh::server::run_stream(config, theirs, handler).await {
-                    let _ = session.await;
-                }
-                ended.seen.lock().unwrap()[index].ended = true;
-            });
-            Ok(Box::new(ours) as Stream)
+            Ok(Box::new(Held::new(ours)) as Stream)
         })
     }
 
@@ -193,96 +155,35 @@ impl Dial for Dialer {
     }
 }
 
-/// One connection's SSH server.
-struct Handler {
+/// One connection of the gateway's.
+struct Connection {
     gateway: Arc<Gateway>,
     index: usize,
-    channels: HashMap<ChannelId, Channel<Msg>>,
 }
 
-impl russh::server::Handler for Handler {
-    type Error = russh::Error;
-
-    async fn auth_publickey(
-        &mut self,
-        _user: &str,
-        verified: VerifiedPublicKey<'_>,
-    ) -> Result<Auth, Self::Error> {
-        self.gateway.seen.lock().unwrap()[self.index].key = Some(public(verified.public_key));
-        Ok(Auth::Accept)
+impl ssh::Connection for Connection {
+    fn seen(&self, f: impl FnOnce(&mut Seen)) {
+        f(&mut self.gateway.seen.lock().unwrap()[self.index]);
     }
 
-    async fn channel_open_session(
-        &mut self,
-        channel: Channel<Msg>,
-        reply: ChannelOpenHandle,
-        _session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        self.channels.insert(channel.id(), channel);
-        reply.accept().await;
-        Ok(())
-    }
-
-    async fn subsystem_request(
-        &mut self,
-        id: ChannelId,
-        name: &str,
-        session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        let Some(channel) = self.channels.remove(&id) else {
-            return Ok(());
-        };
-        if name != "vos-api" {
-            session.channel_failure(id)?;
-            return Ok(());
+    /// `Time` answers 42, a query of `feed` its page, any other query the
+    /// registrar's onion set, anything else its own body back; nothing
+    /// while the gateway is silent.
+    fn answer(&self, kind: u16, body: &[u8]) -> Answer {
+        self.seen(|seen| seen.carried(kind, body));
+        if self.gateway.silent.load(Ordering::SeqCst) {
+            return Answer::Silent;
         }
-        session.channel_success(id)?;
-        tokio::spawn(serve(
-            channel.into_stream(),
-            Arc::clone(&self.gateway),
-            self.index,
-        ));
-        Ok(())
-    }
-}
-
-/// The `vos-api` subsystem: `Time` answers 42, a query of `feed` its page,
-/// any other query the registrar's onion set, anything else its own body
-/// back.
-async fn serve(
-    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    gateway: Arc<Gateway>,
-    index: usize,
-) {
-    let mut reader = Reader::requests(Framing::Stream, Requests::All);
-    let mut chunk = vec![0u8; 64 << 10];
-    loop {
-        let read = match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => read,
-        };
-        reader.push(&chunk[..read]);
-        while let Some(Event::Frame(request)) = reader.event() {
-            gateway.seen.lock().unwrap()[index].kinds.push(request.kind);
-            if gateway.silent.load(Ordering::SeqCst) {
-                continue;
+        Answer::Body(match Kind::from_u16(kind) {
+            Some(Kind::Time) => 42u64.encode(),
+            Some(Kind::Query) => Response::Ran {
+                outcome: Outcome::Done(self.gateway.answer(body)),
+                at: 1,
             }
-            let body = match Kind::from_u16(request.kind) {
-                Some(Kind::Time) => 42u64.encode(),
-                Some(Kind::Query) => Response::Ran {
-                    outcome: Outcome::Done(gateway.answer(&request.body)),
-                    at: 1,
-                }
-                .encode(),
-                _ => request.body.clone(),
-            };
-            let answer = frame(Framing::Stream, request.kind, request.id, &body);
-            if stream.write_all(&answer).await.is_err() {
-                break;
-            }
-        }
+            .encode(),
+            _ => body.to_vec(),
+        })
     }
-    gateway.seen.lock().unwrap()[index].ended = true;
 }
 
 /// A space's handle, by a byte.
@@ -387,14 +288,14 @@ async fn isolation_groups_never_share_a_circuit_or_an_ssh_key() {
     assert_isolated(&seen);
     assert!(seen.iter().all(|seen| seen.key.is_some()));
     // Each connection carried one group's requests: its kinds, in order.
-    let carried: Vec<usize> = seen.iter().map(|seen| seen.kinds.len()).collect();
+    let carried: Vec<usize> = seen.iter().map(|seen| seen.kinds().len()).collect();
     assert_eq!(carried, [3, 2, 1, 1, 1, 1, 2, 2, 2]);
     let proven = Kind::Credentialed as u16;
     for (at, seen) in seen.iter().enumerate() {
-        let carries_proofs = seen.kinds.contains(&proven);
+        let carries_proofs = seen.kinds().contains(&proven);
         assert_eq!(carries_proofs, at == 4 || at == 5, "{at}");
         if carries_proofs {
-            assert_eq!(seen.kinds, [proven]);
+            assert_eq!(seen.kinds(), [proven]);
         }
         let Target::Onion { port, .. } = &seen.target else {
             panic!("a clearnet dial");
@@ -417,20 +318,20 @@ async fn a_proven_call_takes_the_spare_built_ahead() {
     until(|| client.spare_ready(Purpose::Proven)).await;
     assert_eq!(gateway.dials(), 1);
     assert!(gateway.seen()[0].key.is_some(), "the handshake is done");
-    assert!(gateway.seen()[0].kinds.is_empty());
+    assert!(gateway.seen()[0].requests.is_empty());
     client.request(a, Purpose::Proven, &proven()).await.unwrap();
-    assert_eq!(gateway.seen()[0].kinds, [Kind::Credentialed as u16]);
+    assert_eq!(gateway.seen()[0].kinds(), [Kind::Credentialed as u16]);
     // The next spare, on a circuit and key of its own.
     until(|| client.spare_ready(Purpose::Proven)).await;
     assert_eq!(gateway.dials(), 2);
     client.request(a, Purpose::Proven, &proven()).await.unwrap();
-    assert_eq!(gateway.seen()[1].kinds, [Kind::Credentialed as u16]);
+    assert_eq!(gateway.seen()[1].kinds(), [Kind::Credentialed as u16]);
     until(|| client.spare_ready(Purpose::Proven)).await;
     // A key-signed call never takes the spare.
     client.request(a, Purpose::Member, &query()).await.unwrap();
     let seen = gateway.seen();
     assert_eq!(seen.len(), 4);
-    assert!(seen[2].kinds.is_empty() && seen[3].kinds == [Kind::Query as u16]);
+    assert!(seen[2].requests.is_empty() && seen[3].kinds() == [Kind::Query as u16]);
     assert_isolated(&seen);
     // No spare for a space it is not kept for.
     client.keep_spares(None, &[]);
@@ -451,7 +352,7 @@ async fn a_fetch_takes_its_own_spare_once() {
     let ready = || client.spare_ready(Purpose::Proven) && client.spare_ready(Purpose::Fetch);
     until(ready).await;
     assert_eq!(gateway.dials(), 2);
-    assert!(gateway.seen().iter().all(|seen| seen.kinds.is_empty()));
+    assert!(gateway.seen().iter().all(|seen| seen.requests.is_empty()));
     client
         .request(a, Purpose::Fetch, &wire::time_request())
         .await
@@ -459,17 +360,17 @@ async fn a_fetch_takes_its_own_spare_once() {
     let carried: Vec<Seen> = gateway
         .seen()
         .into_iter()
-        .filter(|seen| !seen.kinds.is_empty())
+        .filter(|seen| !seen.requests.is_empty())
         .collect();
     assert_eq!(carried.len(), 1, "the spare carried it");
-    assert_eq!(carried[0].kinds, [Kind::Time as u16]);
+    assert_eq!(carried[0].kinds(), [Kind::Time as u16]);
     until(ready).await;
     assert_eq!(gateway.dials(), 3);
     until(|| {
         gateway
             .seen()
             .iter()
-            .any(|seen| seen.kinds == [Kind::Time as u16] && seen.ended)
+            .any(|seen| seen.kinds() == [Kind::Time as u16] && seen.ended)
     })
     .await;
     client
@@ -506,7 +407,7 @@ async fn spares_live_in_the_foreground_and_not_for_long() {
     // Its life is 200 to 600 ms: then it closes, and another is built.
     until(|| gateway.dials() == 2 && gateway.seen()[0].ended).await;
     until(|| client.spare_ready(Purpose::Proven)).await;
-    assert!(gateway.seen().iter().all(|seen| seen.kinds.is_empty()));
+    assert!(gateway.seen().iter().all(|seen| seen.requests.is_empty()));
     client.set_foreground(false);
     assert!(!client.spare_ready(Purpose::Proven));
     until(|| gateway.seen().iter().all(|seen| seen.ended)).await;
@@ -534,7 +435,7 @@ async fn a_failed_connection_is_retried_on_a_new_circuit() {
     assert_ne!(onions[0], onions[1]);
     assert_eq!(onions[0], onions[2]);
     assert!(seen[..2].iter().all(|seen| seen.key.is_none()));
-    assert_eq!(seen[2].kinds, [Kind::Query as u16]);
+    assert_eq!(seen[2].kinds(), [Kind::Query as u16]);
     gateway.fault(&[Fault::Fail; 3]);
     match client.request(a, Purpose::Fetch, &query()).await {
         Err(Error::Unreachable(why)) => assert!(why.contains("hidden service"), "{why}"),
@@ -588,7 +489,7 @@ async fn a_gateway_whose_host_key_is_not_pinned_is_refused() {
     assert_eq!(seen.len(), 3);
     assert!(
         seen.iter()
-            .all(|seen| seen.key.is_none() && seen.kinds.is_empty())
+            .all(|seen| seen.key.is_none() && seen.requests.is_empty())
     );
 }
 
@@ -678,7 +579,7 @@ async fn dormant_holds_no_connection_and_sends_nothing() {
     client.request(a, Purpose::Member, &query()).await.unwrap();
     let seen = gateway.seen();
     assert_eq!(seen.len(), 4);
-    assert_eq!(seen[3].kinds, [Kind::Query as u16]);
+    assert_eq!(seen[3].kinds(), [Kind::Query as u16]);
     assert_isolated(&seen);
 }
 
@@ -776,7 +677,7 @@ async fn s4s_screens_are_carried_over_a_circuit_of_their_own() {
     let seen = gateway.seen();
     assert_eq!(seen.len(), 2);
     assert_eq!(seen[1].key, Some(s4_key));
-    assert_eq!(seen[1].kinds, [Kind::Time as u16]);
+    assert_eq!(seen[1].kinds(), [Kind::Time as u16]);
     assert_isolated(&seen);
     // Dormant ends it.
     client.set_dormant(true);
@@ -808,8 +709,8 @@ async fn the_pinned_onion_set_is_refreshed_from_the_registrar() {
     // connection closed with the set it was made from.
     let seen = gateway.seen();
     assert_eq!(seen.len(), 3);
-    assert_eq!(seen[1].kinds, [Kind::Time as u16]);
-    assert_eq!(seen[2].kinds, [Kind::Query as u16]);
+    assert_eq!(seen[1].kinds(), [Kind::Time as u16]);
+    assert_eq!(seen[2].kinds(), [Kind::Query as u16]);
     until(|| gateway.seen()[0].ended).await;
     client.request(a, Purpose::Member, &query()).await.unwrap();
     let addresses: Vec<String> = fresh
@@ -849,7 +750,7 @@ async fn a_groups_concurrent_requests_open_one_connection() {
     }
     let seen = gateway.seen();
     assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].kinds.len(), 8);
+    assert_eq!(seen[0].kinds().len(), 8);
 }
 
 /// Opting back into Tor closes the clearnet connection, a request in
@@ -875,7 +776,7 @@ async fn a_route_change_or_a_dormancy_ends_what_the_old_route_carried() {
         let client = client.clone();
         tokio::spawn(async move { client.request(a, Purpose::Member, &query()).await })
     };
-    until(|| gateway.seen()[0].kinds.len() == 2).await;
+    until(|| gateway.seen()[0].kinds().len() == 2).await;
     routes.opt_in();
     client.set_space(a, routes);
     let started = std::time::Instant::now();
@@ -893,7 +794,7 @@ async fn a_route_change_or_a_dormancy_ends_what_the_old_route_carried() {
         let client = client.clone();
         tokio::spawn(async move { client.request(a, Purpose::Member, &query()).await })
     };
-    until(|| gateway.seen()[1].kinds.len() == 2).await;
+    until(|| gateway.seen()[1].kinds().len() == 2).await;
     client.set_dormant(true);
     let started = std::time::Instant::now();
     assert!(matches!(waiting.await.unwrap(), Err(Error::Lost)));
@@ -983,7 +884,7 @@ async fn the_tree_is_read_on_one_feed_connection() {
     assert_eq!(seen.len(), 1, "one connection for every read");
     let (time, query) = (Kind::Time as u16, Kind::Query as u16);
     assert_eq!(
-        seen[0].kinds,
+        seen[0].kinds(),
         [time, query, query, query, time, query, time, query]
     );
 

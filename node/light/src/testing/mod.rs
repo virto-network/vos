@@ -7,7 +7,10 @@
 //!   serving `vos-api` over SSH on each stream the Tor client dials, the
 //!   homes' personal agents [`vos_testkit::personal::Agent`]s, every proof
 //!   checked as ingress checks it, a phone's process killed at any request;
-//! - [`Reach`]: a phone's [`Host`] over that world.
+//! - [`Reach`]: a phone's [`Host`] over that world;
+//! - [`ssh`]: the gateway's SSH server on an in-memory stream, each
+//!   connection recorded, which the world and the Tor client's tests
+//!   answer behind.
 //!
 //! [`Prompts`]: crate::space::Prompts
 //! [`Host`]: crate::space::Host
@@ -15,8 +18,10 @@
 mod held;
 mod phone;
 mod reach;
+pub mod ssh;
 pub mod world;
 
+pub use held::Held;
 pub use phone::{Phone, hmac};
 pub use reach::Reach;
 pub use world::{

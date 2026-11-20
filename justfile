@@ -549,7 +549,7 @@ test-gateway-onion: build-test-actors build-programs
 # checking each connection's circuit and SSH key. No network.
 test-light-tor:
     cargo clippy -p vos-light --features tor --ignore-rust-version --all-targets --quiet -- -D warnings
-    cargo test -p vos-light --features tor --ignore-rust-version --test tor --test tor_state
+    cargo test -p vos-light --features tor,testing --ignore-rust-version --test tor --test tor_state
     cargo clippy -p vos-light --features testing --ignore-rust-version --all-targets --quiet -- -D warnings
     cargo test -p vos-light --features testing --ignore-rust-version --test space
     cargo test -p vos-light --features tor --ignore-rust-version --lib -- tor:: route::

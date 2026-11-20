@@ -20,20 +20,20 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey;
 use russh::keys::ssh_key;
-use russh::server::{Auth, Msg, Session};
-use russh::{Channel, ChannelId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use vos_abi::credentials as tree;
 use vos_abi::credentials::{DEPTH, EMPTY, Words};
 use vos_abi::ids::{AgentId, InstanceId, MethodId, ProgramHash};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode, SpaceId};
-use vos_api::{Event, Framing, Kind, Reader, Requests, frame};
+use vos_api::Kind;
 use vos_testkit::personal::Agent;
 use vos_wire::credentials::method as credentials;
 use vos_wire::personal::method as personal;
 
 use super::held::Held;
+pub use super::ssh::Seen;
+use super::ssh::{self, Answer};
 use crate::release::{Package, Release};
 use crate::space::Kept;
 use crate::tor::{Circuit, Dial, Dialing, Stream, Target, onion_address};
@@ -155,17 +155,6 @@ pub fn wall() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
-}
-
-/// What one connection carried.
-#[derive(Clone, Debug)]
-pub struct Seen {
-    pub target: Target,
-    pub circuit: Circuit,
-    /// The ed25519 key it authenticated with.
-    pub key: Option<[u8; 32]>,
-    /// Each request's kind and the agent it named (0: none).
-    pub requests: Vec<(u16, u32)>,
 }
 
 /// A credential actor's tree, kept as the feed serves it.
@@ -668,7 +657,8 @@ impl World {
                     host: "127.0.0.1".into(),
                     port,
                 };
-                serve_ssh(Arc::clone(&world), &target, Circuit::new(), stream, 0);
+                let connection = world.connection(&target, Circuit::new(), 0);
+                ssh::serve(&world.host_key, connection, stream);
             }
         });
         port
@@ -1092,9 +1082,7 @@ impl Dial for Gateway {
             }
             let delays = world.state.lock().unwrap().delays;
             tokio::time::sleep(delays.connect).await;
-            let (ours, theirs) = tokio::io::duplex(1 << 20);
-            let theirs = Held::new(theirs);
-            serve_ssh(world, &target, circuit, theirs, tag);
+            let ours = ssh::dialed(&world.host_key, world.connection(&target, circuit, tag));
             if delays.none() {
                 return Ok(Box::new(Held::new(ours)) as Stream);
             }
@@ -1155,41 +1143,6 @@ async fn carry(
     let _ = to.shutdown().await;
 }
 
-/// An SSH server of the gateway's on `stream`, its connection recorded.
-fn serve_ssh(
-    world: Arc<World>,
-    target: &Target,
-    circuit: Circuit,
-    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    tag: u8,
-) {
-    let index = {
-        let mut state = world.state.lock().unwrap();
-        state.seen.push(Seen {
-            target: target.clone(),
-            circuit,
-            key: None,
-            requests: Vec::new(),
-        });
-        state.seen.len() - 1
-    };
-    let config = Arc::new(russh::server::Config {
-        keys: vec![world.host_key.clone()],
-        ..russh::server::Config::default()
-    });
-    let handler = Handler {
-        world,
-        index,
-        tag,
-        channels: HashMap::new(),
-    };
-    tokio::spawn(async move {
-        if let Ok(session) = russh::server::run_stream(config, stream, handler).await {
-            let _ = session.await;
-        }
-    });
-}
-
 /// Every target through the gateway's loopback port: a facility in another
 /// process reaching the world.
 pub struct Loopback(pub u16);
@@ -1204,108 +1157,47 @@ impl Dial for Loopback {
     }
 }
 
-struct Handler {
+impl World {
+    /// A connection of the phone tagged `tag` to `target`, recorded.
+    fn connection(self: &Arc<Self>, target: &Target, circuit: Circuit, tag: u8) -> Connection {
+        let mut state = self.state.lock().unwrap();
+        state.seen.push(Seen::new(target, circuit));
+        Connection {
+            world: Arc::clone(self),
+            index: state.seen.len() - 1,
+            tag,
+        }
+    }
+}
+
+/// One connection of the gateway's, the phone's tag on it.
+struct Connection {
     world: Arc<World>,
     index: usize,
     tag: u8,
-    channels: HashMap<ChannelId, Channel<Msg>>,
 }
 
-impl russh::server::Handler for Handler {
-    type Error = russh::Error;
-
-    async fn auth_publickey(
-        &mut self,
-        _: &str,
-        verified: russh::server::VerifiedPublicKey<'_>,
-    ) -> Result<Auth, Self::Error> {
-        self.world.state.lock().unwrap().seen[self.index].key =
-            Some(verified.public_key.key_data().ed25519().unwrap().0);
-        Ok(Auth::Accept)
+impl ssh::Connection for Connection {
+    fn seen(&self, f: impl FnOnce(&mut Seen)) {
+        f(&mut self.world.state.lock().unwrap().seen[self.index]);
     }
 
-    async fn channel_open_session(
-        &mut self,
-        channel: Channel<Msg>,
-        reply: russh::server::ChannelOpenHandle,
-        _session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        self.channels.insert(channel.id(), channel);
-        reply.accept().await;
-        Ok(())
-    }
-
-    async fn subsystem_request(
-        &mut self,
-        id: ChannelId,
-        name: &str,
-        session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        let Some(channel) = self.channels.remove(&id) else {
-            return Ok(());
-        };
-        if name != "vos-api" {
-            session.channel_failure(id)?;
-            return Ok(());
+    /// A request as its fate says: answered by the world, forged, or the
+    /// phone's process dying before the world takes it or after.
+    fn answer(&self, kind: u16, body: &[u8]) -> Answer {
+        let fate = self.world.fate(self.tag, Step::of(kind, body));
+        if matches!(fate, Fate::Drop) {
+            return Answer::Cut;
         }
-        session.channel_success(id)?;
-        tokio::spawn(serve(
-            channel.into_stream(),
-            Arc::clone(&self.world),
-            self.index,
-            self.tag,
-        ));
-        Ok(())
-    }
-}
-
-/// The agent a request names, if it names one.
-fn agent_of(body: &[u8]) -> u32 {
-    body.get(..4)
-        .map_or(0, |bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-}
-
-/// The `vos-api` subsystem: each frame answered by the world, on a thread
-/// of its own (a personal agent's batch runs the interpreter).
-async fn serve(
-    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    world: Arc<World>,
-    index: usize,
-    tag: u8,
-) {
-    let mut reader = Reader::requests(Framing::Stream, Requests::All);
-    let mut chunk = vec![0u8; 64 << 10];
-    loop {
-        let read = match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => read,
+        self.seen(|seen| seen.carried(kind, body));
+        let answer = match fate {
+            Fate::Forge => self.world.forged(body),
+            _ => self.world.answer(kind, body, self.index),
         };
-        reader.push(&chunk[..read]);
-        while let Some(Event::Frame(request)) = reader.event() {
-            let fate = world.fate(tag, Step::of(request.kind, &request.body));
-            if matches!(fate, Fate::Drop) {
-                return;
-            }
-            world.state.lock().unwrap().seen[index]
-                .requests
-                .push((request.kind, agent_of(&request.body)));
-            let answering = Arc::clone(&world);
-            let (kind, body) = (request.kind, request.body.clone());
-            let forge = matches!(fate, Fate::Forge);
-            let answer = tokio::task::spawn_blocking(move || match forge {
-                true => answering.forged(&body),
-                false => answering.answer(kind, &body, index),
-            })
-            .await
-            .expect("the world answered");
-            if matches!(fate, Fate::TakeAndDrop) {
-                return;
-            }
-            let bytes = frame(Framing::Stream, request.kind, request.id, &answer);
-            if stream.write_all(&bytes).await.is_err() {
-                return;
-            }
+        if matches!(fate, Fate::TakeAndDrop) {
+            return Answer::Cut;
         }
+        Answer::Body(answer)
     }
 }
 
