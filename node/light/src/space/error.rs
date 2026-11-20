@@ -232,6 +232,19 @@ pub(crate) fn answered<T>(answer: crate::personal::Answer<T, String>) -> Result<
     answer.map_err(unreached)?.map_err(Error::AgentRefused)
 }
 
+/// The control log from `from` to its head over `link`, read as a pass
+/// reads it ([`crate::job::log`]: each page through the onion, past the
+/// one before): the agent's refusal, or the link's failure.
+pub(crate) fn logged(
+    link: &mut impl crate::job::Control<Error = String>,
+    from: u64,
+) -> Result<Vec<(u64, vos_wire::personal::Entry)>, Error> {
+    crate::job::log(link, from).map_err(|error| match error {
+        crate::personal::SyncError::Refused(error) => Error::AgentRefused(error),
+        error => unreached(error),
+    })
+}
+
 pub(crate) fn store_failed(error: impl std::fmt::Display) -> Error {
     Error::Store(error.to_string())
 }

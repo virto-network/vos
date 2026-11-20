@@ -10,7 +10,7 @@ use vos_wire::personal::{
     Recorded, Standing, Status, method,
 };
 
-use super::link::{AgentLink, Signer, answer};
+use super::link::{AgentLink, Key, Signer, answer};
 use super::{
     AdminKey, Approval, Error, Held, Host, Personal, Posted, Prompts, admin_sign, answered,
     entered_kit, failed, new_kit, unreached,
@@ -494,7 +494,12 @@ impl<H: Host> Personal<H> {
                     .map_err(|error| error.to_string())
             };
             let called = link
-                .settled(&mut signer, &sign, method, arguments, &mut hold)
+                .settled(
+                    &mut Key::Lent(&mut signer, &sign),
+                    method,
+                    arguments,
+                    &mut hold,
+                )
                 .map_err(unreached)?;
             let recorded = match answer::<Recorded>(&called.outcome).map_err(failed)? {
                 Ok(recorded) => recorded,
@@ -562,8 +567,7 @@ impl<H: Host> Personal<H> {
             };
             let called = link
                 .settled(
-                    &mut signer,
-                    &group_sign,
+                    &mut Key::Lent(&mut signer, &group_sign),
                     method::COMMIT,
                     prepared.arguments(),
                     &mut hold,

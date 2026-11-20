@@ -147,8 +147,9 @@ pub trait Control: Link {
     /// `devices()`: the device set, each device's standing and last call.
     fn devices(&mut self) -> Answer<Vec<DeviceView>, Self::Error>;
 
-    /// `post` under the sync key in the link's session: the batch time it
-    /// was taken at.
+    /// `post` under the sync key in the link's session, sent once (the pass
+    /// wakes the agent and posts again while it answers `Settling`): the
+    /// batch time it was taken at.
     fn post(&mut self, post: &Post) -> Answer<u64, Self::Error>;
 }
 
@@ -595,8 +596,12 @@ fn follow<L: Control>(
     Ok(())
 }
 
-/// The log from `from` to its head, page by page.
-fn log<L: Control>(link: &mut L, from: u64) -> Result<Vec<(u64, Entry)>, SyncError<L::Error>> {
+/// The log from `from` to its head, page by page, each page read through
+/// the onion and past the one before.
+pub(crate) fn log<L: Control>(
+    link: &mut L,
+    from: u64,
+) -> Result<Vec<(u64, Entry)>, SyncError<L::Error>> {
     let mut entries = Vec::new();
     let mut next = from;
     loop {
@@ -614,10 +619,14 @@ fn log<L: Control>(link: &mut L, from: u64) -> Result<Vec<(u64, Entry)>, SyncErr
 }
 
 /// `post`, the agent woken and the post made again while it answers
-/// `Settling`: the batch time it was taken at, or `None` when the agent
-/// holds it already or decided its candidate meanwhile.
-fn post_settled<L: Control>(link: &mut L, post: &Post) -> Result<Option<u64>, SyncError<L::Error>> {
-    for _ in 0..=WAKES {
+/// `Settling`, at most [`WAKES`] times: the batch time it was taken at, or
+/// `None` when the agent holds it already or decided its candidate
+/// meanwhile.
+pub(crate) fn post_settled<L: Control>(
+    link: &mut L,
+    post: &Post,
+) -> Result<Option<u64>, SyncError<L::Error>> {
+    for woken in 0..=WAKES {
         onion(link)?;
         match link.post(post).map_err(SyncError::Link)? {
             Ok(at) => return Ok(Some(at)),
@@ -627,10 +636,11 @@ fn post_settled<L: Control>(link: &mut L, post: &Post) -> Result<Option<u64>, Sy
                 | PersonalError::NoCandidate
                 | PersonalError::NotConfirming,
             ) => return Ok(None),
-            Err(PersonalError::Settling) => {
+            Err(PersonalError::Settling) if woken < WAKES => {
                 onion(link)?;
                 answer(link.wake())?;
             }
+            Err(PersonalError::Settling) => return Err(SyncError::Settling),
             Err(error) => return Err(SyncError::Refused(error)),
         }
     }

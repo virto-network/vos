@@ -176,7 +176,7 @@ impl<H: Host> Personal<H> {
         let until = std::time::Instant::now() + self.wait();
         loop {
             let mut link = link(&self.host, kept, Purpose::Personal, agent, &key, &mut sync);
-            if let Ok(Ok(entries)) = link.log_all(0)
+            if let Ok(entries) = super::logged(&mut link, 0)
                 && entries
                     .iter()
                     .any(|(_, entry)| matches!(entry.body, Body::Assigned { .. }))

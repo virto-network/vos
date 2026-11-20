@@ -16,10 +16,11 @@ use vos_wire::personal::{
     method,
 };
 
-use super::link::{AgentLink, Signer, answer};
+use super::link::{AgentLink, Key, Signer, answer};
 use super::set::{Device, evidence};
 use super::{
-    Error, Host, Kept, KitCall, Personal, Posted, Prompts, answered, entered_kit, link, unreached,
+    Error, Host, Kept, KitCall, Personal, Posted, Prompts, answered, entered_kit, link, logged,
+    unreached,
 };
 use crate::job::{Kind, Notice};
 use crate::kit::KitSecret;
@@ -134,7 +135,7 @@ impl<H: Host> Personal<H> {
         let signing = kit.signing();
         let origin = signing.verifying_key().to_bytes();
         self.with_kit(&home, kit, agent, |link, identity| {
-            let entries = answered(link.log_all(0))?;
+            let entries = logged(link, 0)?;
             if let Some(posted) =
                 self.post_kept(link, identity, &entries, origin, method, &arguments)?
             {
@@ -152,7 +153,12 @@ impl<H: Host> Personal<H> {
                 .map_err(|error| error.to_string())
             };
             let called = link
-                .settled(&mut signer, &sign, method, arguments, &mut hold)
+                .settled(
+                    &mut Key::Lent(&mut signer, &sign),
+                    method,
+                    arguments,
+                    &mut hold,
+                )
                 .map_err(unreached)?;
             let recorded = match answer::<Recorded>(&called.outcome).map_err(super::failed)? {
                 Ok(recorded) => recorded,

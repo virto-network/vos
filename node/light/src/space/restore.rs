@@ -11,11 +11,11 @@ use vos_wire::personal::{
     RecoveryView, method,
 };
 
-use super::link::{Signer, answer};
+use super::link::{Key, Signer, answer};
 use super::set::evidence;
 use super::{
     Claim, Claimed, Error, Held, Host, PERSONAL, Personal, Posted, Prompts, Restoring, answered,
-    entered_kit, failed, link, new_kit, secret, unreached,
+    entered_kit, failed, link, logged, new_kit, secret, unreached,
 };
 use crate::group::{Agent as GroupAgent, DeviceGroup, Restored};
 use crate::personal::{Link as _, recover};
@@ -65,7 +65,7 @@ impl<H: Host> Personal<H> {
                 &signing,
                 &mut session,
             );
-            entries = answered(link.log_all(0))?;
+            entries = logged(&mut link, 0)?;
             if restore_cancelled(&entries, &restoring.arguments) {
                 held.state.restoring = None;
                 held.state.home = None;
@@ -138,7 +138,7 @@ impl<H: Host> Personal<H> {
         );
         let restoring = held.state.restoring.clone().ok_or(Error::NoSpace)?;
         if entries.is_empty() && restoring.signed.is_some() {
-            entries = answered(link.log_all(0))?;
+            entries = logged(&mut link, 0)?;
         }
         let taken = entries.iter().find_map(|(index, entry)| match &entry.body {
             Body::Operation { call, matures, .. }
@@ -172,8 +172,7 @@ impl<H: Host> Personal<H> {
                 };
                 let called = link
                     .settled(
-                        &mut kit_signer,
-                        &sign,
+                        &mut Key::Lent(&mut kit_signer, &sign),
                         method::RESTORE,
                         restoring.arguments.clone(),
                         &mut hold,
@@ -206,7 +205,7 @@ impl<H: Host> Personal<H> {
         // When it matures, as the log took it.
         let matures = match matures {
             Some(matures) => matures,
-            None => answered(link.log_all(posted.index))?
+            None => logged(&mut link, posted.index)?
                 .iter()
                 .find_map(|(index, entry)| match &entry.body {
                     Body::Operation { matures, .. } if *index == posted.index => Some(*matures),
@@ -276,7 +275,7 @@ impl<H: Host> Personal<H> {
             let overview: Overview = answered(link.query(method::OVERVIEW, ()))?;
             let devices: Vec<DeviceView> = answered(link.query(method::DEVICES, ()))?;
             // The log's policy, as every device of the set follows it.
-            let entries = answered(link.log_all(0))?;
+            let entries = logged(&mut link, 0)?;
             let read: Vec<_> = entries
                 .into_iter()
                 .filter(|(index, _)| *index < overview.next)
