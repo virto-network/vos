@@ -1,47 +1,16 @@
-# Codegen flags are scoped PER TARGET TRIPLE, never under `[build]`.
-# `[build] rustflags` leaks into every `--target` cross-build (cargo
-# applies rustflags to the *target* units), so `target-cpu=native` —
-# which rustc resolves to the host CPU's name — would poison aarch64
-# codegen ("is not a recognized processor for this target").  Scoping
-# under `[target.<triple>]` keeps the native win for host builds and
-# leaves cross-builds clean; cargo uses the matching target section
-# INSTEAD of `[build] rustflags`, not in addition to it.
+# Codegen flags are set per target triple, never under `[build]`: cargo
+# applies `[build] rustflags` to every `--target` build, and
+# `target-cpu=native` names the host's CPU, which a cross-build's target
+# does not know. A matching target section replaces `[build] rustflags`.
 
-# Native code generation materially improves local proving throughput:
-# Stwo's SimdBackend gains from AVX2, AES-NI and SHA-NI codegen over the
-# generic baseline.
-#
-# Risk: native-codegen binaries are NOT portable.  A binary built on
-# CPU A may segfault on CPU B that lacks the same instruction set.
-# This is fine for users who build from source on their own machine; not
-# fine for distributing binaries.
-#
-# To opt out (for distributable builds):
-#   - Comment out the rustflags below, or
-#   - Override on the command line: RUSTFLAGS="" cargo build --release
+# Native codegen (AVX2, AES-NI, SHA-NI for Stwo's SimdBackend) speeds local
+# proving; its binaries are not portable. A distributable build overrides
+# it: RUSTFLAGS="" cargo build --release.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=native"]
 
-# ── aarch64 cross-compilation ──
-#
-# Only consulted when building `--target aarch64-unknown-linux-gnu`;
-# harmless otherwise.  The linker must be a cross-gcc (or clang with
-# `--target=`) because rust-lld is not the default for this triple.
-# A crate that compiles C (on the node side, `ring`, through its TLS
-# stack) finds the conventional `aarch64-linux-gnu-gcc` on PATH through
-# the `cc` crate; to use clang instead set
-#   CC_aarch64_unknown_linux_gnu=clang
-#   CFLAGS_aarch64_unknown_linux_gnu=--target=aarch64-unknown-linux-gnu
-#
-# No target-cpu pin here: NEON is baseline on aarch64 (stwo's SimdBackend
-# and the hand-written M31 NEON kernel need nothing extra), and per-device
-# tuning (`-C target-cpu=cortex-a76`, `apple-m1`, …) belongs in a local
-# override or an on-device build, not checked in.
+# aarch64 cross-builds link with the cross-gcc, which `cc` also finds for
+# C dependencies (`ring`); no target-cpu pin, NEON being baseline. Android
+# builds go through `cargo ndk`, which sets its own linker.
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
-
-# Android: same story but the linker is the NDK's versioned clang
-# wrapper, whose path is machine-specific — uncomment and point at
-# your NDK (API 24+):
-# [target.aarch64-linux-android]
-# linker = "<NDK>/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"

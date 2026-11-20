@@ -1,8 +1,9 @@
-# Operating a space's nodes: anchoring
+# Operating a space's nodes
 
-What an operator does about a space's anchors at its venue. The protocol
-is `design/proving.md` §7; the venue's calls are `design/spaces-pallet.md` (Kreivo) and the JAM
-statements service's controls. First, how an operator reaches a node.
+How an operator reaches a node, replaces one, and what an operator does
+about a space's anchors at its venue (the protocol is `design/proving.md`
+§7; the venue's calls are `design/spaces-pallet.md` (Kreivo) and the JAM
+statements service's controls) and about its gateway's onion service.
 
 ## Reaching a node
 

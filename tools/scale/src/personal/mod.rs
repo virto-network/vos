@@ -14,8 +14,7 @@ mod load;
 mod onion;
 mod summary;
 
-use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -40,9 +39,6 @@ pub use summary::summary;
 pub const INSTANCE: u32 = 1;
 /// The role `Personal` declares for its home, as the install numbers it.
 const HOMES_ROLE: u8 = 1;
-/// Personal agents created at once, by default: each mostly waits for its
-/// group's first election and its install.
-pub const CREATORS: u32 = 16;
 /// How long every assigned agent has to admit its device once the last
 /// is created.
 const ADMITTED: Duration = Duration::from_secs(300);
@@ -161,11 +157,11 @@ pub fn policy() -> Policy {
 }
 
 /// What `agents --personal` makes.
-pub struct Request<'a> {
+pub struct Request {
     /// The agents the load wakes; one more is made for the fill.
     pub count: u32,
-    pub personal: &'a Path,
-    pub home: &'a Path,
+    pub personal: PathBuf,
+    pub home: PathBuf,
     pub seed: u64,
     pub creators: u32,
 }
@@ -243,8 +239,8 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Personals, Str
     let operators = operators(inventory, &deployed)?;
     let weights = inventory.placement_weights();
     let mut mix = Mix(request.seed ^ 0x9e75_0a1a);
-    let personal = read_elf(request.personal)?;
-    let home_elf = read_elf(request.home)?;
+    let personal = read_elf(&request.personal)?;
+    let home_elf = read_elf(&request.home)?;
     let created_from_ms = crate::now_ms();
     let replicas = place(&weights, &mut mix);
     let home = created(operators[usize::from(replicas[0]) - 1].create_agent(replicas.clone()))?;
@@ -270,99 +266,71 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Personals, Str
         .collect::<Result<std::collections::HashMap<_, _>, String>>()?;
     let total = request.count + 1;
     let placements: Vec<Vec<u8>> = (0..total).map(|_| place(&weights, &mut mix)).collect();
-    let next = AtomicU32::new(0);
-    let made = AtomicU32::new(0);
-    let mut members: Vec<Option<Member>> = vec![None; total as usize];
     let policy = policy();
-    std::thread::scope(|scope| -> Result<(), String> {
-        let workers: Vec<_> = (0..request.creators.clamp(1, total))
-            .map(|creator| {
-                let (routes, placements, deployed) = (&routes, &placements, &deployed);
-                let (next, made, personal, policy) = (&next, &made, &personal, &policy);
-                let home_replicas = home_placed.replicas.clone();
-                scope.spawn(move || -> Result<Vec<Member>, String> {
-                    let operators = crate::agents::operators(inventory, deployed)?;
-                    let at_home = crate::nodes::target(
-                        &deployed.nodes[usize::from(home_replicas[0]) - 1],
-                        client,
-                    )?;
-                    let (key, _) = crate::load::user(request.seed ^ 0x40e5, u64::from(creator));
-                    let mut caller = Client::new(&at_home, SigningKey::from_bytes(&key))
-                        .with_routes(routes.clone());
-                    let readers = deployed
-                        .nodes
-                        .iter()
-                        .map(|node| {
-                            Ok(Client::new(
-                                &crate::nodes::target(node, client)?,
-                                SigningKey::from_bytes(&key),
-                            ))
-                        })
-                        .collect::<Result<Vec<_>, String>>()?;
-                    let mut mine = Vec::new();
-                    loop {
-                        let at = next.fetch_add(1, Ordering::Relaxed);
-                        if at >= total || crate::hosts::interrupted() {
-                            return Ok(mine);
-                        }
-                        let one = (|| -> Result<Member, String> {
-                            let replicas = placements[at as usize].clone();
-                            let creator = &operators[usize::from(replicas[0]) - 1];
-                            let agent = created(creator.create_agent(replicas.clone()))?;
-                            install(
-                                &operators,
-                                agent,
-                                &replicas,
-                                INSTANCE,
-                                personal,
-                                vec![(b"homes".to_vec(), HOMES_ROLE)],
-                            )?;
-                            grant(&operators, agent, &replicas, home)?;
-                            let identity = identity(&readers, agent, &replicas)?;
-                            home_call(&mut caller, home, agent, "configure", *policy)?;
-                            let kit = Kit {
-                                entries: Vec::new(),
-                                r2: vos_pvm::precompile::blake2b_256(&u64::from(at).to_le_bytes()),
-                            };
-                            home_call(
-                                &mut caller,
-                                home,
-                                agent,
-                                "assign",
-                                (device(request.seed, u64::from(at)), kit),
-                            )?;
-                            Ok(Member {
-                                index: u64::from(at),
-                                agent: agent.0,
-                                replicas,
-                                identity: hex::encode(identity),
-                            })
-                        })();
-                        let one = one.inspect_err(|_| next.store(total, Ordering::Relaxed))?;
-                        mine.push(one);
-                        let done = made.fetch_add(1, Ordering::Relaxed) + 1;
-                        if done.is_multiple_of(500) || done == total {
-                            eprintln!("{done} of {total} personal agents created and assigned");
-                        }
-                    }
+    let mut agents = crate::hosts::in_parallel(
+        total,
+        request.creators,
+        |creator| -> Result<(Vec<Operator>, Client, Vec<Client>), String> {
+            let operators = crate::agents::operators(inventory, &deployed)?;
+            let at_home = crate::nodes::target(
+                &deployed.nodes[usize::from(home_placed.replicas[0]) - 1],
+                client,
+            )?;
+            let (key, _) = crate::load::user(request.seed ^ 0x40e5, u64::from(creator));
+            let caller =
+                Client::new(&at_home, SigningKey::from_bytes(&key)).with_routes(routes.clone());
+            let readers = deployed
+                .nodes
+                .iter()
+                .map(|node| {
+                    Ok(Client::new(
+                        &crate::nodes::target(node, client)?,
+                        SigningKey::from_bytes(&key),
+                    ))
                 })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok((operators, caller, readers))
+        },
+        |(operators, caller, readers), at| {
+            let replicas = placements[at as usize].clone();
+            let creator = &operators[usize::from(replicas[0]) - 1];
+            let agent = created(creator.create_agent(replicas.clone()))?;
+            install(
+                operators,
+                agent,
+                &replicas,
+                INSTANCE,
+                &personal,
+                vec![(b"homes".to_vec(), HOMES_ROLE)],
+            )?;
+            grant(operators, agent, &replicas, home)?;
+            let identity = identity(readers, agent, &replicas)?;
+            home_call(caller, home, agent, "configure", policy)?;
+            let kit = Kit {
+                entries: Vec::new(),
+                r2: vos_pvm::precompile::blake2b_256(&u64::from(at).to_le_bytes()),
+            };
+            home_call(
+                caller,
+                home,
+                agent,
+                "assign",
+                (device(request.seed, u64::from(at)), kit),
+            )?;
+            Ok(Member {
+                index: u64::from(at),
+                agent: agent.0,
+                replicas,
+                identity: hex::encode(identity),
             })
-            .collect();
-        for worker in workers {
-            for one in worker.join().expect("a creator")? {
-                let at = one.index as usize;
-                members[at] = Some(one);
+        },
+        |done| {
+            if done.is_multiple_of(500) || done == total {
+                eprintln!("{done} of {total} personal agents created and assigned");
             }
-        }
-        Ok(())
-    })?;
-    if crate::hosts::interrupted() {
-        return Err("personal agents: interrupted".into());
-    }
-    let mut agents: Vec<Member> = members
-        .into_iter()
-        .map(|one| one.expect("every agent created"))
-        .collect();
+        },
+    )?
+    .ok_or("personal agents: interrupted")?;
     let full = agents.pop();
     let mut personals = Personals {
         home: Some(home_placed),

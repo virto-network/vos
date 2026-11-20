@@ -31,7 +31,7 @@ use vos_wire::personal::{
 };
 
 use crate::group::{Device, household};
-use crate::light::{AGENT, NOTES};
+use crate::light::{AGENT, NOTES, embedded, percentile};
 
 /// An envelope the stand-in holds: its id and its bytes.
 type Held = ([u8; 32], Vec<u8>);
@@ -150,11 +150,6 @@ fn sealed<T>(
     f(&mut sync)
 }
 
-fn ms(times: &mut [f64], q: usize) -> f64 {
-    times.sort_by(f64::total_cmp);
-    times[(times.len() * q / 100).min(times.len() - 1)]
-}
-
 pub fn sync(args: &[String]) {
     let mut dir = None;
     let mut rounds = 3usize;
@@ -181,12 +176,7 @@ pub fn sync(args: &[String]) {
         }
     }
     let dir = dir.expect("--dir DIR");
-    if AGENT.is_empty() || NOTES.is_empty() {
-        eprintln!(
-            "built without the release artifacts: `just build-programs build-test-actors`, then build again"
-        );
-        std::process::exit(2);
-    }
+    embedded(&[AGENT, NOTES]);
     let notes = Package::decode_exact(NOTES).expect("the embedded package decodes");
     let (mut devices, _) = household(&Path::new(&dir).join("sync"), 2);
     let mut agent = Agent {
@@ -238,12 +228,12 @@ pub fn sync(args: &[String]) {
         }
         println!(
             r#"{{"sync":"catch_up","shape":"{shape}","rounds":{rounds},"envelopes":{envelopes},"bytes":{bytes},"catch_up_p50_ms":{:.1},"catch_up_p95_ms":{:.1},"push_p50_ms":{:.1},"push_p95_ms":{:.1},"call_p50_ms":{:.2},"call_p95_ms":{:.2}}}"#,
-            ms(&mut catch_ups, 50),
-            ms(&mut catch_ups, 95),
-            ms(&mut pushes, 50),
-            ms(&mut pushes, 95),
-            ms(&mut calls, 50),
-            ms(&mut calls, 95),
+            percentile(&mut catch_ups, 50),
+            percentile(&mut catch_ups, 95),
+            percentile(&mut pushes, 50),
+            percentile(&mut pushes, 95),
+            percentile(&mut calls, 50),
+            percentile(&mut calls, 95),
         );
     }
 }

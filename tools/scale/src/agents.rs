@@ -6,7 +6,6 @@
 //! deployed space's `agents.json` for the drivers.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -348,46 +347,22 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
     // Placed in order from the seed, then created a few at once: each
     // agent's creation mostly waits for its group's first election.
     let placements: Vec<Vec<u8>> = (0..total).map(|_| place(&weights, &mut mix)).collect();
-    let made = AtomicU32::new(0);
-    let next = AtomicU32::new(0);
-    let mut placed: Vec<Option<Placed>> = vec![None; total as usize];
-    std::thread::scope(|scope| -> Result<(), String> {
-        let workers: Vec<_> = (0..request.creators.max(1).min(total.max(1)))
-            .map(|_| {
-                scope.spawn(|| -> Result<Vec<(u32, Placed)>, String> {
-                    let operators = crate::agents::operators(inventory, &deployed)?;
-                    let mut mine = Vec::new();
-                    loop {
-                        let at = next.fetch_add(1, Ordering::Relaxed);
-                        if at >= total || crate::hosts::interrupted() {
-                            return Ok(mine);
-                        }
-                        let one = place_one(&operators, placements[at as usize].clone());
-                        let one = one.inspect_err(|_| next.store(total, Ordering::Relaxed))?;
-                        mine.push((at, one));
-                        let done = made.fetch_add(1, Ordering::Relaxed) + 1;
-                        if done.is_multiple_of(100) || done == total {
-                            eprintln!(
-                                "{done} of {total} agents created ({} shards, {} idle)",
-                                request.count, request.idle
-                            );
-                        }
-                    }
-                })
-            })
-            .collect();
-        for worker in workers {
-            for (at, one) in worker.join().expect("a creator")? {
-                placed[at as usize] = Some(one);
+    let placed = crate::hosts::in_parallel(
+        total,
+        request.creators,
+        |_| crate::agents::operators(inventory, &deployed),
+        |operators, at| place_one(operators, placements[at as usize].clone()),
+        |done| {
+            if done.is_multiple_of(100) || done == total {
+                eprintln!(
+                    "{done} of {total} agents created ({} shards, {} idle)",
+                    request.count, request.idle
+                );
             }
-        }
-        Ok(())
-    })?;
-    if crate::hosts::interrupted() {
-        return Err("agents: interrupted".into());
-    }
+        },
+    )?
+    .ok_or("agents: interrupted")?;
     for (at, one) in placed.into_iter().enumerate() {
-        let one = one.expect("every agent created");
         if (at as u32) < request.count {
             agents.agents.push(one);
         } else {

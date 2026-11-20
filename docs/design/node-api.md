@@ -604,10 +604,11 @@ could replay, and a relay keeps nothing it can reuse.
   HTTP is the clearnet's: its clients are VOS's own tools (`vos`, the
   keeper, the tests) and future web clients; no client reaches a node
   over HTTP anonymously. A circuit counts as an address of its own,
-  `fd76:6f73:<circuit>::/64`, each stream a port of it: 4 connections at
-  once, 20 requests a second with a burst of 40; 8 streams at once a
-  circuit (arti's `max_concurrent_streams_per_circuit` too), 1,024
-  circuits at once, a circuit holding no stream for 60 s let go. The
+  `fd76:6f73:<circuit>::/64`, each stream a port of it, under the caps
+  of `[onion]` (`docs/operations.md`, "The onion service": its
+  connections, requests and streams, the streams also arti's
+  `max_concurrent_streams_per_circuit`, and the circuits at once), a
+  circuit holding no stream for 60 s let go. The
   streams come from **arti in process**, the onion's one host (the `tor` feature: arti-client
   0.47.0 pinned exactly, one `TorClient` with full vanguards, the
   onion's key from the gateway's `key` file inserted once into arti's

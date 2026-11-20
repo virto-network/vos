@@ -50,12 +50,7 @@ pub fn light(args: &[String]) {
         }
     }
     let store = store.expect("--store DIR");
-    if AGENT.is_empty() || NOTES.is_empty() {
-        eprintln!(
-            "built without the release artifacts: `just build-programs build-test-actors`, then build again"
-        );
-        std::process::exit(2);
-    }
+    embedded(&[AGENT, NOTES]);
     let notes = Package::decode_exact(NOTES).expect("the embedded package decodes");
     let methods = Methods {
         set: MethodId(vos_light::method_id("set")),
@@ -94,16 +89,14 @@ pub fn light(args: &[String]) {
         times.push(started.elapsed().as_micros() as u64);
         assert!(matches!(outcome, Outcome::Done(_)), "{outcome:?}");
     }
-    times.sort_unstable();
-    let at = |q: usize| times.get((times.len() * q / 100).min(times.len().saturating_sub(1)));
     let started = Instant::now();
     let read = counted(&light, &methods);
     let us = started.elapsed().as_micros();
     assert_eq!(read, done, "the query reads what the calls wrote");
     println!(
         r#"{{"light":"calls","calls":{calls},"p50_us":{},"p95_us":{},"value":{read}}}"#,
-        at(50).copied().unwrap_or(0),
-        at(95).copied().unwrap_or(0),
+        percentile(&mut times, 50),
+        percentile(&mut times, 95),
     );
     println!(r#"{{"light":"query","us":{us},"value":{read}}}"#);
 }
@@ -174,4 +167,24 @@ fn query<T: Decode>(light: &Light, method: MethodId, arguments: Vec<u8>) -> T {
         Outcome::Done(bytes) => T::decode(&bytes).expect("a reply").0,
         other => panic!("not done: {other:?}"),
     }
+}
+
+/// Exits, naming the recipes to run, when this binary was built without
+/// any of the release `artifacts` it embeds.
+pub fn embedded(artifacts: &[&[u8]]) {
+    if artifacts.iter().any(|bytes| bytes.is_empty()) {
+        eprintln!(
+            "built without the release artifacts: `just build-programs build-test-actors`, then build again"
+        );
+        std::process::exit(2);
+    }
+}
+
+/// The value at percentile `q` of `times`, sorted here; 0 of none.
+pub fn percentile<T: Copy + Default + PartialOrd>(times: &mut [T], q: usize) -> T {
+    times.sort_by(|a, b| a.partial_cmp(b).expect("a time"));
+    times
+        .get((times.len() * q / 100).min(times.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or_default()
 }

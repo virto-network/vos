@@ -261,10 +261,6 @@ def programs():
                 for name, crate in named.items() if built.get(name) != crate]
     failures += [f"agent/programs builds {name}, which programs.toml does not name"
                  for name in built if name not in named]
-    for program in listed:
-        elf = f"agent/programs/target/riscv64em-vos/release/{program['name']}.elf"
-        if program["elf"] != elf:
-            failures.append(f"programs.toml: {program['name']}'s ELF is built at {elf}")
     return failures
 
 

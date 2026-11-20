@@ -88,7 +88,8 @@ primitives that serve it.
   a prover shows a fact and stays unlinkable.
 - **Across spaces,** every cell discloses only what a proof returns.
 - **Metadata** (network addresses, timing, sizes) leaks in every cell.
-  The relay layer (§8) addresses it; spaces that need it opt in.
+  Tor hides the network address (`light-node.md` §6, whose §6.7 names
+  what it does not fix); anonymous calls go only over it.
 - **What is built:** the top-left cell, and with the messenger, the
   bottom-left; the top-right in a space, through the membership
   credential (§5–§7); the bottom-right is postponed (§8).
@@ -328,7 +329,7 @@ proves and the kernel's claim.
     in a scope within one period, and at most nine (twice its limit and
     three) in one that spans a period's end: it may hold one device as the
     period ends and enroll its limit and one more in the next. One admission a person, a ring of
-    person leaves, is later work (`light-node.md` §9.3).
+    person leaves, is later work (`open.md`).
 - **Ingress's checks, in order,** each cheap one before any dearer, every
   state read on this replica's applied state; each refusal is
   `Rejected(Credential(code))` (index 9 of `Rejection`), `code` a
@@ -981,58 +982,15 @@ the device never exports, evaluated once a use after the user's consent
 **Opt-in linking:** a holder can prove "the same person as identity X in
 space A", and only to whom they choose.
 
-## 8. Full privacy: personal spaces and a shielded pool (postponed)
+## 8. Full privacy: personal spaces and a shielded pool
 
-**Postponed** [decided]. These are the primitives that serve the "hidden
-from the operators, actor anonymous" cell, recorded so that the
-primitives built first don't preclude them. A space opts in: each space
-chooses its privacy tier [decided]. Fully private, cash-like
-payments are this section's: membership proven privately, a hidden
-payer, the shielded pool. Of these, only a proof of membership and
-payment together is measured, to fit the phone's budget (`proving.md`
-§8).
-
-- **A personal space** is the VOS runtime inside the person's wallet
-  app: a space with one node, whose state lives on the device.
-  - It holds notes, keys and credentials, and the master secret its
-    pseudonyms and keys derive from.
-  - **Durability is its threat, not operators.** Recovery is required:
-    a seed, a guardian threshold, or a passkey-wrapped secret, with
-    passkeys as the default experience.
-  - A hosted replica stores encrypted snapshots and holds no keys;
-    otherwise it is custody.
-- **The shielded pool needs integrity without trusting its host,** not
-  only secrecy. Its users are exactly those who do not want to trust
-  operators. So it runs as a JAM agent (JAM mode), or in a
-  space that proves its transitions, and it verifies each spend's proof
-  in its guest.
-- **One pool shared by many spaces,** not one per space. The anonymity
-  set is everyone who uses it.
-- **Its costs on JAM:**
-  - a final proof costs about 80M gas of refine (the JAM statements
-    service's, measured), so about 60 fit a work package's 5e9;
-  - scanning notes held on JAM needs the JAM light client in the
-    personal space.
-- **An anonymous input** travels the client path without a session:
-  - self-authenticating, deduplicated by its nullifier;
-  - no acknowledgement;
-  - carrying a fee note inside its proof.
-- **Note discovery:**
-  - scanning by the personal space, with a one-byte view tag per note;
-  - the sender's direct delivery through the end-to-end encrypted
-    messenger as the fast path;
-  - detection keys deferred.
-  - With every key derived from one master secret, a rescan of the
-    pool doubles as recovery.
-- **The relay layer:**
-  - an existing anonymity network (Tor, Arti bundled in the node, or
-    Nym) in front of the pool's ingress, not a network of our own;
-  - this design fixes only the input format: no session, a few padded
-    sizes, accepted from any relay.
-- **Proving on the device:** a fixed spend circuit in the Stwo and
-  Poseidon2-M31 family, with masking. Its statement is defined to be
-  the wallet kernel's, so the general zkPVM can take over once it is
-  masked and fits a phone.
+**The shielded pool is postponed** [decided]: the "hidden from the
+operators, actor anonymous" cell, a tier each space opts into [decided].
+The personal space is built as a personal agent at a home space and local
+actors on the user's devices, and the network layer as Tor at the gateway
+and the light node (`light-node.md` §3, §6). The pool's design, its
+integrity without trusting its host and one pool shared by many spaces are
+`open.md`'s ("Private payments (P2)", "Full privacy").
 
 ## 9. Membership, as axes
 

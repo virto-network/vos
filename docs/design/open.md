@@ -278,7 +278,8 @@ The scale results are in `core-model.md` §14, "The scale test".
   aarch64 host runs the suites: a test leg on one.
 - **The external audit's scope:** the device shape, the stock kernels, the
   Poseidon2 chip and their masking, with the recursion AIR, the final
-  verifier, `derive` and the security tool's counts. Engage before any
+  verifier, `derive` and the security tool's counts; the personal agent's
+  protocol and `vos-mls`'s use of MLS (`light-node.md` §3). Engage before any
   value rides on VOS.
 
 ## Identity and privacy
@@ -309,10 +310,21 @@ The scale results are in `core-model.md` §14, "The scale test".
   removing it moves the actor's ELF. The feed is kept whole on the actor
   and on every device, about 77 bytes a write: a compaction (a snapshot of the leaves, then the changes since)
   is later work, should a space's history outgrow it.
-- **Full privacy** (`identity-and-authority.md` §8): personal spaces, the
-  shared pool, the relay layer and the holder-side prover, postponed; where
-  the shared pool first runs (a JAM agent or a proving space run by the
-  root space) is decided when it is taken up.
+- **Full privacy** (`identity-and-authority.md` §8 points here): a shielded pool
+  shared by many spaces, whose integrity does not trust any one space's
+  operators (it verifies each spend's proof in its guest), postponed;
+  where it first runs (a JAM agent or a proving space run by the root
+  space) is decided when it is taken up. A space's own pool is P2's
+  (below). Its design so far: on JAM a final proof costs about 80M gas of
+  refine (the JAM statements service's, measured), so about 60 fit a work
+  package's 5e9, and scanning notes held on JAM needs the JAM light client
+  on the device; an anonymous input travels the client path without a
+  session (self-authenticating, deduplicated by its nullifier, no
+  acknowledgement, a fee note inside its proof, a few padded sizes,
+  accepted from any relay); notes are discovered by scanning with a
+  one-byte view tag, the sender's direct delivery through the messenger
+  the fast path, detection keys deferred, and with every key derived from
+  one master secret a rescan of the pool doubles as recovery.
 - **Authenticators and attestations:** authenticators beyond ed25519 at
   ingress (SSH keys, P-256, hardware tokens) and device-signed sessions;
   grants, delegation and narrowed authority sets with revocation epochs;
@@ -338,8 +350,8 @@ The scale results are in `core-model.md` §14, "The scale test".
   most four host-service calls in flight, which bounds one circuit's by its
   connections and sessions, but s4's host-service requests name no peer,
   so no rate a circuit holds them to; and the onion's SSH server's
-  connections (`[onion] ssh_connections`, 128 by default, each given 30 s
-  to authenticate) have no idle close (russh's inactivity timeout is reset
+  connections (`[onion] ssh_connections`, `docs/operations.md`) have no
+  idle close (russh's inactivity timeout is reset
   by the keepalives a live client answers, so an idle close needs
   s4-server to count a connection's channels and close one holding none
   for a while). Both need s4-server's work.
@@ -437,7 +449,18 @@ The scale results are in `core-model.md` §14, "The scale test".
   position to hold the operators to, so it can be served a shortened
   scope (its newest envelopes withheld) without an alarm; `Partition`
   is raised only once a later envelope's `seen` position crosses the cut.
-  `Personal`'s `acknowledge` and `acknowledgements` stay for them.
+  `Personal`'s `acknowledge` and `acknowledgements` stay for them. Their
+  design: a checkpoint is a scope's state after every envelope up to a
+  position `P` whose causal past is complete, so every device that has
+  read to `P` computes the same state (two devices checkpointing at once
+  hold the same state); its author pushes it sealed with `P` and the
+  state's hash inside. A new device trusts the checkpoint of the device it
+  pairs from, which already hands it the archive and `R` and sends the
+  checkpoint's hash over the pairing channel; a restore, with no pairing
+  device, trusts a checkpoint that two devices other than its author
+  acknowledged (each having recomputed it), or replays. So a new device
+  never replays years of history, and holds the operators to the
+  checkpoint's position.
 - **Restore elsewhere and the move's carry** [deferred, dated 2026-11-17;
   `light-node.md` §3.9]: a restore lands at its own home (then moves),
   and a move carries nothing, valid only while the personal space holds
@@ -446,6 +469,335 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **The registry and the root space** (`identity-and-authority.md` §12): the registry agent on JAM, the
   root space under a charter, the handover triggers' numbers, and the rules
   for exit and disputes.
+
+## The personal space and the light node
+
+What `light-node.md` leaves for later; the dated risks and deferred flows
+are under "Identity and privacy" above.
+
+- **The phone gates not yet recorded as passed** (`light-node.md` §2.4):
+  PG1′ and PG2′ at format 47 on the Fairphone 6, twice a day apart; PG3′'s
+  flows and PG6 as onion runs on two phones with the security key; PG5's
+  battery and rendezvous counts; the recorded background-job cases (the "rare"
+  bucket, three days offline, a force-stop, an operation's latency to its
+  notification), which the device-change windows are pinned against.
+- **The personal agents' scale gate** (`light-node.md` §3.3, "The scale gate"):
+  of its three limits, the early run met the snapshot's and missed the
+  other two as measured; the rerun splits a replica's memory from the
+  store's and reads the p99 at finer buckets.
+- **The control log's head in an admin call** [not built]: an admin
+  call's arguments do not name the control log's head it was made
+  against, so a device cannot check that an operation was signed against
+  the log it was shown.
+- **A removed device's course** [open, the owner's]: a device turned away
+  (`Course::TurnedAway`) rests on the agent's unsigned word; a removed
+  device could reach `Out` on the signed log were the agent to serve it
+  the log up to its removal's entry.
+- **Messaging between members** on `vos-mls` [E12], in a space or across
+  spaces, the personal agent's inbox its door (`light-node.md` §3.7,
+  §3.10). MLS virtual clients share a virtual leaf's signature and HPKE
+  keys across the user's devices, a secret that syncs, against E2's
+  letter: the owner is asked first.
+- **Plaintext Merge scopes on nodes** ("The core model's unbuilt parts",
+  below) and actors the user installs in the personal agent (E9).
+- **Several homes:** a second home mirroring the first, a live handover
+  between homes, and a successor group after a lost home (`light-node.md`
+  §3.9); reaping a lapsed agent after its grace and returning it to the
+  pool, with tenancy numbers (§3.3).
+- **Forwarding between nodes,** for a gateway that lists only some of a
+  home's nodes (`light-node.md` §3.3; today a home's gateways list every
+  node).
+- **Person leaves for `once` scopes:** a member with three devices holds
+  three leaves, so a `once` scope admits it three times (`light-node.md`
+  §3.8, `identity-and-authority.md` §5).
+- **History and storage:** history horizons for the key archive, garbage
+  collection of covered envelopes and of earlier epochs' archives, and a
+  blob store for media behind the blob-ready `push` and `since`
+  (`light-node.md` §3.4, §3.6); pipelined `since` reads, and re-reading an
+  envelope passed over once a later archive opens it.
+- **An encrypted export file** under the kit's key [E16].
+- **Pluggable transports** (obfs4 through lyrebird, Snowflake, WebTunnel)
+  beside the plain bridges [E22]; **SSH over QUIC**, or a roaming
+  transport in the manner of mosh, once UDP over Tor exists [E23].
+- **Excising a device's operations** after the fact (`light-node.md` §8,
+  C1); today the remedy is removing the device.
+- **A consent model per program id** for developers' device kernels over
+  private data (`light-node.md` §4.4); today such a kernel takes only what
+  the user hands it, never keys.
+- **Local workflows with device effects** (`ctx.prove`,
+  `ctx.call_remote`), which would move the light node's glue around a
+  proven call into the actor.
+- **A device too small for a full replica,** and a wallet's mirror of a
+  large pool (`light-node.md` §8, C10).
+- **MLS on the device is new code:** confirmed epochs, admin-signed
+  commits and copy-and-swap over mls-rs (`light-node.md` §3.4), the risk
+  the external audit's scope names.
+- **Node-signed answers,** so a device's alarm becomes proof a third
+  party can check (`light-node.md` §8, B4; "Node-signed feed heads",
+  above, for the tree's feed).
+- **Not in this design:** a personal space shared by more than one
+  person; iOS (nothing below the secret store is Android-only, but nothing
+  builds it); an anonymity network of VOS's own, or mixnets: Tor only.
+- **Proof bytes over Tor:** the upload dominates a proven call's latency
+  over an onion circuit (`light-node.md` §6.3); smaller device proofs and
+  an upload split over several circuits are the levers.
+
+## Private payments (P2)
+
+Designed, not built [decided, E13, E18]. P1, the pseudonymous ledger, is
+built (`light-node.md` §5). P2 hides payer, payee and amount from the
+operators and every other member inside a shielded pool; deposits into
+and withdrawals from the pool are visible as transparent legs. It builds
+on the personal space and Tor as built.
+
+### The shape
+
+Two actors and one library:
+- **`Payments`**, the public actor in the space, gains a shielded pool
+  beside cipher-clerk's double-entry ledger (note commitments, nullifiers,
+  encrypted notes). It never sees a note's value or owner.
+- **`Wallet`**, a local actor in the user's personal space: the notes
+  the user's devices hold and the nullifiers they have spent, each note
+  marked with the device whose key spends it (E2), synced across the
+  devices through the personal space.
+  It plans spends; the light node builds and proves them with the
+  device's key, which never enters the actor's state. A local actor whose
+  rows no device writes again needs the move's carry first (above, under
+  "Identity and privacy": "Restore elsewhere and the move's carry").
+- **cipher-clerk**, redesigned (below): the ledger kernel, and a shielded
+  module whose spend rule is one `no_std` Rust function, the same function
+  the device kernel runs and the reference implementation checks.
+
+**The spend is the showcase:** the kernel the phone proves is
+`cipher_clerk::shielded::check` called from a five-line method. There is no
+circuit: the rules (owner binding, nullifier derivation, membership,
+Faerie Gold, value balance with 64-bit range checks as `checked_add`) are
+ordinary Rust, and "the reference check is bit-identical with the
+circuit" (cipher-clerk's Phase 3 entry criterion 11) holds by construction.
+Its spending key reaches only kernels the light node ships
+(`light-node.md` §4.4, "Which kernels see a secret").
+
+### cipher-clerk, redesigned
+
+cipher-clerk (codeberg's `Virto/CipherClerk`; VOS pins tag `v0.3.0`, the
+merge commit `b841640`, in its root `Cargo.toml`, and uses its codec, `Account`, `Layer`,
+`Value` and `settlement::window` in the `accounts` and `window` test
+actors) has a sound transparent kernel (its tests are most of the 315 the
+workspace runs with every feature; about 114 are the privacy modules') and a notes
+prototype that is not for value (its status file says so): Pedersen commitments on
+Ristretto, a BLAKE2b nullifier, a pool that rebuilds its tree on every
+insert (F21), no spend proof, and a `pvm-precompile` feature that routes
+scalar multiplication to a Ristretto chip VOS removed as unsound
+(`core-model.md` §11.2), pinned by a git dependency on VOS at
+`9f5337fb`. Its own Phase 3 entry criteria (its viability plan)
+name what a private tier must settle; this design answers them.
+
+**What changes, released as v0.4.0 (breaking) with P2, from cipher-clerk's own
+repository** [decided, E18]**:**
+
+| # | change | why | Phase 3 item |
+|---|---|---|---|
+| R1 | **One hash, Poseidon2-M31's compression `C`**, behind a trait `Compress { fn compress(l: &Digest, r: &Digest) -> Digest }`; cipher-clerk ships no permutation; VOS's SDK implements it over `0x402` in a kernel and natively on hosts; cipher-clerk's tests take golden vectors from VOS | the zkVM proves `0x402` in one chip row and BLAKE2b or a curve not at all cheaply; one hash keeps device shapes free of BLAKE2b (`proving.md` §8, `H_io`) | 8 |
+| R2 | **Hash commitments, not Pedersen**: `cm = C(C(T(note), [asset, v₀, v₁, v₂, 0…]), C(rho, C(owner, r)))`, value in three 24-bit words; `r` a 248-bit blinding the caller passes (randomness as a parameter, v0.3.0's rule kept). The order lets a pool compute a deposit's `cm` from a public amount, a protocol `rho` and the depositor's `C(owner, r)` (below) | the spend proof checks the balance in Rust, so no homomorphism is needed; no curve in the kernel | 4 |
+| R3 | **Keys hash-only, per device**: `sk` per device and pool, 32 random bytes drawn by the light node, wrapped under a per-use keystore key; for recovery, HPKE-sealed to each kit's X25519 key (never under `R`, which every device holds) and stored at the personal agent, released only to a matured restore as `R2` is (`light-node.md` §3.5), re-sealed at each kit rotation: no device opens another's `sk`, a leaked kit alone gets nothing before 7 days unvetoed and unrefuted, and the operators with a leaked kit can spend (the owner is asked first); `owner = C(T(note-owner), sk)`, `nk = C(T(note-nf), sk)`; the device proves knowledge of `sk` | spend authorization without an embedded curve: option 1 of item 1 ("the device proves, with `ak = Poseidon(ask)`"); no delegated proving, which the light node does not need | 1, 2 |
+| R4 | **Nullifier** `nf = C(nk, C(pool, cm))`, scoped to the pool's id; **`rho` of each output** `C(T(rho), C(nf₀, [i, 0…]))` (two calls), bound to the transaction's first nullifier; **a deposit's `rho`** `C(T(rho-deposit), W(b))`, `b` the deposit call's binding digest, unique and recorded | unique per note, unlinkable to `cm` without `nk`; `rho` fixed by the protocol closes Faerie Gold (F3) for spends and deposits alike; `nk`'s tag apart from the credential's `T(nf)`; a note of one pool spends in no other | 3 |
+| R5 | **Fixed-shape transactions**, `Tx<const I, const O>`: `asset` (the transaction's one asset, its fee's too), `anchor`, `nullifiers: [Digest; I]`, `commitments: [Digest; O]`, `memos_hash`, `value_balance: i64` (a withdrawal's amount, or 0), `leg` (the withdrawal's destination account id, or zero), `fee: u64`, `pool: Digest`, `binding`; deposits are not transactions (below) | a proof's shape is its kernel's; two kernels, 1-in-2-out (`spend`) and 2-in-1-out (`join`), cover payments and consolidation; the transparent leg and the fee's asset are in what the proof binds | 4, 5 |
+| R6 | **`shielded::check::<H, I, O>(tx, witness) -> Result<(), SpendError>`**: `no_std`, no allocation, fixed arrays, no `BTreeMap`, no panic; `Witness` the input notes, their positions and paths, `sk`, the output notes; plus `shielded::Plan` and `shielded::build` (host side, taking the device's `sk`) | the device kernel's body; the same function runs on hosts as the reference | 11 |
+| R7 | **An incremental note tree**: append-only, depth 32, its frontier (33 digests) and a ring of the last 64 anchors in point rows behind a `NoteState` trait (as `LedgerState`), O(32) calls an append | F21; the actor stores it in its tables; the anchor ring mirrors the credential actor's | 7 |
+| R8 | **The pool a pseudo-account of the L0 kernel**: a transaction's `value_balance` is one kernel transfer between the payer's or payee's transparent account and the `ShieldedPool` pseudo-account, under the depositor's `Authority` or the proof's | `seal` and `open` kept as the kernel's two legs, not a second ledger | 9 |
+| R9 | **Encrypted notes**: a memo per output, X25519 to the recipient's address key and ChaCha20-Poly1305 (the `viewing-keys` envelope's AEAD), a one-byte view tag; outgoing ciphertext under the sender's `ovk`; host side only, never in a kernel; the transaction binds `memos_hash` | note delivery through the pool's feed (below); the recipient checks a note's `owner` against its own on receipt (F8) | 2, 6 |
+| R10 | **Deleted**: `notes` (replaced by `shielded`), `pvm-precompile` and its VOS git dependency, `fmd-experimental`, `stealth-experimental` (F8: unspendable), the Ristretto `AuthKey` and Schnorr outside the `signatures` helper the CLI uses | fewer pieces; nothing in VOS uses them; the view tag and scanning replace FMD at this scale | — |
+| R11 | **Recovery and refusals** written as tests against `check` and the pool: Faerie Gold, a spend back by the sender, a double spend (at the actor), an anchor out of the ring, a fee or memo-hash mismatch, an overflow, a wrong pool, a mismatched owner on receipt (the wallet's check, R9) | Phase 3's refusal list | 10, 11 |
+
+**Kept as they are:** the L0 kernel (`apply_batch`, `Authority`,
+`LedgerState`, the two layers, two-phase transfers, the encodings, the
+fit check), payments between spaces and `settlement::window` (the window
+test actor's kernel), and `ValueModel` (`Value` the only model; the
+confidential model stays on paper: notes make it unnecessary for privacy).
+cipher-clerk stays independent of VOS: its kernel depends on no VOS crate
+once R10 drops the git dependency, and VOS depends on its tag.
+
+### The code a developer writes
+
+The whole of the payments actor's private path, with cipher-clerk doing
+the cryptography (sketch; names follow the table above):
+
+```rust
+use cipher_clerk::shielded::{self, Spend, Join, NoteTree};
+use vos_sdk::prelude::*;
+
+#[actor]
+pub struct Payments {
+    clerk: Clerk,                       // cipher-clerk's L0 accounts, in tables
+    notes: NoteTree,                    // the frontier and the anchor ring
+    spent: Table<Digest, ()>,           // nullifiers
+    memos: Table<u64, Memo>,            // a position's encrypted note
+}
+
+#[messages]
+impl Payments {
+    /// Proven on the payer's device; never run by a node.
+    #[attestable(device, reference = shielded::reference::<1, 2>)]
+    pub fn spend(witness: &Spend, #[public] tx: &shielded::Tx<1, 2>) {
+        shielded::check::<P2, 1, 2>(tx, witness).expect("a valid spend");
+    }
+
+    #[attestable(device, reference = shielded::reference::<2, 1>)]
+    pub fn join(witness: &Join, #[public] tx: &shielded::Tx<2, 1>) {
+        shielded::check::<P2, 2, 1>(tx, witness).expect("a valid join");
+    }
+
+    /// A proven spend: its nullifiers once, its notes appended.
+    #[msg(proven = spend)]
+    pub async fn pay(&mut self, ctx: &mut Command<Self>, tx: shielded::Tx<1, 2>,
+                     memos: [Memo; 2]) -> Result<(), PayError> {
+        self.notes.accepts(&tx.anchor)?;
+        tx.memos_hash.matches(&memos)?;
+        for nf in tx.nullifiers { self.spent.insert_new(&nf)?; }
+        for (cm, memo) in tx.commitments.into_iter().zip(memos) {
+            let at = self.notes.append(cm)?;
+            self.memos.insert(&at, &memo);
+        }
+        self.clerk.pool_leg(ctx, tx.value_balance, tx.fee)
+    }
+
+    /// A note from a transparent account, under its owner's proof. The pool
+    /// computes the commitment itself from the public amount, a `rho` the
+    /// call's binding fixes, and the depositor's hidden `C(owner, r)`: a
+    /// deposit cannot mint more than it debits, and no two share a `rho`.
+    #[msg(credential = Owner)]
+    pub async fn deposit(&mut self, ctx: &mut Command<Self>, from: AccountId,
+                         hidden: Digest, memo: Memo, amount: u64) -> Result<(), PayError> {
+        let rho = shielded::deposit_rho::<P2>(ctx.binding());
+        let cm = shielded::commit::<P2>(self.asset(), amount, &rho, &hidden);
+        self.clerk.debit_into_pool(ctx, from, amount)?;   // the L0 kernel, the owner's authority
+        let at = self.notes.append(cm)?;
+        self.memos.insert(&at, &memo);
+        Ok(())
+    }
+
+    /// The feeds a wallet scans, every wallet all of them: commitments and
+    /// memos from a position on, and nullifiers from a position on (never
+    /// a query for one nullifier, which would tell the operators which).
+    #[msg]
+    pub async fn notes_feed(&self, from: u64) -> Page<(Digest, Memo)> { /* … */ }
+    #[msg]
+    pub async fn spent_feed(&self, from: u64) -> Page<Digest> { /* … */ }
+}
+```
+
+The wallet, a local actor whose scope the personal space syncs:
+
+```rust
+#[actor]
+pub struct Wallet {
+    notes: crdt::GSet<Owned>,           // notes received: the note, its position, its device
+    spent: crdt::GSet<Digest>,          // nullifiers spent or seen spent
+    tree: crdt::Map<u64, Digest>,       // the pool's leaves seen so far, for paths
+}
+
+#[messages]
+impl Wallet {
+    #[msg(merge)]
+    pub fn received(&mut self, note: Owned) { self.notes.insert(note) }
+
+    #[msg(merge)]
+    pub fn spent(&mut self, nf: Digest) { self.spent.insert(nf) }
+
+    #[msg]
+    pub fn balance(&self) -> u64 {
+        self.unspent().map(|n| n.note.value).sum()
+    }
+
+    /// The plan of a spend paying `amount` to `to` from `device`'s notes,
+    /// its change back to `device`: the light node builds it with that
+    /// device's key, proves it and sends it to the pool.
+    #[msg]
+    pub fn prepare(&self, device: Owner, to: Address, amount: u64)
+                   -> Result<shielded::Plan<1, 2>, PayError> {
+        let input = self.pick(device, amount)?;
+        Ok(shielded::Plan::new(input, self.path(input.position), to, amount))
+    }
+}
+```
+
+**What the light node does around it** (a `pay` operation of the
+facility, `light-node.md` §7.3): calls `prepare` on the local wallet, builds the
+transaction and its witness with the device's `sk` and fresh randomness
+(`shielded::build`), proves the `spend` kernel on them (its device
+program computed from the light node's own build of cipher-clerk and
+checked equal to the pool's installed one, `light-node.md` §4.4), sends the proven call
+over Tor, and on `Ok` records `spent(nf)`. A local workflow with
+device effects (`ctx.prove`, `ctx.call_remote`) would move that glue into
+the actor; it is a later extension of the local host.
+
+### What is proved on the device, and what is checked publicly
+
+**Proved on the device** (the `spend` kernel, `shielded::check`):
+- the payer knows `sk` behind the input note's `owner`;
+- the input note's commitment is a leaf of the pool's tree under `anchor`
+  at the witnessed position;
+- each nullifier is `C(nk, C(pool, cm))` of its input (R4);
+- each output's commitment is well formed, its `rho` the protocol's;
+- `Σ inputs = Σ outputs + fee + value_balance`, every value and sum in
+  `u64` with checked arithmetic (the 64-bit range checks);
+- the proof binds the call (`binding`), the pool, the anchor, the memos'
+  hash, the fee and the transparent leg.
+
+**Checked publicly, by the space:**
+- at ingress: the generic checks and the proof against the `spend`
+  program (`light-node.md` §4.3); no pool-specific pre-check;
+- at apply (`pay`): the anchor accepted (newest, or superseded within
+  `ROOT_GRACE_MS`, the credential ring's rule, 90 s: a spend proof's
+  larger upload, about 1.2 MB, still fits its 45 s margin at the median
+  circuit, and P2 sets its own window if its measured trip does not); each nullifier inserted
+  once (a second is refused, the whole call with it); the memos' hash;
+  the commitments appended; the transparent leg applied by cipher-clerk's
+  kernel (a withdrawal credits the account `leg` names from the pool's
+  pseudo-account);
+- at a deposit: the depositor's owner proof, the debit by cipher-clerk's
+  kernel, and the commitment computed by the pool (above), so the value a
+  note holds is the value debited.
+
+**What the operators learn:** that a spend happened, when, its fee, its
+transparent leg if any, and two new commitments; never the payer, the
+payee, the amount or which note was spent among those under the anchor.
+Over Tor (`light-node.md` §6), not the address it came from.
+
+### What the pool trusts
+
+- **Authority is the users':** no operator can spend a note (it needs
+  `sk`), and there is no `rekey`: the private tier is non-custodial in its
+  authority, unlike today's ledger (`identity-and-authority.md` §7).
+- **Integrity is the operators':** a space's nodes trust each other
+  (`core-model.md` §5); an operator can append a commitment no deposit
+  paid for (inflation), refuse a spend, or roll back. Users see the
+  pool's transparent total (the pseudo-account's balance) and their own
+  notes, not a proof of supply. A pool that needs integrity without
+  trusting its host is "Full privacy"'s (above), postponed.
+- **The anonymity set** is the pool's notes under the anchors in use: in a
+  small space, small. A member who spends right after receiving links
+  the two by timing; the wallet waits a random interval before spending a
+  fresh note, and joins run when the phone is idle and charging.
+
+### The spend's cost
+
+[est] by counting, against the auth kernel (1,722 steps, 43 calls of
+`0x402` with `H_io`'s):
+- calls: `owner` and `nk` 2, the input's commitment 4, its nullifier 2,
+  its path 32, two outputs' `rho` 4 and commitments 8, `H_io` over a claim
+  of about 260 bytes 12: about 64, under the Poseidon2 chip's 2^10 floor;
+- steps: about 2,800–3,600 in SDK form, so the CPU at 2^12 rows (auth's
+  2^11), the memory ledger one power of two above auth's;
+- the cell model's time at that size: 0.9–1.3 s on the Fairphone 6 today
+  [model, est], 0.7–0.95 s with both levers; peak 0.7–0.9 GiB; a proof of
+  about 1.1–1.3 MB.
+- `join` (2 in, 1 out) adds a path and a nullifier: about 100 calls,
+  4,500–5,500 steps, 2^13 rows, 1.4–1.9 s today [est]; it runs in the
+  background, not on a user's tap.
+- **The gate** (PG4, a target until the spend's steps are
+  measured): the spend at most 1.0 s at the median
+  with the levers, at most 1.5 s without them.
 
 ## Execution
 
