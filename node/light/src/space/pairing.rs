@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 use super::link::Signer;
 use super::{
     Acked, AdminKey, CREDENTIAL_BOOK, Error, Held, Host, Kept, POLL, Paired, Personal, Prompts,
-    failed, link, secret, store_failed, unreached,
+    answered, failed, link, secret, store_failed, unreached,
 };
 use crate::group::{DeviceGroup, Prepared};
 use crate::memberships;
@@ -44,10 +44,6 @@ fn device_handle(secret: &crate::DeviceSecret, handle: [u8; 32]) -> DeviceHandle
         member: crate::member(secret).to_bytes(),
         owner: crate::owner(secret).to_bytes(),
     }
-}
-
-fn agent_refused(error: PersonalError) -> Error {
-    Error::AgentRefused(error)
 }
 
 impl<H: Host> Personal<H> {
@@ -92,9 +88,7 @@ impl<H: Host> Personal<H> {
         let (mut opener, drawn) =
             Opener::open(agent.1, offer.clone(), item_bytes).map_err(failed)?;
         let at = self.with_link(&mut held, Purpose::Personal, |link, _| {
-            link.call::<u64>(method::OPEN_SLOT, drawn.slot.arguments())
-                .map_err(unreached)?
-                .map_err(agent_refused)
+            answered(link.call::<u64>(method::OPEN_SLOT, drawn.slot.arguments()))
         })?;
         let expires = at + ttl;
         let code = opener.code(
@@ -202,9 +196,7 @@ impl<H: Host> Personal<H> {
                 return Err(Error::Cancelled);
             }
             let items: Vec<InboxItem> = self.with_link(held, Purpose::Personal, |link, _| {
-                link.query(method::INBOX, Option::<(u64, [u8; 16])>::None)
-                    .map_err(unreached)?
-                    .map_err(agent_refused)
+                answered(link.query(method::INBOX, Option::<(u64, [u8; 16])>::None))
             })?;
             match opener.read(&items).map_err(failed)? {
                 Opened::Waiting => self.host.sleep(POLL),
@@ -266,10 +258,7 @@ impl<H: Host> Personal<H> {
     fn close_slot(&self, held: &mut Held, opener: &Opener) -> Result<(), Error> {
         let slot = opener.slot();
         self.with_link(held, Purpose::Personal, |link, _| {
-            link.call::<u64>(method::CLOSE_SLOT, slot.encode())
-                .map_err(unreached)?
-                .map_err(agent_refused)
-                .map(drop)
+            answered(link.call::<u64>(method::CLOSE_SLOT, slot.encode())).map(drop)
         })
     }
 
@@ -303,9 +292,7 @@ impl<H: Host> Personal<H> {
             return Ok(());
         }
         let overview: Overview = self.with_link(held, Purpose::Personal, |link, _| {
-            link.query(method::OVERVIEW, ())
-                .map_err(unreached)?
-                .map_err(agent_refused)
+            answered(link.query(method::OVERVIEW, ()))
         })?;
         if overview.candidate.is_none()
             && let Some(group) = held.group.as_mut()
@@ -319,10 +306,7 @@ impl<H: Host> Personal<H> {
     /// An item put in the pairing slot under the sync key.
     fn put(&self, held: &mut Held, arguments: &[u8]) -> Result<(), Error> {
         self.with_link(held, Purpose::Personal, |link, _| {
-            link.call::<u64>(method::PUT, arguments.to_vec())
-                .map_err(unreached)?
-                .map_err(agent_refused)
-                .map(drop)
+            answered(link.call::<u64>(method::PUT, arguments.to_vec())).map(drop)
         })
     }
 
@@ -371,7 +355,7 @@ impl<H: Host> Personal<H> {
                     return Err(Error::InSetAlready);
                 }
                 Ok(_) | Err(PersonalError::NotAdmitted) => {}
-                Err(error) => return Err(agent_refused(error)),
+                Err(error) => return Err(Error::AgentRefused(error)),
             }
         }
         // The rest of the home comes in the offer.
@@ -383,10 +367,7 @@ impl<H: Host> Personal<H> {
         let (mut joiner, put) = Joiner::scan(&code).map_err(failed)?;
         let slot_put = |signer: &mut Signer, arguments: Vec<u8>| -> Result<(), Error> {
             let mut link = link(&self.host, &kept, Purpose::Personal, agent, &slot, signer);
-            link.call::<u64>(method::PUT, arguments)
-                .map_err(unreached)?
-                .map_err(agent_refused)
-                .map(drop)
+            answered(link.call::<u64>(method::PUT, arguments)).map(drop)
         };
         slot_put(&mut slot_signer, put.arguments())?;
         let mut home = None;
@@ -419,7 +400,7 @@ impl<H: Host> Personal<H> {
                     Err(PersonalError::NotAdmitted) if self.host.now() <= until => {
                         return Err(Error::PairingDeclined);
                     }
-                    Err(error) => return Err(agent_refused(error)),
+                    Err(error) => return Err(Error::AgentRefused(error)),
                 }
             };
             match joiner.read(&items).map_err(failed)? {
@@ -564,7 +545,7 @@ impl<H: Host> Personal<H> {
                 .map_err(unreached)?
             {
                 Ok(_) => Ok(()),
-                Err(error) => Err(agent_refused(error)),
+                Err(error) => Err(Error::AgentRefused(error)),
             }
         };
         held.state.acked = None;

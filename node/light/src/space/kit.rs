@@ -12,14 +12,15 @@ use vos_abi::ids::MethodId;
 use vos_wire::homes;
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
-    AdminClass, Attached, Body, DeviceView, Entry, KitKind, OpState, Operation, PersonalError,
-    Recorded, Standing, method,
+    AdminClass, Attached, Body, DeviceView, Entry, KitKind, OpState, Operation, Recorded, Standing,
+    method,
 };
 
 use super::link::{AgentLink, Signer, answer};
 use super::set::{Device, evidence};
 use super::{
-    Error, Host, Kept, KitCall, Personal, Posted, Prompts, WAKES, entered_kit, link, unreached,
+    Error, Host, Kept, KitCall, Personal, Posted, Prompts, WAKES, answered, entered_kit, link,
+    unreached,
 };
 use crate::job::{Kind, Notice};
 use crate::kit::KitSecret;
@@ -37,10 +38,6 @@ pub struct KitView {
     pub operations: Vec<Notice>,
 }
 
-fn agent_refused(error: PersonalError) -> Error {
-    Error::AgentRefused(error)
-}
-
 impl<H: Host> Personal<H> {
     /// The device set and its open operations at the agent `home`'s
     /// `Homes` names for the kit of `kind` entered: what a fresh install
@@ -53,14 +50,9 @@ impl<H: Host> Personal<H> {
     ) -> Result<KitView, Error> {
         let kit = entered_kit(prompts, kind)?;
         self.with_kit(&home, &kit, None, |link, _| {
-            let views: Vec<DeviceView> = link
-                .query(method::DEVICES, ())
-                .map_err(unreached)?
-                .map_err(agent_refused)?;
-            let open: Vec<(u64, Operation)> = link
-                .query(method::OPERATIONS, Option::<u64>::None)
-                .map_err(unreached)?
-                .map_err(agent_refused)?;
+            let views: Vec<DeviceView> = answered(link.query(method::DEVICES, ()))?;
+            let open: Vec<(u64, Operation)> =
+                answered(link.query(method::OPERATIONS, Option::<u64>::None))?;
             Ok(KitView {
                 devices: views.into_iter().map(device).collect(),
                 operations: open
@@ -144,7 +136,7 @@ impl<H: Host> Personal<H> {
         let signing = kit.signing();
         let origin = signing.verifying_key().to_bytes();
         self.with_kit(&home, kit, agent, |link, identity| {
-            let entries = link.log_all(0).map_err(unreached)?.map_err(agent_refused)?;
+            let entries = answered(link.log_all(0))?;
             if let Some(posted) =
                 self.post_kept(link, identity, &entries, origin, method, &arguments)?
             {
@@ -168,7 +160,7 @@ impl<H: Host> Personal<H> {
                 Ok(recorded) => recorded,
                 Err(error) => {
                     self.keep_kit_call(identity, Some(called.message), None)?;
-                    return Err(agent_refused(error));
+                    return Err(Error::AgentRefused(error));
                 }
             };
             evidence(
@@ -332,7 +324,7 @@ impl<H: Host> Personal<H> {
             &mut session,
         );
         for _ in 0..WAKES {
-            let woken = link.wake().map_err(unreached)?.map_err(agent_refused)?;
+            let woken = answered(link.wake())?;
             if woken.settled {
                 break;
             }

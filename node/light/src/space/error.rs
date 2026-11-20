@@ -226,6 +226,12 @@ pub(crate) fn unreached(error: impl std::fmt::Display) -> Error {
     Error::Unreachable(error.to_string())
 }
 
+/// A link's answer as a flow names it: the link's failure, then the
+/// agent's refusal.
+pub(crate) fn answered<T>(answer: crate::personal::Answer<T, String>) -> Result<T, Error> {
+    answer.map_err(unreached)?.map_err(Error::AgentRefused)
+}
+
 pub(crate) fn store_failed(error: impl std::fmt::Display) -> Error {
     Error::Store(error.to_string())
 }

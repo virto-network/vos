@@ -7,23 +7,19 @@ use ed25519_dalek::Signer as _;
 use vos_abi::Encode;
 use vos_wire::homes;
 use vos_wire::personal::{
-    Attached, Body, DeviceView, Entry, KitKind, NewDevice, OpState, Overview, PersonalError,
-    RECOVERY, Recorded, RecoveryView, method,
+    Attached, Body, DeviceView, Entry, KitKind, NewDevice, OpState, Overview, RECOVERY, Recorded,
+    RecoveryView, method,
 };
 
 use super::link::{Signer, answer};
 use super::set::evidence;
 use super::{
     Claim, Claimed, Error, Held, Host, PERSONAL, Personal, Posted, Prompts, Restoring, WAKES,
-    entered_kit, failed, link, new_kit, secret, unreached,
+    answered, entered_kit, failed, link, new_kit, secret, unreached,
 };
 use crate::group::{Agent as GroupAgent, DeviceGroup, Restored};
 use crate::personal::{Link as _, recover};
 use crate::route::Purpose;
-
-fn agent_refused(error: PersonalError) -> Error {
-    Error::AgentRefused(error)
-}
 
 impl<H: Host> Personal<H> {
     /// A fresh device's restore from the kit of `old` at the request's
@@ -69,7 +65,7 @@ impl<H: Host> Personal<H> {
                 &signing,
                 &mut session,
             );
-            entries = link.log_all(0).map_err(unreached)?.map_err(agent_refused)?;
+            entries = answered(link.log_all(0))?;
             if restore_cancelled(&entries, &restoring.arguments) {
                 held.state.restoring = None;
                 held.state.home = None;
@@ -142,7 +138,7 @@ impl<H: Host> Personal<H> {
         );
         let restoring = held.state.restoring.clone().ok_or(Error::NoSpace)?;
         if entries.is_empty() && restoring.signed.is_some() {
-            entries = link.log_all(0).map_err(unreached)?.map_err(agent_refused)?;
+            entries = answered(link.log_all(0))?;
         }
         let taken = entries.iter().find_map(|(index, entry)| match &entry.body {
             Body::Operation { call, matures, .. }
@@ -185,7 +181,7 @@ impl<H: Host> Personal<H> {
                     .map_err(unreached)?;
                 let recorded = answer::<Recorded>(&called.outcome)
                     .map_err(failed)?
-                    .map_err(agent_refused)?;
+                    .map_err(Error::AgentRefused)?;
                 let posted = Posted {
                     index: recorded.index,
                     at: recorded.at,
@@ -210,10 +206,7 @@ impl<H: Host> Personal<H> {
         // When it matures, as the log took it.
         let matures = match matures {
             Some(matures) => matures,
-            None => link
-                .log_all(posted.index)
-                .map_err(unreached)?
-                .map_err(agent_refused)?
+            None => answered(link.log_all(posted.index))?
                 .iter()
                 .find_map(|(index, entry)| match &entry.body {
                     Body::Operation { matures, .. } if *index == posted.index => Some(*matures),
@@ -258,22 +251,19 @@ impl<H: Host> Personal<H> {
                 &signing,
                 &mut kit_signer,
             );
-            link.wake().map_err(unreached)?.map_err(agent_refused)?;
+            answered(link.wake())?;
         }
         let key = held.light.sync_key().clone();
         let mut sync = held.sync;
         let (view, envelopes, overview, devices, policy) = {
             let mut link = link(&self.host, &kept, Purpose::Personal, agent, &key, &mut sync);
             for _ in 0..WAKES {
-                let woken = link.wake().map_err(unreached)?.map_err(agent_refused)?;
+                let woken = answered(link.wake())?;
                 if woken.settled {
                     break;
                 }
             }
-            let view: RecoveryView = link
-                .query(method::RECOVERY, ())
-                .map_err(unreached)?
-                .map_err(agent_refused)?;
+            let view: RecoveryView = answered(link.query(method::RECOVERY, ()))?;
             let mut envelopes = Vec::new();
             loop {
                 let after = envelopes
@@ -281,25 +271,17 @@ impl<H: Host> Personal<H> {
                     .map_or(0, |envelope: &vos_wire::personal::Envelope| {
                         envelope.position
                     });
-                let page: Vec<vos_wire::personal::Envelope> = link
-                    .query(method::SINCE, (RECOVERY, after))
-                    .map_err(unreached)?
-                    .map_err(agent_refused)?;
+                let page: Vec<vos_wire::personal::Envelope> =
+                    answered(link.query(method::SINCE, (RECOVERY, after)))?;
                 if page.is_empty() {
                     break;
                 }
                 envelopes.extend(page);
             }
-            let overview: Overview = link
-                .query(method::OVERVIEW, ())
-                .map_err(unreached)?
-                .map_err(agent_refused)?;
-            let devices: Vec<DeviceView> = link
-                .query(method::DEVICES, ())
-                .map_err(unreached)?
-                .map_err(agent_refused)?;
+            let overview: Overview = answered(link.query(method::OVERVIEW, ()))?;
+            let devices: Vec<DeviceView> = answered(link.query(method::DEVICES, ()))?;
             // The log's policy, as every device of the set follows it.
-            let entries = link.log_all(0).map_err(unreached)?.map_err(agent_refused)?;
+            let entries = answered(link.log_all(0))?;
             let read: Vec<_> = entries
                 .into_iter()
                 .filter(|(index, _)| *index < overview.next)

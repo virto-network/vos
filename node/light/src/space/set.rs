@@ -12,7 +12,7 @@ use vos_wire::personal::{
 
 use super::link::{AgentLink, Signer, answer};
 use super::{
-    AdminKey, Approval, Error, Held, Host, Personal, Posted, Prompts, WAKES, admin_sign,
+    AdminKey, Approval, Error, Held, Host, Personal, Posted, Prompts, WAKES, admin_sign, answered,
     entered_kit, failed, new_kit, unreached,
 };
 use crate::group::{Event, Prepared};
@@ -114,10 +114,6 @@ pub struct Device {
     pub me: bool,
 }
 
-fn agent_refused(error: PersonalError) -> Error {
-    Error::AgentRefused(error)
-}
-
 impl<H: Host> Personal<H> {
     /// The device set as the agent holds it, at its batch time now: a home
     /// whose batch time is older than [`crate::job::STALE_MS`] is woken
@@ -128,9 +124,7 @@ impl<H: Host> Personal<H> {
         let me = held.group.as_ref().and_then(crate::group::DeviceGroup::id);
         let now = self.host.now();
         let overview: Overview = self.with_link(&mut held, Purpose::Personal, |link, _| {
-            link.query(method::OVERVIEW, ())
-                .map_err(unreached)?
-                .map_err(agent_refused)
+            answered(link.query(method::OVERVIEW, ()))
         })?;
         if overview.at.saturating_add(crate::job::STALE_MS) < now {
             self.wake(&mut held)?;
@@ -154,9 +148,7 @@ impl<H: Host> Personal<H> {
     /// The device set as the agent shows it.
     fn views(&self, held: &mut Held) -> Result<Vec<DeviceView>, Error> {
         self.with_link(held, Purpose::Personal, |link, _| {
-            link.query(method::DEVICES, ())
-                .map_err(unreached)?
-                .map_err(agent_refused)
+            answered(link.query(method::DEVICES, ()))
         })
     }
 
@@ -183,7 +175,7 @@ impl<H: Host> Personal<H> {
     fn wake(&self, held: &mut Held) -> Result<(), Error> {
         self.with_link(held, Purpose::Personal, |link, _| {
             for _ in 0..WAKES {
-                let woken = link.wake().map_err(unreached)?.map_err(agent_refused)?;
+                let woken = answered(link.wake())?;
                 if woken.settled {
                     break;
                 }
@@ -514,7 +506,7 @@ impl<H: Host> Personal<H> {
                 Ok(recorded) => recorded,
                 Err(error) => {
                     group.unsent(&called.message).map_err(failed)?;
-                    return Err(agent_refused(error));
+                    return Err(Error::AgentRefused(error));
                 }
             };
             group
@@ -599,14 +591,12 @@ impl<H: Host> Personal<H> {
                         return Err(failed("a commit's evidence"));
                     };
                     let arguments = ((index, message), (signature, attached)).encode();
-                    link.call::<Recorded>(method::EVIDENCE, arguments)
-                        .map_err(unreached)?
-                        .map_err(agent_refused)?;
+                    answered(link.call::<Recorded>(method::EVIDENCE, arguments))?;
                     Ok(candidacy)
                 }
                 Err(error) => {
                     group.abandon().map_err(failed)?;
-                    Err(agent_refused(error))
+                    Err(Error::AgentRefused(error))
                 }
             }
         });
@@ -636,8 +626,5 @@ pub(super) fn evidence<H: Host>(
     attached: Attached,
 ) -> Result<(), Error> {
     let arguments = ((index, message.to_vec()), (*signature, attached)).encode();
-    link.call::<Recorded>(method::EVIDENCE, arguments)
-        .map_err(unreached)?
-        .map_err(agent_refused)
-        .map(drop)
+    answered(link.call::<Recorded>(method::EVIDENCE, arguments)).map(drop)
 }
