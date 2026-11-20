@@ -30,6 +30,10 @@ pub enum Message {
 /// One connection's screens.
 pub struct Screens {
     demo: Demo,
+    /// The connection came over the gateway's onion: s4 reaches this
+    /// server so once the device is enrolled here, so its screens offer no
+    /// enrollment.
+    carried: bool,
     screen: Screen,
     payee: String,
     amount: String,
@@ -41,10 +45,18 @@ pub struct Screens {
 }
 
 impl Screens {
-    pub fn new(demo: Demo) -> Self {
+    /// The screens of a connection on a port of transport `mark`: one over
+    /// the onion opens on *Sign in*.
+    pub fn new(demo: Demo, mark: Mark) -> Self {
+        let carried = mark == Mark::Onion;
         Self {
             demo,
-            screen: Screen::Enroll,
+            carried,
+            screen: if carried {
+                Screen::SignIn
+            } else {
+                Screen::Enroll
+            },
             payee: String::new(),
             amount: String::new(),
             digests: None,
@@ -111,6 +123,10 @@ fn map_text(value: &Value, name: &str) -> Option<String> {
         _ => None,
     }
 }
+
+/// What a carried session says of the enrollment it cannot see.
+const ENROLLED_WAITING: &str = "Enrolled. Waiting for the operator's invitation: once the \
+                                operator has invited this device, sign in here.";
 
 fn short(bytes: &[u8]) -> String {
     hex::encode(&bytes[..bytes.len().min(8)])
@@ -213,15 +229,21 @@ impl App for Screens {
                     .button("Pay", Message::Show(Screen::Pay))
             });
         page = match self.screen {
+            // A device s4 carries here is enrolled here: a second
+            // enrollment would only show its digests again, joined to this
+            // session. What it waits for is the operator, which this
+            // server cannot tell apart from a device already invited.
+            Screen::Enroll if self.carried => page.text(ENROLLED_WAITING),
             Screen::Enroll => {
                 let page = page
                     .text("Enroll this device")
                     .button("Enroll this device", Message::Enroll);
                 match self.digests {
                     Some(_) => page.text(
-                        "Your device showed its two digests in its own window: read them \
-                         from there to the space's operator. The operator's invitation claims \
-                         them; then sign in from the next session.",
+                        "Your device showed its digests in its own window, as a code and a \
+                         six-digit check: let the space's operator scan the code from there, \
+                         and compare the check. The operator's invitation claims them; then \
+                         sign in from the next session.",
                     ),
                     None => page,
                 }
@@ -232,9 +254,15 @@ impl App for Screens {
                 "This session showed your device's digests: reconnect, and sign in from the \
                  new session, so this server cannot join the sign-in to them.",
             ),
-            Screen::SignIn => page
-                .text("Sign in with your device")
-                .button("Sign in with my device", Message::SignIn),
+            Screen::SignIn => {
+                let page = page
+                    .text("Sign in with your device")
+                    .button("Sign in with my device", Message::SignIn);
+                match self.carried {
+                    true => page.text(ENROLLED_WAITING),
+                    false => page,
+                }
+            }
             Screen::Pay => {
                 let page = page
                     .text("Pay from this device's account")

@@ -349,6 +349,14 @@ impl Headless {
         document.revision
     }
 
+    /// Whether the document shows a button `label`.
+    fn has_button(&self, label: &str) -> bool {
+        self.state
+            .documents()
+            .document()
+            .is_some_and(|document| find(&document.root, "s4.button", "label", label).is_some())
+    }
+
     /// Activate the button `label`: the revision it acted on.
     async fn click(&mut self, label: &str) -> u64 {
         self.event("s4.button", "label", label, |node| {
@@ -374,6 +382,27 @@ fn digest(shown: &str) -> [u8; 32] {
     hex::decode(shown).unwrap().try_into().unwrap()
 }
 
+/// The member and owner digests the device's digests form shows: whole,
+/// and in its code, with the six digits the operator's tool shows.
+fn digests(form: &Form) -> ([u8; 32], [u8; 32]) {
+    assert_eq!(form.title, "This device's digests");
+    let row = |label: &str| {
+        form.rows
+            .iter()
+            .find(|(named, _)| named == label)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| panic!("no row {label}: {form:?}"))
+    };
+    let (member, owner) = (digest(&row("Member")), digest(&row("Owner")));
+    assert_eq!(
+        form.code.as_deref().and_then(vos_api::read_enrollment_code),
+        Some((member, owner)),
+        "the code a camera reads is the digests shown"
+    );
+    assert_eq!(row("Check"), vos_api::enrollment_check(&member, &owner));
+    (member, owner)
+}
+
 /// The stock kernels' release artifacts of this tree's credential actor,
 /// which the space installs: the ones s4's facility embeds, so a pin of s4
 /// whose artifacts are another credential actor's fails here. They follow
@@ -395,15 +424,34 @@ fn stock() -> Stock {
     stock
 }
 
-/// A local space and its gateway, and a headless client on its SSH port.
-async fn demo(user: Arc<User>) -> (Arc<LocalSpace>, Headless, [tempfile::TempDir; 2]) {
+/// A local space and its gateway, and a headless client on its SSH port;
+/// the address of a second port of the gateway's, as its onion serves the
+/// screens (its connections marked onion), its host key the same.
+async fn demo(
+    user: Arc<User>,
+) -> (
+    Arc<LocalSpace>,
+    Headless,
+    std::net::SocketAddr,
+    [tempfile::TempDir; 2],
+) {
     let data = tempfile::tempdir().unwrap();
     let space = tokio::task::block_in_place(|| {
         Arc::new(LocalSpace::found(data.path(), random(), random()).unwrap())
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = local(&listener);
-    let _gateway = space.gateway(listener, host_key(), random(), vec![random()]);
+    let (key, app, onions) = (host_key(), random(), vec![random()]);
+    let _gateway = space.gateway(
+        listener,
+        vos_api::Mark::Clearnet,
+        key.clone(),
+        app,
+        onions.clone(),
+    );
+    let carried = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let onion = local(&carried);
+    let _onion = space.gateway(carried, vos_api::Mark::Onion, key, app, onions);
     let store = tempfile::tempdir().unwrap();
     let net = Arc::new(Net::new(Arc::new(Local(address)), store.path()));
     let facility = Facility::new(
@@ -414,7 +462,7 @@ async fn demo(user: Arc<User>) -> (Arc<LocalSpace>, Headless, [tempfile::TempDir
     .with_stock(stock())
     .with_tick(Duration::from_millis(200));
     let phone = Headless::connect(address, facility, user).await;
-    (space, phone, [data, store])
+    (space, phone, onion, [data, store])
 }
 
 /// A digest of 32 random bytes, each word below p.
@@ -425,7 +473,7 @@ fn some_owner() -> [u8; 32] {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
     let user = Arc::new(User::default());
-    let (space, mut phone, _dirs) = demo(Arc::clone(&user)).await;
+    let (space, mut phone, _onion, _dirs) = demo(Arc::clone(&user)).await;
 
     // Enroll: the chrome shows what is pinned; the device answers its two
     // digests, which the operator invites before the claim.
@@ -434,10 +482,7 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
     let at = phone.click("Enroll this device").await;
     phone.settle(at, &["in its own window"]).await;
     let enrolled = user.shown.lock().unwrap()[0].clone();
-    let digests = user.shown.lock().unwrap()[1].clone();
-    assert_eq!(digests.title, "This device's digests");
-    let member = digest(&digests.rows[0].1);
-    let owner = digest(&digests.rows[1].1);
+    let (member, owner) = digests(&user.shown.lock().unwrap()[1]);
     assert_eq!(enrolled.title, "Enroll this device");
     assert!(
         enrolled
@@ -537,26 +582,39 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
     );
 }
 
-/// After an enrollment s4 connects again (over Tor on a phone, carried):
-/// the new session, the device's digests never shown in it nor named by
-/// it, signs in once the operator's invitation claimed the device the
+/// After an enrollment s4 connects again, carried over the onion: the new
+/// session opens on *Sign in*, says the device is enrolled and waits for
+/// the operator, and offers no second enrollment that would show the
+/// digests in it; the device's digests never shown in it nor named by it,
+/// it signs in once the operator's invitation claimed the device the
 /// screens enrolled; before that, a sign-in says to claim first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_session_after_the_enrollment_signs_in_once_invited() {
     let user = Arc::new(User::default());
-    let (space, mut phone, _dirs) = demo(Arc::clone(&user)).await;
+    let (space, mut phone, onion, _dirs) = demo(Arc::clone(&user)).await;
     user.will(confirm(&[]));
     user.will(confirm(&[]));
     let at = phone.click("Enroll this device").await;
     phone.settle(at, &["sign in from the next session"]).await;
-    let digests = user.shown.lock().unwrap()[1].clone();
-    let member = digest(&digests.rows[0].1);
-    let owner = digest(&digests.rows[1].1);
+    let (member, owner) = digests(&user.shown.lock().unwrap()[1]);
     let facility = phone.facility.clone();
-    let address =
-        std::net::SocketAddr::new(phone.gateway.host.parse().unwrap(), phone.gateway.port);
     drop(phone);
-    let mut phone = Headless::connect(address, facility, Arc::clone(&user)).await;
+    let mut phone = Headless::connect(onion, facility, Arc::clone(&user)).await;
+    phone
+        .settle(0, &["Waiting for the operator's invitation"])
+        .await;
+    assert!(
+        phone.has_button("Sign in with my device"),
+        "it opens on Sign in"
+    );
+    let at = phone.click("Enroll").await;
+    phone
+        .settle(at, &["Enrolled. Waiting for the operator's invitation"])
+        .await;
+    assert!(
+        !phone.has_button("Enroll this device"),
+        "no second enrollment in the carried session"
+    );
     let at = phone.click("Sign in").await;
     phone.settle(at, &["Sign in with your device"]).await;
     let unclaimed = loop {
@@ -631,7 +689,7 @@ async fn the_session_after_the_enrollment_signs_in_once_invited() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_naming_another_method_never_reaches_the_node() {
     let user = Arc::new(User::default());
-    let (space, mut phone, _dirs) = demo(Arc::clone(&user)).await;
+    let (space, mut phone, _onion, _dirs) = demo(Arc::clone(&user)).await;
     let request = |instance: u32, name: &str| {
         let body = vos_wire::ingress::Credentialed {
             instance: vos_abi::ids::InstanceId(instance),

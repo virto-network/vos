@@ -321,12 +321,14 @@ impl LocalSpace {
     }
 
     /// The gateway on this node's socket, its SSH port on `listener`
-    /// serving the demo, its host key `host_key` and the app's key
-    /// `app`; the enrollment pins `onions`, the onion keys a device sends
-    /// its proofs to (an onion in front of this port).
+    /// serving the demo as a port of transport `mark`, its host key
+    /// `host_key` and the app's key `app`; the enrollment pins `onions`,
+    /// the onion keys a device sends its proofs to (an onion in front of
+    /// this port).
     pub fn gateway(
         &self,
         listener: tokio::net::TcpListener,
+        mark: vos_api::Mark,
         host_key: russh::keys::PrivateKey,
         app: [u8; 32],
         onions: Vec<[u8; 32]>,
@@ -337,7 +339,7 @@ impl LocalSpace {
             random(),
         )]));
         let port = vos_gateway::ssh::Port::new(
-            vos_api::Mark::Clearnet,
+            mark,
             Limits::new(PerAddress::default()),
             vos_gateway::caps::Caps::none(),
         );

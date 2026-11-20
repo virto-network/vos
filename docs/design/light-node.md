@@ -2936,7 +2936,23 @@ nodes may ask the onion's mark of its proven calls, or of every request
   session never holds both what names the device (its digests, its
   account's owner proof) and a sign-in: either is refused on a session
   that holds the other, so a server cannot join the two (built
-  2026-11-18).
+  2026-11-18). The user grants `vos.credential` once a session, in s4's
+  chrome; every reconnect s4 makes by itself (the one after an
+  enrollment, a retry after a dropped connection) keeps the grant of the
+  session it replaces, for the same host, port and application, in s4's
+  memory alone, and a session the user starts asks as ever (owner,
+  2026-11-20; built). The new session is the facility's new session all
+  the same: it starts knowing nothing (`Learned::Nothing`), never
+  inherits what the old one was shown, so a session that showed the
+  digests or paid still signs in nothing, and the next one signs in. A
+  sign-in's and a payment's form name their stages in s4's chrome while
+  they run ("Proving…", "Sending…", `IVosPrompts.stage`). The digests
+  show as a code a camera reads (`VOSENROLL1:`, member ‖ owner) and a
+  six-digit check the operator's tool shows too (`vos_api::
+  enrollment_check`): the check catches a misread code or the wrong
+  screen, and proves nothing of who chose the digests (a million tries
+  find six digits), so the operator still takes them from the device's
+  chrome alone.
   The onion set's refresh (`refresh_onions`) is a `Time` and an `onions`
   query, each a fetch; a set of one to sixteen distinct onions replaces
   the pinned one, closing the space's connections.
@@ -2997,6 +3013,17 @@ nodes may ask the onion's mark of its proven calls, or of every request
     renewed every 4 to 12 minutes while the app is in the foreground,
     each a fetch: open times again, none of them joined to another
     session.
+  - **Two sessions joined by their timing:** a reconnect s4 makes by
+    itself follows the session it replaces within seconds, so its
+    server can join the two by timing, as an immediate reconnect always
+    let it; keeping the grant adds no prompt the user could notice
+    between them, nothing more. What the two sessions held stays apart
+    (each its own `Learned`), so the join gives the server the timing it
+    had. And s4 now opens a session with no act of the user (a retry
+    after a dropped connection asks nothing): the server sees a session,
+    granted, that the user did not start, though every call in it still
+    asks its own confirmation, so it gets no proof the user did not
+    confirm (owner's decision D5, 2026-11-20).
   - **Rendezvous (PG5, §2.4):** a foreground hour with a session open costs one
     a kept group (the feed, the member's, the personal agent's: 3), the
     proven spare's lives (4 to 12 unused, one a sign-in otherwise) and the

@@ -56,6 +56,8 @@ pub struct Scripted {
     pub read: Duration,
     pub shown_at: Mutex<Vec<std::time::Instant>>,
     pub answered_at: Mutex<Vec<std::time::Instant>>,
+    /// The stages the calls reported, in turn.
+    pub stages: Mutex<Vec<String>>,
 }
 
 impl Scripted {
@@ -94,6 +96,10 @@ impl Chrome for Scripted {
                 .push(std::time::Instant::now());
             answer.unwrap_or(Answer::Declined)
         })
+    }
+
+    fn stage(&self, stage: &str) {
+        self.stages.lock().unwrap().push(stage.to_owned());
     }
 }
 

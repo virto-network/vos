@@ -67,6 +67,10 @@ const WINDOW: &str =
     "the space admits none of this app's programs: the app or the space must update";
 /// A window a space's node could not compute whole yet.
 const UNAVAILABLE: &str = "the space's node cannot read its device window yet: try again";
+/// The stages of a sign-in or a payment the chrome shows, after its form
+/// and its key: the proof made on the device, then sent over Tor.
+const PROVING: &str = "Proving…";
+const SENDING: &str = "Sending…";
 /// A space's handle, an agent and an instance there: whose device window.
 type WindowKey = ([u8; 32], u32, u32);
 /// How long a space's device window is taken as read.
@@ -1062,6 +1066,7 @@ impl Session {
                 (None, Some(paired)) => vec![choice(paired.kind()).into()],
                 (None, None) => kinds.iter().map(|kind| choice(*kind).into()).collect(),
             },
+            code: None,
         };
         let Answer::Confirmed { choice, .. } = chrome.confirm(form).await else {
             return Err(declined());
@@ -1115,25 +1120,27 @@ impl Session {
         drop(self.warm());
         // The digests the operator invites, shown here: a server's document
         // could show its own in their place.
+        let (member, owner) = (member.to_bytes(), owner.to_bytes());
         chrome
             .confirm(Form {
                 title: "This device's digests".into(),
-                detail: "Read these to the space's operator from this screen, never from \
-                         the server's, so no one else's are invited in their place."
+                detail: "Let the space's operator scan this code from this screen, never \
+                         from the server's, so no one else's are invited in their place; \
+                         then compare the check: the operator's tool shows the same six \
+                         digits."
                     .into(),
                 rows: vec![
-                    ("Member".into(), hex::encode(member.to_bytes())),
-                    ("Owner".into(), hex::encode(owner.to_bytes())),
+                    ("Check".into(), vos_api::enrollment_check(&member, &owner)),
+                    ("Member".into(), hex::encode(member)),
+                    ("Owner".into(), hex::encode(owner)),
                 ],
                 fields: Vec::new(),
                 notice: None,
                 choices: vec!["Done".into()],
+                code: Some(vos_api::enrollment_code(&member, &owner)),
             })
             .await;
-        Ok(Enrolled {
-            member: member.to_bytes(),
-            owner: owner.to_bytes(),
-        })
+        Ok(Enrolled { member, owner })
     }
 
     /// The pinned method `name`, which `wanted` accepts.
@@ -1301,6 +1308,7 @@ impl Session {
             } else {
                 "Prove".into()
             }],
+            code: None,
         };
         if !matches!(chrome.confirm(form).await, Answer::Confirmed { .. }) {
             return Err(declined());
@@ -1315,9 +1323,11 @@ impl Session {
             .await?;
         let refused_root = witness.root;
         let secret = self.secret(&enrollment).await?;
+        chrome.stage(PROVING);
         let started = Instant::now();
         let request = self.prove_sign_in(call, scope, &secret, witness).await?;
         let mut proving_ms = started.elapsed().as_millis() as u64;
+        chrome.stage(SENDING);
         let mut answer = self.send(&enrollment, &request).await?;
         let again = match root_refused(&answer) {
             Some(stale) => self.next_witness(&enrollment, refused_root, stale).await,
@@ -1325,10 +1335,12 @@ impl Session {
         };
         if let Some(again) = again {
             let call = self.call_for(&enrollment, method, arguments).await?;
+            chrome.stage(PROVING);
             let started = Instant::now();
             let request = self.prove_sign_in(call, scope, &secret, again).await?;
             proving_ms += started.elapsed().as_millis() as u64;
             drop(secret);
+            chrome.stage(SENDING);
             answer = self.send(&enrollment, &request).await?;
         }
         Ok(SignedIn { answer, proving_ms })
@@ -1457,6 +1469,7 @@ impl Session {
                 ],
                 notice: notice.take(),
                 choices: vec!["Pay".into()],
+                code: None,
             };
             let Answer::Confirmed { values, .. } = chrome.confirm(form).await else {
                 return Err(declined());
@@ -1496,11 +1509,13 @@ impl Session {
                 .filter(|last| last.values == values && now + 5_000 < last.expires_ms)
         });
         if let Some(again) = again {
+            chrome.stage(SENDING);
             return Ok(answer(self.send(&enrollment, &again.request).await?, 0));
         }
         let arguments = vos_light::transfer_arguments(&values.0, amount);
         let call = self.call_at(&enrollment, method, arguments, now)?;
         let secret = self.secret(&enrollment).await?;
+        chrome.stage(PROVING);
         let started = Instant::now();
         let expires_ms = call.expires_ms;
         let bytes = Inner::prove(
@@ -1522,6 +1537,7 @@ impl Session {
                 request: bytes.clone(),
             });
         }
+        chrome.stage(SENDING);
         Ok(answer(self.send(&enrollment, &bytes).await?, proving_ms))
     }
 

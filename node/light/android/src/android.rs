@@ -144,6 +144,25 @@ impl Prompts for Lent {
         })
         .unwrap_or_else(|refusal| KeyAnswer::Failed(refusal.message))
     }
+
+    /// A one-way call: a client gone shows nothing, and the operation goes on.
+    fn stage(&self, stage: &str) {
+        let _ = attached(|env| {
+            let stage = env.new_string(stage).map_err(failed)?;
+            if env
+                .call_method(
+                    &self.prompts,
+                    jni_str!("stage"),
+                    jni_sig!("(Ljava/lang/String;)V"),
+                    &[JValue::Object(&stage)],
+                )
+                .is_err()
+            {
+                java::refusal(env);
+            }
+            Ok(())
+        });
+    }
 }
 
 /// The device, as `VosNode` reads it in this process.

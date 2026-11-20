@@ -53,7 +53,25 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
         bytes(field(&enrolled, "owner")),
         vos_light::owner(&secret).to_bytes().to_vec()
     );
-    assert_eq!(digests.rows[0], ("Member".to_owned(), hex::encode(member)));
+    // The digests as a code for the operator's camera, its six-digit
+    // check, and whole.
+    let owner = vos_light::owner(&secret).to_bytes();
+    assert_eq!(
+        digests.rows[0],
+        (
+            "Check".to_owned(),
+            vos_api::enrollment_check(&member, &owner)
+        )
+    );
+    assert_eq!(digests.rows[1], ("Member".to_owned(), hex::encode(member)));
+    assert_eq!(digests.rows[2], ("Owner".to_owned(), hex::encode(owner)));
+    assert_eq!(
+        digests
+            .code
+            .as_deref()
+            .and_then(vos_api::read_enrollment_code),
+        Some((member, owner))
+    );
     world.enroll(AGENT, &member);
     session.granted();
 
@@ -194,7 +212,13 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
     ]);
     chrome.will(confirm(&["shop", "twenty"]));
     chrome.will(confirm(&[" shop ", "20"]));
+    chrome.stages.lock().unwrap().clear();
     let paid = session.ask("pay", &pay, &chrome).await.unwrap();
+    assert_eq!(
+        *chrome.stages.lock().unwrap(),
+        ["Proving…", "Sending…"],
+        "the chrome shows where the payment is"
+    );
     let forms = chrome.shown.lock().unwrap().clone();
     let (first, second) = (&forms[forms.len() - 2], &forms[forms.len() - 1]);
     assert_eq!(

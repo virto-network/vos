@@ -181,19 +181,17 @@ abstract class Screen {
     }
   }
 
-  /** A home's code field, with its scan and what the code names. */
+  /** A home's code: its scan first, then the field it may be pasted into, and what it names. */
   final class HomeField {
     final EditText code;
     private final TextView named;
 
     HomeField(LinearLayout into, String value, Keep keep) {
-      code = kept(field("The home's code (" + Codes.HOME + "…)", value, true), keep);
+      code = kept(field("Or paste the home's code (" + Codes.HOME + "…)", value, true), keep);
       named = mono("");
+      into.addView(buttons(button("Scan the home's code", v -> app.scan(text -> set(text)))));
       into.addView(code);
-      into.addView(
-          buttons(
-              button("Scan the home's code", v -> app.scan(text -> set(text))),
-              button("Check", v -> show())));
+      into.addView(buttons(button("Check", v -> show())));
       into.addView(named);
       show();
     }
@@ -220,7 +218,7 @@ abstract class Screen {
     Home home() {
       Home home = Codes.home(code.getText().toString());
       if (home == null) {
-        app.say("Enter or scan the home's code first.");
+        app.say("Scan or paste the home's code first.");
       }
       return home;
     }

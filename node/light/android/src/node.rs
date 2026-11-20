@@ -61,6 +61,8 @@ pub trait Prompts: Send + Sync + 'static {
     /// The admin key's Ed25519 signature over `message`, which this process
     /// prepared, after a strong biometric at its prompt: 64 bytes.
     fn sign_key(&self, kind: Kind, key: &[u8], message: &[u8]) -> KeyAnswer;
+    /// Where the operation is, in words, for the client's chrome to show.
+    fn stage(&self, _stage: &str) {}
 }
 
 /// What the device offers, which this process reads itself.
@@ -153,6 +155,10 @@ impl Chrome for Shown {
                 .await
                 .unwrap_or(Answer::Declined)
         })
+    }
+
+    fn stage(&self, stage: &str) {
+        self.0.stage(stage);
     }
 }
 

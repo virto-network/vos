@@ -13,21 +13,27 @@
 //! a pool of `--pool` personal agents (6 by default), the delays and the
 //! lease of [`vos_gateway_demo::home::SESSION`], its open claim at a low
 //! difficulty; each printed as the code the app scans or pastes
-//! (`home N VOSHOME1:…`). Two homes let a phone move home.
+//! (`home N VOSHOME1:…`), and as a QR code for its Scan. Two homes let a
+//! phone move home.
 //!
 //! The space is founded anew at each start (`DIR/space`, removed first): a
 //! phone enrolled or claimed at an earlier run clears the app's data. The
 //! gateway's keys and arti's state under `DIR` stay, so the onion's address
 //! and the host key do. The operator's commands come on standard input:
 //!
-//! - `invite MEMBER ACCOUNT OWNER`: invite the member digest into the
+//! - `invite CODE ACCOUNT`: the phone's enrollment code (`VOSENROLL1:…`,
+//!   the QR code its own window shows after an enrollment, scanned and
+//!   pasted here): its six-digit check is printed, and `yes`, once the
+//!   phone shows the same six, invites the member digest into the
 //!   credential actor's tree and the account `ACCOUNT` for the owner
-//!   digest, both as the phone's Enroll screen shows them, claiming both
-//!   at once for a device that enrolled through the screens;
+//!   digest, claiming both at once for a device that enrolled through the
+//!   screens; any other line invites nothing;
+//! - `invite MEMBER ACCOUNT OWNER`: the same with the two digests typed
+//!   whole, their check printed and asked as well;
 //! - `mint ACCOUNT AMOUNT`; `balance ACCOUNT`;
 //! - `members N`: N members of random digests enrolled, so a device's
 //!   first read of the tree's feed is a catch-up of about 77 bytes each;
-//! - `homes`: each home's code again, and its pool's counts;
+//! - `homes`: each home's code again, its QR code, and its pool's counts;
 //! - `quit`.
 //!
 //! The space starts with an account `shop` of another owner, to pay to. The
@@ -39,6 +45,42 @@ use tokio::io::AsyncBufReadExt as _;
 use vos_gateway_demo::home::{Home, SESSION};
 use vos_gateway_demo::{LocalSpace, random};
 use vos_wire::credentials::Onion;
+
+/// An invitation asked, waiting for the operator's `yes` to its check.
+struct Asked {
+    member: [u8; 32],
+    account: String,
+    owner: [u8; 32],
+}
+
+/// `text` as a QR code in the terminal: two modules a character, dark on
+/// light whatever the terminal's colours, its quiet zone around it.
+fn qr(text: &str) -> String {
+    const QUIET: usize = 2;
+    let Ok(code) = qrcode::QrCode::new(text.as_bytes()) else {
+        return String::new();
+    };
+    let (width, colors) = (code.width(), code.to_colors());
+    let dark = |x: usize, y: usize| {
+        let inside = (QUIET..QUIET + width).contains(&x) && (QUIET..QUIET + width).contains(&y);
+        inside && colors[(y - QUIET) * width + (x - QUIET)] == qrcode::Color::Dark
+    };
+    let side = width + 2 * QUIET;
+    let mut out = String::new();
+    for y in (0..side).step_by(2) {
+        out.push_str("\x1b[30;47m");
+        for x in 0..side {
+            out.push(match (dark(x, y), dark(x, y + 1)) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        out.push_str("\x1b[0m\n");
+    }
+    out
+}
 
 fn digest(text: &str) -> Result<[u8; 32], String> {
     hex::decode(text)
@@ -52,10 +94,11 @@ fn homes(space: &LocalSpace, homes: &[Home], onion: &Onion) -> Result<String, St
     let mut lines = Vec::new();
     for (n, home) in homes.iter().enumerate() {
         let counts = space.tally(home)?;
+        let code = space.home_code(home, std::slice::from_ref(onion));
         lines.push(format!(
-            "home {} {}\nhome {} handle {} agent {}: {} pooled, {} claimed, {} assigned",
+            "home {} {code}\n{}home {} handle {} agent {}: {} pooled, {} claimed, {} assigned",
             n + 1,
-            space.home_code(home, std::slice::from_ref(onion)),
+            qr(&code),
             n + 1,
             hex::encode(home.handle),
             home.agent.0,
@@ -67,15 +110,49 @@ fn homes(space: &LocalSpace, homes: &[Home], onion: &Onion) -> Result<String, St
     Ok(lines.join("\n"))
 }
 
-fn command(space: &LocalSpace, line: &str) -> Result<String, String> {
+/// The invitation `asked`, its check printed, waiting for `yes`.
+fn ask(asked: &mut Option<Asked>, member: [u8; 32], account: &str, owner: [u8; 32]) -> String {
+    let check = vos_api::enrollment_check(&member, &owner);
+    *asked = Some(Asked {
+        member,
+        account: account.to_owned(),
+        owner,
+    });
+    format!(
+        "check {check}: does the phone show the same six digits? `yes` invites the member and \
+         the account {account}; any other line does not"
+    )
+}
+
+fn command(space: &LocalSpace, line: &str, asked: &mut Option<Asked>) -> Result<String, String> {
     let words: Vec<&str> = line.split_whitespace().collect();
+    if let Some(Asked {
+        member,
+        account,
+        owner,
+    }) = asked.take()
+    {
+        if words.as_slice() != ["yes"] {
+            return Ok(format!("not invited: {account}"));
+        }
+        let claimed = space.invite(member, &account, owner)?;
+        return Ok(match claimed {
+            true => format!("invited and claimed the member and the account {account}"),
+            false => format!("invited the member and the account {account}"),
+        });
+    }
     match words.as_slice() {
+        ["invite", code, account] => {
+            let (member, owner) = vos_api::read_enrollment_code(code).ok_or_else(|| {
+                format!(
+                    "not an enrollment code (the phone's starts with {})",
+                    vos_api::ENROLLMENT_CODE
+                )
+            })?;
+            Ok(ask(asked, member, account, owner))
+        }
         ["invite", member, account, owner] => {
-            let claimed = space.invite(digest(member)?, account, digest(owner)?)?;
-            Ok(match claimed {
-                true => format!("invited and claimed the member and the account {account}"),
-                false => format!("invited the member and the account {account}"),
-            })
+            Ok(ask(asked, digest(member)?, account, digest(owner)?))
         }
         ["mint", account, amount] => {
             let amount = amount.parse().map_err(|_| "the amount is a number")?;
@@ -93,8 +170,8 @@ fn command(space: &LocalSpace, line: &str) -> Result<String, String> {
         }),
         [] => Ok(String::new()),
         _ => Err(
-            "invite MEMBER ACCOUNT OWNER | mint ACCOUNT AMOUNT | balance ACCOUNT | members N \
-                 | homes | quit"
+            "invite CODE ACCOUNT | invite MEMBER ACCOUNT OWNER | mint ACCOUNT AMOUNT | balance \
+                 ACCOUNT | members N | homes | quit"
                 .into(),
         ),
     }
@@ -166,17 +243,18 @@ fn main() -> Result<(), String> {
                 tokio::task::block_in_place(|| homes(&space, &founded, onion))?
             );
         }
+        let mut asked = None;
         let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim() == "quit" {
                 break;
             }
             let done = tokio::task::block_in_place(|| match line.trim() {
-                "homes" => match &pinned {
+                "homes" if asked.is_none() => match &pinned {
                     Some(onion) => homes(&space, &founded, onion),
                     None => Ok("no homes: start with --homes N".into()),
                 },
-                _ => command(&space, &line),
+                _ => command(&space, &line, &mut asked),
             });
             match done {
                 Ok(done) if done.is_empty() => {}

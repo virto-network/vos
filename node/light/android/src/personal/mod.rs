@@ -219,6 +219,7 @@ impl space::Prompts for Asked<'_> {
             fields: Vec::new(),
             notice: None,
             choices: vec!["I wrote them down".into()],
+            code: None,
         })
     }
 
@@ -232,6 +233,7 @@ impl space::Prompts for Asked<'_> {
             fields: Vec::new(),
             notice: None,
             choices: vec!["I wrote it down".into()],
+            code: None,
         })
     }
 
@@ -246,6 +248,7 @@ impl space::Prompts for Asked<'_> {
             }],
             notice: None,
             choices: vec!["Restore".into()],
+            code: None,
         });
         match answer {
             Answer::Confirmed { values, .. } => Some(Zeroizing::new(values.join(" "))),
@@ -277,6 +280,7 @@ impl space::Prompts for Asked<'_> {
             fields: Vec::new(),
             notice: None,
             choices: vec!["Approve".into()],
+            code: None,
         })
     }
 
@@ -290,6 +294,7 @@ impl space::Prompts for Asked<'_> {
             fields: Vec::new(),
             notice: None,
             choices: vec!["It shows the same".into()],
+            code: None,
         })
     }
 
@@ -303,6 +308,7 @@ impl space::Prompts for Asked<'_> {
             fields: Vec::new(),
             notice: None,
             choices: vec!["Go on".into()],
+            code: None,
         })
     }
 

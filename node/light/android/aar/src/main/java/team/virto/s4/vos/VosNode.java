@@ -577,11 +577,11 @@ public final class VosNode {
 
   /**
    * The UI's prompts, saying when a key was used (the proof starts then, with nothing more asked of
-   * the UI), and logging each stage of a sign-in or a payment with the milliseconds since it was
-   * asked: the form shown and answered, the key asked and answered, then done. A late form is the
-   * reads before it; a gap from the form's answer to the key's ask is the node's time read; a long
-   * wait from the key's answer to done, past the proof, is the send. Nothing of the form's values
-   * or the key's output is logged.
+   * the UI), passing on the stages the operation reports, and logging each stage of a sign-in or a
+   * payment with the milliseconds since it was asked: the form shown and answered, the key asked
+   * and answered, proving, sending, then done. A late form is the reads before it; a gap from the
+   * form's answer to the key's ask is the node's time read. Nothing of the form's values or the
+   * key's output is logged.
    */
   private static final class Announced extends IVosPrompts.Stub {
     private final IVosPrompts prompts;
@@ -600,7 +600,7 @@ public final class VosNode {
               + (granted == null ? "" : ", the session open " + (start - granted) + " ms"));
     }
 
-    private void stage(String stage) {
+    private void mark(String stage) {
       long now = SystemClock.elapsedRealtime() - start;
       Log.i(TAG, what + " " + stage + " at +" + now + " ms (+" + (now - last) + ")");
       last = now;
@@ -617,9 +617,9 @@ public final class VosNode {
 
     @Override
     public Answer confirm(Form form) throws RemoteException {
-      stage("form shown");
+      mark("form shown");
       Answer answer = prompts.confirm(form);
-      stage("form answered");
+      mark("form answered");
       return answer;
     }
 
@@ -629,15 +629,21 @@ public final class VosNode {
     }
 
     @Override
+    public void stage(String stage) throws RemoteException {
+      mark(stage);
+      prompts.stage(stage);
+    }
+
+    @Override
     public KeyResult signKey(byte kind, byte[] key, byte[] message) throws RemoteException {
       return prompts.signKey(kind, key, message);
     }
 
     @Override
     public KeyResult evaluateKey(byte kind, byte[] key, byte[] input) throws RemoteException {
-      stage("key asked");
+      mark("key asked");
       KeyResult result = prompts.evaluateKey(kind, key, input);
-      stage("key answered");
+      mark("key answered");
       if (result != null && result.status == KeyStatus.DONE) {
         Log.i(TAG, "proof started");
       }
