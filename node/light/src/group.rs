@@ -860,13 +860,13 @@ impl DeviceGroup {
         self.merge_archive(&taken)
     }
 
-    /// Whether an open operation whose signature this device verified
-    /// removes `device`: a removal, a regroup naming it, a restore.
-    pub fn removal_signed(&self, device: DeviceId) -> bool {
-        self.operations().iter().any(|open| {
-            open.verified
-                && (matches!(open.op, Op::Restore { .. })
-                    || set::removes(&open.op).contains(&device))
+    /// Whether the log asserted a maturity removing `device` that its
+    /// evidence has not supported: one waiting for evidence never posted,
+    /// or refused for want of it. Not a removal pending its delay.
+    pub fn removal_unsupported(&self, device: DeviceId) -> bool {
+        self.state.set.claims.iter().any(|claim| {
+            matches!(claim.support, Support::Waiting | Support::Refused)
+                && (claim.every || claim.removes.contains(&device))
         })
     }
 
