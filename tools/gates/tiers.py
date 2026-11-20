@@ -134,7 +134,10 @@ def flags(tier, arguments, members=None):
             # No flag at all would run every target again.
             sys.exit(f"no heavy test target in {' '.join(packages)}: drop the recipe's line")
         return [flag for name in sorted(slow) for flag in ("--test", name)]
-    return ["--lib", "--bins"] + [flag for name in sorted(fast) for flag in ("--test", name)]
+    # `--lib` where no package has a library is cargo's error, not an empty set.
+    lib = ["--lib"] if any(kind == "lib" for package in packages
+                           for _, kind, _ in members[package]) else []
+    return lib + ["--bins"] + [flag for name in sorted(fast) for flag in ("--test", name)]
 
 
 # ===== The tripwire =====
