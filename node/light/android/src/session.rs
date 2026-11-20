@@ -13,8 +13,8 @@ use vos_light::route::{Clearnet, Purpose};
 use vos_light::tor::Registrar;
 use vos_light::wire;
 use vos_light::{
-    AuthWitness, Call, DeviceError, DeviceProgram, DeviceSecret, Digest, PEAK_BYTES, Prover,
-    ProverConfig, TreeKeeper,
+    AuthWitness, Call, DeviceError, DeviceProgram, DeviceSecret, Digest, PEAK_BYTES, Proven,
+    Prover, ProverConfig, TreeKeeper,
 };
 use vos_wire::ingress::DeviceWindow;
 
@@ -70,9 +70,10 @@ const CLOCK_SKEW_MS: u64 = 300_000;
 /// How long a session uses its reading of the node's clock. A reading
 /// is an offset from the device's clock, which drifts a few milliseconds
 /// in that time; what makes it wrong is a step of the device's clock,
-/// which [`CLOCK_STEP_MS`] catches. The bound is PG5's: each reading is a
-/// fetch, a rendezvous, so a session reads again every 4 to 12 minutes
-/// ([`CLOCK_EVERY`]), about seven an hour.
+/// which [`CLOCK_STEP_MS`] catches. The bound is on rendezvous an hour
+/// (at most 30 in the foreground): each reading is a fetch, a rendezvous,
+/// so a session reads again every 4 to 12 minutes ([`CLOCK_EVERY`]), about
+/// seven an hour.
 const CLOCK_LIFE: Duration = Duration::from_secs(15 * 60);
 /// How often a session reads the node's clock again, about: each reading
 /// draws its renewal between half and one and a half of it.
@@ -101,7 +102,22 @@ pub struct Stock {
     pub owner: Vec<u8>,
 }
 
+/// A stock kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kernel {
+    Auth,
+    Owner,
+}
+
 impl Stock {
+    /// `kernel`'s release artifact.
+    pub(crate) fn artifact(&self, kernel: Kernel) -> &[u8] {
+        match kernel {
+            Kernel::Auth => &self.auth,
+            Kernel::Owner => &self.owner,
+        }
+    }
+
     /// The artifacts this crate embeds, built from this tree's credential
     /// actor (`just facility-release`).
     pub fn embedded() -> Self {
@@ -135,7 +151,7 @@ pub(crate) struct Inner {
     /// process's life: no connection that proves starts or steers it.
     trees: Mutex<HashMap<(String, String), Arc<Tree>>>,
     /// The device's personal space, while it runs.
-    paired: Mutex<Option<std::sync::Weak<dyn Paired>>>,
+    personal: Mutex<Option<std::sync::Weak<dyn PersonalLink>>>,
     /// Each space's device window for its credential actor, as its node answered it
     /// last, and when: read before a proof, and kept for [`WINDOW_TTL`]
     /// while it admits this app's programs.
@@ -146,7 +162,7 @@ pub(crate) struct Inner {
 }
 
 /// What an enrollment asks of the device's personal space.
-pub(crate) trait Paired: Send + Sync {
+pub(crate) trait PersonalLink: Send + Sync {
     /// The source this device's handle in the space `handle` was derived
     /// from at a pairing, while its confirmation there is owed: the device
     /// that paired it enrolled that handle, so this one enrolls with it.
@@ -265,7 +281,7 @@ impl Facility {
                 tick: TICK,
                 net,
                 trees: Mutex::new(HashMap::new()),
-                paired: Mutex::new(None),
+                personal: Mutex::new(None),
                 windows: Mutex::new(HashMap::new()),
                 window_reads: Mutex::new(HashMap::new()),
             }),
@@ -273,8 +289,8 @@ impl Facility {
     }
 
     /// The device's personal space, which enrollments ask.
-    pub(crate) fn lend_personal(&self, paired: std::sync::Weak<dyn Paired>) {
-        *self.inner.paired.lock().unwrap_or_else(|e| e.into_inner()) = Some(paired);
+    pub(crate) fn lend_personal(&self, personal: std::sync::Weak<dyn PersonalLink>) {
+        *crate::lock(&self.inner.personal) = Some(personal);
     }
 
     fn inner_mut(&mut self) -> &mut Inner {
@@ -389,9 +405,7 @@ impl Facility {
         };
         let net = &self.inner.net;
         for enrollment in self.inner.store.all().map_err(store_error)? {
-            if net.client().routes(&enrollment.routes()).is_none() {
-                net.pin(enrollment.routes(), pinned(&enrollment));
-            }
+            self.inner.pin_missing(&enrollment);
             let pins = net
                 .client()
                 .routes(&enrollment.routes())
@@ -415,9 +429,7 @@ impl Facility {
             if enrollment.port != gateway.port || host(&enrollment.host) != host(&gateway.host) {
                 continue;
             }
-            if net.client().routes(&enrollment.routes()).is_none() {
-                net.pin(enrollment.routes(), pinned(&enrollment));
-            }
+            self.inner.pin_missing(&enrollment);
             let routes = net.client().routes(&enrollment.routes());
             match routes {
                 Some(routes) if routes.opted_out() => {
@@ -444,20 +456,14 @@ impl Facility {
     /// name or its port is spelled, and s4 does not reach it over the
     /// clearnet itself. A space the user opted out of Tor refuses nothing.
     pub fn clearnet_refused(&self, host_key: &[u8; 32]) -> Result<(), Refusal> {
-        let net = &self.inner.net;
-        for enrollment in self.inner.store.all().map_err(store_error)? {
-            if net.client().routes(&enrollment.routes()).is_none() {
-                net.pin(enrollment.routes(), pinned(&enrollment));
-            }
+        let all = self.inner.store.all().map_err(store_error)?;
+        for enrollment in &all {
+            self.inner.pin_missing(enrollment);
         }
-        match net.onion_pinned(host_key) {
+        match self.inner.net.onion_pinned(host_key) {
             None => Ok(()),
             Some(space) => {
-                let through = self
-                    .inner
-                    .store
-                    .all()
-                    .map_err(store_error)?
+                let through = all
                     .into_iter()
                     .find(|enrollment| enrollment.routes() == space)
                     .map(|enrollment| {
@@ -497,18 +503,22 @@ impl Facility {
 }
 
 impl Inner {
-    fn personal(&self) -> Option<Arc<dyn Paired>> {
-        self.paired
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .and_then(Weak::upgrade)
+    /// `enrollment`'s space told to the client, its routes as pinned, if
+    /// the client holds none for it.
+    fn pin_missing(&self, enrollment: &Enrollment) {
+        if self.net.client().routes(&enrollment.routes()).is_none() {
+            self.net.pin(enrollment.routes(), pinned(enrollment));
+        }
+    }
+
+    fn personal(&self) -> Option<Arc<dyn PersonalLink>> {
+        crate::lock(&self.personal).as_ref().and_then(Weak::upgrade)
     }
 
     /// The source a pairing derived this device's handle `handle` from,
     /// while its confirmation is owed. Unread, the enrollment is refused:
     /// a new key there would never prove.
-    async fn paired(&self, handle: [u8; 32]) -> Result<Option<Reference>, Refusal> {
+    async fn owed_source(&self, handle: [u8; 32]) -> Result<Option<Reference>, Refusal> {
         let Some(personal) = self.personal() else {
             return Ok(None);
         };
@@ -542,9 +552,9 @@ impl Inner {
     pub(crate) async fn admits(
         &self,
         enrollment: &Enrollment,
-        kernel: &[u8],
+        kernel: Kernel,
     ) -> Result<(), Refusal> {
-        let shipped = <Release as vos_abi::Decode>::decode_exact(kernel)
+        let shipped = <Release as vos_abi::Decode>::decode_exact(self.stock.artifact(kernel))
             .ok_or_else(|| refused(Code::Prove, "a stock kernel's artifact does not decode"))?;
         let window = self.window(enrollment, WINDOW_TTL).await?;
         // A window that admits none of them is read again next time: the
@@ -662,22 +672,28 @@ impl Inner {
         Ok(made)
     }
 
-    /// One proof at a time, its heap handed back after: `prove` on a
-    /// blocking thread, given the program of `kernel`.
-    pub(crate) async fn prove<T: Send + 'static>(
+    /// One proof at a time, its heap handed back after: `prove` of `call`
+    /// on a blocking thread, given the program of `kernel`; the call's
+    /// credentialed request.
+    pub(crate) async fn prove(
         this: &Arc<Self>,
-        kernel: fn(&Stock) -> &[u8],
-        prove: impl FnOnce(&Prover, &DeviceProgram) -> Result<T, DeviceError> + Send + 'static,
-    ) -> Result<T, Refusal> {
+        kernel: Kernel,
+        call: Call,
+        prove: impl FnOnce(&Prover, &DeviceProgram, &Call) -> Result<Proven, DeviceError>
+        + Send
+        + 'static,
+    ) -> Result<Vec<u8>, Refusal> {
         let prover = this
             .prover()
             .map_err(|error| refused(Code::Prove, error.to_string()))?;
         let inner = Arc::clone(this);
         tokio::task::spawn_blocking(move || {
-            let proof = inner.program(kernel(&inner.stock)).and_then(|program| {
-                let _one = warm::lock(&inner.device_proof);
-                prove(&prover, &program)
-            });
+            let proof = inner
+                .program(inner.stock.artifact(kernel))
+                .and_then(|program| {
+                    let _one = crate::lock(&inner.device_proof);
+                    prove(&prover, &program, &call).map(|proof| wire::credentialed(&call, &proof))
+                });
             // A proof's half a gigabyte handed back, whether it was made or
             // failed.
             warm::release_heap();
@@ -1128,7 +1144,7 @@ impl Session {
         // it derived that handle from, not a new key.
         let paired = match &existing {
             Some(_) => None,
-            None => self.inner.paired(request.handle).await?,
+            None => self.inner.owed_source(request.handle).await?,
         };
         let mut rows = vec![
             ("Space handle".to_owned(), short(&request.handle)),
@@ -1372,9 +1388,7 @@ impl Session {
                 "a once-guarded call is proved with no arguments the chrome cannot show",
             ));
         }
-        self.inner
-            .admits(&enrollment, &self.inner.stock.auth)
-            .await?;
+        self.inner.admits(&enrollment, Kernel::Auth).await?;
         let Some(witness) = self.witness() else {
             return Err(self.pathless().await);
         };
@@ -1464,14 +1478,15 @@ impl Session {
         let (secret, name) = (Arc::clone(secret), scope.to_owned());
         Inner::prove(
             &self.inner,
-            |stock| &stock.auth,
-            move |prover, program| {
+            Kernel::Auth,
+            call,
+            move |prover, program, call| {
                 // The stock kernel's program, as the space's ingress
                 // computes it from the installed kernel: the warm-up's if
                 // it made it, waited for if it is making it.
-                let proof = prover.prove_auth(&secret, &witness, name.as_bytes(), &call, program);
+                let proof = prover.prove_auth(&secret, &witness, name.as_bytes(), call, program);
                 drop(secret);
-                proof.map(|proof| wire::credentialed(&call, &proof))
+                proof
             },
         )
         .await
@@ -1544,9 +1559,7 @@ impl Session {
             |method| method.guard == Guard::Owner && method.name == TRANSFER,
         )?;
         self.carried(&enrollment)?;
-        self.inner
-            .admits(&enrollment, &self.inner.stock.owner)
-            .await?;
+        self.inner.admits(&enrollment, Kernel::Owner).await?;
         self.apart(Learned::Named)?;
         self.read_clock_meanwhile(&enrollment);
         let (mut payee, mut amount) = (request.payee.clone(), request.amount.to_string());
@@ -1624,11 +1637,12 @@ impl Session {
         let expires_ms = call.expires_ms;
         let bytes = Inner::prove(
             &self.inner,
-            |stock| &stock.owner,
-            move |prover, program| {
-                let proof = prover.prove_owner(&secret, &call, program);
+            Kernel::Owner,
+            call,
+            move |prover, program, call| {
+                let proof = prover.prove_owner(&secret, call, program);
                 drop(secret);
-                proof.map(|proof| wire::credentialed(&call, &proof))
+                proof
             },
         )
         .await?;
@@ -1905,7 +1919,7 @@ fn format_refused(answer: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enrollment::{Location, Onion};
+
     use crate::source::{BoxFuture, Output, Reference};
 
     struct NoSource;
@@ -1930,37 +1944,14 @@ mod tests {
 
     fn enrollment(guard: Guard) -> Enrollment {
         Enrollment {
-            handle: [1; 32],
-            space: [2; 32],
-            agents: vec![Agent {
-                agent: 7,
-                identity: [3; 32],
-            }],
-            methods: vec![Method {
+            fingerprint: origin().host,
+            application: origin().application,
+            ..crate::enrollment::fixture(vec![Method {
                 agent: 7,
                 instance: 4,
                 name: "login".into(),
                 guard,
-            }],
-            credentials: Location {
-                agent: 7,
-                instance: 9,
-            },
-            source: Reference::Keystore {
-                alias: "vos.device.1".into(),
-            },
-            member: [4; 32],
-            owner: [8; 32],
-            host: "gateway.example".into(),
-            port: 2222,
-            fingerprint: origin().host,
-            application: origin().application,
-            host_key: None,
-            onions: vec![Onion {
-                key: [5; 32],
-                ssh_host_key: [6; 32],
-            }],
-            onion_only: false,
+            }])
         }
     }
 

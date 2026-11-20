@@ -90,7 +90,7 @@ impl Scripted {
 }
 
 impl Personal for Scripted {
-    fn pass(&self, _now: u64, _runtime: &tokio::runtime::Handle) -> Result<Passed, String> {
+    fn pass(&self, _now: u64) -> Result<Passed, String> {
         self.passes
             .lock()
             .unwrap()

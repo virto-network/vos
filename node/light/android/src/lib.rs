@@ -73,6 +73,13 @@ pub use s4_credential_contract::{
 pub use session::{Facility, Session, Stock};
 pub use warm::Warming;
 
+/// `mutex` locked, whether or not a holder panicked.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A refusal of `code`.
 pub(crate) fn refused(code: Code, message: impl Into<String>) -> Refusal {
     Refusal::new(code, message)

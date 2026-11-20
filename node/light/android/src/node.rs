@@ -283,7 +283,7 @@ impl Node {
             .map(Arc::new)
         });
         if let Some(Ok(space)) = &personal {
-            let paired: Arc<dyn crate::session::Paired> = Arc::clone(space) as _;
+            let paired: Arc<dyn crate::session::PersonalLink> = Arc::clone(space) as _;
             facility.lend_personal(Arc::downgrade(&paired));
             if space.grouped() {
                 job.attach(Arc::clone(space) as Arc<dyn crate::job::Personal>);
@@ -318,7 +318,7 @@ impl Node {
     }
 
     fn keep_warming(&self, warming: Option<Warming>) {
-        let mut all = self.warming.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = crate::lock(&self.warming);
         all.retain(|warming| !warming.is_finished());
         all.extend(warming);
     }
@@ -328,7 +328,7 @@ impl Node {
     /// one.
     pub fn open_session(&self, gateway: Gateway) -> u64 {
         let session = Arc::new(self.facility.session(gateway));
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sessions = crate::lock(&self.sessions);
         let handle = loop {
             let mut bytes = [0; 8];
             getrandom::getrandom(&mut bytes).expect("the system's randomness");
@@ -352,9 +352,7 @@ impl Node {
     }
 
     fn session(&self, handle: u64) -> Result<Arc<Session>, Refusal> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        crate::lock(&self.sessions)
             .open
             .get(&handle)
             .cloned()
@@ -373,7 +371,7 @@ impl Node {
     /// Close the session: the last holding a space's tree stops its
     /// refresher.
     pub fn close(&self, handle: u64) {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sessions = crate::lock(&self.sessions);
         if let Some(session) = sessions.open.remove(&handle) {
             sessions.order.retain(|open| *open != handle);
             drop(sessions);
@@ -477,7 +475,7 @@ impl Node {
     /// The client awake, within the runtime, until the guard drops.
     fn wake(&self) -> Awake<'_> {
         let entered = self.runtime.enter();
-        let mut waking = self.waking.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waking = crate::lock(&self.waking);
         waking.1 += 1;
         self.facility.net().set_dormant(false);
         drop(waking);
@@ -492,7 +490,7 @@ impl Node {
     /// firing) once no operation or job runs.
     pub fn foreground(&self, foreground: bool) {
         let _entered = self.runtime.enter();
-        let mut waking = self.waking.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waking = crate::lock(&self.waking);
         waking.0 = foreground;
         self.facility.net().set_foreground(foreground);
         self.facility.net().keep_rendezvous();
@@ -687,7 +685,7 @@ struct Awake<'a> {
 
 impl Drop for Awake<'_> {
     fn drop(&mut self) {
-        let mut waking = self.node.waking.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waking = crate::lock(&self.node.waking);
         waking.1 -= 1;
         if *waking == (false, 0) {
             self.node.facility.net().set_dormant(true);
@@ -697,19 +695,10 @@ impl Drop for Awake<'_> {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        for warming in self
-            .warming
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
+        for warming in crate::lock(&self.warming).iter() {
             warming.cancel();
         }
         let _entered = self.runtime.enter();
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .open
-            .clear();
+        crate::lock(&self.sessions).open.clear();
     }
 }

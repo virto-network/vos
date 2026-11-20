@@ -53,7 +53,7 @@ impl Kept {
     /// is; refused if it is of another layout.
     pub fn open(directory: &Path) -> Result<Self, String> {
         let path = directory.join(DIRECTORY);
-        let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        let mut open = crate::lock(&OPEN);
         if let Some(inner) = open.get(&path).and_then(Weak::upgrade) {
             return Ok(Self(inner));
         }

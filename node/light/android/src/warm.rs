@@ -6,10 +6,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use sha2::Digest as _;
 use vos_light::{DeviceError, DeviceProgram};
+
+use crate::lock;
 
 /// A kernel's key: its release artifact's SHA-256.
 pub(crate) type Key = [u8; 32];
@@ -19,41 +21,13 @@ pub(crate) fn key(kernel: &[u8]) -> Key {
 }
 
 /// Computed values by key, each computed once however many ask: a caller
-/// arriving while another computes it waits for that one.
+/// arriving while another computes it waits for that one; a computation
+/// that unwinds leaves its key empty, for the next caller to compute.
 pub(crate) struct Programs<P = DeviceProgram> {
-    slots: Mutex<HashMap<Key, Arc<Slot<P>>>>,
+    slots: Mutex<HashMap<Key, Slot<P>>>,
 }
 
-struct Slot<P> {
-    state: Mutex<State<P>>,
-    ready: Condvar,
-}
-
-enum State<P> {
-    Empty,
-    Computing,
-    Done(Result<Arc<P>, DeviceError>),
-}
-
-/// Puts a slot whose computation unwound back to empty, for the next
-/// caller to compute.
-struct Unwind<'a, P>(&'a Slot<P>);
-
-impl<P> Drop for Unwind<'_, P> {
-    fn drop(&mut self) {
-        let mut state = lock(&self.0.state);
-        if matches!(*state, State::Computing) {
-            *state = State::Empty;
-            self.0.ready.notify_all();
-        }
-    }
-}
-
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+type Slot<P> = Arc<OnceLock<Result<Arc<P>, DeviceError>>>;
 
 impl<P> Default for Programs<P> {
     fn default() -> Self {
@@ -72,30 +46,8 @@ impl<P> Programs<P> {
         key: Key,
         compute: impl FnOnce() -> Result<P, DeviceError>,
     ) -> Result<Arc<P>, DeviceError> {
-        let slot = Arc::clone(lock(&self.slots).entry(key).or_insert_with(|| {
-            Arc::new(Slot {
-                state: Mutex::new(State::Empty),
-                ready: Condvar::new(),
-            })
-        }));
-        let mut state = lock(&slot.state);
-        loop {
-            match &*state {
-                State::Done(done) => return done.clone(),
-                State::Computing => {
-                    state = slot.ready.wait(state).unwrap_or_else(|e| e.into_inner())
-                }
-                State::Empty => break,
-            }
-        }
-        *state = State::Computing;
-        drop(state);
-        let unwind = Unwind(&slot);
-        let done = compute().map(Arc::new);
-        std::mem::forget(unwind);
-        *lock(&slot.state) = State::Done(done.clone());
-        slot.ready.notify_all();
-        done
+        let slot = Arc::clone(lock(&self.slots).entry(key).or_default());
+        slot.get_or_init(|| compute().map(Arc::new)).clone()
     }
 
     /// Only the values of `keys` kept: a kernel no longer enrolled has its
@@ -109,7 +61,7 @@ impl<P> Programs<P> {
     pub(crate) fn holds(&self, key: &Key) -> bool {
         lock(&self.slots)
             .get(key)
-            .is_some_and(|slot| matches!(*lock(&slot.state), State::Done(_)))
+            .is_some_and(|slot| slot.get().is_some())
     }
 }
 

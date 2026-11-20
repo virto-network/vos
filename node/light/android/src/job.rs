@@ -62,10 +62,10 @@ const RUNS_ROW: &[u8] = b"runs";
 
 /// The device's personal space, as a pass syncs it.
 pub trait Personal: Send + Sync {
-    /// One pass at the device's time `now` (milliseconds), its requests
-    /// driven on `runtime` (the facility's, which the pass is called
-    /// beside, never on): what it found, or why it reached nothing.
-    fn pass(&self, now: u64, runtime: &tokio::runtime::Handle) -> Result<Passed, String>;
+    /// One pass at the device's time `now` (milliseconds), called beside
+    /// the facility's runtime, never on it: what it found, or why it
+    /// reached nothing.
+    fn pass(&self, now: u64) -> Result<Passed, String>;
 
     /// The device group's `alarms`, raised by a pass, are kept as the
     /// run's notices: the group keeps them no more.
@@ -330,7 +330,7 @@ impl Job {
 
     /// The personal space each pass syncs from now on.
     pub fn attach(&self, personal: Arc<dyn Personal>) {
-        *self.personal.lock().unwrap_or_else(|e| e.into_inner()) = Some(personal);
+        *crate::lock(&self.personal) = Some(personal);
     }
 
     pub fn runs(&self) -> Result<Vec<JobRun>, Refusal> {
@@ -355,7 +355,7 @@ impl Job {
         facility: &Facility,
         part: Part,
     ) -> Result<Synced, Refusal> {
-        let _one = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::lock(&self.running);
         let clock = Instant::now();
         let mut state = self.runs.read().map_err(job_error)?;
         let started_ms = now_ms();
@@ -389,14 +389,10 @@ impl Job {
                     })
             }
             Part::Personal => {
-                let personal = self
-                    .personal
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                let personal = crate::lock(&self.personal).clone();
                 if let Some(personal) = personal {
                     synced.enrollments = 1;
-                    match personal.pass(now, runtime.handle()) {
+                    match personal.pass(now) {
                         Ok(passed) => {
                             match passed.stopped {
                                 None => synced.synced = 1,

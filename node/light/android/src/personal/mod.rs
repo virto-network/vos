@@ -17,14 +17,14 @@ use vos_abi::ids::InstanceId;
 use vos_light::group::Alarm;
 use vos_light::route::{Purpose, Route};
 use vos_light::space::{self, AdminKey, Approval, Card, Enrolled, Error, Host, Proof};
-use vos_light::wire;
+
 use vos_wire::credentials::Onion;
 use zeroize::Zeroizing;
 
 use crate::job::{Passed, Personal};
 use crate::net::Pinned;
 use crate::node::Prompts;
-use crate::session::Inner;
+use crate::session::{Inner, Kernel};
 use crate::source::{Kind, Reference};
 use crate::{Answer, Code, Facility, Field, Form};
 use s4_credential_contract::KeyAnswer;
@@ -52,9 +52,6 @@ pub fn embedded() -> Artifacts {
         ],
     }
 }
-
-/// A removed device whose leaf a retirement revokes in each space.
-pub type Removal = u32;
 
 /// The facility as the personal space's host: requests over its client on
 /// its runtime, proofs on its prover one at a time, its enrollments.
@@ -101,20 +98,22 @@ impl Host for Reach {
                 call,
             } => self.runtime.block_on(Inner::prove(
                 &inner,
-                |stock| &stock.auth,
-                move |prover, program| {
-                    let proof = prover.prove_home(&secret, &witness, &call, program);
+                Kernel::Auth,
+                call,
+                move |prover, program, call| {
+                    let proof = prover.prove_home(&secret, &witness, call, program);
                     drop(secret);
-                    proof.map(|proof| wire::credentialed(&call, &proof))
+                    proof
                 },
             )),
             Proof::Owner { secret, call } => self.runtime.block_on(Inner::prove(
                 &inner,
-                |stock| &stock.owner,
-                move |prover, program| {
-                    let proof = prover.prove_owner(&secret, &call, program);
+                Kernel::Owner,
+                call,
+                move |prover, program, call| {
+                    let proof = prover.prove_owner(&secret, call, program);
                     drop(secret);
-                    proof.map(|proof| wire::credentialed(&call, &proof))
+                    proof
                 },
             )),
         };
@@ -361,80 +360,84 @@ impl space::Prompts for Asked<'_> {
 
 /// Why `error`, as the screens branch on it: its kind, a time or a
 /// device it names, and the inner error's name or the failure's detail.
-pub fn refusal(error: Error) -> Refused {
-    let why = |why| Refused {
-        why,
-        ..Refused::default()
-    };
-    let detailed = |kind, detail: String| Refused {
-        why: kind,
-        detail,
-        ..Refused::default()
-    };
-    match error {
-        Error::NoSpace => why(Why::NoSpace),
-        Error::AlreadyHeld => why(Why::AlreadyHeld),
-        Error::HoldsKeys => why(Why::HoldsKeys),
-        Error::ClaimElsewhere { home } => detailed(Why::ClaimElsewhere, hex::encode(home)),
-        Error::AtThatHome => why(Why::AtThatHome),
-        Error::NoRestore => why(Why::NoRestore),
-        Error::NoPairing => why(Why::NoPairing),
-        Error::NeedsRepair(detail) => detailed(Why::NeedsRepair, detail),
-        Error::Declined => why(Why::Declined),
-        Error::Cancelled => why(Why::Cancelled),
-        Error::NotAKit => why(Why::NotAKit),
-        Error::WrongKit => why(Why::WrongKit),
-        Error::NotAPairingCode => why(Why::NotAPairingCode),
-        Error::NotAnOffer => why(Why::NotAnOffer),
-        Error::StaleOffer => why(Why::StaleOffer),
-        Error::OwnKey => why(Why::OwnKey),
-        Error::NotInSet => why(Why::NotInSet),
-        Error::Source(detail) => detailed(Why::Source, detail),
-        Error::NoOpenClaim => why(Why::NoOpenClaim),
-        Error::OpenClaimRefused(detail) => detailed(Why::OpenClaimRefused, detail),
-        Error::NoAgentToGive => why(Why::NoAgentToGive),
-        Error::NoAgentForKit => why(Why::NoAgentForKit),
-        Error::HoldsAgentThere => why(Why::HoldsAgentThere),
-        Error::UnknownAgent => why(Why::UnknownAgent),
-        Error::NoLeaf => why(Why::NoLeaf),
-        Error::HomeRefused(error) => detailed(Why::HomeRefused, format!("{error:?}")),
-        Error::Update => why(Why::Update),
-        Error::Rejected(detail) => detailed(Why::Rejected, detail),
-        Error::AgentRefused(error) => detailed(Why::AgentRefused, format!("{error:?}")),
-        Error::NotTakenYet => why(Why::NotTakenYet),
-        Error::NotJoinedYet => why(Why::NotJoinedYet),
-        Error::AwaitsVotes => why(Why::AwaitsVotes),
-        Error::Undecided => why(Why::Undecided),
-        Error::CommitVoid => why(Why::CommitVoid),
-        Error::CommittedMeanwhile => why(Why::CommittedMeanwhile),
-        Error::SlotExpired => why(Why::SlotExpired),
-        Error::PairingDeclined => why(Why::PairingDeclined),
-        Error::InSetAlready => why(Why::InSetAlready),
-        Error::NotInAgentSet => why(Why::NotInAgentSet),
-        Error::Regrouped { by } => Refused {
-            why: Why::Regrouped,
-            device: by,
+impl From<Error> for Refused {
+    fn from(error: Error) -> Self {
+        let why = |why| Refused {
+            why,
             ..Refused::default()
-        },
-        Error::DelayedAdmin => why(Why::DelayedAdmin),
-        Error::NotEnrolled => why(Why::NotEnrolled),
-        Error::NothingOwed => why(Why::NothingOwed),
-        Error::Spent => why(Why::Spent),
-        Error::RegistrarRefused(error) => detailed(
-            Why::RegistrarRefused,
-            error.map(|error| format!("{error:?}")).unwrap_or_default(),
-        ),
-        Error::Unreachable(detail) => detailed(Why::Unreachable, detail),
-        Error::Prove(detail) => detailed(Why::Prove, detail),
-        Error::Store(detail) => detailed(Why::Store, detail),
-        Error::Failed(detail) => detailed(Why::Failed, detail),
+        };
+        let detailed = |kind, detail: String| Refused {
+            why: kind,
+            detail,
+            ..Refused::default()
+        };
+        match error {
+            Error::NoSpace => why(Why::NoSpace),
+            Error::AlreadyHeld => why(Why::AlreadyHeld),
+            Error::HoldsKeys => why(Why::HoldsKeys),
+            Error::ClaimElsewhere { home } => detailed(Why::ClaimElsewhere, hex::encode(home)),
+            Error::AtThatHome => why(Why::AtThatHome),
+            Error::NoRestore => why(Why::NoRestore),
+            Error::NoPairing => why(Why::NoPairing),
+            Error::NeedsRepair(detail) => detailed(Why::NeedsRepair, detail),
+            Error::Declined => why(Why::Declined),
+            Error::Cancelled => why(Why::Cancelled),
+            Error::NotAKit => why(Why::NotAKit),
+            Error::WrongKit => why(Why::WrongKit),
+            Error::NotAPairingCode => why(Why::NotAPairingCode),
+            Error::NotAnOffer => why(Why::NotAnOffer),
+            Error::StaleOffer => why(Why::StaleOffer),
+            Error::OwnKey => why(Why::OwnKey),
+            Error::NotInSet => why(Why::NotInSet),
+            Error::Source(detail) => detailed(Why::Source, detail),
+            Error::NoOpenClaim => why(Why::NoOpenClaim),
+            Error::OpenClaimRefused(detail) => detailed(Why::OpenClaimRefused, detail),
+            Error::NoAgentToGive => why(Why::NoAgentToGive),
+            Error::NoAgentForKit => why(Why::NoAgentForKit),
+            Error::HoldsAgentThere => why(Why::HoldsAgentThere),
+            Error::UnknownAgent => why(Why::UnknownAgent),
+            Error::NoLeaf => why(Why::NoLeaf),
+            Error::HomeRefused(error) => detailed(Why::HomeRefused, format!("{error:?}")),
+            Error::Update => why(Why::Update),
+            Error::Rejected(detail) => detailed(Why::Rejected, detail),
+            Error::AgentRefused(error) => detailed(Why::AgentRefused, format!("{error:?}")),
+            Error::NotTakenYet => why(Why::NotTakenYet),
+            Error::NotJoinedYet => why(Why::NotJoinedYet),
+            Error::AwaitsVotes => why(Why::AwaitsVotes),
+            Error::Undecided => why(Why::Undecided),
+            Error::CommitVoid => why(Why::CommitVoid),
+            Error::CommittedMeanwhile => why(Why::CommittedMeanwhile),
+            Error::SlotExpired => why(Why::SlotExpired),
+            Error::PairingDeclined => why(Why::PairingDeclined),
+            Error::InSetAlready => why(Why::InSetAlready),
+            Error::NotInAgentSet => why(Why::NotInAgentSet),
+            Error::Regrouped { by } => Refused {
+                why: Why::Regrouped,
+                device: by,
+                ..Refused::default()
+            },
+            Error::DelayedAdmin => why(Why::DelayedAdmin),
+            Error::NotEnrolled => why(Why::NotEnrolled),
+            Error::NothingOwed => why(Why::NothingOwed),
+            Error::Spent => why(Why::Spent),
+            Error::RegistrarRefused(error) => detailed(
+                Why::RegistrarRefused,
+                error.map(|error| format!("{error:?}")).unwrap_or_default(),
+            ),
+            Error::Unreachable(detail) => detailed(Why::Unreachable, detail),
+            Error::Prove(detail) => detailed(Why::Prove, detail),
+            Error::Store(detail) => detailed(Why::Store, detail),
+            Error::Failed(detail) => detailed(Why::Failed, detail),
+        }
     }
 }
 
-fn kit(kind: KitKind) -> vos_wire::personal::KitKind {
-    match kind {
-        KitKind::Phrase => vos_wire::personal::KitKind::Phrase,
-        KitKind::SecurityKey => vos_wire::personal::KitKind::SecurityKey,
+impl From<KitKind> for vos_wire::personal::KitKind {
+    fn from(kind: KitKind) -> Self {
+        match kind {
+            KitKind::Phrase => Self::Phrase,
+            KitKind::SecurityKey => Self::SecurityKey,
+        }
     }
 }
 
@@ -442,130 +445,34 @@ fn kit(kind: KitKind) -> vos_wire::personal::KitKind {
 fn claim(request: Claim) -> Result<space::Claim, Refused> {
     let request = request.check()?;
     Ok(space::Claim {
-        home: kept(request.home),
-        kit: kit(request.kit),
+        home: request.home.into(),
+        kit: request.kit.into(),
         label: request.label,
     })
 }
 
 /// A home as the chrome names it, checked ([`Home::check`]): as the
 /// personal space reaches it.
-fn kept(home: Home) -> space::Kept {
-    space::Kept {
-        home: vos_light::home::Home {
-            space: home.space,
-            handle: home.handle,
-            agent: home.agent,
-            identity: home.identity,
-            homes: InstanceId(home.homes),
-            credentials: InstanceId(home.credentials),
-        },
-        onions: crate::net::onions(&home.onions),
+impl From<Home> for space::Kept {
+    fn from(home: Home) -> Self {
+        Self {
+            home: vos_light::home::Home {
+                space: home.space,
+                handle: home.handle,
+                agent: home.agent,
+                identity: home.identity,
+                homes: InstanceId(home.homes),
+                credentials: InstanceId(home.credentials),
+            },
+            onions: crate::net::onions(&home.onions),
+        }
     }
 }
 
-fn device(device: space::Device) -> Device {
-    Device {
-        id: device.id,
-        label: device.label,
-        strong: device.strong,
-        standing: device.standing as u8,
-        seen: device.seen,
-        removed: device.removed,
-        me: device.me,
-    }
-}
-
-fn claimed(claimed: space::Claimed) -> Claimed {
-    Claimed {
-        agent: claimed.agent,
-        device: claimed.device,
-    }
-}
-
-fn paired(paired: space::Paired) -> Paired {
-    Paired {
-        device: paired.device,
-        memberships: paired.memberships,
-    }
-}
-
-fn posted(posted: space::Posted) -> Posted {
-    Posted {
-        index: posted.index,
-        at: posted.at,
-    }
-}
-
-fn membership(membership: space::Membership) -> Membership {
-    Membership {
-        space: membership.space,
-        handle: membership.handle,
-        agent: membership.agent,
-        instance: membership.instance,
-        owed: match membership.owed {
-            space::Owed::Enroll => Owed::Enroll,
-            space::Owed::Confirm => Owed::Confirm,
-        },
-    }
-}
-
-fn of_membership(membership: Membership) -> space::Membership {
-    space::Membership {
-        space: membership.space,
-        handle: membership.handle,
-        agent: membership.agent,
-        instance: membership.instance,
-        owed: match membership.owed {
-            Owed::Enroll => space::Owed::Enroll,
-            Owed::Confirm => space::Owed::Confirm,
-        },
-    }
-}
-
-/// The device's personal space, as the facility serves it.
-pub struct Space(space::Personal<Reach>);
-
-/// The prompts a flow is lent.
-pub type Lent<'a> = &'a dyn Prompts;
-
-/// A shared space, as the node holds it.
-pub type Shared = Arc<Space>;
-
-impl Space {
-    /// The personal space under `directory` (the facility's), its light
-    /// node opened from `artifacts`, its homes' routes told to the
-    /// facility's client. One this build does not read is refused as in
-    /// need of repair, and left as it is.
-    pub fn open(
-        directory: &Path,
-        artifacts: &Artifacts,
-        facility: Facility,
-        runtime: tokio::runtime::Handle,
-    ) -> Result<Self, Refused> {
-        space::Personal::open(directory, artifacts, Reach { facility, runtime })
-            .map(Space)
-            .map_err(refusal)
-    }
-
-    pub fn grouped(&self) -> bool {
-        self.0.grouped()
-    }
-
-    /// The personal space's state as the device holds it, the facility's
-    /// parts (Tor, the notices standing) left for the node to fill.
-    pub fn status(&self) -> Result<PersonalStatus, Refused> {
-        let status = self.0.status().map_err(refusal)?;
-        let (phase, matures) = match status.phase {
-            space::Phase::None => (Phase::None, 0),
-            space::Phase::Claiming => (Phase::Claiming, 0),
-            space::Phase::Joining => (Phase::Joining, 0),
-            space::Phase::Held => (Phase::Held, 0),
-            space::Phase::Restoring { matures } => (Phase::Restoring, matures),
-            space::Phase::Removed => (Phase::Removed, 0),
-            space::Phase::Stuck => (Phase::Stuck, 0),
-        };
-        let home = status.home.map_or_else(Home::default, |kept| Home {
+/// A kept home as the chrome names it.
+impl From<space::Kept> for Home {
+    fn from(kept: space::Kept) -> Self {
+        Self {
             space: kept.home.space,
             handle: kept.home.handle,
             agent: kept.home.agent,
@@ -580,7 +487,121 @@ impl Space {
                     ssh_host_key: onion.ssh_host_key,
                 })
                 .collect(),
-        });
+        }
+    }
+}
+
+impl From<space::Device> for Device {
+    fn from(device: space::Device) -> Self {
+        Self {
+            id: device.id,
+            label: device.label,
+            strong: device.strong,
+            standing: device.standing as u8,
+            seen: device.seen,
+            removed: device.removed,
+            me: device.me,
+        }
+    }
+}
+
+impl From<space::Claimed> for Claimed {
+    fn from(claimed: space::Claimed) -> Self {
+        Self {
+            agent: claimed.agent,
+            device: claimed.device,
+        }
+    }
+}
+
+impl From<space::Paired> for Paired {
+    fn from(paired: space::Paired) -> Self {
+        Self {
+            device: paired.device,
+            memberships: paired.memberships,
+        }
+    }
+}
+
+impl From<space::Posted> for Posted {
+    fn from(posted: space::Posted) -> Self {
+        Self {
+            index: posted.index,
+            at: posted.at,
+        }
+    }
+}
+
+impl From<space::Membership> for Membership {
+    fn from(membership: space::Membership) -> Self {
+        Self {
+            space: membership.space,
+            handle: membership.handle,
+            agent: membership.agent,
+            instance: membership.instance,
+            owed: match membership.owed {
+                space::Owed::Enroll => Owed::Enroll,
+                space::Owed::Confirm => Owed::Confirm,
+            },
+        }
+    }
+}
+
+impl From<Membership> for space::Membership {
+    fn from(membership: Membership) -> Self {
+        Self {
+            space: membership.space,
+            handle: membership.handle,
+            agent: membership.agent,
+            instance: membership.instance,
+            owed: match membership.owed {
+                Owed::Enroll => space::Owed::Enroll,
+                Owed::Confirm => space::Owed::Confirm,
+            },
+        }
+    }
+}
+
+/// The device's personal space, as the facility serves it.
+pub struct Space(space::Personal<Reach>);
+
+/// The prompts a flow is lent.
+pub type Lent<'a> = &'a dyn Prompts;
+
+impl Space {
+    /// The personal space under `directory` (the facility's), its light
+    /// node opened from `artifacts`, its homes' routes told to the
+    /// facility's client. One this build does not read is refused as in
+    /// need of repair, and left as it is.
+    pub fn open(
+        directory: &Path,
+        artifacts: &Artifacts,
+        facility: Facility,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, Refused> {
+        space::Personal::open(directory, artifacts, Reach { facility, runtime })
+            .map(Space)
+            .map_err(Refused::from)
+    }
+
+    pub fn grouped(&self) -> bool {
+        self.0.grouped()
+    }
+
+    /// The personal space's state as the device holds it, the facility's
+    /// parts (Tor, the notices standing) left for the node to fill.
+    pub fn status(&self) -> Result<PersonalStatus, Refused> {
+        let status = self.0.status()?;
+        let (phase, matures) = match status.phase {
+            space::Phase::None => (Phase::None, 0),
+            space::Phase::Claiming => (Phase::Claiming, 0),
+            space::Phase::Joining => (Phase::Joining, 0),
+            space::Phase::Held => (Phase::Held, 0),
+            space::Phase::Restoring { matures } => (Phase::Restoring, matures),
+            space::Phase::Removed => (Phase::Removed, 0),
+            space::Phase::Stuck => (Phase::Stuck, 0),
+        };
+        let home = status.home.map_or_else(Home::default, Home::from);
         Ok(PersonalStatus {
             phase,
             matures,
@@ -615,7 +636,7 @@ impl Space {
     }
 
     pub fn scope_key(&self, name: &[u8]) -> Result<[u8; 32], Refused> {
-        self.0.scope_key(name).map_err(refusal)
+        Ok(self.0.scope_key(name)?)
     }
 
     #[doc(hidden)]
@@ -629,14 +650,11 @@ impl Space {
 
     pub fn claim(&self, prompts: Lent<'_>, request: Claim) -> Result<Claimed, Refused> {
         let request = claim(request)?;
-        self.0
-            .claim(&Asked(prompts), request)
-            .map(claimed)
-            .map_err(refusal)
+        Ok(self.0.claim(&Asked(prompts), request)?.into())
     }
 
     pub fn pair_offer(&self, _prompts: Lent<'_>) -> Result<PairCode, Refused> {
-        let code = self.0.pair_offer().map_err(refusal)?;
+        let code = self.0.pair_offer()?;
         Ok(PairCode {
             code: code.code,
             expires_ms: code.expires_ms,
@@ -644,10 +662,7 @@ impl Space {
     }
 
     pub fn pair_await(&self, prompts: Lent<'_>) -> Result<Paired, Refused> {
-        self.0
-            .pair_await(&Asked(prompts))
-            .map(paired)
-            .map_err(refusal)
+        Ok(self.0.pair_await(&Asked(prompts))?.into())
     }
 
     pub fn pair_cancel(&self) {
@@ -661,40 +676,34 @@ impl Space {
         label: &str,
     ) -> Result<Paired, Refused> {
         contract::label(label)?;
-        self.0
-            .pair_join(&Asked(prompts), code, label)
-            .map(paired)
-            .map_err(refusal)
+        Ok(self.0.pair_join(&Asked(prompts), code, label)?.into())
     }
 
     pub fn memberships(&self) -> Result<Vec<Membership>, Refused> {
-        let all = self.0.memberships().map_err(refusal)?;
-        Ok(all.into_iter().map(membership).collect())
+        let all = self.0.memberships()?;
+        Ok(all.into_iter().map(Into::into).collect())
     }
 
     pub fn enroll_device(&self, prompts: Lent<'_>, owed: Membership) -> Result<(), Refused> {
-        self.0
-            .enroll_device(&Asked(prompts), of_membership(owed))
-            .map_err(refusal)
+        Ok(self.0.enroll_device(&Asked(prompts), owed.into())?)
     }
 
     pub fn confirm_device(&self, prompts: Lent<'_>, owed: Membership) -> Result<(), Refused> {
-        self.0
-            .confirm_device(&Asked(prompts), of_membership(owed))
-            .map_err(refusal)
+        Ok(self.0.confirm_device(&Asked(prompts), owed.into())?)
     }
 
     pub fn drop_enrollment(&self, owed: Membership) -> Result<(), Refused> {
-        self.0.drop_enrollment(of_membership(owed)).map_err(refusal)
+        Ok(self.0.drop_enrollment(owed.into())?)
     }
 
-    pub fn revoke(&self, prompts: Lent<'_>, device: Removal) -> Result<u32, Refused> {
-        self.0.revoke(&Asked(prompts), device).map_err(refusal)
+    /// Each space's leaf of the removed `device` revoked.
+    pub fn revoke(&self, prompts: Lent<'_>, device: u32) -> Result<u32, Refused> {
+        Ok(self.0.revoke(&Asked(prompts), device)?)
     }
 
     pub fn devices(&self) -> Result<Vec<Device>, Refused> {
-        let all = self.0.devices().map_err(refusal)?;
-        Ok(all.into_iter().map(device).collect())
+        let all = self.0.devices()?;
+        Ok(all.into_iter().map(Into::into).collect())
     }
 
     pub fn kit_view(
@@ -705,10 +714,9 @@ impl Space {
     ) -> Result<KitView, Refused> {
         let view = self
             .0
-            .kit_view(&Asked(prompts), kept(home.check()?), kit(kind))
-            .map_err(refusal)?;
+            .kit_view(&Asked(prompts), home.check()?.into(), kind.into())?;
         Ok(KitView {
-            devices: view.devices.into_iter().map(device).collect(),
+            devices: view.devices.into_iter().map(Into::into).collect(),
             operations: view
                 .operations
                 .into_iter()
@@ -724,10 +732,10 @@ impl Space {
         kind: KitKind,
         device: u32,
     ) -> Result<Posted, Refused> {
-        self.0
-            .remove_by_kit(&Asked(prompts), kept(home.check()?), kit(kind), device)
-            .map(posted)
-            .map_err(refusal)
+        Ok(self
+            .0
+            .remove_by_kit(&Asked(prompts), home.check()?.into(), kind.into(), device)?
+            .into())
     }
 
     pub fn resolve_by_kit(
@@ -738,82 +746,61 @@ impl Space {
         index: u64,
         upheld: bool,
     ) -> Result<Posted, Refused> {
-        self.0
+        Ok(self
+            .0
             .resolve_by_kit(
                 &Asked(prompts),
-                kept(home.check()?),
-                kit(kind),
+                home.check()?.into(),
+                kind.into(),
                 index,
                 upheld,
-            )
-            .map(posted)
-            .map_err(refusal)
+            )?
+            .into())
     }
 
     pub fn operations(&self) -> Result<Vec<Notice>, Refused> {
-        let open = self.0.operations().map_err(refusal)?;
+        let open = self.0.operations()?;
         Ok(open.into_iter().map(crate::job::notice).collect())
     }
 
     pub fn remove(&self, prompts: Lent<'_>, device: u32) -> Result<Posted, Refused> {
-        self.0
-            .remove(&Asked(prompts), device)
-            .map(posted)
-            .map_err(refusal)
+        Ok(self.0.remove(&Asked(prompts), device)?.into())
     }
 
     pub fn veto(&self, prompts: Lent<'_>, index: u64) -> Result<Posted, Refused> {
-        self.0
-            .veto(&Asked(prompts), index)
-            .map(posted)
-            .map_err(refusal)
+        Ok(self.0.veto(&Asked(prompts), index)?.into())
     }
 
     pub fn cosign(&self, prompts: Lent<'_>, index: u64) -> Result<Posted, Refused> {
-        self.0
-            .cosign(&Asked(prompts), index)
-            .map(posted)
-            .map_err(refusal)
+        Ok(self.0.cosign(&Asked(prompts), index)?.into())
     }
 
     pub fn resolve(&self, prompts: Lent<'_>, index: u64, upheld: bool) -> Result<Posted, Refused> {
-        self.0
-            .resolve(&Asked(prompts), index, upheld)
-            .map(posted)
-            .map_err(refusal)
+        Ok(self.0.resolve(&Asked(prompts), index, upheld)?.into())
     }
 
     pub fn rotate_kit(&self, prompts: Lent<'_>, kind: KitKind) -> Result<Posted, Refused> {
-        self.0
-            .rotate_kit(&Asked(prompts), kit(kind))
-            .map(posted)
-            .map_err(refusal)
+        Ok(self.0.rotate_kit(&Asked(prompts), kind.into())?.into())
     }
 
     pub fn replace_admin(&self, prompts: Lent<'_>, kind: KitKind) -> Result<Posted, Refused> {
-        self.0
-            .replace_admin(&Asked(prompts), kit(kind))
-            .map(posted)
-            .map_err(refusal)
+        Ok(self.0.replace_admin(&Asked(prompts), kind.into())?.into())
     }
 
     pub fn admin_offer(&self, prompts: Lent<'_>) -> Result<Vec<u8>, Refused> {
-        self.0.admin_offer(&Asked(prompts)).map_err(refusal)
+        Ok(self.0.admin_offer(&Asked(prompts))?)
     }
 
     pub fn replace_admin_of(&self, prompts: Lent<'_>, code: &[u8]) -> Result<Posted, Refused> {
-        self.0
-            .replace_admin_of(&Asked(prompts), code)
-            .map(posted)
-            .map_err(refusal)
+        Ok(self.0.replace_admin_of(&Asked(prompts), code)?.into())
     }
 
     pub fn regroup(&self, prompts: Lent<'_>) -> Result<Posted, Refused> {
-        self.0.regroup(&Asked(prompts)).map(posted).map_err(refusal)
+        Ok(self.0.regroup(&Asked(prompts))?.into())
     }
 
     pub fn update(&self, prompts: Lent<'_>) -> Result<(), Refused> {
-        self.0.update(&Asked(prompts)).map_err(refusal)
+        Ok(self.0.update(&Asked(prompts))?)
     }
 
     pub fn restore(
@@ -823,30 +810,21 @@ impl Space {
         old: KitKind,
     ) -> Result<Posted, Refused> {
         let request = claim(request)?;
-        self.0
-            .restore(&Asked(prompts), request, kit(old))
-            .map(posted)
-            .map_err(refusal)
+        Ok(self.0.restore(&Asked(prompts), request, old.into())?.into())
     }
 
     pub fn restored(&self, prompts: Lent<'_>, kind: KitKind) -> Result<Claimed, Refused> {
-        self.0
-            .restored(&Asked(prompts), kit(kind))
-            .map(claimed)
-            .map_err(refusal)
+        Ok(self.0.restored(&Asked(prompts), kind.into())?.into())
     }
 
     pub fn move_home(&self, prompts: Lent<'_>, request: Claim) -> Result<Claimed, Refused> {
         let request = claim(request)?;
-        self.0
-            .move_home(&Asked(prompts), request)
-            .map(claimed)
-            .map_err(refusal)
+        Ok(self.0.move_home(&Asked(prompts), request)?.into())
     }
 }
 
 impl Personal for Space {
-    fn pass(&self, now: u64, _runtime: &tokio::runtime::Handle) -> Result<Passed, String> {
+    fn pass(&self, now: u64) -> Result<Passed, String> {
         let passed = self.0.pass(now).map_err(|error| error.to_string())?;
         Ok(Passed {
             notices: passed.notices.into_iter().map(crate::job::notice).collect(),
@@ -867,7 +845,7 @@ impl Personal for Space {
     }
 }
 
-impl crate::session::Paired for Space {
+impl crate::session::PersonalLink for Space {
     fn owed_source(&self, handle: &[u8; 32]) -> Result<Option<Reference>, String> {
         match self
             .0

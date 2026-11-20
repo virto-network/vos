@@ -219,11 +219,6 @@ impl Store {
             .join(format!("{}.tree", hex::encode(origin.digest())))
     }
 
-    /// The directory the facility keeps its state under.
-    pub fn directory(&self) -> &Path {
-        &self.directory
-    }
-
     /// The enrollment pinned for `origin`, if there is one.
     pub fn get(&self, origin: &Origin) -> Result<Option<Enrollment>, String> {
         self.kept()?.get(&Self::key(origin))
@@ -262,6 +257,7 @@ impl Store {
     }
 
     /// Forget `origin`'s enrollment: the source's key is left as it is.
+    #[cfg(test)]
     pub fn remove(&self, origin: &Origin) -> Result<(), String> {
         self.kept()?.remove(&Self::key(origin))
     }
@@ -291,7 +287,7 @@ fn partial(path: &Path) -> std::path::PathBuf {
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
     static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let _writing = crate::lock(&WRITING);
     let partial = partial(path);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -309,6 +305,39 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
             None => Ok(()),
         })
         .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// An enrollment of agent 7 pinning `methods`, for the tests.
+#[cfg(test)]
+pub(crate) fn fixture(methods: Vec<Method>) -> Enrollment {
+    Enrollment {
+        handle: [1; 32],
+        space: [2; 32],
+        agents: vec![Agent {
+            agent: 7,
+            identity: [3; 32],
+        }],
+        methods,
+        credentials: Location {
+            agent: 7,
+            instance: 9,
+        },
+        source: Reference::Keystore {
+            alias: "vos.device.1".into(),
+        },
+        member: [4; 32],
+        owner: [8; 32],
+        host: "gateway.example".into(),
+        port: 2222,
+        fingerprint: "SHA256:abc".into(),
+        application: "vos.gateway".into(),
+        host_key: None,
+        onions: vec![Onion {
+            key: [5; 32],
+            ssh_host_key: [6; 32],
+        }],
+        onion_only: false,
+    }
 }
 
 #[cfg(test)]
@@ -339,50 +368,23 @@ mod tests {
     use super::*;
 
     fn enrollment() -> Enrollment {
-        Enrollment {
-            handle: [1; 32],
-            space: [2; 32],
-            agents: vec![Agent {
+        fixture(vec![
+            Method {
                 agent: 7,
-                identity: [3; 32],
-            }],
-            methods: vec![
-                Method {
-                    agent: 7,
-                    instance: 3,
-                    name: "login".into(),
-                    guard: Guard::Auth {
-                        scope: "login".into(),
-                        once: false,
-                    },
+                instance: 3,
+                name: "login".into(),
+                guard: Guard::Auth {
+                    scope: "login".into(),
+                    once: false,
                 },
-                Method {
-                    agent: 7,
-                    instance: 2,
-                    name: "transfer".into(),
-                    guard: Guard::Owner,
-                },
-            ],
-            credentials: Location {
+            },
+            Method {
                 agent: 7,
-                instance: 9,
+                instance: 2,
+                name: "transfer".into(),
+                guard: Guard::Owner,
             },
-            source: Reference::Keystore {
-                alias: "vos.device.1".into(),
-            },
-            member: [4; 32],
-            owner: [8; 32],
-            host: "gateway.example".into(),
-            port: 2222,
-            fingerprint: "SHA256:abc".into(),
-            application: "vos.gateway".into(),
-            host_key: None,
-            onions: vec![Onion {
-                key: [5; 32],
-                ssh_host_key: [6; 32],
-            }],
-            onion_only: false,
-        }
+        ])
     }
 
     #[test]

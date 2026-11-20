@@ -18,9 +18,6 @@ use crate::{Code, Refusal};
 /// The interface's AIDL source root, beside this crate.
 pub const AIDL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/aar/src/main/aidl");
 
-/// The intent action `VosNodeService` serves the interface for.
-pub const ACTION: &str = "team.virto.vos.personal.IVosPersonal";
-
 /// A device's label, at most this many bytes (`vos_wire::books::LABEL_BYTES`).
 pub const MAX_LABEL: usize = 64;
 

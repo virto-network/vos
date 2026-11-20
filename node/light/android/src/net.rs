@@ -29,8 +29,8 @@
 //!   is written, so s4 never reaches it over the clearnet itself.
 //! - **The rendezvous an hour** ([`RENDEZVOUS`]): the client's tally of
 //!   the onion connections it opened, in the foreground and in the
-//!   background, written beside the enrollments for PG5's bound and
-//!   counted in again when the process starts anew.
+//!   background, written beside the enrollments for the bound on
+//!   rendezvous an hour and counted in again when the process starts anew.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -256,7 +256,7 @@ impl Arti {
     /// A bootstrap's outcome kept as Tor's state.
     fn found(&self, bootstrapped: Result<(), BootstrapError>) -> Result<(), BootstrapError> {
         use crate::personal::Tor as State;
-        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = match &bootstrapped {
+        *crate::lock(&self.state) = match &bootstrapped {
             Ok(()) => (State::Connected, String::new()),
             Err(error) => (State::Blocked, error.to_string()),
         };
@@ -265,13 +265,12 @@ impl Arti {
 
     /// Tor held back for `why`: no bootstrap is tried until the user asks.
     pub fn hold(&self, why: String) {
-        *self.state.lock().unwrap_or_else(|e| e.into_inner()) =
-            (crate::personal::Tor::Blocked, why);
+        *crate::lock(&self.state) = (crate::personal::Tor::Blocked, why);
     }
 
     /// Tor's state as its last bootstrap found it, and why it is blocked.
     pub fn state(&self) -> (crate::personal::Tor, String) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        crate::lock(&self.state).clone()
     }
 }
 
@@ -362,7 +361,7 @@ impl Net {
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lock(&self.state)
     }
 
     /// `space`'s routes as `state` holds them, kept.
@@ -416,10 +415,7 @@ impl Net {
             }
         }
         self.client.set_space(space, routes);
-        self.pinned
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(space);
+        crate::lock(&self.pinned).insert(space);
     }
 
     /// A space whose routes take its onion and which pinned `host_key` for
@@ -428,11 +424,7 @@ impl Net {
     /// key, however its name or port is spelled, would carry over the
     /// clearnet what the space's routes keep on Tor.
     pub fn onion_pinned(&self, host_key: &[u8; 32]) -> Option<SpaceId> {
-        let pinned = self
-            .pinned
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let pinned = crate::lock(&self.pinned).clone();
         pinned.into_iter().find(|space| {
             self.client.routes(space).is_some_and(|routes| {
                 !routes.opted_out()
@@ -488,9 +480,7 @@ impl Net {
         // The client takes a spare only under the keeping named, so a
         // session kept spares since takes this one's none.
         let spare = session.and_then(|session| {
-            self.spare
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            crate::lock(&self.spare)
                 .filter(|(kept, by, _)| (*kept, *by) == (space, session))
                 .map(|(_, _, epoch)| epoch)
         });
@@ -573,7 +563,7 @@ impl Net {
     /// was kept are closed, so no connection opened in one session's time
     /// carries another's request (`light-node.md` §6.2).
     pub fn keep_spare(&self, space: SpaceId, session: u64) {
-        let mut spare = self.spare.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spare = crate::lock(&self.spare);
         if spare.is_some_and(|(kept, by, _)| (kept, by) == (space, session)) {
             return;
         }
@@ -586,7 +576,7 @@ impl Net {
     /// No spares for `session` any more: it closed. Spares kept for
     /// another session stay.
     pub fn drop_spare(&self, space: SpaceId, session: u64) {
-        let mut spare = self.spare.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spare = crate::lock(&self.spare);
         if spare.is_some_and(|(kept, by, _)| (kept, by) == (space, session)) {
             *spare = None;
             self.client.keep_spares(None, &[]);
