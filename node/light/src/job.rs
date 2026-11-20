@@ -615,7 +615,7 @@ pub(crate) fn log<L: Control>(
 }
 
 /// `post`, the agent woken and the post made again while it answers
-/// `Settling`, at most [`WAKES`] times: the batch time it was taken at, or
+/// `Settling`, at most `WAKES` times: the batch time it was taken at, or
 /// `None` when the agent holds it already or decided its candidate
 /// meanwhile.
 pub(crate) fn post_settled<L: Control>(

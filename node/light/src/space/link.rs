@@ -218,7 +218,7 @@ impl<'a, H: Host> AgentLink<'a, H> {
 
     /// `method` signed by `key` in its session, sent again after a `wake`
     /// (the sync key's) while the agent answers `Settling`, at most
-    /// [`WAKES`] times, each call's message held before it is sent (as
+    /// `WAKES` times, each call's message held before it is sent (as
     /// `AgentLink::signed` holds): a call signed again after `Settling` is
     /// held again.
     pub fn settled(
