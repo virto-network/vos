@@ -47,12 +47,13 @@ impl<T: Encode> Measured for Vec<Result<T, PersonalError>> {
     }
 }
 
-/// The link to the home's agent as a phone's sync key, counting its
-/// requests and the bytes of the answers it reads; it dies as `death`
-/// says, and answers nothing after.
+/// The link to the home's agent as a phone's sync key over `route`,
+/// counting its requests and the bytes of the answers it reads; it dies as
+/// `death` says, and answers nothing after.
 struct JobLink<'a> {
     home: &'a mut Home,
     sync: SigningKey,
+    route: Route,
     requests: usize,
     down: usize,
     death: Option<Death>,
@@ -67,6 +68,7 @@ impl<'a> JobLink<'a> {
         Self {
             home,
             sync: phone.sync.clone(),
+            route: Route::Onion,
             requests: 0,
             down: 0,
             death: None,
@@ -108,7 +110,7 @@ impl Link for JobLink<'_> {
     type Error = Killed;
 
     fn route(&self) -> Route {
-        Route::Onion
+        self.route
     }
 
     fn push(
@@ -516,52 +518,17 @@ fn a_pass_killed_around_its_vote_votes_once() {
 /// A link that is not the onion's: the pass sends nothing.
 #[test]
 fn a_pass_over_the_clearnet_sends_nothing() {
-    struct Clear<'a>(JobLink<'a>);
-    impl Link for Clear<'_> {
-        type Error = Killed;
-        fn route(&self) -> Route {
-            Route::Clearnet
-        }
-        fn push(
-            &mut self,
-            envelopes: &[Vec<u8>],
-        ) -> Result<Vec<Result<Pushed, PersonalError>>, Killed> {
-            self.0.push(envelopes)
-        }
-        fn since(&mut self, scope: Scope, position: u64) -> Answer<Vec<Envelope>, Killed> {
-            self.0.since(scope, position)
-        }
-        fn wake(&mut self) -> Answer<Woken, Killed> {
-            self.0.wake()
-        }
-        fn frontier(&mut self, device: u32) -> Answer<Frontier, Killed> {
-            self.0.frontier(device)
-        }
-    }
-    impl Control for Clear<'_> {
-        fn log(&mut self, from: u64) -> Answer<Vec<(u64, Entry)>, Killed> {
-            self.0.log(from)
-        }
-        fn overview(&mut self) -> Answer<Overview, Killed> {
-            self.0.overview()
-        }
-        fn devices(&mut self) -> Answer<Vec<DeviceView>, Killed> {
-            self.0.devices()
-        }
-        fn post(&mut self, post: &Post) -> Answer<u64, Killed> {
-            self.0.post(post)
-        }
-    }
     let (mut home, mut phones) = household(2);
     let now = home.now();
-    let mut link = Clear(JobLink::new(&mut home, &phones[0]));
+    let mut link = JobLink::new(&mut home, &phones[0]);
+    link.route = Route::Clearnet;
     let Phone { light, group, .. } = &mut phones[0];
     let stopped = job::run(light, group.as_mut().unwrap(), &mut link, &[NOTES], now).unwrap_err();
     assert!(matches!(
         stopped.error,
         vos_light::personal::SyncError::Clearnet
     ));
-    assert_eq!(link.0.requests, 0);
+    assert_eq!(link.requests, 0);
 }
 
 /// The kit's removal of phone 1, open, which phone 0 has yet to read: the
