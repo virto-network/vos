@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use vos_api::Kind;
 use vos_api::client::Answer;
-use vos_wire::credentials::{MAX_ONIONS, Onion};
+use vos_wire::credentials::Onion;
 
 use super::connection::{Connection, OpenError};
 use super::dial::{Circuit, Dial, Target, Unpublished};
@@ -64,8 +64,9 @@ pub enum Error {
     Local(String),
     /// The registrar's answer to the onion set's refresh.
     Answer(DeviceError),
-    /// The registrar served an empty set, or one past [`MAX_ONIONS`] or
-    /// naming an onion twice: the pinned set is kept.
+    /// The registrar served an empty set, or one past
+    /// [`MAX_ONIONS`](vos_wire::credentials::MAX_ONIONS) or naming an onion
+    /// twice: the pinned set is kept.
     Onions,
 }
 
@@ -611,11 +612,7 @@ impl Client {
             .request_with(space, Purpose::Fetch, &query, None)
             .await?;
         let onions: Vec<Onion> = wire::query_answer(&answer).map_err(Error::Answer)?;
-        let repeated = onions
-            .iter()
-            .enumerate()
-            .any(|(at, onion)| onions[..at].iter().any(|seen| seen.key == onion.key));
-        if onions.is_empty() || onions.len() > MAX_ONIONS || repeated {
+        if !crate::route::usable_onions(&onions) {
             return Err(Error::Onions);
         }
         if !self.state().spaces.contains_key(&space) {

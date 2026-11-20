@@ -662,11 +662,7 @@ impl<H: Host> Personal<H> {
             vos_wire::credentials::method::ONIONS,
             Vec::new(),
         )?;
-        let repeated = onions
-            .iter()
-            .enumerate()
-            .any(|(at, onion)| onions[..at].iter().any(|seen| seen.key == onion.key));
-        if onions.is_empty() || onions.len() > vos_wire::credentials::MAX_ONIONS || repeated {
+        if !crate::route::usable_onions(&onions) {
             return Err(failed("the home's registrar served an unusable onion set"));
         }
         let mut previous: Vec<Onion> = Vec::new();

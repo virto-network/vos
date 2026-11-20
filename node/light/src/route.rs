@@ -157,6 +157,16 @@ pub const OPT_OUT_WARNING: &str = "Without Tor, this space's operators see this 
      sign-ins and payments asked there came from this device. Proofs still travel over Tor, \
      and your personal space stays on Tor.";
 
+/// A registrar's onion set is usable: 1 to
+/// [`MAX_ONIONS`](vos_wire::credentials::MAX_ONIONS) onions, no key twice.
+pub(crate) fn usable_onions(onions: &[Onion]) -> bool {
+    let repeated = onions
+        .iter()
+        .enumerate()
+        .any(|(at, onion)| onions[..at].iter().any(|seen| seen.key == onion.key));
+    !onions.is_empty() && onions.len() <= vos_wire::credentials::MAX_ONIONS && !repeated
+}
+
 /// A space's routes: the onions it pins, the clearnet port it may offer,
 /// and the choices the space and the user made.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
