@@ -900,7 +900,7 @@ async fn the_tree_is_read_on_one_feed_connection() {
     assert_eq!(gateway.seen().len(), 1);
 }
 
-/// PG5's foreground schedule, on a clock a thousand times faster (a
+/// A foreground hour's schedule, on a clock a thousand times faster (a
 /// second a millisecond: the hour 3.6 s, the feed's timer 30 ms, drawn
 /// between 15 and 45; the kept-open connections' idle limit a second, past
 /// any stall of a loaded host): the feed read on its timer, the member's
@@ -912,8 +912,8 @@ async fn the_tree_is_read_on_one_feed_connection() {
 /// rendezvous are one a kept-open group (its connection outlives the gaps
 /// between its requests), one a sign-in and one a clock reading (each takes
 /// its purpose's spare, built anew after it), and the two spares left
-/// built: 3 + 12 + 8 + 2 = 25, within PG5's 30. Counted as the
-/// foreground's; a background run after it as the background's.
+/// built: 3 + 12 + 8 + 2 = 25, within the bound of 30 an hour. Counted as
+/// the foreground's; a background run after it as the background's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_foreground_hour_opens_a_rendezvous_a_kept_group_a_sign_in_and_a_clock_reading() {
     const SIGN_INS: u32 = 12;
@@ -983,7 +983,7 @@ async fn a_foreground_hour_opens_a_rendezvous_a_kept_group_a_sign_in_and_a_clock
         assert_eq!(of(purpose), 1, "{purpose:?} kept open across the hour");
     }
     assert_eq!(foreground, 3 + SIGN_INS + READINGS + 2);
-    assert!(foreground <= 30, "PG5: {foreground} rendezvous in the hour");
+    assert!(foreground <= 30, "{foreground} rendezvous in the hour");
     assert_eq!(foreground as usize, gateway.dials());
     assert!(hours.iter().all(|hour| hour.foreground.failed == 0));
 

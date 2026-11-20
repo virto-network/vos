@@ -215,8 +215,8 @@ fn pass(home: &mut Home, phone: &mut Phone) -> Run {
 
 /// A pass with nothing new, each phone having passed once: no post, no
 /// push, no envelope; the log's head, the overview, the scope's empty
-/// pages and the device set. Its requests and bytes are what PG6's job
-/// reads on a quiet day, before the transport's framing.
+/// pages and the device set. Its requests and bytes are what the background
+/// job reads on a quiet day, before the transport's framing.
 #[test]
 fn a_pass_with_nothing_new_reads_little() {
     let (mut home, mut phones) = household(2);
