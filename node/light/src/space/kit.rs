@@ -19,7 +19,7 @@ use vos_wire::personal::{
 use super::link::{AgentLink, Key, Signer, answer};
 use super::set::{Device, evidence};
 use super::{
-    Error, Host, Kept, KitCall, Personal, Posted, Prompts, answered, entered_kit, link, logged,
+    Error, Host, Kept, KitCall, Personal, Posted, Prompts, answered, entered_kit, logged,
     unreached,
 };
 use crate::job::{Kind, Notice};
@@ -319,9 +319,7 @@ impl<H: Host> Personal<H> {
         };
         let signing = kit.signing();
         let mut session = Signer::new(signing.verifying_key().to_bytes());
-        let mut link = link(
-            &self.host,
-            home,
+        let mut link = self.link(home,
             Purpose::Personal,
             (agent, identity),
             &signing,

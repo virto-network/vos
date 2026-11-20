@@ -81,6 +81,26 @@ impl Host for Reach {
             .block_on(self.facility.net().requests(*space, purpose, requests))
     }
 
+    fn fetch_timed(
+        &self,
+        space: &[u8; 32],
+        query: &mut dyn FnMut(u64) -> Result<Vec<u8>, String>,
+    ) -> Result<Vec<u8>, String> {
+        self.runtime
+            .block_on(self.facility.net().client().fetch_timed(*space, |now| {
+                query(now).map_err(vos_light::tor::Error::Query)
+            }))
+            .map(|(_, body)| body)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prepare(&self, space: &[u8; 32], purpose: Purpose) {
+        let (client, space) = (self.facility.net().client().clone(), *space);
+        self.runtime.spawn(async move {
+            let _ = client.prepare(space, purpose).await;
+        });
+    }
+
     fn pin(&self, home: &[u8; 32], onions: &[Onion]) {
         self.facility.net().pin(
             *home,
@@ -212,7 +232,7 @@ impl Asked<'_> {
 }
 
 impl space::Prompts for Asked<'_> {
-    fn show_phrase(&self, words: &str, card: &Card) -> bool {
+    fn show_phrase(&self, words: &str, card: &Card, void: Option<&str>) -> bool {
         let rows = words
             .split(' ')
             .enumerate()
@@ -227,12 +247,12 @@ impl space::Prompts for Asked<'_> {
                 .into(),
             rows,
             fields: Vec::new(),
-            notice: None,
+            notice: void.map(str::to_owned),
             choices: vec!["I wrote them down".into()],
         })
     }
 
-    fn show_card(&self, card: &Card) -> bool {
+    fn show_card(&self, card: &Card, void: Option<&str>) -> bool {
         self.shown(Form {
             title: "Your recovery key's card".into(),
             detail: "Write this card down and keep it with the security key: it names the home \
@@ -240,7 +260,7 @@ impl space::Prompts for Asked<'_> {
                 .into(),
             rows: card_rows(card),
             fields: Vec::new(),
-            notice: None,
+            notice: void.map(str::to_owned),
             choices: vec!["I wrote it down".into()],
         })
     }
@@ -596,6 +616,16 @@ impl Space {
 
     pub fn grouped(&self) -> bool {
         self.0.grouped()
+    }
+
+    /// Whether a flow returned with follows left for after it.
+    pub fn behind(&self) -> bool {
+        self.0.behind()
+    }
+
+    /// The follows a flow left for after it returned.
+    pub fn follow_behind(&self) -> Result<(), Refused> {
+        Ok(self.0.follow_behind()?)
     }
 
     /// The personal space's state as the device holds it, the facility's

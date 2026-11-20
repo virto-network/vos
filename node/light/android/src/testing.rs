@@ -77,11 +77,11 @@ impl Prompts for Phone {
                     .filter(|(label, _)| label.parse::<u8>().is_ok())
                     .map(|(_, word)| word.as_str())
                     .collect();
-                let shown = self.show_phrase(&words.join(" "), &card(&form));
+                let shown = self.show_phrase(&words.join(" "), &card(&form), form.notice.as_deref());
                 answered(shown, &form)
             }
             "Your recovery key's card" => {
-                let shown = self.show_card(&card(&form));
+                let shown = self.show_card(&card(&form), form.notice.as_deref());
                 answered(shown, &form)
             }
             "Enter your recovery phrase" => match self.enter_phrase() {

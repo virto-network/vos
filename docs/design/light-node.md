@@ -1740,6 +1740,17 @@ the one taken]:
   same queries, under the same key, on the same connection: only their
   order in flight changes. A quiet pass is four round trips after the
   node's time instead of nine.
+- **A flow is done at its first complete follow** [built, the owner's
+  choice D3, `job::complete`]: a pairing (the joiner's), a commit now and
+  a restore's finish return once a follow leaves this device in the set
+  and following, no candidate pending (its vote posted, the epoch
+  decided), the archive and the recovery envelopes kept with nothing
+  stale and no scope's reading waiting; the follows the flow made after
+  that before (two for a joiner, up to three after a commit) run after it
+  returns, on the facility's thread, each holding the space alone, the
+  status read meanwhile answered as the flow left it. One that fails
+  stands as a notice (`Pending::Unfinished`) until a pass of the
+  personal space runs to its end.
 - **Not built here:** re-reading an envelope passed
   over once a later archive brings a key that opens it, and garbage
   collection of covered envelopes and of earlier epochs' archives
@@ -2126,12 +2137,27 @@ nodes through their sockets with the onion's mark in
 `node/host/tests/served/personal.rs`, at a test home of seconds and an open
 claim's difficulty of 4; where the text above leaves a choice, this is the
 one taken]:
-- **The claim at a home-only space** (`home::Claim`): the device's open
-  claim first (`home::open_claim`, `claim_open(member, nonce)` in a session
-  of its own, its key drawn for that call alone), then the claim of the
-  agent `Homes` answers `pooled` for, sealed to that agent's identity
-  (§3.3, "The device names the agent"), with a phrase's or a security
-  key's kit or both. The claim (the device, the kit with `R2`, `R`, the
+- **The claim at a home-only space** (`home::Claim`): the open claim's
+  terms (`opening`) and the agent `Homes` answers `pooled` for asked
+  first, the two a home can refuse before anything is shown; then the
+  kit shown, and while the user writes it down the device's open claim
+  (its work, then `claim_open(member, nonce)` in a session of its own,
+  its key drawn for that call alone), the home's tree read from its
+  feed, the node's time read on a fetch of its own and the proof's
+  connection opened ahead, one at a time, each after a pause drawn below
+  4 s, as a session's spares are built; then the claim of that agent,
+  sealed to its identity (§3.3, "The device names the agent"), with a
+  phrase's or a security key's kit or both. The proof's expiry is the
+  fetch's reading moved on by the monotonic clock (five minutes at
+  most, read again past it or past a step of the device's clock), never
+  a time taken before the kit; the tree's root read meanwhile is proved
+  on while half its grace (`ROOT_GRACE_MS`) has not passed since, else
+  the feed is read on, each page's expiry from the feed's own reading (one
+  round trip). A home that refuses the open claim or the claim once the
+  kit was shown voids that kit: the claim is abandoned and new words are
+  shown with the reason ("the words shown before are void"), at most
+  three kits; one unreached keeps the claim and its kit, as a retry
+  sends it. The claim (the device, the kit with `R2`, `R`, the
   agent) is held in the store from before its call until the device's
   group starts from the agent's log (`Claim::claimed`, the `R` the kit's
   from the `Assigned` entry), so a retry after a lost answer sends the
@@ -2949,9 +2975,18 @@ nodes may ask the onion's mark of its proven calls, or of every request
   account's owner proof) and a sign-in: either is refused on a session
   that holds the other, so a server cannot join the two (built
   2026-11-18).
-  The onion set's refresh (`refresh_onions`) is a `Time` and an `onions`
-  query, each a fetch; a set of one to sixteen distinct onions replaces
-  the pinned one, closing the space's connections.
+  The onion set's refresh (`refresh_onions`, and the home's at the
+  personal space's pass) is a **timed fetch** (`Client::fetch_timed`): a
+  `Time` and then the one `onions` query whose expiry it sets, on one
+  connection of the fetch's isolation opened for the two alone, no spare,
+  closed after; any other request is refused before it leaves. A set of
+  one to sixteen distinct onions replaces the pinned one, closing the
+  space's connections. What the gateway sees of it: one fresh connection
+  a day carrying a time read and, half a round trip later, an anonymous
+  query for the set every member asks, under a key drawn for it; before,
+  the same two on two connections a few seconds apart, which it could
+  join by their timing all the same. Every other fetch still carries one
+  request.
 - **What the gateway learns from connections opened ahead** [built,
   `Client::keep_spares`, the facility's `Session`]: a facility session
   keeps one spare for its proven calls and one for its fetches, reads the
@@ -3003,7 +3038,13 @@ nodes may ask the onion's mark of its proven calls, or of every request
     is proved), so it goes on the feed's connection and is kept for the
     space.
   - **What is left:** a small gateway can join one session's
-    connections by their timing, as before; the drawn delays spread the
+    connections by their timing, as before; and a sign-in made seconds
+    after the first root holding a new leaf points at that newest member:
+    a sign-in with no path waits for the space to list the device,
+    reading the feed now and every 5 s for up to a minute (built
+    2026-11-20, the owner's choice D7: no drawn delay), so a device's
+    first sign-in after its invitation follows the leaf's root by a few
+    seconds; a member tapping again shows the same, less tightly; the drawn delays spread the
     open times of several devices' spares into each other, and against a
     single device online nothing does. A session's clock reading is
     renewed every 4 to 12 minutes while the app is in the foreground,
@@ -3525,7 +3566,10 @@ against a no-flood baseline:
   minutes idle). Read on a jittered timer (30 s, between 15 s and 45 s),
   never because a proof is about to be made, since that connection is one
   circuit of the device's and a read before each proof would join the
-  proofs through it; a page that says more is due at once; `RootUnknown`
+  proofs through it (two exceptions, each once a device's life at a
+  space: a sign-in waiting for its leaf, which reads the feed every 5 s
+  until it is listed, and the claim of a personal agent, which reads its
+  home's tree while the kit is written down); a page that says more is due at once; `RootUnknown`
   or `RootStale` makes the feed due at once and halves the period.
 - **The root in the log:** the claim keeps the root, which the apply
   checks; its place in the ring is the feed's (each change's root and

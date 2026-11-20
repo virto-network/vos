@@ -124,6 +124,36 @@ fn status_after(node: &Node, flow: &str) {
     );
 }
 
+/// The follows a flow left for after it, waited for: when they ended
+/// after the flow returned, and the device's state the same before and
+/// after them.
+fn behind_done(node: &Node, flow: &str) {
+    let before = node.status().unwrap();
+    let start = Instant::now();
+    while node.space().unwrap().behind() {
+        assert!(start.elapsed() < Duration::from_secs(120), "{flow}: follows left running");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let after = node.status().unwrap();
+    println!(
+        "flow: {flow}: the follows left for after it ended {} ms after it returned",
+        start.elapsed().as_millis()
+    );
+    assert_eq!(
+        (before.phase, before.device, before.agent, before.owed),
+        (after.phase, after.device, after.agent, after.owed),
+        "{flow}"
+    );
+    assert!(
+        after
+            .standing
+            .iter()
+            .all(|notice| notice.pending != vos_facility::Pending::Unfinished),
+        "{flow}: {:?}",
+        after.standing
+    );
+}
+
 /// One flow's measurement from its start: the world's log and the prompts
 /// from here.
 struct Meter {
@@ -391,6 +421,7 @@ fn pair_sync_retire_and_the_removed_phone() {
     });
     meter.print(&world, "pair: from the scan to both done");
     status_after(&joiner.node, "pair: the joiner");
+    behind_done(&joiner.node, "pair: the joiner");
     assert_eq!(opened.device, joined.device);
 
     for (phone, stamped, name) in [
@@ -439,6 +470,7 @@ fn pair_sync_retire_and_the_removed_phone() {
     opener.node.personal().unwrap().update(&*opening).unwrap();
     meter.print(&world, "retire: commit now");
     status_after(&opener.node, "retire: commit now");
+    behind_done(&opener.node, "retire: commit now");
 
     let meter = Meter::start(&world, &[&joining]);
     let synced = joiner.node.sync_personal();
@@ -527,6 +559,7 @@ fn restore_from_the_kit_and_move() {
         .unwrap();
     meter.print(&world, "restore: finished after the kit's delay");
     status_after(&fresh.node, "restore: finished");
+    behind_done(&fresh.node, "restore: finished");
 
     let meter = Meter::start(&world, &[&stamped]);
     fresh

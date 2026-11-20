@@ -271,7 +271,7 @@ impl<H: Host> Personal<H> {
     ) -> Result<Posted, Error> {
         let mut held = self.held();
         let kept = held.state.home.clone().ok_or(Error::NoSpace)?;
-        let kit = new_kit(prompts, kind, &kept)?;
+        let kit = new_kit(prompts, kind, &kept, None)?;
         let group = held.group.as_mut().ok_or(Error::NoSpace)?;
         let split = group.rotate(&[kit.key()]).map_err(failed)?;
         self.operate(
@@ -466,9 +466,10 @@ impl<H: Host> Personal<H> {
                 }
             }
         }
-        for _ in 0..3 {
-            self.follow(&mut held)?;
-        }
+        // Done once a follow leaves the device complete (its vote on the
+        // commit posted, the epoch decided, the archive and recovery
+        // kept); the rest of the three after the flow returns.
+        self.follow_until_complete(&mut held, 3)?;
         Ok(())
     }
 

@@ -165,6 +165,31 @@ fn a_space_is_claimed_and_paired_through_the_light_node() {
     first.space.pair_cancel();
 }
 
+/// The open claim runs while the phrase is written down: refused after
+/// the phrase was shown, the claim says those words are void and shows
+/// new ones, and goes on to the end with them.
+#[test]
+fn an_open_claim_refused_behind_the_phrase_shows_new_words() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let first = device(&world, 0x13);
+    world.refuse(
+        0x13,
+        Step::call(vos_wire::credentials::method::CLAIM_OPEN),
+        PersonalError::NotAdmitted,
+        1,
+    );
+    let words = first.claim_phrase(&world, home);
+    let phrases = first.phone.phrases.lock().unwrap().clone();
+    assert_eq!(phrases.len(), 2, "new words after the refusal");
+    assert_eq!(phrases[1], words);
+    assert_ne!(phrases[0], phrases[1]);
+    let voids = first.phone.voids.lock().unwrap().clone();
+    assert_eq!(voids.len(), 1, "{voids:?}");
+    assert!(voids[0].contains("refused the backup") && voids[0].contains("void"));
+    assert_eq!(first.space.status().unwrap().phase, Phase::Held);
+}
+
 /// A phone whose removal is pending its delay is in the set still: its
 /// own space's code scanned is refused, as for any live device.
 #[test]

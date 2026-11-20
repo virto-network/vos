@@ -281,6 +281,9 @@ pub struct Pass {
     pub course: group::Course,
     /// The commit owed after the pass, if one is.
     pub commit: Option<Commit>,
+    /// Whether the archive and the recovery envelopes were kept with
+    /// nothing stale.
+    pub kept: bool,
 }
 
 impl Pass {
@@ -376,6 +379,18 @@ pub fn run<L: Control>(
             error,
         }),
     }
+}
+
+/// Whether a pass that ran to its end, `pass`, left `group` with nothing
+/// a flow waits for: in the set and following, no candidate pending (its
+/// vote posted and the epoch decided), the archive and the recovery
+/// envelopes kept with nothing stale, and no scope's reading waiting.
+pub fn complete(group: &DeviceGroup, pass: &Pass) -> bool {
+    group.course() == group::Course::Following
+        && group.id().is_some()
+        && !group.pending()
+        && pass.kept
+        && pass.waiting.is_empty()
 }
 
 /// The commit `group` owes, if it follows, is in the set and no
@@ -747,6 +762,7 @@ fn keep<L: Control>(
         let archive = sync.archive()?;
         let recovery = sync.recovery()?;
         if archive.stale.is_none() && recovery.stale.is_none() {
+            pass.kept = true;
             return Ok(());
         }
         follow(light, group, link, pass)?;

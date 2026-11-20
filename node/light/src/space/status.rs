@@ -41,23 +41,41 @@ pub struct Status {
 }
 
 impl<H: Host> Personal<H> {
-    /// The personal space's state, from what the device holds alone.
+    /// The personal space's state, from what the device holds alone; while
+    /// a follow a flow left for after it holds the space, the state as
+    /// last read, which those follows leave as it is.
     pub fn status(&self) -> Result<Status, super::Error> {
-        let held = self.held();
-        let phase = phase(&held)?;
-        let store = held.light.store();
-        let owed = memberships::enrollments(store).map_err(store_failed)?.len()
-            + memberships::confirmations(store)
-                .map_err(store_failed)?
-                .len();
-        Ok(Status {
-            phase,
-            home: held.state.home.clone(),
-            agent: held.state.agent,
-            device: held.group.as_ref().and_then(|group| group.id()),
-            owed: owed as u32,
-        })
+        let held = match self.held.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let last = self.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                match last {
+                    Some(last) if self.behind() => return Ok(last),
+                    _ => self.held(),
+                }
+            }
+        };
+        let status = read(&held)?;
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(status.clone());
+        Ok(status)
     }
+}
+
+fn read(held: &Held) -> Result<Status, super::Error> {
+    let phase = phase(held)?;
+    let store = held.light.store();
+    let owed = memberships::enrollments(store).map_err(store_failed)?.len()
+        + memberships::confirmations(store)
+            .map_err(store_failed)?
+            .len();
+    Ok(Status {
+        phase,
+        home: held.state.home.clone(),
+        agent: held.state.agent,
+        device: held.group.as_ref().and_then(|group| group.id()),
+        owed: owed as u32,
+    })
 }
 
 fn phase(held: &Held) -> Result<Phase, super::Error> {

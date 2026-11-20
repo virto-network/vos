@@ -1,6 +1,9 @@
 //! The claim of a personal agent at a home-only space, and a move home: a
 //! leave and a claim at the new home.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
 use vos_abi::Decode;
 use vos_abi::Encode;
 use vos_abi::ids::MethodId;
@@ -12,14 +15,72 @@ use vos_wire::personal::{Body, Entry};
 use super::link::Signer;
 use super::{
     Claim, Claimed, EXPIRY_MS, Error, Held, Host, Kept, PERSONAL, POLL, Personal, Prompts, Proof,
-    To, failed, link, new_kit, secret, store_failed,
+    To, failed, new_kit, secret, store_failed,
 };
 use crate::home::{self, Claim as Claiming, Home};
 use crate::route::Purpose;
+use vos_wire::defaults::ROOT_GRACE_MS;
 use crate::{AuthWitness, Call, Digest, TreeKeeper, wire};
 
 /// The open claim's work, on this many threads.
 const WORK_THREADS: usize = 2;
+/// The kits a claim shows before it gives up on a home that keeps
+/// refusing it after each was shown.
+const KITS: usize = 3;
+/// The longest drawn pause before each of the reads a claim makes while
+/// its kit is written down.
+const AHEAD_GAP: Duration = Duration::from_secs(4);
+/// How long a claim counts on a reading of the node's clock, moved on by
+/// the monotonic clock: a proof's expiry or a feed query's set from it.
+const READING_LIFE: Duration = Duration::from_secs(300);
+/// The most the device's clock may move apart from its monotonic clock
+/// while a reading is counted on: past it the clock was set, or the
+/// device slept, and the node's clock is read again.
+const READING_STEP_MS: u64 = 2_000;
+
+/// The node's time as one purpose's connection read it: the node's, the
+/// device's and the monotonic clock's then.
+#[derive(Clone, Copy)]
+struct Reading {
+    node: u64,
+    wall: u64,
+    at: Instant,
+}
+
+impl Reading {
+    /// The node's time now, `wall` the device's clock: the reading moved on
+    /// by the monotonic clock, none past `life` or once the device's clock
+    /// moved apart from the monotonic one.
+    fn now(&self, wall: u64, life: Duration) -> Option<u64> {
+        let elapsed = self.at.elapsed();
+        if elapsed >= life {
+            return None;
+        }
+        let elapsed_ms = elapsed.as_millis() as u64;
+        let moved = wall as i64 - self.wall as i64;
+        if moved.abs_diff(elapsed_ms as i64) > READING_STEP_MS {
+            return None;
+        }
+        Some(self.node + elapsed_ms)
+    }
+}
+
+/// What a claim did while its kit was written down.
+struct Ahead {
+    /// The open claim's call, made or refused.
+    open: Result<(), Error>,
+    /// The tree as the feed read it, and the feed's reading of the node's
+    /// time.
+    tree: Option<(TreeKeeper, Reading)>,
+    /// The fetch's reading of the node's time: the proof's expiry's.
+    clock: Option<Reading>,
+}
+
+/// What the kit shown before a new one says: the home refused the backup
+/// for `why`, so its words are void.
+fn voided(why: &str) -> String {
+    format!("The home refused the backup ({why}): the words shown before are void; write these new ones.")
+}
 /// The pages of a home's feed one read of its tree follows.
 const FEED_PAGES: usize = 64;
 
@@ -59,10 +120,15 @@ impl<H: Host> Personal<H> {
             .ok_or(Error::UnknownAgent)
     }
 
-    /// The open claim of `member` at `home`: its work for the terms the
-    /// registrar serves, a call in a session of its own. A member already
-    /// there is done.
+    /// The open claim of `member` at `home`: its terms, then its work and
+    /// its call ([`Personal::claim_open`]).
     fn open_claim(&self, home: &Home, member: &[u8; 32]) -> Result<(), Error> {
+        let terms = self.opening(home)?;
+        self.claim_open(home, member, &terms)
+    }
+
+    /// The terms of the open claim the registrar at `home` serves.
+    fn opening(&self, home: &Home) -> Result<Open, Error> {
         let terms: Option<Open> = self.home_query(
             home,
             Purpose::Member,
@@ -70,7 +136,12 @@ impl<H: Host> Personal<H> {
             credentials::method::OPENING,
             Vec::new(),
         )?;
-        let terms = terms.ok_or(Error::NoOpenClaim)?;
+        terms.ok_or(Error::NoOpenClaim)
+    }
+
+    /// The open claim of `member` at `home` for `terms`: its work, a call
+    /// in a session of its own. A member already there is done.
+    fn claim_open(&self, home: &Home, member: &[u8; 32], terms: &Open) -> Result<(), Error> {
         let nonce = home::work(
             &home.handle,
             member,
@@ -93,18 +164,98 @@ impl<H: Host> Personal<H> {
         }
     }
 
-    /// `member`'s path at the newest root of `home`'s tree, read from its
-    /// feed until it holds the member's leaf.
-    fn home_witness(&self, home: &Home, member: &[u8; 32]) -> Result<AuthWitness, Error> {
-        let member = Digest::from_bytes(member).ok_or_else(|| failed("the member is no digest"))?;
-        let mut keeper = TreeKeeper::new(member);
-        let until = std::time::Instant::now() + self.wait();
+    /// What a claim does while its kit is written down, one at a time,
+    /// each after a drawn pause while the user still writes (as a
+    /// session's spares are built): the open claim of `member` for
+    /// `terms`; the home's tree read from its feed; the node's time read
+    /// on a fetch of its own, the proof's expiry's; and the connection
+    /// the proof goes on opened ahead. Nothing after a refused open claim.
+    fn behind_the_kit(
+        &self,
+        home: &Home,
+        member: &[u8; 32],
+        terms: &Open,
+        written: &AtomicBool,
+    ) -> Ahead {
+        let mut ahead = Ahead {
+            open: self.claim_open(home, member, terms),
+            tree: None,
+            clock: None,
+        };
+        if ahead.open.is_err() {
+            return ahead;
+        }
+        if let Some(digest) = Digest::from_bytes(member) {
+            self.pause(written);
+            let mut keeper = TreeKeeper::new(digest);
+            let mut feed = None;
+            if self.read_tree(home, &mut keeper, &mut feed).is_ok() {
+                ahead.tree = feed.map(|feed| (keeper, feed));
+            }
+        }
+        self.pause(written);
+        ahead.clock = self.reading(home, Purpose::Fetch).ok();
+        self.pause(written);
+        self.host
+            .prepare(&To::Home(home.handle).routes(), Purpose::Proven);
+        ahead
+    }
+
+    /// A pause drawn below [`AHEAD_GAP`], cut short once the kit is
+    /// `written` down: from then on the claim waits for each step.
+    fn pause(&self, written: &AtomicBool) {
+        let mut draw = [0; 8];
+        let _ = getrandom::getrandom(&mut draw);
+        let gap = AHEAD_GAP.as_millis() as u64;
+        let until = Instant::now() + Duration::from_millis(u64::from_le_bytes(draw) % gap.max(1));
+        while Instant::now() < until && !written.load(Ordering::SeqCst) {
+            self.host.sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The node's time at `home` read now under `purpose`.
+    fn reading(&self, home: &Home, purpose: Purpose) -> Result<Reading, Error> {
+        let node = self.time(To::Home(home.handle), purpose)?;
+        Ok(Reading {
+            node,
+            wall: self.host.now(),
+            at: Instant::now(),
+        })
+    }
+
+    /// `member`'s path at a root of `home`'s tree: the one `tree` read
+    /// while the kit was written down, while that root's grace lasts
+    /// (`ROOT_GRACE_MS` from any later root's time, so half of it from the
+    /// reading on is safe); else the feed read on from there, under the
+    /// feed's own reading of the node's time, until it holds the member's
+    /// leaf.
+    fn witness_after(
+        &self,
+        home: &Home,
+        member: &[u8; 32],
+        tree: Option<(TreeKeeper, Reading)>,
+    ) -> Result<AuthWitness, Error> {
+        let (mut keeper, mut feed) = match tree {
+            Some((keeper, feed)) => (keeper, Some(feed)),
+            None => {
+                let member =
+                    Digest::from_bytes(member).ok_or_else(|| failed("the member is no digest"))?;
+                (TreeKeeper::new(member), None)
+            }
+        };
+        let grace = Duration::from_millis(ROOT_GRACE_MS / 2);
+        if let (Some(witness), Some(feed)) = (keeper.witness(), feed)
+            && feed.at.elapsed() < grace
+        {
+            return Ok(witness);
+        }
+        let until = Instant::now() + self.wait();
         loop {
-            self.read_tree(home, &mut keeper)?;
+            self.read_tree(home, &mut keeper, &mut feed)?;
             if let Some(witness) = keeper.witness() {
                 return Ok(witness);
             }
-            if std::time::Instant::now() > until {
+            if Instant::now() > until {
                 return Err(Error::NoLeaf);
             }
             self.host.sleep(POLL);
@@ -112,10 +263,23 @@ impl<H: Host> Personal<H> {
     }
 
     /// `home`'s tree read into `keeper` from the credential actor's feed,
-    /// page by page, each under a time the node gave.
-    fn read_tree(&self, home: &Home, keeper: &mut TreeKeeper) -> Result<(), Error> {
+    /// page by page, each query's expiry from `feed`, the feed's own
+    /// reading of the node's time, while it lasts, else from one read now.
+    fn read_tree(
+        &self,
+        home: &Home,
+        keeper: &mut TreeKeeper,
+        feed: &mut Option<Reading>,
+    ) -> Result<(), Error> {
         for _ in 0..FEED_PAGES {
-            let now = self.time(To::Home(home.handle), Purpose::Feed)?;
+            let now = match feed.and_then(|feed| feed.now(self.host.now(), READING_LIFE)) {
+                Some(now) => now,
+                None => {
+                    let reading = self.reading(home, Purpose::Feed)?;
+                    *feed = Some(reading);
+                    reading.node
+                }
+            };
             let query = keeper
                 .request(
                     home.agent,
@@ -175,7 +339,7 @@ impl<H: Host> Personal<H> {
         let mut sync = Signer::new(key.verifying_key().to_bytes());
         let until = std::time::Instant::now() + self.wait();
         loop {
-            let mut link = link(&self.host, kept, Purpose::Personal, agent, &key, &mut sync);
+            let mut link = self.link(kept, Purpose::Personal, agent, &key, &mut sync);
             if let Ok(entries) = super::logged(&mut link, 0)
                 && entries
                     .iter()
@@ -248,47 +412,64 @@ impl<H: Host> Personal<H> {
             }
         };
         let member = crate::member(&secret).to_bytes();
-        self.open_claim(&home, &member)?;
-        let claim = match pending {
-            Some(claim) => claim,
-            None => {
-                let agent = self.pooled(&home)?;
-                let device = self.device(held, prompts, &home, &secret, &request.label)?;
-                let kit = new_kit(prompts, request.kit, &kept)?;
-                // The home and agent are the device's in the claim's batch.
-                let mut next = held.state.clone();
-                next.home = Some(kept.clone());
-                next.agent = Some(agent);
-                next.label = request.label;
-                let claim = Claiming::prepare(
-                    held.light.store(),
-                    device,
-                    vec![kit.key()],
-                    agent.0,
-                    agent.1,
-                    next.rows(),
-                )
-                .map_err(failed)?;
-                self.adopt(held, next);
-                claim
+        let mut secret = Some(secret);
+        // Why the kit shown last is void: the home refused the backup after
+        // it was shown.
+        let mut void: Option<String> = None;
+        let mut kits = 0;
+        let (agent, claim) = loop {
+            let secret = match secret.take() {
+                Some(secret) => secret,
+                None => {
+                    let source = self.source(prompts, held)?;
+                    super::secret(prompts, &source, &home.handle)?
+                }
+            };
+            let (claim, ahead) = match Claiming::pending(held.light.store()).map_err(failed)? {
+                Some(claim) => {
+                    self.open_claim(&home, &member)?;
+                    (claim, None)
+                }
+                None => {
+                    kits += 1;
+                    match self.kit_and_open(held, prompts, &request, &secret, &member, void.as_deref())
+                    {
+                        Ok((claim, ahead)) => (claim, Some(ahead)),
+                        Err(Error::OpenClaimRefused(why)) if kits < KITS => {
+                            void = Some(voided(&why));
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
+            let agent = claim.agent();
+            let (tree, clock) = ahead.map_or((None, None), |ahead| (ahead.tree, ahead.clock));
+            let witness = self.witness_after(&home, &member, tree)?;
+            // The proof's expiry from the fetch's reading while it lasts.
+            let now = match clock.and_then(|clock| clock.now(self.host.now(), READING_LIFE)) {
+                Some(now) => now,
+                None => self.time(To::Home(home.handle), Purpose::Fetch)?,
+            };
+            let call = claim.call(&home, now + EXPIRY_MS).map_err(failed)?;
+            match self.prove_home::<u32>(&home, secret, witness, call)? {
+                Ok(_) | Err(HomesError::Claimed) => break (agent, claim),
+                Err(error) => {
+                    let mut next = held.state.clone();
+                    (next.home, next.agent) = (None, None);
+                    claim
+                        .abandon(held.light.store(), next.rows())
+                        .map_err(store_failed)?;
+                    self.adopt(held, next);
+                    if kits == 0 || kits >= KITS {
+                        return Err(Error::HomeRefused(error));
+                    }
+                    // Shown this time: the home refused it, so new words.
+                    self.pin(&kept);
+                    void = Some(voided(&format!("{error:?}")));
+                }
             }
         };
-        let agent = claim.agent();
-        let witness = self.home_witness(&home, &member)?;
-        let now = self.time(To::Home(home.handle), Purpose::Fetch)?;
-        let call = claim.call(&home, now + EXPIRY_MS).map_err(failed)?;
-        match self.prove_home::<u32>(&home, secret, witness, call)? {
-            Ok(_) | Err(HomesError::Claimed) => {}
-            Err(error) => {
-                let mut next = held.state.clone();
-                (next.home, next.agent) = (None, None);
-                claim
-                    .abandon(held.light.store(), next.rows())
-                    .map_err(store_failed)?;
-                self.adopt(held, next);
-                return Err(Error::HomeRefused(error));
-            }
-        }
         let kept = held.state.home.clone().unwrap_or(kept);
         let entries = self.assigned(held, &kept, agent)?;
         let group = claim
@@ -302,6 +483,69 @@ impl<H: Host> Personal<H> {
             agent: agent.0,
             device,
         })
+    }
+
+    /// The claim's first part at `home` with a new kit: the open claim's
+    /// terms and an agent to give asked first, then the kit shown while
+    /// the open claim's work and call run behind it, with the reads the
+    /// proof takes ([`Personal::behind_the_kit`]); the claim held in the
+    /// store once the kit is shown, so a retry after a lost answer sends
+    /// the same one. An open claim the home refused once the kit was
+    /// shown abandons it ([`Error::OpenClaimRefused`]: the words are
+    /// void); one unreached leaves the claim held, its kit the one shown.
+    fn kit_and_open(
+        &self,
+        held: &mut Held,
+        prompts: &dyn Prompts,
+        request: &Claim,
+        secret: &crate::DeviceSecret,
+        member: &[u8; 32],
+        void: Option<&str>,
+    ) -> Result<(Claiming, Ahead), Error> {
+        let kept = &request.home;
+        let home = &kept.home;
+        let terms = self.opening(home)?;
+        let agent = self.pooled(home)?;
+        let device = self.device(held, prompts, home, secret, &request.label)?;
+        let written = AtomicBool::new(false);
+        let (kit, ahead) = std::thread::scope(|scope| {
+            let behind = scope.spawn(|| self.behind_the_kit(home, member, &terms, &written));
+            let kit = new_kit(prompts, request.kit, kept, void);
+            written.store(true, Ordering::SeqCst);
+            (kit, behind.join())
+        });
+        let ahead = ahead.map_err(|_| failed("the claim's reads stopped"))?;
+        let kit = kit?;
+        // The home and agent are the device's in the claim's batch.
+        let mut next = held.state.clone();
+        next.home = Some(kept.clone());
+        next.agent = Some(agent);
+        next.label = request.label.clone();
+        let claim = Claiming::prepare(
+            held.light.store(),
+            device,
+            vec![kit.key()],
+            agent.0,
+            agent.1,
+            next.rows(),
+        )
+        .map_err(failed)?;
+        self.adopt(held, next);
+        let mut ahead = ahead;
+        match std::mem::replace(&mut ahead.open, Ok(())) {
+            Ok(()) => Ok((claim, ahead)),
+            Err(Error::OpenClaimRefused(why)) => {
+                let mut next = held.state.clone();
+                (next.home, next.agent) = (None, None);
+                claim
+                    .abandon(held.light.store(), next.rows())
+                    .map_err(store_failed)?;
+                self.adopt(held, next);
+                self.pin(kept);
+                Err(Error::OpenClaimRefused(why))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// The personal space moved to another home, carrying nothing: once

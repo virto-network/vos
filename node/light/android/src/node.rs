@@ -165,7 +165,7 @@ const SESSIONS: usize = 64;
 pub struct Node {
     runtime: tokio::runtime::Runtime,
     facility: Facility,
-    job: Job,
+    job: Arc<Job>,
     /// The personal space, or why it does not open: sign-in and payments
     /// run whatever it is.
     personal: Option<Result<Arc<Space>, Refused>>,
@@ -173,7 +173,7 @@ pub struct Node {
     warming: Mutex<Vec<Warming>>,
     /// Whether the app is in the foreground, and the operations and jobs
     /// running: the client is dormant only when neither.
-    waking: Mutex<(bool, usize)>,
+    waking: Arc<Mutex<(bool, usize)>>,
 }
 
 #[derive(Default)]
@@ -296,11 +296,11 @@ impl Node {
         Ok(Self {
             runtime,
             facility,
-            job,
+            job: Arc::new(job),
             personal,
             sessions: Mutex::new(Sessions::default()),
             warming: Mutex::new(Vec::new()),
-            waking: Mutex::new((false, 0)),
+            waking: Arc::new(Mutex::new((false, 0))),
         })
     }
 
@@ -651,12 +651,46 @@ impl Node {
             _awake: self.wake(),
         })
     }
+
+    /// The follows a flow left for after it returned
+    /// ([`vos_light::space::Personal::follow_behind`]), on a thread of
+    /// their own with the client awake: the flow's answer does not wait
+    /// for them, and one that fails stands as a notice until a pass
+    /// finishes what it left.
+    fn follow_behind(&self, space: &Arc<Space>) {
+        if !space.behind() {
+            return;
+        }
+        let (space, job, waking) = (
+            Arc::clone(space),
+            Arc::clone(&self.job),
+            Arc::clone(&self.waking),
+        );
+        let (facility, runtime) = (self.facility.clone(), self.runtime.handle().clone());
+        crate::lock(&waking).1 += 1;
+        facility.net().set_dormant(false);
+        std::thread::spawn(move || {
+            {
+                let _entered = runtime.enter();
+                match space.follow_behind() {
+                    Ok(()) => job.finished(),
+                    Err(_) => job.unfinished(crate::job::now_ms()),
+                }
+            }
+            let _entered = runtime.enter();
+            let mut waking = crate::lock(&waking);
+            waking.1 -= 1;
+            if *waking == (false, 0) {
+                facility.net().set_dormant(true);
+            }
+        });
+    }
 }
 
 /// The personal space lent to one flow ([`Node::personal`]).
 pub struct Personal<'a> {
     space: &'a Arc<Space>,
-    job: &'a Job,
+    job: &'a Arc<Job>,
     _awake: Awake<'a>,
 }
 
@@ -674,6 +708,7 @@ impl Drop for Personal<'_> {
             self.job
                 .attach(Arc::clone(self.space) as Arc<dyn crate::job::Personal>);
         }
+        self._awake.node.follow_behind(self.space);
     }
 }
 

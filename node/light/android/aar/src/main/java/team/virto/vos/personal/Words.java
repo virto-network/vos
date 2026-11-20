@@ -102,6 +102,8 @@ public final class Words {
         return "A removed device still holds your keys until you commit: commit now";
       case Pending.RESEAL:
         return "Your recovery kit must be sealed again: commit now";
+      case Pending.UNFINISHED:
+        return "The last sync after your change did not finish: the next sync finishes it";
       default:
         return "The sync found something wrong";
     }

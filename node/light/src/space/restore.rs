@@ -15,7 +15,7 @@ use super::link::{Key, Signer, answer};
 use super::set::evidence;
 use super::{
     Claim, Claimed, Error, Held, Host, PERSONAL, Personal, Posted, Prompts, Restoring, answered,
-    entered_kit, failed, link, logged, new_kit, secret, unreached,
+    entered_kit, failed, logged, new_kit, secret, unreached,
 };
 use crate::group::{Agent as GroupAgent, DeviceGroup, Restored};
 use crate::personal::{Link as _, recover};
@@ -57,9 +57,7 @@ impl<H: Host> Personal<H> {
             && let Some(restoring) = held.state.restoring.clone()
             && restoring.signed.is_some()
         {
-            let mut link = link(
-                &self.host,
-                &kept,
+            let mut link = self.link(&kept,
                 Purpose::Personal,
                 agent,
                 &signing,
@@ -103,7 +101,7 @@ impl<H: Host> Personal<H> {
                 let source = self.source(prompts, &mut held)?;
                 let secret = secret(prompts, &source, &home.handle)?;
                 let device = self.device(&mut held, prompts, &home, &secret, &request.label)?;
-                let kit = new_kit(prompts, request.kit, &kept)?;
+                let kit = new_kit(prompts, request.kit, &kept, None)?;
                 // The home, the agent and the restore are the device's in
                 // the split's batch.
                 let mut next = held.state.clone();
@@ -128,9 +126,7 @@ impl<H: Host> Personal<H> {
                 agent
             }
         };
-        let mut link = link(
-            &self.host,
-            &kept,
+        let mut link = self.link(&kept,
             Purpose::Personal,
             agent,
             &signing,
@@ -242,9 +238,7 @@ impl<H: Host> Personal<H> {
         let signing = kit.signing();
         let mut kit_signer = Signer::new(signing.verifying_key().to_bytes());
         {
-            let mut link = link(
-                &self.host,
-                &kept,
+            let mut link = self.link(&kept,
                 Purpose::Personal,
                 agent,
                 &signing,
@@ -256,9 +250,7 @@ impl<H: Host> Personal<H> {
         let (view, envelopes, overview, devices, policy) = {
             // The sync key's own session: a read that fails keeps what the
             // wakes before it used.
-            let mut link = link(
-                &self.host,
-                &kept,
+            let mut link = self.link(&kept,
                 Purpose::Personal,
                 agent,
                 &key,

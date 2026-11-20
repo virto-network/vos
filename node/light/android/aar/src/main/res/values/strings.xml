@@ -15,6 +15,7 @@
     <string name="vos_pending_removed">This device was removed from your personal space.</string>
     <string name="vos_pending_commit">A device you removed still holds your keys until you commit. Open your devices and commit now.</string>
     <string name="vos_pending_reseal">Your recovery kit must be sealed again, away from a removed device. Open your devices and commit now.</string>
+    <string name="vos_pending_unfinished">The last sync after your change did not finish. The next sync finishes it.</string>
     <string name="vos_pending_stuck">This device cannot follow your other devices. Remove it from one of them, then pair it again; or regroup on it.</string>
     <string name="vos_pending_alarm">The background sync found something wrong.</string>
     <string name="vos_personal_name">Personal space</string>

@@ -101,6 +101,37 @@ pub fn answer<T: Decode>(outcome: &Outcome) -> Result<Result<T, PersonalError>, 
     wire::answer(outcome).map_err(|_| format!("the agent answered {outcome:?}"))
 }
 
+/// The node's time as each kept-open purpose's connection to a routes'
+/// key last read it, and when: every link of that purpose there counts on
+/// it while it is young (half of [`QUERY_MS`]), so a flow reads the
+/// node's time once, however many links it makes. A one-shot purpose's
+/// reading is its own connection's alone, and is never kept here.
+#[derive(Default)]
+pub struct Clocks(std::sync::Mutex<std::collections::HashMap<([u8; 32], Purpose), (u64, Instant)>>);
+
+impl Clocks {
+    /// The node's time now under `purpose` at `space`, by a reading young
+    /// enough.
+    pub fn now(&self, space: &[u8; 32], purpose: Purpose) -> Option<u64> {
+        let clocks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (node, at) = clocks.get(&(*space, purpose))?;
+        young(at).then(|| node + at.elapsed().as_millis() as u64)
+    }
+
+    /// The node's time `node` read now under `purpose` at `space`.
+    pub fn read(&self, space: &[u8; 32], purpose: Purpose, node: u64, at: Instant) {
+        if !purpose.one_shot() {
+            let mut clocks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            clocks.insert((*space, purpose), (node, at));
+        }
+    }
+}
+
+/// Whether a reading made `at` is still counted on.
+fn young(at: &Instant) -> bool {
+    at.elapsed().as_millis() < u128::from(QUERY_MS / 2)
+}
+
 /// A link to the personal agent at the home `space`.
 pub struct AgentLink<'a, H: Host> {
     host: &'a H,
@@ -111,6 +142,8 @@ pub struct AgentLink<'a, H: Host> {
     signer: &'a mut Signer,
     /// The node's time read last, and when.
     clock: Option<(u64, Instant)>,
+    /// The readings every link of a flow counts on, if it shares them.
+    clocks: Option<&'a Clocks>,
     /// The reads asked ahead and not yet taken: each query's method and
     /// arguments, the scope a `since` reads, and its answer.
     ahead: Vec<Ahead>,
@@ -141,8 +174,15 @@ impl<'a, H: Host> AgentLink<'a, H> {
             sync,
             signer,
             clock: None,
+            clocks: None,
             ahead: Vec::new(),
         }
+    }
+
+    /// The same, counting on `clocks`' readings and leaving its own there.
+    pub fn with_clocks(mut self, clocks: &'a Clocks) -> Self {
+        self.clocks = Some(clocks);
+        self
     }
 
     pub fn agent(&self) -> Agent {
@@ -154,16 +194,27 @@ impl<'a, H: Host> AgentLink<'a, H> {
         self.host.request(&self.space, self.purpose, request)
     }
 
-    /// The node's time now: read once a link, then counted on.
+    /// The node's time now: read once a link (or once a flow, its links
+    /// sharing [`Clocks`]), then counted on.
     pub fn now(&mut self) -> Result<u64, String> {
         if let Some((node, at)) = self.clock
-            && at.elapsed().as_millis() < u128::from(QUERY_MS / 2)
+            && young(&at)
         {
             return Ok(node + at.elapsed().as_millis() as u64);
         }
+        if let Some(now) = self
+            .clocks
+            .and_then(|clocks| clocks.now(&self.space, self.purpose))
+        {
+            return Ok(now);
+        }
         let node = wire::time_answer(&self.send(&wire::time_request())?)
             .map_err(|error| error.to_string())?;
-        self.clock = Some((node, Instant::now()));
+        let at = Instant::now();
+        self.clock = Some((node, at));
+        if let Some(clocks) = self.clocks {
+            clocks.read(&self.space, self.purpose, node, at);
+        }
         Ok(node)
     }
 

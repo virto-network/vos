@@ -34,6 +34,8 @@ pub struct Phone {
     made: Mutex<u8>,
     /// Every phrase shown, the newest last.
     pub phrases: Mutex<Vec<String>>,
+    /// Why each kit shown in place of an earlier one was so.
+    pub voids: Mutex<Vec<String>>,
     /// Every kit's card shown, the newest last.
     pub cards: Mutex<Vec<Card>>,
     /// The words to enter when asked.
@@ -78,6 +80,7 @@ impl Phone {
             admins: Mutex::new(HashMap::new()),
             made: Mutex::new(seed.wrapping_mul(16)),
             phrases: Mutex::new(Vec::new()),
+            voids: Mutex::new(Vec::new()),
             cards: Mutex::new(Vec::new()),
             words: Mutex::new(None),
             signed: Mutex::new(None),
@@ -199,14 +202,20 @@ impl Phone {
 }
 
 impl Prompts for Phone {
-    fn show_phrase(&self, words: &str, card: &Card) -> bool {
+    fn show_phrase(&self, words: &str, card: &Card, void: Option<&str>) -> bool {
+        if let Some(void) = void {
+            self.voids.lock().unwrap().push(void.to_owned());
+        }
         assert_eq!(words.split(' ').count(), 24, "a phrase's 24 words");
         self.phrases.lock().unwrap().push(words.to_owned());
         self.cards.lock().unwrap().push(card.clone());
         !self.declines()
     }
 
-    fn show_card(&self, card: &Card) -> bool {
+    fn show_card(&self, card: &Card, void: Option<&str>) -> bool {
+        if let Some(void) = void {
+            self.voids.lock().unwrap().push(void.to_owned());
+        }
         self.cards.lock().unwrap().push(card.clone());
         !self.declines()
     }

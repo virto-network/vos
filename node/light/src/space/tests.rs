@@ -265,10 +265,10 @@ impl Host for Nowhere {
 struct Key;
 
 impl Prompts for Key {
-    fn show_phrase(&self, _: &str, _: &Card) -> bool {
+    fn show_phrase(&self, _: &str, _: &Card, _: Option<&str>) -> bool {
         false
     }
-    fn show_card(&self, _: &Card) -> bool {
+    fn show_card(&self, _: &Card, _: Option<&str>) -> bool {
         false
     }
     fn enter_phrase(&self) -> Option<zeroize::Zeroizing<String>> {

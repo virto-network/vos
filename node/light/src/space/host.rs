@@ -41,6 +41,27 @@ pub trait Host: Send + Sync + 'static {
             .collect()
     }
 
+    /// A timed fetch over the routes kept under `space`: the node's time,
+    /// then the one query `query` makes from it, on one connection of
+    /// [`Purpose::Fetch`]'s of their own, closed after: the query's answer.
+    /// Where the host has no such fetch, two fetches, each its own
+    /// connection.
+    fn fetch_timed(
+        &self,
+        space: &[u8; 32],
+        query: &mut dyn FnMut(u64) -> Result<Vec<u8>, String>,
+    ) -> Result<Vec<u8>, String> {
+        let time = self.request(space, Purpose::Fetch, &crate::wire::time_request())?;
+        let now = crate::wire::time_answer(&time).map_err(|error| error.to_string())?;
+        self.request(space, Purpose::Fetch, &query(now)?)
+    }
+
+    /// A connection of the one-shot `purpose` over the routes kept under
+    /// `space` opened from now on, beside the flow (this returns at once),
+    /// for that purpose's next request there, so a flow's proof does not
+    /// wait for its connection. Nothing where the host builds none ahead.
+    fn prepare(&self, _space: &[u8; 32], _purpose: Purpose) {}
+
     /// The routes of a home, kept under its key `home`
     /// ([`crate::route::home`]): its `onions`, onion only.
     fn pin(&self, home: &[u8; 32], onions: &[Onion]);
@@ -147,10 +168,13 @@ pub struct Approval {
 /// only inside a flow the user started; none outside one.
 pub trait Prompts {
     /// A new phrase kit's 24 `words`, shown once beside its `card`:
-    /// whether the user wrote them down.
-    fn show_phrase(&self, words: &str, card: &Card) -> bool;
-    /// A new security-key kit's `card`: whether the user wrote it down.
-    fn show_card(&self, card: &Card) -> bool;
+    /// whether the user wrote them down. `void`: why the kit shown before
+    /// is void (the home refused the backup after it was shown), so the
+    /// user writes these in its place.
+    fn show_phrase(&self, words: &str, card: &Card, void: Option<&str>) -> bool;
+    /// A new security-key kit's `card`: whether the user wrote it down,
+    /// `void` as [`Prompts::show_phrase`]'s.
+    fn show_card(&self, card: &Card, void: Option<&str>) -> bool;
     /// The kit's 24 words, entered; `None` when the user declined.
     fn enter_phrase(&self) -> Option<Zeroizing<String>>;
     /// Whether the user approves another device's new admin key.
