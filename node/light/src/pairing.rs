@@ -66,7 +66,7 @@ use crate::group::Pairing;
 use crate::home::Home;
 
 /// The handshake's pattern.
-pub const PATTERN: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2b";
+const PATTERN: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2b";
 
 /// The code's bytes in the QR: its version first.
 const VERSION: u8 = 1;

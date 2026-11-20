@@ -61,7 +61,7 @@ const ROUNDS: usize = 8;
 const READINGS: usize = 4;
 
 /// The own envelopes a pass audits in each scope.
-pub const AUDIT_SAMPLE: usize = 1;
+const AUDIT_SAMPLE: usize = 1;
 
 /// How old, by the device's clock, the agent's batch time may be before a
 /// pass that posts nothing wakes the agent.

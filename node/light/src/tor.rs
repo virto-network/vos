@@ -7,12 +7,12 @@
 //!   bounded, and its failure named: a wrong clock, a bridge that does not
 //!   answer, a network that blocks Tor ([`BootstrapError`]).
 //! - **`vos-api` over SSH over the onion** ([`Client`]): each request goes
-//!   under its [`Purpose`], on that purpose's connection to the space, an
-//!   SSH connection whose `vos-api` subsystem carries the node API's frames,
-//!   multiplexed. Each connection is its own circuit (an arti isolation
-//!   token drawn for it alone) under its own SSH key (an ed25519 key drawn
-//!   for it alone), so the gateway cannot join two purposes by circuit or
-//!   by key (§8, H10). A kept-open purpose's connection stays while it is
+//!   under its [`Purpose`](crate::route::Purpose), on that purpose's
+//!   connection to the space, an SSH connection whose `vos-api` subsystem
+//!   carries the node API's frames, multiplexed. Each connection is its own
+//!   circuit (an arti isolation token drawn for it alone) under its own SSH
+//!   key (an ed25519 key drawn for it alone), so the gateway cannot join two
+//!   purposes by circuit or by key (§8, H10). A kept-open purpose's connection stays while it is
 //!   used, closed after [`Config::idle`] without a request; a proven call
 //!   and a fetch each take one of their own, closed once answered.
 //! - **A spare a one-shot purpose** ([`Client::keep_spares`]): for a proven
@@ -23,12 +23,10 @@
 //!   ([`Client::set_foreground`]); one left unused past a time drawn around
 //!   [`Config::spare_idle`] is closed and built anew.
 //! - **A fresh connection that fails is retried on a new circuit**, up to
-//!   [`Config::attempts`], through the next onion of the pinned set: 10–20%
-//!   of fresh onion connections failed on the phones (§6.4). When every
-//!   attempt found the onion service unpublished or unreachable
+//!   [`Config::attempts`], through the next onion of the pinned set (§6.4).
+//!   When every attempt found the onion service unpublished or unreachable
 //!   ([`Unpublished`], a service just relaunched), one more is made after
-//!   [`Config::again`]: first contacts with a home's onion failed so on the
-//!   phones, where the user's retry a few seconds on went through. Every step has
+//!   [`Config::again`]. Every step has
 //!   its deadline ([`Config`]), as nothing in arti or SSH ends on its own;
 //!   a request that misses one loses its connection.
 //! - **Dormant** ([`Client::set_dormant`]): no connection, no spare, no
@@ -43,7 +41,8 @@
 //!   current set, read through any onion of the pinned one, replaces it.
 //!   The answer is the gateway's word, as any answer it relays (§8, H5).
 //! - **What it opened** ([`Client::opened`]): each hour's rendezvous by
-//!   purpose, in the foreground and in the background, for PG5's bound.
+//!   purpose, in the foreground and in the background, for the bound on
+//!   rendezvous an hour.
 //! - **The credential tree's feed** ([`Client::read_tree`]): each page on
 //!   the space's one feed connection, which carries reads alone and names
 //!   nothing of the member's; the tree kept by a [`crate::TreeKeeper`].
@@ -115,4 +114,3 @@ impl Default for Config {
     }
 }
 
-pub use crate::route::{OPT_OUT_WARNING, Purpose, Refused, Route, Routes};

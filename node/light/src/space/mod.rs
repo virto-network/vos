@@ -230,7 +230,7 @@ pub const ONIONS_EVERY_MS: u64 = 24 * 60 * 60 * 1000;
 /// How long the onions a read no longer names stay pinned.
 pub const ONIONS_KEPT_MS: u64 = 7 * ONIONS_EVERY_MS;
 /// How soon a read of the home's onion set that failed is tried again.
-pub const ONIONS_RETRY_MS: u64 = 60 * 60 * 1000;
+const ONIONS_RETRY_MS: u64 = 60 * 60 * 1000;
 
 /// Whether two onion sets name the same onions, in any order.
 fn same_onions(a: &[Onion], b: &[Onion]) -> bool {

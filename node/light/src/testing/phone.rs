@@ -122,11 +122,6 @@ impl Phone {
         ));
     }
 
-    /// The next of the app's other forms declined.
-    pub fn will_decline(&self) {
-        self.confirms.lock().unwrap().push_back(None);
-    }
-
     /// The answer to one of the app's other forms, `shown` as it showed
     /// it, its fields `filled`: the script's next, or `filled` confirmed.
     pub fn answer(&self, shown: String, filled: Vec<String>) -> Option<Vec<String>> {

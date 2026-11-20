@@ -36,7 +36,7 @@ pub const WORDS: usize = 24;
 
 /// The bytes of `R1` sealed to an entry: the ephemeral key and the sealed
 /// `R1` with its tag.
-pub const SEALED_R1: usize = 32 + 32 + 16;
+const SEALED_R1: usize = 32 + 32 + 16;
 
 const SALT_DOMAIN: &[u8] = b"vos/personal/kit/v1";
 const SIGNING: &[u8] = b"vos/personal/kit/signing";

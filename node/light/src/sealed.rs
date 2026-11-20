@@ -49,7 +49,7 @@ pub const fn padme(len: usize) -> usize {
 
 /// The largest padded frame an envelope holds: its header, the frame and
 /// the tag within [`MAX_ENVELOPE`].
-pub const MAX_PADDED: usize = {
+const MAX_PADDED: usize = {
     let room = MAX_ENVELOPE - Header::BYTES - TAG;
     let mut len = room;
     while padme(len) != len {

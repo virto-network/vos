@@ -132,9 +132,5 @@ name = "space"
 required-features = ["testing"]
 
 [[example]]
-name = "devices"
-required-features = ["release"]
-
-[[example]]
 name = "onion"
 required-features = ["tor"]

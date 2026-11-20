@@ -256,7 +256,7 @@ impl<'a, H: Host> AgentLink<'a, H> {
         Err("the agent is still settling".into())
     }
 
-    /// What fell due settled at the agent, through up to [`WAKES`] wakes.
+    /// What fell due settled at the agent, through a bounded number of wakes.
     pub fn settle(&mut self) -> Answer<(), String> {
         for _ in 0..WAKES {
             match self.wake()? {
