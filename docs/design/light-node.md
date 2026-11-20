@@ -1088,7 +1088,14 @@ arm64-v8a build; the phones' timings below of 2026-11-06]:
   the window deciding as of the window's end as the agent does. The
   agent's verdict is advisory: one this device cannot count raises an
   alarm, and the next candidate stops it (re-pair). A call refused with
-  `Settling` is made again after a `wake`.
+  `Settling` is made again after a `wake`, sent at most nine times with
+  eight wakes between (`WAKES`), by one owner: a flow's call by the link
+  (`AgentLink::settled`), a pass's post by the pass (`job::post_settled`;
+  the link sends a post once). The sync key's calls and its wakes share
+  one session and one sequence count, so no wake reuses a call's
+  sequence. A flow reads the log as a pass does (`job::log`): each page
+  through the onion, a page that does not move past the one before
+  refused (`Disordered`).
 - **Regroup and restore:** a matured regroup voids the pending candidate
   and removes every device but its regrouper, one added while it was open
   too, and the next commit is the regrouper's new group of it alone
