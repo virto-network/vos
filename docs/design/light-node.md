@@ -2418,13 +2418,12 @@ picked the circuit; a proven call carries the kernel's claim:
   in their SCALE encoding. The format is a device format the node admits:
   47 alone by release (§4.4).
 - **The guard names the kernel:** `#[msg(proven = spend)]`, naming a
-  device kernel of this actor, or `#[msg(proven = owner)]`, the
-  credential actor's. `#[msg(credential = Auth("login"))]` and
-  `#[msg(credential = Owner)]` stay as the SDK's sugar for the stock
-  kernels, so purses-style code reads as today. The stock auth kernel is
-  named through `credential = Auth("name")` alone, since its scope needs
-  the guard's name: `proven = auth` is refused, naming that form, unless
-  the actor has its own kernel `auth`, whose name comes first [built].
+  device kernel of this actor. `#[msg(credential = Auth("login"))]` and
+  `#[msg(credential = Owner)]` name the stock kernels, so purses-style
+  code reads as today: the stock auth kernel's scope needs the guard's
+  name, and one spelling serves both. `proven = auth` and `proven = owner`
+  are refused, naming that form, unless the actor has its own kernel of
+  that name, whose name comes first [built].
 - **Ingress's generic checks,** in order: the frame, the decode, the
   agent, the space, the format, the sizes, the expiry, the method and its
   guard; then **the binding**: the claim's last field is `C(T(binding),

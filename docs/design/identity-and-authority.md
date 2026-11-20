@@ -279,9 +279,8 @@ proves and the kernel's claim.
     `CredentialGuard::Auth { name, once: false }`, proven by the stock
     `auth` kernel. It admits `Anonymous` origins; `name`, 1–64 bytes, is
     the scope's.
-  - `#[msg(proven = owner)]` is `CredentialGuard::Owner`, proven by the
-    stock `owner` kernel (`#[msg(credential = Owner)]` is the same guard).
-    It admits `Owner` origins; the handler debits the account the digest
+  - `#[msg(credential = Owner)]` is `CredentialGuard::Owner`, proven by
+    the stock `owner` kernel. It admits `Owner` origins; the handler debits the account the digest
     holds (`ctx.owner()`), at apply, as the account is then.
   - `#[msg(proven = k)]`, `k` one of the actor's own device kernels, is
     `CredentialGuard::Kernel { name }`. It admits `Kernel { program }`
