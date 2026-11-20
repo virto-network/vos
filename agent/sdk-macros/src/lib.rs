@@ -146,8 +146,9 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   `Principal::Kernel { program }`; the handler takes the kernel's
 ///   claim, its public arguments, as its first argument (after its
 ///   context), decoded whole from its own part, and checks it: ingress
-///   checks only the proof and its binding. An actor's own kernel takes
-///   its name before a stock kernel's refusal. The stock kernels of the agent's credential actor have their
+///   checks only the proof and its binding. An actor's own kernel of a
+///   stock kernel's name comes first. The stock kernels of the agent's
+///   credential actor have their
 ///   own guards, whose checks ingress runs: `#[msg(credential =
 ///   Auth("login"))]` admits the callers proving a member's leaf, each by
 ///   its pseudonym in the scope `"login"` names, with `once` each

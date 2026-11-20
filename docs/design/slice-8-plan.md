@@ -664,7 +664,7 @@ later; S8-P5 at M4's end (two devices, the security key); S8-P6 at M5's end
   over); the gateway hands each onion SSH stream to its onion's SSH
   server with its circuit's address, the loopback carrier gone, so the
   onion serves the demo's screens beside `vos-api`, its streams and
-  `vos-api` channels counted and capped per circuit (`tests/ssh.rs`,
+  `vos-api` channels counted and capped per circuit (`tests/gateway/ssh.rs`,
   `the_onions_ssh_serves_the_screens_marked_onion_and_limited_per_circuit`,
   the gateway's own screen, streams handed as arti's circuits hand them,
   every place given back; the demo's screens by its e2e on its SSH

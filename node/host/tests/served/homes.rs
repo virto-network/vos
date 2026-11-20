@@ -262,7 +262,6 @@ impl Founded {
     }
 }
 
-#[track_caller]
 fn kit(n: u32) -> Kit {
     let mut signing = [0xe1; 32];
     signing[..4].copy_from_slice(&n.to_le_bytes());

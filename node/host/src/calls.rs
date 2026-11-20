@@ -602,8 +602,6 @@ impl Inner {
                 let Some(answer) = answer else {
                     return Response::TimedOut;
                 };
-                // Full, the call not queued: nothing ran, unless an earlier
-                // send is running elsewhere.
                 match then(answer, sent == 0, sent > 1) {
                     Then::Pause(most) => pause(run, most, until, moved).await,
                     Then::Recorded(refusal) => {
@@ -696,7 +694,7 @@ impl Inner {
 
     /// The answer to a forwarded call apply refused `refusal` (`Replayed`,
     /// or `CredentialExpired` after an earlier send), by `until`: for a
-    /// credentialed call, [`Api::recorded`] (the run of one of its own sends
+    /// credentialed call, `recorded`'s answer (the run of one of its own sends
     /// `watch` saw, once applied; `Replayed` if a copy ran; else `refusal`);
     /// for a call, `refusal`.
     async fn recorded_or(
