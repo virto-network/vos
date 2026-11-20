@@ -3136,11 +3136,11 @@ nodes may ask the onion's mark of its proven calls, or of every request
   - the credential tree's feed (§6.7): one long-lived circuit, since
     every member reads the same feed, its reads on the connection kept
     open while used, so a poll costs a round trip, not a rendezvous;
-  - proven calls (each its own, from a spare: the client keeps one
-    circuit to the onion built ahead, its SSH handshake done, for the next
-    proven call, and builds the next spare once it is used, since each
-    isolated circuit to an onion service is a new rendezvous, a second or
-    more, heavy-tailed);
+  - proven calls, and fetches (the node's time): each its own, from a
+    spare (the client keeps one connection a purpose built ahead, its
+    SSH handshake done, for the purpose's next request, and builds the
+    next once it is used, since each isolated circuit to an onion service
+    is a new rendezvous, a second or more, heavy-tailed);
   - the member's own key-signed calls in each space (one group a space);
   - the personal agent's traffic (its own group; its background schedule
     its own, §3.10), never sharing a circuit with the member's proofs;
@@ -3187,10 +3187,16 @@ nodes may ask the onion's mark of its proven calls, or of every request
   connection. Each connection is made under its space's routes and the
   awake period: a change of either closes it, requests in flight
   included, so none outlives the route it was chosen for (an opt-in
-  ends the clearnet connection at once). The spare (`keep_spare`) is
-  built once its space is set, taken by the next proven call, and the
-  next built as it is taken. Dormant (`set_dormant`) closes every
-  connection, the spare and the screens, stops the idle timer, sets
+  ends the clearnet connection at once). The spares (`keep_spares`, one
+  for `Proven` and one for `Fetch`) are built one at a time, each after
+  a delay drawn below 4 s once it is wanted (the space set, the app in
+  the foreground, the last one taken), only in the foreground
+  (`set_foreground`: leaving it closes them); each is taken by its
+  purpose's next request, carries it alone, and a spare unused for a
+  life drawn between 5 and 15 minutes is closed and built anew. A
+  caller that keeps spares for itself alone sends with
+  `request_with(…, spare)`; the onion set's refresh takes none. Dormant (`set_dormant`) closes every
+  connection, the spares and the screens, stops the idle timer, sets
   arti's `DormantMode::Soft`, and refuses every request until woken. s4's screen session is carried as bytes
   between a stream or a descriptor s4 hands over (`screens_fd`, a
   socketpair's end) and the onion's port 22, on a circuit of its own; s4
@@ -3215,6 +3221,74 @@ nodes may ask the onion's mark of its proven calls, or of every request
   The onion set's refresh (`refresh_onions`) is a `Time` and an `onions`
   query, each a fetch; a set of one to sixteen distinct onions replaces
   the pinned one, closing the space's connections.
+- **What the gateway learns from connections opened ahead** [built,
+  `Client::keep_spares`, the facility's `Session`]: a facility session
+  keeps one spare for its proven calls and one for its fetches, reads the
+  node's clock itself and keeps the reading, and the space's device
+  window is read at its grant (§6.3), so a sign-in or a payment sends one
+  request after its confirm, on a connection already open. What the
+  gateway sees:
+  - **Keys and circuits:** a spare is a connection like any other, its
+    own isolation token and an SSH key drawn for it, used for one request
+    and closed. Opened ahead or not, no two requests share a key or a
+    circuit, and `Proven` still carries proven calls alone.
+  - **Open times:** spares are built one at a time, each after a delay
+    drawn below 4 s once it is wanted (a session's grant, or its last
+    spare's use), never two together and never on a schedule; only while
+    a facility session is open and the app is in the foreground. A spare
+    left unused lives 5 to 15 minutes, drawn, then is closed and built
+    anew, closed at its own drawn time (not on a timer's tick), so the
+    gateway sees a connection opened, held without a request, and closed:
+    that a device keeps spares, nothing more.
+  - **Use times:** a spare is used at the user's confirm, seconds or
+    minutes after it opened. Its open time follows the session's grant or
+    the session's last request by a few drawn seconds, so the gateway may
+    join it to that session by timing: a join the session's server has
+    already, since the session asked the call and gets its answer.
+  - **One session's alone:** the spares are kept for one facility
+    session (its number, `Net::keep_spare`): a new session's grant closes
+    the last one's and builds its own, and a session's request never
+    takes another's spare (`Net::request_for`; the client takes a spare
+    only under the keeping it was built for, and drops one whose build
+    began under another). No connection opened in
+    one session's time carries another session's request, so a payment's
+    session, which names the device's account, and a sign-in's session,
+    which must not be joined to it, share no connection, opened ahead or
+    not.
+  - **The expiry:** a call's expiry is the node's time plus 60 s, in the
+    clear in the request, and the gateway answers that time. A gateway
+    can mark each connection's answer (seconds apart, within
+    `CLOCK_SKEW_MS`) and find the mark again in a proof's expiry: a
+    reading of the node's clock ties every call set from it to the
+    connection it was read on, and the device's own clock error cancels
+    out. So each session reads the node's clock itself, on a fetch of
+    its own that carries nothing else, and shares the reading among its
+    own calls alone; it is never taken from the feed's connection, which
+    every session shares, nor kept for the space. A mark then joins a
+    proof to its own session's reading, which the session's server joins
+    anyway (tested: `a_proofs_expiry_carries_its_own_sessions_reading_alone`,
+    each connection's time ten seconds apart). The window read at the
+    grant enters no request's bytes (it only gates which stock program
+    is proved), so it goes on the feed's connection and is kept for the
+    space.
+  - **What is left:** a small gateway can join one session's
+    connections by their timing, as before; the drawn delays spread the
+    open times of several devices' spares into each other, and against a
+    single device online nothing does. A session's clock reading is
+    renewed every 4 to 12 minutes while the app is in the foreground,
+    each a fetch: open times again, none of them joined to another
+    session.
+  - **Rendezvous (PG5):** a foreground hour with a session open costs one
+    a kept group (the feed, the member's, the personal agent's: 3), the
+    proven spare's lives (4 to 12 unused, one a sign-in otherwise) and the
+    clock's readings (5 to 15, about 7.5, each taking the fetch spare and
+    one built after it; a fetch spare outliving the next reading's gap
+    adds about two): about 3 + 6 + 10 = 19 idle, about 3 + 13 + 10 = 26
+    with twelve sign-ins (the client's test on a fast clock, its spares
+    outliving every gap: 25), within PG5's 30. That is for one open
+    session: each open session reads its own clock, so a second one open
+    the hour adds its readings. Before, a sign-in cost two (its time read and its proof):
+    3 + 1 + 2 × 12 = 28.
 - **The policy** (`Routes`, §6.5): the onion unless the request is
   key-signed (`Member`, `Screens`), the user opted the space out
   (`opt_out`, refused for an onion-only space or one offering no
@@ -3226,7 +3300,9 @@ nodes may ask the onion's mark of its proven calls, or of every request
   connection's isolation token, SSH key and kinds: no two connections
   share a token (none compatible by arti's own `Isolation`) or a key,
   and every kind went under its purpose; an anonymous call on a
-  clearnet-only path dials nothing; the spare, the retry on a new
+  clearnet-only path dials nothing; the spares (a fetch's beside a
+  proven call's, each used once; none built in the background; one unused
+  closed after its life), the retry on a new
   circuit, dormancy, the deadlines, the screens over a socketpair and
   the refresh, concurrent requests sharing one open, a route change and
   a dormancy ending requests in flight each have their test; arti's
@@ -3259,7 +3335,7 @@ nodes may ask the onion's mark of its proven calls, or of every request
 | onion connection (descriptor, introduction and rendezvous circuits) | about 1 to several seconds, heavy-tailed; arti's own issue reports onion connections timing out [unverified, onionperf, arti#2482] | once a purpose a session; pre-built when the app opens (§6.2) |
 | an SSH handshake over the circuit (key exchange and user authentication, about three round trips) | about 1–3 s [est] | once a connection, kept open while its group is in use; done ahead for a proven call's spare |
 | a request on an open connection (six hops each way) | 0.3–1 s round trip [est] | every call |
-| a proven call without a spare ready | adds an onion connection and an SSH handshake, 2 to several seconds | a second proven call within a spare's build time |
+| a proven call without a spare ready | adds an onion connection and an SSH handshake, 2 to several seconds | a call in a session's first seconds, or a second proven call within a spare's build time |
 | a proof's upload | a device proof is about 0.9 MB (a spend about 1.2 MB [est]); at the 0.5–2 MB/s an onion circuit sustains, 0.5–2 s [est] | every proven call |
 
 **A sign-in end to end** (a spare connected, the path held): prove 0.45–0.65
@@ -3316,6 +3392,56 @@ acknowledgement. Phone figures come from the phone session (§6.4).
 - **Pipelining works:** sixteen queries take about twice one round trip,
   so one SSH connection a purpose carries its group's reads without a
   second rendezvous.
+
+**A payment and a sign-in, from the tap and from the confirm.** UX sets the
+bar: a payment competes with tapping a card. Targets: from the confirm to
+the answer, at most 2 s with Tor warm (the source's answer, the proof and
+one send on a connection already open); from the tap to the form, at most
+0.5 s once the session has been open a few seconds. On the Fairphone 6
+over the onion before this [measured, Fairphone 6, debug APK, vos-core
+91e7c0a24, 2026-11-19]: a payment about 35 s from Pay to Paid, of which
+the proof 0.54 s: the form about 6 s after Pay (the device window read on
+a fetch of its own), the proof 8–10 s after the confirm (the node's time
+read on another fetch, then the Keystore), the send on the spare about
+2 s; a sign-in about 22 s from Sign in, the proof 0.68 s. Each fetch was a
+new onion connection and an SSH handshake, about 3 s at the gateway.
+What the light node does now (§6.2): the session's grant reads the device
+window (on the feed's connection) and the node's clock (a fetch, the
+reading kept as an offset from the device's clock, moved on by the
+monotonic clock) at drawn delays, and
+builds the spares; at the tap nothing is read; after the confirm the call
+is set from the kept reading and sent on the proven spare; a reading not
+held at the tap is read while the user reads the form.
+
+In the World [measured, x86: Intel Core Ultra 7 155H, the facility's
+`latency` test over `Delays::ONION` (a connection 4 s to its stream, a
+round trip 0.5 s, no rate cap: §6.3's desktop medians), a debug build,
+2026-11-20; the session open 25 s before the tap, the user reading the
+form 3 s]:
+
+| stage | before (vos-core 7921dd5ad) | after |
+|---|---|---|
+| payment, tap → form | 8.0 s: the window read on a new connection | 0 ms |
+| payment, confirm → paid | 8.5 s: the time read on a new connection 7.5 s, the proof 0.43 s, the send on the spare 0.55 s | 0.83 s: the proof 0.28 s, the send 0.55 s |
+| sign-in, tap → form | 0 ms (the window kept from the payment) | 0 ms |
+| sign-in, confirm → signed in | 8.7 s: the time read 8.0 s, the proof 0.16 s, the send | 0.69 s: the proof 0.18 s, the send 0.51 s |
+| requests after the confirm | the time on a new connection, then the proof | the proof alone, on a connection opened before the confirm |
+
+The SSH handshake is about six round trips (3 s at 0.5 s), the onion
+connection 4 s of a fresh connection's 7.5 s, the first request the
+rest; spares do both
+ahead. How soon after the grant the targets hold [measured, the same]:
+tapped 2 s after it, the payment's form came 6.0 s later (the window's
+read in flight, one connection), confirm → paid 0.84 s (the clock's read
+done while the form was read); at 6 s the form 2.1 s, a sign-in 1.4 s
+(its clock read in flight); from 10 s on, both targets (the form at once,
+confirm → answer 0.68–0.83 s). So a call in a session's first ten seconds
+or so waits for the reads in flight, at most one connection's time,
+never a second one. Outside the model: the proof's upload (a payment's
+0.75 MB, a sign-in's 0.79 MB: at the desktop's median 0.15 MB/s about
+5 s, while the Fairphone 6's spare sent a payment in about 2 s) and the
+source's answer (the Keystore, after the user's unlock), each logged on
+the phone (`vos.node`'s stage lines).
 
 ### 6.4 What it costs on the phone
 
@@ -3855,12 +3981,15 @@ device's crates faster); Q9's size argument for it is small.
   `Client` whose every space is set from the onions pinned at enrollment
   (the enrollment carries the onion set, each onion with its SSH host key),
   its clearnet only the per-space opt-out of key-signed calls, kept with
-  each `refresh_onions` answer as rows of the facility's database. A
-  spare circuit is kept while a session is open; the client is dormant
+  each `refresh_onions` answer as rows of the facility's database. Spare
+  connections (a proven call's, a fetch's) are kept for the session last
+  granted while the app is in the foreground (§6.2); the client is dormant
   in the background and woken around each job. Every request is `client.request` under its
   purpose: a sign-in's and a payment's proof sent by the facility itself
   (`Proven`; the s4 server gets the node's answer, never the request), the
-  node's time (`Fetch`), the tree (`Feed`, a `TreeKeeper` kept beside the
+  node's time (`Fetch`, each session's own reading, kept as an offset
+  from the device's clock and read again every 4 to 12 minutes), the
+  device window and the tree (`Feed`, a `TreeKeeper` kept beside the
   enrollment), open claims (`Member`), the personal agent (`Personal` for
   what the user does, `Background` for its job). s4's screens to an onion
   service no space pins go over Tor too, on a circuit of their own with no
@@ -4472,8 +4601,9 @@ reaches every gateway through SSH over the onion (E23); one connection for
 everything would let the gateway link the member's calls, proven calls
 and the personal agent by their shared SSH session. *Mitigation:* one SSH
 connection per isolation group, each on its own circuit and under an SSH
-key drawn for it alone; a proven call's spare connection is made ahead.
-(8.26)
+key drawn for it alone; a session's spare connections (a proven call's,
+a fetch's) are made ahead, one at a time after drawn delays, each used
+once, kept for that session alone (§6.2). (8.26)
 
 **H11. A user opts out of Tor for a space.** *Mitigation:* the opt-out
 covers that space's key-signed calls and its screens only, after a
