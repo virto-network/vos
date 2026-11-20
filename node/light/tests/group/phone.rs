@@ -30,8 +30,7 @@ impl Phone {
     /// admin key's seed `[n | 0x80; 32]`, a strong admin.
     pub fn new(n: u8) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let light =
-            Light::open(dir.path(), &crate::home::artifacts().0, Config::default()).unwrap();
+        let light = Light::open(dir.path(), crate::common::agent(), Config::default()).unwrap();
         let store = light.store().clone();
         let sync = light.sync_key().clone();
         let admin = SigningKey::from_bytes(&[n | 0x80; 32]);

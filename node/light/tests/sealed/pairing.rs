@@ -20,7 +20,6 @@ use vos_light::memberships::{self, Enrollment};
 use vos_light::pairing::{
     Code, Hello, Joined, Joiner, Membership, Offer, Opened, Opener, PairError, Put,
 };
-use vos_light::release;
 use vos_testkit::programs;
 use vos_wire::books::{Agent, DeviceHandle, Enrolled, Location};
 use vos_wire::personal::{Attached, DeviceView, InboxItem, PersonalError, Recorded, Status};
@@ -480,11 +479,7 @@ fn another_code_or_a_replaced_item_fails_the_handshake() {
 /// The credential book installed on `light`, the club joined, and each
 /// of `devices`' handle there as the registrar's person record holds it.
 fn book(light: &vos_light::Light, devices: &[(u32, u8)]) {
-    let book = release::package(
-        &std::fs::read(programs::program_elf("vos-credential-book")).unwrap(),
-        1,
-    )
-    .unwrap();
+    let book = crate::common::package(programs::program_elf("vos-credential-book"), 1);
     let outcome = light.install(BOOK, &book, Vec::new()).unwrap();
     assert!(matches!(outcome, Outcome::Done(_)), "{outcome:?}");
     let enrolled = Enrolled {

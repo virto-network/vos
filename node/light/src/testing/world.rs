@@ -443,6 +443,26 @@ pub fn personal_package() -> &'static Package {
     })
 }
 
+/// The light node's artifacts from this tree's guests: the default agent
+/// and the two books' packages.
+pub fn artifacts() -> &'static crate::space::Artifacts {
+    static ARTIFACTS: std::sync::OnceLock<crate::space::Artifacts> = std::sync::OnceLock::new();
+    ARTIFACTS.get_or_init(|| {
+        let read = |name| std::fs::read(vos_testkit::programs::program_elf(name)).unwrap();
+        let package = |name| crate::release::package(&read(name), 1).unwrap().encode();
+        crate::space::Artifacts {
+            agent: crate::release::agent(&read("vos-agent")).unwrap(),
+            books: vec![
+                (
+                    crate::space::CREDENTIAL_BOOK,
+                    package("vos-credential-book"),
+                ),
+                (crate::space::DEVICE_BOOK, package("vos-device-book")),
+            ],
+        }
+    })
+}
+
 /// A personal agent of `Personal`'s package at `agent`, its identity
 /// `identity`, its role `homes` the home's key's.
 fn personal_agent(agent: u32, identity: [u8; 32], homes: &SigningKey, now: u64) -> Agent {

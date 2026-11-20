@@ -7,7 +7,7 @@ use vos_abi::abi::Failure;
 use vos_abi::ids::{AgentId, MethodId};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode};
-use vos_light::release::{self, Package};
+use vos_light::release::Package;
 use vos_testkit::personal::Agent;
 use vos_testkit::programs;
 use vos_wire::ingress::{self, call_message};
@@ -59,16 +59,10 @@ pub struct Home {
     pub identity: [u8; 32],
 }
 
-/// The release artifacts: the default agent, linked, and `Personal`'s
-/// package.
-pub fn artifacts() -> &'static (Vec<u8>, Package) {
-    static ARTIFACTS: std::sync::OnceLock<(Vec<u8>, Package)> = std::sync::OnceLock::new();
-    ARTIFACTS.get_or_init(|| {
-        let read = |path: std::path::PathBuf| std::fs::read(path).unwrap();
-        let agent = release::agent(&read(programs::program_elf("vos-agent"))).unwrap();
-        let personal = release::package(&read(programs::program_elf("vos-personal")), 1).unwrap();
-        (agent, personal)
-    })
+/// `Personal`'s package.
+pub fn personal() -> &'static Package {
+    static PERSONAL: std::sync::OnceLock<Package> = std::sync::OnceLock::new();
+    PERSONAL.get_or_init(|| crate::common::package(programs::program_elf("vos-personal"), 1))
 }
 
 impl Home {
@@ -80,7 +74,7 @@ impl Home {
     /// [`Home::new`] for an agent whose identity is `identity`: another
     /// home's.
     pub fn at(homes: &SigningKey, policy: Policy, identity: [u8; 32]) -> Self {
-        let (_, package) = artifacts();
+        let package = personal();
         let checked = package.checked().unwrap();
         let installed: Vec<&[u8]> = checked.iter().map(|(_, program)| *program).collect();
         let agent = Agent::new(

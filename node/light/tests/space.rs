@@ -14,35 +14,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use vos_abi::Encode;
 use vos_light::group::Alarm;
-use vos_light::space::{Artifacts, CREDENTIAL_BOOK, Claim, DEVICE_BOOK, Error, Personal, Phase};
-use vos_light::testing::{Death, Phone, Reach, Step, World, policy};
-use vos_testkit::programs::program_elf;
+use vos_light::space::{Claim, Error, Personal, Phase};
+use vos_light::testing::{Death, Phone, Reach, Step, World, artifacts, policy};
 use vos_wire::personal::method;
 use vos_wire::personal::{KitKind, PersonalError, Policy, Standing};
 
 const HOME: [u8; 32] = [0x61; 32];
-
-/// The light node's artifacts from this tree's guests.
-fn artifacts() -> &'static Artifacts {
-    static ARTIFACTS: std::sync::OnceLock<Artifacts> = std::sync::OnceLock::new();
-    ARTIFACTS.get_or_init(|| {
-        let read = |name| std::fs::read(program_elf(name)).unwrap();
-        let package = |name| {
-            vos_light::release::package(&read(name), 1)
-                .unwrap()
-                .encode()
-        };
-        Artifacts {
-            agent: vos_light::release::agent(&read("vos-agent")).unwrap(),
-            books: vec![
-                (CREDENTIAL_BOOK, package("vos-credential-book")),
-                (DEVICE_BOOK, package("vos-device-book")),
-            ],
-        }
-    })
-}
 
 /// A device: its personal space over the world, its phone, its store.
 struct Device {

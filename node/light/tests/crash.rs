@@ -6,6 +6,8 @@
 //! tail, as a power loss could leave it), holds the nodes of the first
 //! calls and their counts, no more and no fewer.
 
+mod common;
+
 use std::path::Path;
 
 use vos_abi::ids::{InstanceId, Principal};
@@ -13,7 +15,7 @@ use vos_abi::records::unstored;
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode, keys};
 use vos_checker::crash::{Round, Rounds, journal};
-use vos_light::release::{self, Package};
+use vos_light::release::Package;
 use vos_light::{Config, Light};
 use vos_testkit::programs;
 
@@ -27,21 +29,14 @@ const TEAR: u64 = 512;
 /// `TEAR` bytes reaches at most `TEAR / 32` operations.
 const TEAR_REACH: u64 = TEAR / 32;
 
-fn artifacts() -> (Vec<u8>, Package) {
-    let read = |path: std::path::PathBuf| std::fs::read(path).unwrap();
-    let agent = release::agent(&read(programs::program_elf("vos-agent"))).unwrap();
-    let notes = release::package(&read(programs::actor_elf("notes")), 1).unwrap();
-    (agent, notes)
-}
-
 /// The child: install the notes actor if this store has not, then call it
 /// in a loop, reporting each call's number once committed.
 fn writer(dir: &Path) {
-    let (agent, notes) = artifacts();
+    let (agent, notes) = (common::agent(), common::notes());
     let set = programs::method(&notes.programs[0], "set");
-    let light = Light::open(dir, &agent, Config::default()).unwrap();
+    let light = Light::open(dir, agent, Config::default()).unwrap();
     if version(&light) == 0 {
-        light.install(NOTES, &notes, Vec::new()).unwrap();
+        light.install(NOTES, notes, Vec::new()).unwrap();
     }
     let mut calls = recorded(&light);
     loop {
@@ -69,10 +64,10 @@ fn stored<T: Decode>(light: &Light, key: &[u8]) -> Option<T> {
 }
 
 fn main() {
-    let (agent, notes) = artifacts();
+    let (agent, notes) = (common::agent(), common::notes());
     let mut last = 0;
     ROUNDS.run(writer, journal(TEAR), |round| {
-        check(round, &agent, &notes, &mut last)
+        check(round, agent, notes, &mut last)
     });
     println!(
         "light crash: {} rounds reopened on one prefix each",

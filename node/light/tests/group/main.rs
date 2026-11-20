@@ -7,6 +7,8 @@
 //! commit (A20, A21), every disallowed proposal (A17), and devices shown
 //! different confirming sets (B4).
 
+#[path = "../common/mod.rs"]
+mod common;
 mod garble;
 mod home;
 mod phone;

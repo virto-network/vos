@@ -7,6 +7,8 @@
 //! (C9), recovery envelopes under `R` (D1), and no request over the
 //! clearnet (E17).
 
+#[path = "../common/mod.rs"]
+mod common;
 #[allow(dead_code)]
 #[path = "../group/home.rs"]
 mod home;
@@ -26,11 +28,9 @@ use vos_abi::{Decode, Encode};
 use vos_light::personal::{
     Answer, Frontier, Link, SealedSync, SyncError, Unusable, Waiting, open_recovery, recovery_key,
 };
-use vos_light::release::{self, Package};
 use vos_light::route::Route;
 use vos_light::sealed::{self, OpenError};
 use vos_light::{Error, Light, MAX_ARGUMENTS};
-use vos_testkit::programs;
 use vos_wire::personal::{Envelope, PersonalError, Policy, Pushed, RECOVERY, Scope, Woken};
 
 use home::Home;
@@ -55,19 +55,14 @@ fn policy() -> Policy {
     }
 }
 
-fn notes() -> &'static Package {
-    static NOTES: std::sync::OnceLock<Package> = std::sync::OnceLock::new();
-    NOTES.get_or_init(|| {
-        release::package(&std::fs::read(programs::actor_elf("notes")).unwrap(), 1).unwrap()
-    })
-}
-
 fn method(name: &str) -> MethodId {
     MethodId(vos_light::method_id(name))
 }
 
 fn install(light: &Light, instance: InstanceId) {
-    let outcome = light.install(instance, notes(), Vec::new()).unwrap();
+    let outcome = light
+        .install(instance, common::notes(), Vec::new())
+        .unwrap();
     assert!(matches!(outcome, Outcome::Done(_)), "{outcome:?}");
 }
 
@@ -217,7 +212,7 @@ fn settle(home: &mut Home, phones: &mut [Phone]) {
 /// its store, as after its process's death.
 fn restart(phone: &mut Phone) {
     let scratch = tempfile::tempdir().unwrap();
-    let artifacts = &home::artifacts().0;
+    let artifacts = common::agent();
     phone.group = None;
     let stand_in = Light::open(scratch.path(), artifacts, Default::default()).unwrap();
     phone.store = stand_in.store().clone();
