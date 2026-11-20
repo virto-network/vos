@@ -40,9 +40,6 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
-use blake2::Blake2b;
-use blake2::digest::Digest as _;
-use blake2::digest::consts::U32;
 use merkle_crdt::Ingested;
 use vos_abi::ids::InstanceId;
 use vos_abi::{Decode, Encode};
@@ -357,7 +354,7 @@ const _: () = assert!(CHUNK_BYTES < 1 << 30, "the length prefix stays four bytes
 
 /// The digest an archive's chunks name it by.
 fn archive_digest(encoding: &[u8]) -> [u8; 32] {
-    digest(b"vos/personal/archive-digest", encoding)
+    crate::hash(b"vos/personal/archive-digest", &[encoding])
 }
 
 /// An archive's parts read so far: how many it has, those read, and the
@@ -441,17 +438,10 @@ fn chunks(
     (digest, envelopes)
 }
 
-fn digest(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Blake2b::<U32>::new();
-    hasher.update(domain);
-    hasher.update(bytes);
-    hasher.finalize().into()
-}
-
 /// The key recovery envelopes are sealed under: `R`'s, apart from every
 /// other use of it.
 pub fn recovery_key(r: &[u8; 32]) -> Zeroizing<[u8; 32]> {
-    Zeroizing::new(digest(b"vos/personal/recovery", r))
+    Zeroizing::new(crate::hash(b"vos/personal/recovery", &[r]))
 }
 
 /// What the recovery scope's `envelopes` of the agent whose identity is

@@ -53,7 +53,7 @@
 
 use blake2::Blake2b;
 use blake2::digest::Digest as _;
-use blake2::digest::consts::{U16, U32};
+use blake2::digest::consts::U16;
 use ed25519_dalek::SigningKey;
 use vos_abi::ids::InstanceId;
 use vos_abi::{Decode, Encode};
@@ -272,15 +272,7 @@ fn item_id(slot: &Scope, side: Side, n: u32) -> [u8; 16] {
 }
 
 fn psk(code: &[u8; 16], slot: &Scope, identity: &[u8; 32]) -> Zeroizing<[u8; 32]> {
-    Zeroizing::new(
-        Blake2b::<U32>::new()
-            .chain_update(PSK)
-            .chain_update(code)
-            .chain_update(slot)
-            .chain_update(identity)
-            .finalize()
-            .into(),
-    )
+    Zeroizing::new(crate::hash(PSK, &[code, slot, identity]))
 }
 
 fn prologue(slot: &Scope, identity: &[u8; 32]) -> Vec<u8> {
@@ -288,21 +280,13 @@ fn prologue(slot: &Scope, identity: &[u8; 32]) -> Vec<u8> {
 }
 
 fn received(handover: &[u8]) -> [u8; 32] {
-    Blake2b::<U32>::new()
-        .chain_update(RECEIVED)
-        .chain_update(handover)
-        .finalize()
-        .into()
+    crate::hash(RECEIVED, &[handover])
 }
 
 /// The six-digit check of a handshake whose hash is `hash`, as both sides
 /// show it: `123 456`.
 pub fn check(hash: &[u8]) -> String {
-    let digest: [u8; 32] = Blake2b::<U32>::new()
-        .chain_update(CHECK)
-        .chain_update(hash)
-        .finalize()
-        .into();
+    let digest = crate::hash(CHECK, &[hash]);
     let n = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
     format!("{:03} {:03}", n / 1000, n % 1000)
 }

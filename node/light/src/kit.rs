@@ -19,9 +19,7 @@
 //! hashed from the agreement, the agent and both public keys, the agent's
 //! identity bound as the AAD (80 bytes).
 
-use blake2::Blake2b;
 use blake2::digest::Digest as _;
-use blake2::digest::consts::U32;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::SigningKey;
@@ -60,12 +58,7 @@ pub trait SecurityKey {
 }
 
 fn hash(domain: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; 32]> {
-    let mut hasher = Blake2b::<U32>::new();
-    hasher.update(domain);
-    for part in parts {
-        hasher.update(part);
-    }
-    Zeroizing::new(hasher.finalize().into())
+    Zeroizing::new(crate::hash(domain, parts))
 }
 
 /// The kit's public keys: its kind, its signing key (its client key at the

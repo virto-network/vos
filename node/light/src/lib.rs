@@ -242,3 +242,15 @@ impl core::fmt::Display for DeviceError {
 }
 
 impl std::error::Error for DeviceError {}
+
+/// The BLAKE2b-256 digest of `parts` under `domain`, apart from every other
+/// domain's.
+pub(crate) fn hash(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    use blake2::Digest as _;
+    let mut hasher = blake2::Blake2b::<blake2::digest::consts::U32>::new();
+    hasher.update(domain);
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}

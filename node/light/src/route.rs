@@ -18,9 +18,6 @@
 //!   carries nothing else, so a credentialed call never rides a key-signed
 //!   connection that may be on the clearnet.
 
-use blake2::Blake2b;
-use blake2::digest::Digest as _;
-use blake2::digest::consts::U32;
 use vos_api::Kind;
 use vos_wire::credentials::Onion;
 
@@ -40,10 +37,7 @@ pub fn space(handle: &[u8; 32]) -> [u8; 32] {
 }
 
 fn keyed(domain: &[u8], handle: &[u8; 32]) -> [u8; 32] {
-    Blake2b::<U32>::new_with_prefix(domain)
-        .chain_update(handle)
-        .finalize()
-        .into()
+    crate::hash(domain, &[handle])
 }
 
 /// How a request reaches a space.
