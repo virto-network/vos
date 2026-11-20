@@ -179,10 +179,9 @@ impl Link for HomeLink<'_> {
 /// as [`NOTES`] and its scope tracked: its key archived at every confirmed
 /// epoch from now.
 fn household(count: u8) -> (Home, Vec<Phone>) {
-    let homes = SigningKey::from_bytes(&[0x50; 32]);
-    let mut home = Home::new(&homes, policy());
+    let mut home = Home::new(policy());
     let mut phones: Vec<Phone> = (1..=count).map(Phone::new).collect();
-    phones[0].claim(&mut home, &homes);
+    phones[0].claim(&mut home);
     for n in 1..count as usize {
         let (paired, rest) = phones.split_at_mut(n);
         paired[0].pair(&mut home, &mut rest[0]);

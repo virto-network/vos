@@ -7,7 +7,7 @@ use vos_abi::Encode;
 use vos_light::group::{DeviceGroup, Event, Pairing, Prepared};
 use vos_light::kit::{KitKey, KitSecret, SecurityKey, Split};
 use vos_wire::personal::{
-    AdminClass, Attached, Attestation, Candidacy, NewDevice, PersonalError, Recorded, Vote,
+    AdminClass, Attached, Attestation, Candidacy, NewDevice, PersonalError, Vote,
 };
 use zeroize::Zeroizing;
 
@@ -73,17 +73,14 @@ impl Phone {
 
     /// The claiming phone: its group made, the home assigned to it with
     /// the kit of [`kit_key`]`(0)`, `R` split: the split.
-    pub fn claim(&mut self, home: &mut Home, homes: &SigningKey) -> Split {
-        self.claim_with(home, homes, vec![kit_key(0)])
+    pub fn claim(&mut self, home: &mut Home) -> Split {
+        self.claim_with(home, vec![kit_key(0)])
     }
 
     /// The claiming phone with the kit of `keys`.
-    pub fn claim_with(&mut self, home: &mut Home, homes: &SigningKey, keys: Vec<KitKey>) -> Split {
+    pub fn claim_with(&mut self, home: &mut Home, keys: Vec<KitKey>) -> Split {
         let split = Split::draw(&keys, &home.identity).unwrap();
-        let assigned: Recorded = home
-            .call(homes, "assign", (self.keys.clone(), split.claim()).encode())
-            .answer()
-            .unwrap();
+        let assigned = home.claim(&self.keys, split.claim());
         let mut group = DeviceGroup::create(
             &self.store,
             home.agent(),
@@ -92,7 +89,7 @@ impl Phone {
             home.now(),
         )
         .unwrap();
-        group.set_recovery(assigned.index, *split.r()).unwrap();
+        group.set_recovery(assigned, *split.r()).unwrap();
         self.group = Some(group);
         split
     }

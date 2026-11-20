@@ -314,8 +314,7 @@ fn a_personal_agent_admits_its_devices_through_the_onion_alone() {
     let phone = Keys::of(11);
     let mut sync = personal.signer(&phone.sync, 1);
     assert_eq!(personal.call(&mut sync, "alive", Vec::new()).1, unknown());
-    personal.home("configure", policy());
-    personal.home("assign", (phone.device(), kit()));
+    personal.home("claim", (phone.device(), kit(), policy()));
     let alive: Recorded = personal.admitted(&mut sync, "alive", Vec::new()).unwrap();
     assert!(alive.at > 0);
     // Off the onion: refused before anything is read.
@@ -351,9 +350,10 @@ fn a_personal_agent_admits_its_devices_through_the_onion_alone() {
     let kit_key = SigningKey::from_bytes(&[0xc1; 32]);
     let entries: Vec<(u64, Entry)> = personal.query(&kit_key, "log", 0u64).unwrap();
     assert!(matches!(
-        entries[1].1.body,
+        entries[0].1.body,
         Body::Assigned { device: 0, .. }
     ));
+    assert!(matches!(entries[1].1.body, Body::Configured(_)));
 }
 
 /// The gate at ingress: a commit signed by a sync key runs and is refused
@@ -366,8 +366,7 @@ fn a_personal_agent_admits_its_devices_through_the_onion_alone() {
 fn admin_calls_are_verified_at_ingress_and_checked_against_the_device_set() {
     let mut personal = Personal::start();
     let phone = Keys::of(21);
-    personal.home("configure", policy());
-    personal.home("assign", (phone.device(), kit()));
+    personal.home("claim", (phone.device(), kit(), policy()));
     let mut sync = personal.signer(&phone.sync, 1);
     personal
         .admitted::<Recorded>(&mut sync, "alive", Vec::new())
@@ -450,8 +449,7 @@ fn admin_calls_are_verified_at_ingress_and_checked_against_the_device_set() {
 fn a_removed_device_keeps_its_session_and_the_agent_refuses_it() {
     let mut personal = Personal::start();
     let (phone, tablet) = (Keys::of(31), Keys::of(32));
-    personal.home("configure", policy());
-    personal.home("assign", (phone.device(), kit()));
+    personal.home("claim", (phone.device(), kit(), policy()));
     let mut admin = personal.signer(&phone.admin, 2);
     let add = (
         (
@@ -517,7 +515,7 @@ fn a_removed_device_keeps_its_session_and_the_agent_refuses_it() {
 fn a_push_and_its_read_round_trip() {
     let mut personal = Personal::start();
     let phone = Keys::of(41);
-    personal.home("assign", (phone.device(), kit()));
+    personal.home("claim", (phone.device(), kit(), Policy::DEFAULT));
     let mut sync = personal.signer(&phone.sync, 1);
     personal
         .admitted::<Recorded>(&mut sync, "alive", Vec::new())

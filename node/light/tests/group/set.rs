@@ -619,10 +619,9 @@ fn a_device_that_cannot_follow_regroups() {
 /// own commit carries it, and every device confirms the new phone.
 #[test]
 fn a_delayed_admins_add_waits_its_delay() {
-    let homes = crate::homes();
-    let mut home = Home::new(&homes, policy());
+    let mut home = Home::new(policy());
     let mut first = Phone::new(1);
-    first.claim(&mut home, &homes);
+    first.claim(&mut home);
     let mut delayed = Phone::delayed(2);
     first.pair(&mut home, &mut delayed);
     settle(&mut home, &mut [&mut first, &mut delayed]);

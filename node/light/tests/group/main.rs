@@ -14,7 +14,7 @@ mod home;
 mod phone;
 mod set;
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::Signer;
 use mls_rs::{ExtensionList, ProtocolVersion};
 use vos_abi::Encode;
 use vos_abi::ids::InstanceId;
@@ -44,10 +44,6 @@ fn policy() -> Policy {
     }
 }
 
-fn homes() -> SigningKey {
-    SigningKey::from_bytes(&[0x50; 32])
-}
-
 /// Read every phone, in turn, until none posts anything: each phone's
 /// events.
 fn settle(home: &mut Home, phones: &mut [&mut Phone]) -> Vec<Vec<Event>> {
@@ -67,10 +63,9 @@ fn all(phones: &mut [Phone]) -> Vec<&mut Phone> {
 /// A home claimed by phone 1 and `count - 1` more phones paired, each
 /// confirmed by every phone and past its probation, each seen.
 fn household(count: u8) -> (Home, Vec<Phone>) {
-    let homes = homes();
-    let mut home = Home::new(&homes, policy());
+    let mut home = Home::new(policy());
     let mut phones: Vec<Phone> = (1..=count).map(Phone::new).collect();
-    phones[0].claim(&mut home, &homes);
+    phones[0].claim(&mut home);
     for n in 1..count as usize {
         let (paired, rest) = phones.split_at_mut(n);
         paired[0].pair(&mut home, &mut rest[0]);

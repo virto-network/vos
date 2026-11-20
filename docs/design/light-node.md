@@ -508,7 +508,7 @@ operator makes ahead of time**:
   over with `homes.stock(ids)`, an operator-role call.
 - **The keeper** (`tools/`, holding an operator key) tops the pool up in
   bulk: create, install `Personal`, and grant `Principal::Agent(homes)`
-  the role under which `Personal` takes `assign` (`Grant`; `Install`
+  the role under which `Personal` takes `claim` (`Grant`; `Install`
   carries no configuration, `agent/wire/src/ingress.rs`). Creating an agent
   costs about 2 s, 0.15–0.17 s each sixteen at a time [measured,
   `core-model.md` §14.1], so a pool of a few hundred hides creation from
@@ -595,8 +595,9 @@ this is the one taken]:
   and sent `claim(device, kit, policy,
   homes)`, `Personal`'s entry for its home: the policy and the claim
   checked whole, answered by message, `assigned`, or `refused` with the
-  error and nothing written (`assign` and `configure` stay for a home's
-  stand-in, and answer only their caller). The reply is the agent's id.
+  error and nothing written: the one way an agent is assigned and its
+  policy set [decided 2026-11-20, built: no `assign` or `configure`]. The
+  reply is the agent's id.
   The same claim again (its nullifier and kit) while its answer is awaited
   is sent again, and `Personal` answers `assigned` again to a claim it
   took from the same home, so an answer lost is recovered by the device's
@@ -665,10 +666,14 @@ this is the one taken]:
   and every claim was assigned [measured, the served suite on a debug build
   with the prover's crates optimized, Core Ultra 7 155H, 2026-11-07, two
   runs].
-- **The `home` test actor stays, for tests alone** (`agent/test-actors/
-  home`): it passes a client's `assign`, `configure` and `renew` on to a
-  personal agent with no proof, for the suites of `Personal` itself, the
-  light node's and the scale harness's; a home runs `Homes`.
+- **The `home` test actor stays, for the node's suites and the scale
+  harness alone** (`agent/test-actors/home`): it sends a client's `claim`
+  and `renew` on to a personal agent as `Homes` does, without the member's
+  proof `Homes` asks first (a proof a claim, about 1.6 s each on a debug
+  build, above, for each of the scale harness's thousands of agents), and
+  takes `Personal`'s answers. `Personal`'s own suite and the light node's
+  claim as the home's agent in process (`vos_testkit::personal::Agent::
+  claim`); a home runs `Homes`.
 
 **Replicas:** three by default, the space's policy, fixed when the keeper
 makes the agent. One replica is allowed for small spaces and shown in the
@@ -792,7 +797,7 @@ sealed scopes, acknowledgements, the recovery scope, quotas, the inbox,
 pairing slots, the lease and its grace, and gated reads, over the device
 set of §3.5 (its rules as built are there): devices with their keys,
 class, attestation, nullifier, sealed label, probation, seasoning and
-status; the claiming device active at `assign`, a strong admin's add
+status; the claiming device active at its claim, a strong admin's add
 inline in its commit, and the operations with their vetoes, contests,
 resolutions and second signatures. Batch time decides lazily: each call
 first settles one operation that fell due (a removal's device leaves
@@ -820,9 +825,8 @@ owed are at most a pass old. The Devices screen's read wakes the agent
 the same way first (`space::Personal::devices`). `seen` stays each
 device's last call (below, "Seen means a call"). Delays and maturities
 themselves run on batch time alone, as below. The home's
-calls (`configure`, `assign`, `claim`, `renew`) take the role `homes`;
-`assign` answers its caller, and `claim` answers `Homes` by message
-(above, "`Homes` as built"). Bounds the rules above leave open: `alive` is logged at
+calls (`claim`, `renew`) take the role `homes`; `claim` answers
+`Homes` by message (above, "`Homes` as built"). Bounds the rules above leave open: `alive` is logged at
 most once an hour a device (the entry logged last answers between), a
 vote's signed message names its candidate's log index as well as its
 epoch (an epoch's number is free again after a void), an opener holds one
@@ -1890,10 +1894,11 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   window past it (an add's keys, nullifier and label, the votes, the
   candidates, `alive`), which before it read none of: a stolen phone
   removed and then replaced learns the new phone's nullifier. A device
-  named by a removal whose signature it verified, but whose maturity its
-  log never shows it supported (a cosign's evidence never posted), stays
-  in the set by its rules and pairs again from a code of its own space
-  (`DeviceGroup::removal_signed`). The Devices screen's own row says
+  whose removal's maturity the log asserted but whose evidence never
+  supported it (a cosign's evidence never posted) stays in the set by its
+  rules, and pairs again from a code of its own space
+  (`DeviceGroup::removal_unsupported`); a removal pending its delay lets
+  no device in the set pair again. The Devices screen's own row says
   removed only once the device is out (`space::Personal::devices`). What
   a gateway can still do is withhold, which any route can, and replay: an
   operation's evidence binds its call, not its place in the log, so a

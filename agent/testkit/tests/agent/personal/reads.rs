@@ -58,8 +58,7 @@ fn queries_answer_only_admitted_keys() {
             "{name} before the assignment"
         );
     }
-    home.call::<Recorded>(HOMES, "assign", (device(0), kit()))
-        .unwrap();
+    home.claim(device(0), kit(), Policy::DEFAULT).unwrap();
     home.pair(0, 1);
     home.push(1, envelope(scope(1), 1, 1, 100)).unwrap();
     for (name, arguments) in reads() {

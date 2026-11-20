@@ -165,6 +165,29 @@ fn a_space_is_claimed_and_paired_through_the_light_node() {
     first.space.pair_cancel();
 }
 
+/// A phone whose removal is pending its delay is in the set still: its
+/// own space's code scanned is refused, as for any live device.
+#[test]
+fn a_phone_whose_removal_is_pending_pairs_no_more_than_a_live_one() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let first = device(&world, 0x23);
+    first.claim(&world, home);
+    let second = device(&world, 0x24);
+    let id = first.pair(&second);
+    first.space.remove(&first.phone, id).unwrap();
+    second.pass();
+    let code = first.space.pair_offer().unwrap();
+    assert_eq!(
+        second
+            .space
+            .pair_join(&second.phone, &code.code, "again")
+            .unwrap_err(),
+        Error::InSetAlready
+    );
+    first.space.pair_cancel();
+}
+
 /// A regroup's removal set is the agent's: the regrouper's commit carries
 /// the removals the light node voices, which the agent takes only when
 /// they are exactly its live set's (`check_removals`). A device still on

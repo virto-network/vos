@@ -170,46 +170,15 @@ pub struct Personal {
 impl Personal {
     // ===== The home's =====
 
-    /// Set the space's policy for this agent: delays, windows and quotas.
-    /// Once a claim assigned the agent, a configuration lowers no delay or
-    /// window of the device set's rules ([`Policy::over`]): those are the
-    /// claim's.
-    #[msg(role = "homes")]
-    pub async fn configure(
-        &mut self,
-        ctx: &mut Command<Self>,
-        policy: Policy,
-    ) -> Result<Recorded, PersonalError> {
-        let now = ctx.now();
-        let policy = if self.assigned().is_ok() {
-            policy.over(&self.policy())
-        } else {
-            policy
-        };
-        self.policy.set(&policy);
-        let index = self.append(now, Body::Configured(policy));
-        Ok(Recorded { at: now, index })
-    }
-
-    /// Assign the agent to a claim: its device, the first, active at once,
-    /// and its recovery kit. The lease runs from now.
-    #[msg(role = "homes")]
-    pub async fn assign(
-        &mut self,
-        ctx: &mut Command<Self>,
-        device: NewDevice,
-        kit: Kit,
-    ) -> Result<Recorded, PersonalError> {
-        self.take(ctx.now(), device, kit)
-    }
-
-    /// [`Personal::configure`] then [`Personal::assign`] for the home's
-    /// `Homes` at `homes` in the calling agent, answered by message (a send
-    /// is one-way): `assigned`, or `refused` with the error, writing
-    /// nothing. The same claim again, from the same home, is answered
-    /// `assigned` again. From then on the agent tells `Homes` each device's
-    /// nullifier as its add is confirmed and as its removal matures, and
-    /// each new kit's keys.
+    /// The home's `Homes` at `homes` in the calling agent assigns the agent
+    /// to a claim: its device, the first, active at once, its recovery kit
+    /// and the space's policy (delays, windows and quotas, set here alone,
+    /// so no later word lowers them); the lease runs from now. Answered by
+    /// message (a send is one-way): `assigned`, or `refused` with the
+    /// error, writing nothing. The same claim again, from the same home,
+    /// is answered `assigned` again. From then on the agent tells `Homes`
+    /// each device's nullifier as its add is confirmed and as its removal
+    /// matures, and each new kit's keys.
     #[msg(role = "homes")]
     pub async fn claim(
         &mut self,

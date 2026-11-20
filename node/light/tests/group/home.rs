@@ -11,7 +11,7 @@ use vos_light::release::Package;
 use vos_testkit::personal::Agent;
 use vos_testkit::programs;
 use vos_wire::ingress::{self, call_message};
-use vos_wire::personal::{Entry, PersonalError, Policy};
+use vos_wire::personal::{Body, Entry, Kit, NewDevice, PersonalError, Policy};
 
 pub use vos_wire::personal::PERSONAL;
 /// The agent's identity, which calls are signed for.
@@ -57,7 +57,12 @@ pub struct Home {
     agent: Agent,
     /// The agent's identity, which calls are signed for.
     pub identity: [u8; 32],
+    /// The policy the home's claims set.
+    policy: Policy,
 }
+
+/// The home's agent, whose `Homes` claims the agent.
+const HOME_AGENT: AgentId = AgentId(0x50);
 
 /// `Personal`'s package.
 pub fn personal() -> &'static Package {
@@ -66,14 +71,15 @@ pub fn personal() -> &'static Package {
 }
 
 impl Home {
-    /// `Personal` installed, its role `homes` granted to `homes`.
-    pub fn new(homes: &SigningKey, policy: Policy) -> Self {
-        Self::at(homes, policy, IDENTITY)
+    /// `Personal` installed, its role `homes` granted to the home's agent,
+    /// whose claims set `policy`.
+    pub fn new(policy: Policy) -> Self {
+        Self::at(policy, IDENTITY)
     }
 
     /// [`Home::new`] for an agent whose identity is `identity`: another
     /// home's.
-    pub fn at(homes: &SigningKey, policy: Policy, identity: [u8; 32]) -> Self {
+    pub fn at(policy: Policy, identity: [u8; 32]) -> Self {
         let package = personal();
         let checked = package.checked().unwrap();
         let installed: Vec<&[u8]> = checked.iter().map(|(_, program)| *program).collect();
@@ -82,14 +88,29 @@ impl Home {
             identity,
             package.derivation.clone(),
             &installed,
-            homes.verifying_key().to_bytes(),
+            HOME_AGENT,
             T0 - 1,
         );
-        let mut home = Self { agent, identity };
-        home.call(homes, "configure", policy.encode())
-            .answer::<vos_wire::personal::Recorded>()
+        Self {
+            agent,
+            identity,
+            policy,
+        }
+    }
+
+    /// The home's claim of the agent for `device` with `kit`, as `Homes`
+    /// sends it: the index of the log's entry assigning it.
+    pub fn claim(&mut self, device: &NewDevice, kit: Kit) -> u64 {
+        let now = self.now();
+        self.agent
+            .claim(now, device.clone(), kit, self.policy)
             .unwrap();
-        home
+        self.log(device.sync, 0)
+            .unwrap()
+            .iter()
+            .find(|(_, entry)| matches!(entry.body, Body::Assigned { .. }))
+            .expect("the assignment")
+            .0
     }
 
     /// The next batch's time.

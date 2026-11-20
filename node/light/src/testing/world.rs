@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ed25519_dalek::SigningKey;
 use russh::keys::ssh_key;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use vos_abi::credentials as tree;
@@ -262,7 +261,6 @@ impl Tree {
 /// recorded.
 pub struct Homes {
     pub instance: u32,
-    key: SigningKey,
     pub pool: Vec<u32>,
     pub kits: HashMap<[u8; 32], u32>,
     /// The agent each claiming device's nullifier holds.
@@ -458,8 +456,8 @@ pub fn artifacts() -> &'static crate::space::Artifacts {
 }
 
 /// A personal agent of `Personal`'s package at `agent`, its identity
-/// `identity`, its role `homes` the home's key's.
-fn personal_agent(agent: u32, identity: [u8; 32], homes: &SigningKey, now: u64) -> Agent {
+/// `identity`, its role `homes` the home's agent `homes`'.
+fn personal_agent(agent: u32, identity: [u8; 32], homes: u32, now: u64) -> Agent {
     let package = personal_package();
     let checked = package.checked().expect("a checked package");
     let programs: Vec<&[u8]> = checked.iter().map(|(_, program)| *program).collect();
@@ -468,7 +466,7 @@ fn personal_agent(agent: u32, identity: [u8; 32], homes: &SigningKey, now: u64) 
         identity,
         package.derivation.clone(),
         &programs,
-        homes.verifying_key().to_bytes(),
+        AgentId(homes),
         now,
     )
 }
@@ -598,18 +596,16 @@ impl World {
         let agent = self.space(handle, onion);
         let now = self.now();
         let mut state = self.state.lock().unwrap();
-        let key = SigningKey::from_bytes(&[handle[0] ^ 0x77; 32]);
         let mut agents = Vec::new();
         for _ in 0..pool {
             let (id, identity) = Self::agent(&mut state);
             state
                 .personal
-                .insert(id, personal_agent(id, identity, &key, now));
+                .insert(id, personal_agent(id, identity, agent, now));
             agents.push(id);
         }
         state.spaces.get_mut(&agent).unwrap().homes = Some(Homes {
             instance: 3,
-            key,
             pool: agents,
             kits: HashMap::new(),
             nullifiers: HashMap::new(),
@@ -1068,12 +1064,10 @@ impl State {
             for entry in &kit.entries {
                 homes.kits.insert(crate::kit::index(&entry.signing), chosen);
             }
-            let key = homes.key.clone();
             let policy = self.policy.unwrap_or_else(policy);
             let host = self.personal.get_mut(&chosen).unwrap();
-            host.configure(now, &key, policy);
-            let (assigned, _) = host.signed(now, &key, personal::ASSIGN, (device, kit).encode());
-            assert!(matches!(assigned, Outcome::Done(_)), "{assigned:?}");
+            host.claim(now, device, kit, policy)
+                .expect("the claim taken");
             return done(chosen);
         }
         if named(credentials::ENROLL_DEVICE) {

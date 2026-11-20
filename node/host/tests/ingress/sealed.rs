@@ -212,8 +212,7 @@ fn household(agent: &[u8]) -> (Personal, Phone, Phone) {
     let mut personal = Personal::start();
     let mut first = Phone::new(&personal, 51, agent);
     let mut second = Phone::new(&personal, 52, agent);
-    personal.home("configure", roomy());
-    personal.home("assign", (first.keys.device(), kit()));
+    personal.home("claim", (first.keys.device(), kit(), roomy()));
     let alive: Recorded = personal
         .admitted(&mut first.sync, "alive", Vec::new())
         .unwrap();

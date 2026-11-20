@@ -38,8 +38,11 @@ use vos_wire::personal::{
 use crate::common::{AGENT, Node};
 
 pub use vos_wire::personal::PERSONAL;
-/// The principal holding the role `homes`, as the home's `Homes` does.
-pub const HOMES: Principal = Principal::Client([0x50; 32]);
+/// The principal holding the role `homes`: the home's agent, whose
+/// `Homes` claims the agent.
+pub const HOMES: Principal = Principal::Agent(AgentId(0x50));
+/// `Homes`' instance in the home's agent, which a claim's answer goes to.
+pub const HOMES_AT: u32 = 3;
 const HOMES_ROLE: u8 = 1;
 /// The batch time a test's agent starts at.
 pub const T0: u64 = 1_800_000_000_000;
@@ -264,12 +267,11 @@ impl Home {
         Home::on(world, AGENT)
     }
 
-    /// Assigned to device 0 with [`kit`], under `policy`.
+    /// Claimed by device 0 with [`kit`], under `policy`, as `Homes`
+    /// claims it.
     pub fn with(policy: Policy) -> Self {
         let mut home = Self::installed();
-        home.call::<Recorded>(HOMES, "configure", policy).unwrap();
-        home.call::<Recorded>(HOMES, "assign", (device(0), kit()))
-            .unwrap();
+        home.claim(device(0), kit(), policy).unwrap();
         home
     }
 
@@ -397,6 +399,39 @@ impl<W: BorrowMut<World>> Home<W> {
 
     /// `caller`'s call of `name`, refused before the handler ran: its
     /// failure.
+    /// The home's claim of the agent for `device` with `kit` under
+    /// `policy`, as `Homes` sends it: the answer it sends back, `assigned`
+    /// or the error `refused` carries.
+    pub fn claim(
+        &mut self,
+        device: NewDevice,
+        kit: Kit,
+        policy: Policy,
+    ) -> Result<(), PersonalError> {
+        self.call::<()>(HOMES, "claim", ((device, kit), (policy, HOMES_AT)))?;
+        let Principal::Agent(home) = HOMES else {
+            unreachable!("the home is an agent")
+        };
+        let (_, sent) = self
+            .world()
+            .sent()
+            .filter(|(_, sent)| sent.to == home)
+            .last()
+            .expect("the claim's answer")
+            .clone();
+        let vos_abi::message::Body::Call {
+            method, arguments, ..
+        } = sent.body
+        else {
+            panic!("a call: {sent:?}")
+        };
+        if method == vos_wire::homes::method::ASSIGNED {
+            Ok(())
+        } else {
+            Err(PersonalError::decode_exact(&arguments).expect("a refusal"))
+        }
+    }
+
     pub fn refused(&mut self, caller: Principal, name: &str, arguments: impl Encode) -> Failure {
         match self.run(caller, name, arguments).outcome {
             Outcome::Failed { code, .. } => code,

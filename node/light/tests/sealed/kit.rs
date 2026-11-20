@@ -22,10 +22,9 @@ use crate::phone::Touch;
 /// phones paired, every phone seasoned and seen, the notes actor
 /// installed on each and its scope tracked: the claim's split too.
 pub(super) fn household_with(count: u8, keys: Vec<KitKey>) -> (Home, Vec<Phone>, Split) {
-    let homes = SigningKey::from_bytes(&[0x50; 32]);
-    let mut home = Home::new(&homes, policy());
+    let mut home = Home::new(policy());
     let mut phones: Vec<Phone> = (1..=count).map(Phone::new).collect();
-    let split = phones[0].claim_with(&mut home, &homes, keys);
+    let split = phones[0].claim_with(&mut home, keys);
     for n in 1..count as usize {
         let (paired, rest) = phones.split_at_mut(n);
         paired[0].pair(&mut home, &mut rest[0]);

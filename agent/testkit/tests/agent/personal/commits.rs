@@ -332,9 +332,9 @@ fn one_commit_carries_every_matured_removal_and_removed_devices_have_no_voice() 
     );
 }
 
-/// The home's calls take the role `homes`: no other caller assigns,
-/// configures or renews, and an agent is assigned once. Nothing else is
-/// taken before the assignment.
+/// The home's calls take the role `homes`: no other caller claims or
+/// renews, and an agent is assigned once, a claim refused answered as
+/// refused. Nothing else is taken before the assignment.
 #[test]
 fn only_the_home_assigns_and_once() {
     let mut home = Home::installed();
@@ -344,11 +344,11 @@ fn only_the_home_assigns_and_once() {
     );
     for caller in [sync(0), STRANGER] {
         assert_eq!(
-            home.refused(caller, "assign", (device(0), kit())),
-            Failure::Forbidden
-        );
-        assert_eq!(
-            home.refused(caller, "configure", Policy::DEFAULT),
+            home.refused(
+                caller,
+                "claim",
+                ((device(0), kit()), (Policy::DEFAULT, HOMES_AT))
+            ),
             Failure::Forbidden
         );
         assert_eq!(home.refused(caller, "renew", ()), Failure::Forbidden);
@@ -360,13 +360,17 @@ fn only_the_home_assigns_and_once() {
     let mut sharing = kit();
     sharing.entries[0].signing = device(0).admin;
     assert_eq!(
-        home.call::<Recorded>(HOMES, "assign", (device(0), sharing)),
+        home.claim(device(0), sharing, Policy::DEFAULT),
         Err(PersonalError::KeyTaken)
     );
-    home.call::<Recorded>(HOMES, "assign", (device(0), kit()))
-        .unwrap();
+    home.claim(device(0), kit(), Policy::DEFAULT).unwrap();
     assert_eq!(
-        home.call::<Recorded>(HOMES, "assign", (device(1), kit())),
+        home.claim(device(0), kit(), Policy::DEFAULT),
+        Ok(()),
+        "the same claim again"
+    );
+    assert_eq!(
+        home.claim(device(1), kit(), Policy::DEFAULT),
         Err(PersonalError::Assigned)
     );
     let devices: Vec<DeviceView> = home.query(KIT, "devices", ()).unwrap();

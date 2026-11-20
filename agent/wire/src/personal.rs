@@ -23,8 +23,6 @@ pub const PERSONAL: vos_abi::ids::InstanceId = vos_abi::ids::InstanceId(5);
 /// `Personal`'s handlers.
 pub mod method {
     methods! {
-        CONFIGURE = "configure";
-        ASSIGN = "assign";
         CLAIM = "claim";
         RENEW = "renew";
         REMOVE = "remove";
