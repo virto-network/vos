@@ -483,19 +483,19 @@ What the personal agent and the device's keys still leave open
 - **A local actor's new state shape** is not migrated: it starts a new
   scope and the device imports again (D7).
 - **A newly paired or restored device can be served a shortened scope**
-  without an alarm (C4; scope checkpoints are slice 9's, the owner's
-  decision 16 of 2026-11-17): it reads each scope from its start with no
-  position of its own to hold the operators to, so they can withhold a
-  scope's newest envelopes from it; it raises `Partition` only once a
-  later envelope's `seen` position crosses the cut, and a scope no other
-  device writes in again stays short.
-- **A move carries nothing** (2026-11-17, decision 16): a move or a
-  re-pair at the new home starts each scope there anew; only the books,
-  which every device writes again, follow. A scope's history stays at the
-  old home, for as long as its operators keep it; a device that missed
-  the move is told nothing by it. The device's sync and admin keys are
-  new at the new home (`Space::leave`), so only a reused kit and the
-  scopes' ids link the two agents for the two homes' operators together.
-- **The lease lapses 13 months after the claim** (decision 16): no device
-  re-proves in slice 8, so the agent enters its grace unless the home
-  sets a longer lease (`open.md`).
+  without an alarm (C4; no checkpoint guards a fresh device's first
+  read): it reads each scope from its start with no position of its own
+  to hold the operators to, so they can withhold a scope's newest
+  envelopes from it; it raises `Partition` only once a later envelope's
+  `seen` position crosses the cut, and a scope no other device writes in
+  again stays short.
+- **A move carries nothing**: a move or a re-pair at the new home starts
+  each scope there anew; only the books, which every device writes
+  again, follow. A scope's history stays at the old home, for as long as
+  its operators keep it; a device that missed the move is told nothing by
+  it. The device's sync and admin keys are new at the new home (the
+  leave in `Personal::move_home`), so only a reused kit and the scopes'
+  ids link the two agents for the two homes' operators together.
+- **The lease lapses 13 months after the claim**: no device re-proves
+  the claim, so the agent enters its grace unless the home sets a longer
+  lease (`open.md`).

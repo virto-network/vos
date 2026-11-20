@@ -1,53 +1,20 @@
 //! The light node (`docs/design/light-node.md` §2): what a member's phone
-//! runs as VOS.
+//! runs as VOS. Each module's header says more.
 //!
-//! - **Local actors** ([`Light`]): one local agent, the default agent's
-//!   program, on the interpreter over the light node's own store
-//!   ([`Store`]), with no log; each operation one entry of the agent
-//!   program, committed in one batch. Its actors and the agent program are
-//!   release artifacts ([`release`]): the phone transpiles nothing. The
-//!   first are the credential book and the device book (`vos_wire::books`).
-//!   Below a reserve of disk room, it refuses what adds data
-//!   ([`Error::Full`]).
-//! - **Sync** ([`mod@sync`]): each local instance one scope, a merkle-crdt
-//!   DAG of nodes the store's author key signs; a call is a merge
-//!   handler's operation recorded as a node, and a peer's nodes run
-//!   through the same handlers, what the device cannot run yet held and
-//!   what is invalid quarantined; the merge fields read filtered. Each
-//!   scope's id derives from its name and the key archive's naming secret.
-//! - **The device group** ([`group`]): the user's devices as one MLS group
-//!   over `vos-mls`, its commits admin calls the personal agent orders,
-//!   each candidate processed on a copy and confirmed by the devices'
-//!   signed votes; data keys exported at the confirmed epoch, and the key
-//!   archive.
-//! - **Sealed sync** ([`personal`]): each scope's nodes sealed at push
-//!   under the confirmed epoch's key ([`sealed`]), the push queue keeping
-//!   the sealed bytes; each scope read by its cursor at the personal agent,
-//!   every envelope opened and its node applied; the archive pushed at each
-//!   confirmed epoch, and the recovery envelopes under `R`; over the onion
-//!   alone.
-//! - **The home** ([`home`]): the open claim's work, the device's
-//!   nullifier in the home's scope, that scope reserved for the claim, and
-//!   the claim of a personal agent (refused on a device that holds one's
-//!   archive).
-//! - **Pairing** ([`pairing`]): a new device joined through a pairing
-//!   slot's inbox over Noise `XXpsk3`, the QR code carrying the slot and
-//!   the pre-shared code; the archive and `R` handed over on the channel.
-//! - **Memberships** ([`memberships`]): a new device enrolled in every
-//!   other space by another of the person's devices, each deferrable,
-//!   confirmed by its own proof; a retired one revoked.
-//! - **The recovery kit** ([`kit`]): a phrase or a security key's 32
-//!   bytes, the kit's signing and sealing keys, and `R = R1 ⊕ R2` split
-//!   across the kit and the agent.
-//!
-//! - **The Tor policy** ([`route`]): the route each request takes to a
-//!   space, by its purpose, decided before it leaves: Tor by default, a
-//!   per-space opt-out for key-signed calls, no clearnet route for
-//!   anonymous requests nor the personal agent's.
-//! - **The client over arti** (`tor`, the `tor` feature): one `TorClient`
-//!   a process, `vos-api` over SSH over a space's onion, a connection a
-//!   purpose, each its own circuit and SSH key; the spare for proven calls,
-//!   dormancy, s4's screens carried, the pinned onion set refreshed.
+//! - **Local actors** ([`Light`]): one local agent on the interpreter over
+//!   the light node's own store ([`Store`]), its programs release
+//!   artifacts ([`release`]).
+//! - **Sync** ([`mod@sync`]): each local instance one merkle-crdt scope.
+//! - **The device group** ([`group`]): the user's devices as one MLS group,
+//!   and the key archive.
+//! - **Sealed sync** ([`personal`]): each scope's nodes sealed ([`sealed`])
+//!   and read at the personal agent, over the onion alone.
+//! - **The personal space's flows** ([`space`]) and **the background pass**
+//!   ([`job`]).
+//! - **The home** ([`home`]), **pairing** ([`pairing`]), **memberships**
+//!   ([`memberships`]) and **the recovery kit** ([`kit`]).
+//! - **The Tor policy** ([`route`]) and **the client over arti** (`tor`,
+//!   the `tor` feature).
 //!
 //! **The device library** (`docs/design/proving.md` §8): what the phone
 //! runs to prove facts about its device secret to its space's ingress, and
@@ -59,8 +26,8 @@
 //!   stores. A [`DeviceSecret`] is zeroized on drop and has no `Clone` and
 //!   no `Debug`.
 //! - **Proven calls** ([`Prover`]): a device kernel's run proved under the
-//!   program's device format (47, the device format), against the program ingress computes from the same
-//!   kernel, which the app embeds as a release artifact
+//!   program's device format, against the program ingress computes from the
+//!   same kernel, which the app embeds as a release artifact
 //!   ([`release::Release`], [`DeviceProgram`]). The stock kernels of the
 //!   credential actor take the secret: auth, a member's leaf under the
 //!   actor's root with its nullifier in a scope ([`Prover::prove_auth`]);
@@ -77,18 +44,18 @@
 //!   its time, the tree's feed and a credentialed call, and the answers
 //!   it decodes.
 //! - **The tree** ([`TreeKeeper`]): the credential actor's whole tree,
-//!   kept from its feed on a jittered timer, each page checked against
-//!   the root its last change names; the member's path computed on the device, so no
-//!   query names the member, and its proofs made against the newest root
-//!   it read.
+//!   kept from its feed on a jittered timer, each page checked against the
+//!   root its last change names; the member's path computed on the device,
+//!   so no query names the member, and its proofs made against the newest
+//!   root it read.
 //!
 //! The release artifacts are computed in the registry's device format
-//! ([`vos_pvm_device::FORMAT`]); a program proves in its
-//! artifact's format, one this build proves
-//! ([`vos_pvm_device::FORMATS`]). No witness is logged, and
-//! its proofs' masks are the operating system's (a seeded stream exists
-//! only under the `seeded-masks` test seam, which no production build
-//! enables). `SECURITY.md` states what the secret is exposed to.
+//! ([`vos_pvm_device::FORMAT`]); a program proves in its artifact's format,
+//! one this build proves ([`vos_pvm_device::FORMATS`]). No witness is
+//! logged, and its proofs' masks are the operating system's (a seeded
+//! stream exists only under the `seeded-masks` test seam, which no
+//! production build enables). `SECURITY.md` states what the secret is
+//! exposed to.
 
 mod call;
 pub mod group;
