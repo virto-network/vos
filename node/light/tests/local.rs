@@ -531,7 +531,6 @@ fn a_full_disk_refuses_new_writes_until_room_is_freed() {
     let probe = Arc::clone(&free);
     let config = Config {
         disk: Disk::Probe(Arc::new(move || probe.load(Ordering::SeqCst))),
-        ..Config::default()
     };
     let phone = Device::with(&agent, &first, config.clone());
     let laptop = Device::new(&agent, &first);
@@ -643,7 +642,6 @@ fn an_install_stands_when_its_replay_finds_no_room() {
                 Err(_) => 0,
             }
         })),
-        ..Config::default()
     };
     let older = Device::with(&agent, &first, config);
     let newer = Device::new(&agent, &next);

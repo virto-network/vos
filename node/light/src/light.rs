@@ -15,7 +15,7 @@
 //! is invalid quarantined ([`crate::sync`]); an install replays its
 //! instance's held operations. Before an operation that adds data (an
 //! install, a call, an ingest, a replay) the light node asks the disk for
-//! room past its reserve ([`Config::reserve_bytes`]), and refuses it with
+//! room past its reserve ([`RESERVE_BYTES`]), and refuses it with
 //! nothing written when there is none ([`Error::Full`]): the store stops
 //! growing before the disk fills, sync pauses, and both resume once room
 //! is freed.
@@ -76,29 +76,19 @@ pub struct Queued {
 /// keeps the device in its group.
 pub const RESERVE_BYTES: u64 = 64 << 20;
 
-/// How the light node runs.
+/// How the light node runs: refine's gas for one run is
+/// `defaults::REFINE_GAS`, the store's block cache [`CACHE_BYTES`], and an
+/// operation that adds data is refused ([`Error::Full`]) below
+/// [`RESERVE_BYTES`] of room.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Refine's gas for one run: a query's, a call's, or an install's
-    /// budget.
-    pub refine_gas: u64,
-    /// The store's block cache.
-    pub cache_bytes: u64,
-    /// The room on the store's disk below which an operation that adds data
-    /// is refused ([`Error::Full`]).
-    pub reserve_bytes: u64,
     /// Where the room is read.
     pub disk: Disk,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            refine_gas: defaults::REFINE_GAS,
-            cache_bytes: CACHE_BYTES,
-            reserve_bytes: RESERVE_BYTES,
-            disk: Disk::System,
-        }
+        Self { disk: Disk::System }
     }
 }
 
@@ -306,7 +296,7 @@ impl Light {
     /// default agent, linked: a release artifact), and every program
     /// installed in its store pooled.
     pub fn open(dir: &Path, agent: &[u8], config: Config) -> Result<Self, Error> {
-        let store = Store::open(dir, config.cache_bytes)?;
+        let store = Store::open(dir, CACHE_BYTES)?;
         let unloadable = |error| Error::Fault(Fault::Agent(format!("{error:?}")));
         // One operation runs at a time: one machine kept idle.
         let program = OuterMachines::with_idle_limit(agent, PvmBackend::ForceInterpreter, 1)
@@ -437,7 +427,7 @@ impl Light {
             version,
             time,
             seed,
-            budget: self.config.refine_gas,
+            budget: defaults::REFINE_GAS,
             inputs: vec![Input::Admin(Admin::Install {
                 instance,
                 derivation: package.derivation.clone(),
@@ -654,7 +644,7 @@ impl Light {
     /// Room on the disk past the reserve, or [`Error::Full`].
     pub(crate) fn room(&self) -> Result<(), Error> {
         let free = self.config.disk.free(&self.dir)?;
-        if free < self.config.reserve_bytes {
+        if free < RESERVE_BYTES {
             return Err(Error::Full { free });
         }
         Ok(())
@@ -921,7 +911,7 @@ impl Light {
         work: &Work,
     ) -> Result<Vec<u8>, Error> {
         let ran = catch_unwind(AssertUnwindSafe(|| {
-            machines.refine(snapshot, LOCAL, work, self.config.refine_gas)
+            machines.refine(snapshot, LOCAL, work, defaults::REFINE_GAS)
         }))
         .map_err(|panic| Fault::Infrastructure(format!("panicked: {}", panic_message(&*panic))))?;
         Ok(ran?.0)
