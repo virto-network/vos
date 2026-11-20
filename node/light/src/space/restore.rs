@@ -171,7 +171,7 @@ impl<H: Host> Personal<H> {
                         .map_err(|error| error.to_string())
                 };
                 let called = link
-                    .settled_held(
+                    .settled(
                         &mut kit_signer,
                         &sign,
                         method::RESTORE,

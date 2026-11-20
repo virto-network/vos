@@ -152,7 +152,7 @@ impl<H: Host> Personal<H> {
                 .map_err(|error| error.to_string())
             };
             let called = link
-                .settled_held(&mut signer, &sign, method, arguments, &mut hold)
+                .settled(&mut signer, &sign, method, arguments, &mut hold)
                 .map_err(unreached)?;
             let recorded = match answer::<Recorded>(&called.outcome).map_err(super::failed)? {
                 Ok(recorded) => recorded,

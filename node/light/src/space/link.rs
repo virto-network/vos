@@ -137,21 +137,11 @@ impl<'a, H: Host> AgentLink<'a, H> {
     }
 
     /// The call of `name` with `arguments` at the agent, signed by `sign` in
-    /// `signer`'s session: its outcome, and what was signed. A call whose
-    /// answer was lost keeps its sequence, so it is sent again as it was.
-    pub fn signed(
-        &mut self,
-        signer: &mut Signer,
-        sign: Sign<'_>,
-        method: MethodId,
-        arguments: Vec<u8>,
-    ) -> Result<Called, String> {
-        self.signed_held(signer, sign, method, arguments, &mut |_, _| Ok(()))
-    }
-
-    /// The same, its message and signature given to `hold` before the call
-    /// is sent: a call `hold` refuses is not.
-    pub fn signed_held(
+    /// `signer`'s session, its message and signature given to `hold` before
+    /// the call is sent (a call `hold` refuses is not): its outcome, and
+    /// what was signed. A call whose answer was lost keeps its sequence, so
+    /// it is sent again as it was.
+    fn signed(
         &mut self,
         signer: &mut Signer,
         sign: Sign<'_>,
@@ -187,8 +177,7 @@ impl<'a, H: Host> AgentLink<'a, H> {
         let message = call.message(&self.agent.identity);
         call.signature = sign(&message)?;
         hold(&message, &call.signature)?;
-        let mut request = (Kind::Call as u16).to_le_bytes().to_vec();
-        (AgentId(self.agent.agent), call.clone()).encode_to(&mut request);
+        let request = wire::request(Kind::Call as u16, (AgentId(self.agent.agent), call.clone()));
         match Response::decode_exact(&self.send(&request)?) {
             Some(Response::Ran { outcome, .. }) => {
                 signer.next += 1;
@@ -206,35 +195,36 @@ impl<'a, H: Host> AgentLink<'a, H> {
     /// The sync key's call of `name`, sent again after a `wake` while the
     /// agent answers `Settling`.
     pub fn call<T: Decode>(&mut self, method: MethodId, arguments: Vec<u8>) -> Answer<T, String> {
-        answer(&self.call_raw(method, arguments)?.outcome)
+        answer(&self.sync_call(method, arguments, true)?.outcome)
     }
 
-    /// The same, its outcome as it came.
-    pub fn call_raw(&mut self, method: MethodId, arguments: Vec<u8>) -> Result<Called, String> {
+    /// The sync key's call of `name` in the link's session, its outcome as
+    /// it came; sent again after a `wake` while the agent answers
+    /// `Settling` if `settle`.
+    fn sync_call(
+        &mut self,
+        method: MethodId,
+        arguments: Vec<u8>,
+        settle: bool,
+    ) -> Result<Called, String> {
         let key = self.sync.clone();
         let sign = move |message: &[u8]| Ok(key.sign(message).to_bytes());
         let mut signer = *self.signer;
-        let called = self.settled(&mut signer, &sign, method, arguments);
+        let hold = &mut |_: &[u8], _: &[u8; 64]| Ok(());
+        let called = if settle {
+            self.settled(&mut signer, &sign, method, arguments, hold)
+        } else {
+            self.signed(&mut signer, &sign, method, arguments, hold)
+        };
         *self.signer = signer;
         called
     }
 
     /// `name` signed by `sign` in `signer`'s session, sent again after a
-    /// `wake` (the sync key's) while the agent answers `Settling`.
+    /// `wake` (the sync key's) while the agent answers `Settling`, each
+    /// call's message held before it is sent ([`AgentLink::signed`]): a
+    /// call signed again after `Settling` is held again.
     pub fn settled(
-        &mut self,
-        signer: &mut Signer,
-        sign: Sign<'_>,
-        method: MethodId,
-        arguments: Vec<u8>,
-    ) -> Result<Called, String> {
-        self.settled_held(signer, sign, method, arguments, &mut |_, _| Ok(()))
-    }
-
-    /// The same, each call's message held before it is sent
-    /// ([`AgentLink::signed_held`]): a call signed again after `Settling`
-    /// is held again.
-    pub fn settled_held(
         &mut self,
         signer: &mut Signer,
         sign: Sign<'_>,
@@ -243,7 +233,7 @@ impl<'a, H: Host> AgentLink<'a, H> {
         hold: Hold<'_>,
     ) -> Result<Called, String> {
         for _ in 0..WAKES {
-            let called = self.signed_held(signer, sign, method, arguments.clone(), &mut *hold)?;
+            let called = self.signed(signer, sign, method, arguments.clone(), &mut *hold)?;
             let settling = matches!(
                 answer::<()>(&called.outcome),
                 Ok(Err(PersonalError::Settling))
@@ -287,8 +277,7 @@ impl<'a, H: Host> AgentLink<'a, H> {
             .sync
             .sign(&query.message(&self.agent.identity))
             .to_bytes();
-        let mut request = (Kind::Query as u16).to_le_bytes().to_vec();
-        (AgentId(self.agent.agent), query).encode_to(&mut request);
+        let request = wire::request(Kind::Query as u16, (AgentId(self.agent.agent), query));
         let outcome = wire::outcome(&self.send(&request)?).map_err(|error| error.to_string())?;
         answer(&outcome)
     }
@@ -333,12 +322,7 @@ impl<H: Host> Link for AgentLink<'_, H> {
     }
 
     fn wake(&mut self) -> Answer<Woken, String> {
-        let key = self.sync.clone();
-        let sign = move |message: &[u8]| Ok(key.sign(message).to_bytes());
-        let mut signer = *self.signer;
-        let called = self.signed(&mut signer, &sign, method::WAKE, Vec::new());
-        *self.signer = signer;
-        answer(&called?.outcome)
+        answer(&self.sync_call(method::WAKE, Vec::new(), false)?.outcome)
     }
 
     fn frontier(&mut self, device: u32) -> Answer<Frontier, String> {
@@ -360,7 +344,7 @@ impl<H: Host> Control for AgentLink<'_, H> {
     }
 
     fn post(&mut self, post: &Post) -> Answer<u64, String> {
-        let called = self.call_raw(post.method(), post.arguments())?;
+        let called = self.sync_call(post.method(), post.arguments(), true)?;
         Ok(match &called.outcome {
             Outcome::Done(reply) => {
                 Ok(post.at(reply).ok_or("the agent's reply does not decode")?)

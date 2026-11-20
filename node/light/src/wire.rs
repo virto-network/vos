@@ -25,7 +25,7 @@ use zeroize::Zeroize;
 use crate::{Call, DeviceError, Proven};
 
 /// `kind`'s request holding `body`.
-fn request(kind: u16, body: impl Encode) -> Vec<u8> {
+pub(crate) fn request(kind: u16, body: impl Encode) -> Vec<u8> {
     let mut bytes = kind.to_le_bytes().to_vec();
     body.encode_to(&mut bytes);
     bytes
