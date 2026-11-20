@@ -46,11 +46,16 @@ pub fn now() -> u64 {
     })
 }
 
-/// Answers its forms from a script, keeping what it was shown.
+/// Answers its forms from a script, keeping what it was shown and when,
+/// each answer given after the user's reading time `read`, and when each
+/// was answered.
 #[derive(Default)]
 pub struct Scripted {
     pub answers: Mutex<VecDeque<Answer>>,
     pub shown: Mutex<Vec<Form>>,
+    pub read: Duration,
+    pub shown_at: Mutex<Vec<std::time::Instant>>,
+    pub answered_at: Mutex<Vec<std::time::Instant>>,
 }
 
 impl Scripted {
@@ -61,13 +66,34 @@ impl Scripted {
     pub fn last(&self) -> Form {
         self.shown.lock().unwrap().last().cloned().unwrap()
     }
+
+    pub fn last_shown(&self) -> std::time::Instant {
+        *self.shown_at.lock().unwrap().last().unwrap()
+    }
+
+    pub fn last_answered(&self) -> std::time::Instant {
+        *self.answered_at.lock().unwrap().last().unwrap()
+    }
 }
 
 impl Chrome for Scripted {
     fn confirm(&self, form: Form) -> BoxFuture<'_, Answer> {
         self.shown.lock().unwrap().push(form);
+        self.shown_at
+            .lock()
+            .unwrap()
+            .push(std::time::Instant::now());
         let answer = self.answers.lock().unwrap().pop_front();
-        Box::pin(async move { answer.unwrap_or(Answer::Declined) })
+        Box::pin(async move {
+            if answer.is_some() && !self.read.is_zero() {
+                tokio::time::sleep(self.read).await;
+            }
+            self.answered_at
+                .lock()
+                .unwrap()
+                .push(std::time::Instant::now());
+            answer.unwrap_or(Answer::Declined)
+        })
     }
 }
 
@@ -210,6 +236,37 @@ pub fn object(entries: &[(&str, Value)]) -> Value {
             .iter()
             .map(|(name, value)| (name.to_string(), value.clone())),
     )
+}
+
+/// The poll's `login`, as a sign-in asks it.
+pub fn login() -> Value {
+    object(&[
+        ("agent", Value::from(AGENT)),
+        ("instance", Value::from(POLL)),
+        ("method", Value::from("login")),
+        ("arguments", Value::Bytes(Vec::new())),
+    ])
+}
+
+/// [`login`] as the node reads it.
+pub fn sign_in() -> vos_facility::SignIn {
+    vos_facility::SignIn::read(&login()).unwrap()
+}
+
+/// [`login`] signed in on `session`, confirmed in `chrome`, once the device
+/// holds its path: a refusal for a path not read yet is asked again.
+pub async fn sign_in_held(session: &Session, chrome: &Scripted) -> Result<Value, Refusal> {
+    let login = login();
+    loop {
+        chrome.will(confirm(&[]));
+        match session.ask("sign_in", &login, chrome).await {
+            Err(error) if matches!(error.code, Code::NoPath | Code::Unclaimed) => {
+                chrome.answers.lock().unwrap().clear();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            answered => return answered,
+        }
+    }
 }
 
 pub fn method(instance: u32, name: &str, guard: &str, scope: Option<(&str, bool)>) -> Value {

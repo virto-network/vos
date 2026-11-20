@@ -68,12 +68,7 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
     // The session that showed the digests signs in nothing: its server
     // would join the sign-in to them. A new session signs in, and pays
     // nothing; the first pays.
-    let login = object(&[
-        ("agent", Value::from(AGENT)),
-        ("instance", Value::from(POLL)),
-        ("method", Value::from("login")),
-        ("arguments", Value::Bytes(Vec::new())),
-    ]);
+    let login = login();
     let forms = chrome.shown.lock().unwrap().len();
     let refused = loop {
         match session.ask("sign_in", &login, &chrome).await.unwrap_err() {
@@ -95,23 +90,7 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
     session.granted();
 
     // The tree arrives apart, from its feed; a sign-in proves on it.
-    let login = object(&[
-        ("agent", Value::from(AGENT)),
-        ("instance", Value::from(POLL)),
-        ("method", Value::from("login")),
-        ("arguments", Value::Bytes(Vec::new())),
-    ]);
-    let signed = loop {
-        chrome.will(confirm(&[]));
-        match session.ask("sign_in", &login, &chrome).await {
-            Ok(signed) => break signed,
-            Err(error) if matches!(error.code, Code::NoPath | Code::Unclaimed) => {
-                chrome.answers.lock().unwrap().clear();
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(error) => panic!("{error:?}"),
-        }
-    };
+    let signed = sign_in_held(&session, &chrome).await.unwrap();
     assert!(chrome.last().notice.is_none(), "login spends nothing");
     assert!(matches!(
         Response::decode_exact(&bytes(field(&signed, "answer"))),
@@ -350,12 +329,7 @@ async fn a_session_not_carried_over_tor_proves_nothing() {
     world.enroll(AGENT, &member);
     let session = facility.session(clearnet());
     session.granted();
-    let login = object(&[
-        ("agent", Value::from(AGENT)),
-        ("instance", Value::from(POLL)),
-        ("method", Value::from("login")),
-        ("arguments", Value::Bytes(Vec::new())),
-    ]);
+    let login = login();
     let pay = object(&[
         ("agent", Value::from(AGENT)),
         ("instance", Value::from(PAYMENTS)),
@@ -379,7 +353,7 @@ async fn a_session_not_carried_over_tor_proves_nothing() {
         .net()
         .opt_out(vos_light::route::space(&HANDLE), true)
         .unwrap();
-    signed_in(&session, &login, &chrome).await.unwrap();
+    sign_in_held(&session, &chrome).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -389,12 +363,7 @@ async fn nothing_is_proved_before_enrollment_or_for_an_unknown_operation() {
     let facility = facility(&world, directory.path(), Arc::new(Phone::new(9)));
     let session = facility.session(gateway());
     let chrome = Scripted::default();
-    let login = object(&[
-        ("agent", Value::from(AGENT)),
-        ("instance", Value::from(POLL)),
-        ("method", Value::from("login")),
-        ("arguments", Value::Bytes(Vec::new())),
-    ]);
+    let login = login();
     let error = session.ask("sign_in", &login, &chrome).await.unwrap_err();
     assert_eq!(error.code, Code::NotEnrolled);
     let error = session
@@ -678,13 +647,7 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
     // A session apart from the enrolling one, which showed the digests.
     let session = facility.session(gateway());
     session.granted();
-    let login = object(&[
-        ("agent", Value::from(AGENT)),
-        ("instance", Value::from(POLL)),
-        ("method", Value::from("login")),
-        ("arguments", Value::Bytes(Vec::new())),
-    ]);
-    signed_in(&session, &login, &chrome).await.unwrap();
+    sign_in_held(&session, &chrome).await.unwrap();
     let stale = || {
         Response::Rejected(ingress::Rejection::Credential(
             ingress::CredentialRefusal::RootStale,
@@ -712,7 +675,7 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
         .unwrap()
         .refusing
         .push_back((stale(), Some([0x77; 32])));
-    let signed = signed_in(&session, &login, &chrome).await.unwrap();
+    let signed = sign_in_held(&session, &chrome).await.unwrap();
     assert!(matches!(
         Response::decode_exact(&bytes(field(&signed, "answer"))),
         Some(Response::Ran {
@@ -735,7 +698,7 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
         .unwrap()
         .refusing
         .push_back((stale(), None));
-    let signed = signed_in(&session, &login, &chrome).await.unwrap();
+    let signed = sign_in_held(&session, &chrome).await.unwrap();
     assert_eq!(
         Response::decode_exact(&bytes(field(&signed, "answer"))),
         Some(stale())
@@ -750,7 +713,7 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
         state.refusing.push_back((stale(), Some([0x78; 32])));
         state.refusing.push_back((stale(), None));
     }
-    let signed = signed_in(&session, &login, &chrome).await.unwrap();
+    let signed = sign_in_held(&session, &chrome).await.unwrap();
     assert_eq!(
         Response::decode_exact(&bytes(field(&signed, "answer"))),
         Some(stale())
@@ -770,7 +733,7 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
             .unwrap()
             .refusing
             .push_back((retired, None));
-        let refused = signed_in(&session, &login, &chrome).await.unwrap_err();
+        let refused = sign_in_held(&session, &chrome).await.unwrap_err();
         assert_eq!(refused.code, Code::Refused);
         assert!(refused.message.contains("update the app"), "{refused:?}");
     }
@@ -793,12 +756,7 @@ async fn a_sign_in_before_the_claim_says_to_claim_first() {
     let member: [u8; 32] = bytes(field(&enrolled, "member")).try_into().unwrap();
     let session = facility.session(gateway());
     session.granted();
-    let login = object(&[
-        ("agent", Value::from(AGENT)),
-        ("instance", Value::from(POLL)),
-        ("method", Value::from("login")),
-        ("arguments", Value::Bytes(Vec::new())),
-    ]);
+    let login = login();
     let refused = loop {
         match session.ask("sign_in", &login, &chrome).await.unwrap_err() {
             refused if refused.code == Code::NoPath => {
@@ -813,30 +771,11 @@ async fn a_sign_in_before_the_claim_says_to_claim_first() {
         "{refused:?}"
     );
     world.enroll(AGENT, &member);
-    let signed = signed_in(&session, &login, &chrome).await.unwrap();
+    let signed = sign_in_held(&session, &chrome).await.unwrap();
     assert!(matches!(
         Response::decode_exact(&bytes(field(&signed, "answer"))),
         Some(Response::Ran { .. })
     ));
-}
-
-/// `request` signed in, confirmed in `chrome`, once the device holds its
-/// path: a refusal for a path not read yet is asked again.
-async fn signed_in(
-    session: &Session,
-    request: &Value,
-    chrome: &Scripted,
-) -> Result<Value, Refusal> {
-    loop {
-        chrome.will(confirm(&[]));
-        match session.ask("sign_in", request, chrome).await {
-            Err(error) if matches!(error.code, Code::NoPath | Code::Unclaimed) => {
-                chrome.answers.lock().unwrap().clear();
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            answered => return answered,
-        }
-    }
 }
 
 /// A sign-in or a payment reads the space's device window first (§4.4):
@@ -873,12 +812,7 @@ async fn a_window_without_this_apps_programs_is_refused_before_proving() {
     // A session apart from the enrolling one, which showed the digests.
     let session = facility.session(gateway());
     session.granted();
-    let login = object(&[
-        ("agent", Value::from(AGENT)),
-        ("instance", Value::from(POLL)),
-        ("method", Value::from("login")),
-        ("arguments", Value::Bytes(Vec::new())),
-    ]);
+    let login = login();
     let pay = object(&[
         ("agent", Value::from(AGENT)),
         ("instance", Value::from(PAYMENTS)),
@@ -912,17 +846,7 @@ async fn a_window_without_this_apps_programs_is_refused_before_proving() {
     );
 
     world.state.lock().unwrap().window = None;
-    loop {
-        chrome.will(confirm(&[]));
-        match session.ask("sign_in", &login, &chrome).await {
-            Ok(_) => break,
-            Err(error) if matches!(error.code, Code::NoPath | Code::Unclaimed) => {
-                chrome.answers.lock().unwrap().clear();
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(error) => panic!("{error:?}"),
-        }
-    }
+    sign_in_held(&session, &chrome).await.unwrap();
     // A stock kernel is the credential actor's method: its window is the
     // one read, whichever instance the call goes to.
     let asked = world.state.lock().unwrap().windows_asked.clone();
@@ -996,12 +920,7 @@ async fn a_proofs_expiry_carries_its_own_sessions_reading_alone() {
         ("payee", Value::from("shop")),
         ("amount", Value::from(20u64)),
     ]);
-    let login = object(&[
-        ("agent", Value::from(AGENT)),
-        ("instance", Value::from(POLL)),
-        ("method", Value::from("login")),
-        ("arguments", Value::Bytes(Vec::new())),
-    ]);
+    let login = login();
 
     // Session A pays; session B, opened after, signs in.
     let paying = facility.session(gateway());

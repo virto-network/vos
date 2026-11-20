@@ -833,31 +833,9 @@ fn a_space_enrolled_after_the_claim_is_offered_and_revoked() {
 
 /// A sign-in in the club, once the path is held.
 fn signs_in(phone: &Held) {
-    let login = vos_facility::SignIn::read(&object(&[
-        ("agent", Value::from(AGENT)),
-        ("instance", Value::from(POLL)),
-        ("method", Value::from("login")),
-        ("arguments", Value::Bytes(Vec::new())),
-    ]))
-    .unwrap();
     let session = phone.node.open_session(gateway());
-    for _ in 0..20 {
-        match phone.node.sign_in(
-            session,
-            login.clone(),
-            Arc::clone(&phone.hand) as Arc<dyn vos_facility::node::Prompts>,
-        ) {
-            Err(refusal) if matches!(refusal.code, Code::NoPath | Code::Unclaimed) => {
-                phone.node.sync().unwrap();
-            }
-            signed => {
-                signed.unwrap();
-                phone.node.close(session);
-                return;
-            }
-        }
-    }
-    panic!("no path");
+    common::phone::signs_in(&phone.node, session, || Arc::clone(&phone.hand), 20);
+    phone.node.close(session);
 }
 
 /// The light store's keyspace the personal space's rows are in.

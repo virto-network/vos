@@ -21,9 +21,10 @@ use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use common::phone::signs_in;
 use common::*;
+use vos_facility::Enroll;
 use vos_facility::node::Node;
-use vos_facility::{Enroll, SignIn};
 
 const ROLE: &str = "S4_CREDENTIAL_KILLED_ROLE";
 const DIRECTORY: &str = "S4_CREDENTIAL_KILLED_DIRECTORY";
@@ -49,31 +50,6 @@ fn at(directory: &Path, port: u16) -> Node {
     node_over(Arc::new(world::Loopback(port)), directory, client(false))
 }
 
-fn login() -> SignIn {
-    SignIn::read(&object(&[
-        ("agent", Value::from(AGENT)),
-        ("instance", Value::from(POLL)),
-        ("method", Value::from("login")),
-        ("arguments", Value::Bytes(Vec::new())),
-    ]))
-    .unwrap()
-}
-
-/// A sign-in, once the path is held (a sync fetches it).
-fn signed_in(node: &Node, session: u64) {
-    loop {
-        match node.sign_in(session, login(), client(false)) {
-            Err(refusal) if matches!(refusal.code, Code::NoPath | Code::Unclaimed) => {
-                node.sync().unwrap();
-            }
-            signed => {
-                signed.unwrap();
-                return;
-            }
-        }
-    }
-}
-
 /// Every enrollment row of the store, and its bytes.
 fn files(directory: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
     vos_facility::kept::Kept::open(directory)
@@ -93,7 +69,7 @@ fn child(role: &str) {
     node.granted(session).unwrap();
     loop {
         match role {
-            "proof" => signed_in(&node, session),
+            "proof" => signs_in(&node, session, || client(false), usize::MAX),
             _ => {
                 println!("syncing");
                 node.sync().unwrap();
@@ -185,7 +161,7 @@ fn killed_during(role: &str, test: &str, marker: &str, most: Duration) {
         assert_eq!(last.bytes_down, synced.bytes_down);
         let session = node.open_session(gateway());
         node.granted(session).unwrap();
-        signed_in(&node, session);
+        signs_in(&node, session, || client(false), usize::MAX);
     }
 }
 
@@ -223,12 +199,12 @@ fn a_client_gone_during_an_operation_costs_only_that_operation() {
     // Signed in on a session of its own: the enrolling one showed the
     // digests.
     let session = node.open_session(gateway());
-    let gone = node.sign_in(session, login(), client(true)).unwrap_err();
+    let gone = node.sign_in(session, sign_in(), client(true)).unwrap_err();
     assert_eq!(gone.code, Code::Declined);
     // A session of an earlier process names nothing here.
     let stale = node
-        .sign_in(session ^ 1, login(), client(false))
+        .sign_in(session ^ 1, sign_in(), client(false))
         .unwrap_err();
     assert_eq!(stale.code, Code::NoSession);
-    signed_in(&node, session);
+    signs_in(&node, session, || client(false), usize::MAX);
 }

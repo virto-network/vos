@@ -330,13 +330,7 @@ fn nothing_the_facility_shows_or_keeps_carries_a_secret() {
     node.granted(signing).unwrap();
 
     // A sign-in on the tree kept apart.
-    let login = SignIn::read(&object(&[
-        ("agent", Value::from(AGENT)),
-        ("instance", Value::from(POLL)),
-        ("method", Value::from("login")),
-        ("arguments", Value::Bytes(Vec::new())),
-    ]))
-    .unwrap();
+    let login = sign_in();
     let signed = loop {
         shown.will_confirm(&[]);
         match node.sign_in(signing, login.clone(), prompts()) {

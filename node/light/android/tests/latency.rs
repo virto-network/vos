@@ -13,52 +13,6 @@ mod common;
 use common::*;
 use std::time::Instant;
 
-/// Answers its forms from a script after the user's reading time, noting
-/// when each was shown and answered.
-struct Reading {
-    answers: Mutex<VecDeque<Answer>>,
-    read: Duration,
-    shown: Mutex<Vec<Instant>>,
-    answered: Mutex<Vec<Instant>>,
-}
-
-impl Reading {
-    fn new(read: Duration) -> Self {
-        Self {
-            answers: Mutex::default(),
-            read,
-            shown: Mutex::default(),
-            answered: Mutex::default(),
-        }
-    }
-
-    fn will(&self, answer: Answer) {
-        self.answers.lock().unwrap().push_back(answer);
-    }
-
-    fn last_shown(&self) -> Instant {
-        *self.shown.lock().unwrap().last().unwrap()
-    }
-
-    fn last_answered(&self) -> Instant {
-        *self.answered.lock().unwrap().last().unwrap()
-    }
-}
-
-impl Chrome for Reading {
-    fn confirm(&self, _: Form) -> BoxFuture<'_, Answer> {
-        self.shown.lock().unwrap().push(Instant::now());
-        let answer = self.answers.lock().unwrap().pop_front();
-        Box::pin(async move {
-            if answer.is_some() {
-                tokio::time::sleep(self.read).await;
-            }
-            self.answered.lock().unwrap().push(Instant::now());
-            answer.unwrap_or(Answer::Declined)
-        })
-    }
-}
-
 /// Each connection's requests so far, by kind.
 fn requests(world: &World) -> Vec<Vec<u16>> {
     world
@@ -121,7 +75,10 @@ async fn timed(
     let granted = Instant::now();
     session.granted();
     tokio::time::sleep(open).await;
-    let chrome = Reading::new(Duration::from_secs(3));
+    let chrome = Scripted {
+        read: Duration::from_secs(3),
+        ..Scripted::default()
+    };
     chrome.will(confirm(values));
     let before = requests(world);
     let tap = Instant::now();
@@ -236,12 +193,7 @@ async fn a_payment_and_a_sign_in_wait_for_one_send_after_the_confirm() {
         sent.proof.len() + sent.claim.len()
     );
 
-    let login = object(&[
-        ("agent", Value::from(AGENT)),
-        ("instance", Value::from(POLL)),
-        ("method", Value::from("login")),
-        ("arguments", Value::Bytes(Vec::new())),
-    ]);
+    let login = login();
     let signing = facility.session(gateway());
     let signed = timed(&world, &signing, "sign_in", &login, &[], open).await;
     signed.print("sign-in");

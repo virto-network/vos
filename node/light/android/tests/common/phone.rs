@@ -173,3 +173,26 @@ pub fn personal_agents(world: &World) -> HashSet<u32> {
 pub fn after(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms + 300));
 }
+
+/// A sign-in on `session` under `prompts`, once the path is held: a
+/// refusal for a path not read yet syncs and asks again, `attempts` times
+/// at most.
+pub fn signs_in<P: Prompts + 'static>(
+    node: &Node,
+    session: u64,
+    prompts: impl Fn() -> Arc<P>,
+    attempts: usize,
+) {
+    for _ in 0..attempts {
+        match node.sign_in(session, sign_in(), prompts()) {
+            Err(refusal) if matches!(refusal.code, Code::NoPath | Code::Unclaimed) => {
+                node.sync().unwrap();
+            }
+            signed => {
+                signed.unwrap();
+                return;
+            }
+        }
+    }
+    panic!("no path");
+}
