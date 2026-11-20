@@ -46,13 +46,18 @@ impl client::Handler for Pinned {
 /// line without flushing it, then waits for the gateway's: unflushed, the
 /// line never leaves, and the gateway drops the connection at its handshake
 /// deadline.
-struct Flushed {
-    stream: Stream,
+///
+/// A write whose flush is pending holds the count of the bytes the stream
+/// took across polls, so it must be polled again with the same bytes until
+/// it is ready, never dropped for another write: the bytes left already,
+/// and another write's would be counted as theirs.
+struct Flushed<S = Stream> {
+    stream: S,
     /// The bytes of a write taken but not yet flushed.
     unflushed: Option<usize>,
 }
 
-impl AsyncRead for Flushed {
+impl<S: AsyncRead + Unpin> AsyncRead for Flushed<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -62,7 +67,7 @@ impl AsyncRead for Flushed {
     }
 }
 
-impl AsyncWrite for Flushed {
+impl<S: AsyncWrite + Unpin> AsyncWrite for Flushed<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -76,8 +81,10 @@ impl AsyncWrite for Flushed {
                 written
             }
         };
-        ready!(Pin::new(&mut self.stream).poll_flush(cx))?;
+        let flushed = ready!(Pin::new(&mut self.stream).poll_flush(cx));
+        // Done with this write, flushed or failed: the next write is its own.
         self.unflushed = None;
+        flushed?;
         Poll::Ready(Ok(written))
     }
 
@@ -205,5 +212,90 @@ impl Connection {
     /// When its last request was made or answered.
     pub fn last(&self) -> Instant {
         *self.last.lock().expect("the last request's time")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A writer whose first `pending` flushes are pending, holding what it
+    /// took, and failing its next flush when told.
+    #[derive(Default)]
+    struct Slow {
+        taken: Vec<u8>,
+        pending: usize,
+        fail: bool,
+    }
+
+    impl AsyncWrite for Slow {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.taken.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.pending > 0 {
+                self.pending -= 1;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if std::mem::take(&mut self.fail) {
+                return Poll::Ready(Err(io::Error::other("the stream broke")));
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn write(flushed: &mut Flushed<Slow>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        Pin::new(flushed).poll_write(&mut cx, bytes)
+    }
+
+    /// A write whose first flush is pending is counted once, when its flush
+    /// is done, and its bytes are taken once.
+    #[test]
+    fn a_pending_flush_counts_its_write_once() {
+        let mut flushed = Flushed {
+            stream: Slow {
+                pending: 1,
+                ..Slow::default()
+            },
+            unflushed: None,
+        };
+        assert!(write(&mut flushed, b"SSH-2.0-vos\r\n").is_pending());
+        let Poll::Ready(Ok(written)) = write(&mut flushed, b"SSH-2.0-vos\r\n") else {
+            panic!("the flush is done");
+        };
+        assert_eq!(written, 13);
+        assert_eq!(flushed.stream.taken, b"SSH-2.0-vos\r\n");
+        assert_eq!(flushed.unflushed, None);
+    }
+
+    /// A flush that fails ends its write: the next write is taken anew.
+    #[test]
+    fn a_failed_flush_ends_its_write() {
+        let mut flushed = Flushed {
+            stream: Slow {
+                fail: true,
+                ..Slow::default()
+            },
+            unflushed: None,
+        };
+        assert!(matches!(write(&mut flushed, b"one"), Poll::Ready(Err(_))));
+        assert_eq!(flushed.unflushed, None);
+        let Poll::Ready(Ok(written)) = write(&mut flushed, b"other") else {
+            panic!("the next write is taken");
+        };
+        assert_eq!(written, 5);
+        assert_eq!(flushed.stream.taken, b"oneother");
     }
 }

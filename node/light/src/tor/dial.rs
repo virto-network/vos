@@ -52,6 +52,36 @@ impl Default for Circuit {
 /// The future of a dial.
 pub type Dialing = Pin<Box<dyn Future<Output = io::Result<Stream>> + Send>>;
 
+/// A dial's failure to find an onion service, or to reach it through its
+/// introduction points (arti's `OnionServiceNotFound`,
+/// `OnionServiceNotRunning`, `OnionServiceConnectionFailed`): a service
+/// just launched or relaunched is not published yet, and every attempt in
+/// a burst fails alike, where one a few seconds on often succeeds.
+#[derive(Debug)]
+pub struct Unpublished(pub String);
+
+impl std::fmt::Display for Unpublished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unpublished {}
+
+impl Unpublished {
+    /// The dial's error for it.
+    pub fn error(why: impl Into<String>) -> io::Error {
+        io::Error::other(Self(why.into()))
+    }
+
+    /// Whether `error` is one.
+    pub fn is(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|inner| inner.downcast_ref::<Self>().is_some())
+    }
+}
+
 /// A way to open streams to gateways.
 pub trait Dial: Send + Sync + 'static {
     /// A stream to `target` on `circuit`, which a clearnet target ignores.

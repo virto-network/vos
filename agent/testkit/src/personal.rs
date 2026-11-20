@@ -2,7 +2,9 @@
 //! installed in the default agent of a [`World`] of its own, its role
 //! `homes` granted to the home's key; each call and query taken as ingress
 //! takes it, its signature checked over the agent's identity, each call
-//! alone in a batch at the caller's clock or a millisecond past the last.
+//! alone in a batch at the caller's clock or a millisecond past the last,
+//! each query at the last batch's time, as a node serves it: a home with
+//! no calls reads at the time of its last.
 //! The light node's tests, the facility's and `tools/phone` reach their
 //! homes' agents through it.
 
@@ -26,6 +28,8 @@ pub struct Agent {
     agent: AgentId,
     /// The agent's identity, which calls and queries are signed for.
     pub identity: [u8; 32],
+    /// The last batch's time, which queries read at.
+    last: u64,
 }
 
 fn verified(key: &[u8; 32], message: &[u8], signature: &[u8; 64], what: &str) {
@@ -58,10 +62,12 @@ impl Agent {
                 &[("homes", 1)],
             )
             .grant(Principal::Client(homes), 1);
+        let last = world.now.saturating_sub(1);
         Self {
             world,
             agent,
             identity,
+            last,
         }
     }
 
@@ -90,7 +96,7 @@ impl Agent {
     /// past ingress, at the last batch's time.
     pub fn read(&self, caller: [u8; 32], method: MethodId, arguments: Vec<u8>) -> Outcome {
         let work = Work::Query(Query {
-            time: self.world.now.saturating_sub(1),
+            time: self.last,
             seed: [0; 32],
             caller: Principal::Client(caller),
             instance: PERSONAL,
@@ -128,12 +134,13 @@ impl Agent {
             method: call.method,
             arguments: call.arguments,
         }));
+        self.last = at;
         (run.outcome, at)
     }
 
     /// A query as ingress takes it: its signature checked, then run at
-    /// `now` (or the last batch's time).
-    pub fn query(&self, now: u64, query: &QueryCall) -> Outcome {
+    /// the last batch's time.
+    pub fn query(&self, query: &QueryCall) -> Outcome {
         verified(
             &query.key,
             &query.message(&self.identity),
@@ -141,7 +148,7 @@ impl Agent {
             "query",
         );
         let work = Work::Query(Query {
-            time: now.max(self.world.now.saturating_sub(1)),
+            time: self.last,
             seed: [0; 32],
             caller: Principal::Client(query.key),
             instance: query.instance,

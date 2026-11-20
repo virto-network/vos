@@ -33,6 +33,7 @@ use vos_testkit::personal::Agent;
 use vos_wire::credentials::method as credentials;
 use vos_wire::personal::method as personal;
 
+use super::held::Held;
 use crate::release::{Package, Release};
 use crate::space::Kept;
 use crate::tor::{Circuit, Dial, Dialing, Stream, Target, onion_address};
@@ -322,6 +323,9 @@ pub struct State {
     /// The next request each phone asks of a step, the world's time moved
     /// on before it is taken ([`World::pass_at`]).
     passing: HashMap<u8, (Step, u64)>,
+    /// The next dials of each phone that find the onion service
+    /// unpublished ([`World::unpublished`]).
+    unpublished: HashMap<u8, usize>,
     next_agent: u32,
 }
 
@@ -659,6 +663,12 @@ impl World {
         self.state.lock().unwrap().passing.insert(tag, (step, ms));
     }
 
+    /// The next `dials` of the phone tagged `tag` find the onion service
+    /// unpublished, as arti does for a service just launched.
+    pub fn unpublished(&self, tag: u8, dials: usize) {
+        self.state.lock().unwrap().unpublished.insert(tag, dials);
+    }
+
     /// Whether the phone tagged `tag` died.
     pub fn died(&self, tag: u8) -> bool {
         self.state
@@ -764,7 +774,7 @@ impl World {
             }
             Some(Kind::Query) => {
                 let (agent, query) = <(AgentId, QueryCall)>::decode_exact(body).expect("a query");
-                let outcome = state.query(agent.0, &query, now);
+                let outcome = state.query(agent.0, &query);
                 Response::Ran { outcome, at: 1 }.encode()
             }
             Some(Kind::Call) => {
@@ -836,9 +846,9 @@ fn verified(query_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) {
 }
 
 impl State {
-    fn query(&mut self, agent: u32, query: &QueryCall, now: u64) -> Outcome {
+    fn query(&mut self, agent: u32, query: &QueryCall) -> Outcome {
         if let Some(host) = self.personal.get(&agent) {
-            return host.query(now, query);
+            return host.query(query);
         }
         let space = self.spaces.get_mut(&agent).expect("a space's agent");
         verified(
@@ -1004,67 +1014,19 @@ impl Dial for Gateway {
             if world.died(tag) {
                 return Err(std::io::Error::other("the phone's process is gone"));
             }
+            if let Some(left) = world.state.lock().unwrap().unpublished.get_mut(&tag)
+                && *left > 0
+            {
+                *left -= 1;
+                return Err(crate::tor::Unpublished::error(
+                    "Onion Service not found: failed to obtain hidden service circuit",
+                ));
+            }
             let (ours, theirs) = tokio::io::duplex(1 << 20);
-            let theirs = Held {
-                stream: theirs,
-                held: Vec::new(),
-            };
+            let theirs = Held::new(theirs);
             serve_ssh(world, &target, circuit, theirs, tag);
-            Ok(Box::new(Held {
-                stream: ours,
-                held: Vec::new(),
-            }) as Stream)
+            Ok(Box::new(Held::new(ours)) as Stream)
         })
-    }
-}
-
-/// A stream that holds what is written until it is flushed, as a Tor
-/// stream does at either end: the gateway's onion service and the phone's
-/// client.
-struct Held<S> {
-    stream: S,
-    held: Vec<u8>,
-}
-
-impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Held<S> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
-    }
-}
-
-impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Held<S> {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        _: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        self.held.extend_from_slice(buf);
-        std::task::Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = &mut *self;
-        while !this.held.is_empty() {
-            let written =
-                std::task::ready!(std::pin::Pin::new(&mut this.stream).poll_write(cx, &this.held))?;
-            this.held.drain(..written);
-        }
-        std::pin::Pin::new(&mut this.stream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::ready!(self.as_mut().poll_flush(cx))?;
-        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 

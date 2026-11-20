@@ -421,6 +421,59 @@ fn the_kit_removes_a_lost_phone_and_the_restore_completes() {
     assert!(removal.index > 0);
 }
 
+/// The home's onion not yet published at the first contact: every attempt
+/// of the first burst finds it so, and the light node tries once more
+/// after a pause, so the claim goes through.
+#[test]
+fn a_first_contact_with_an_unpublished_onion_is_tried_again() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let first = device(&world, 0x85);
+    world.unpublished(0x85, vos_light::tor::Config::default().attempts);
+    first.claim(&world, home);
+    assert_eq!(first.space.status().unwrap().phase, Phase::Held);
+}
+
+/// A phone the kit removed while it was off, a restore by the kit after
+/// that: once on again, its pass reads that it is out of the personal
+/// space, and says so, rather than failing at every pass.
+#[test]
+fn a_phone_the_kit_removed_while_off_reads_its_removal() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let lost = device(&world, 0x83);
+    let words = lost.claim_phrase(&world, home);
+    let fresh = device(&world, 0x84);
+    fresh.phone.will_enter(words);
+    let restore = Claim {
+        home: world.home_of(home),
+        kit: KitKind::Phrase,
+        label: "fresh".into(),
+    };
+    fresh
+        .space
+        .remove_by_kit(&fresh.phone, world.home_of(home), KitKind::Phrase, 0)
+        .unwrap();
+    after(suite().kit_delay_ms);
+    fresh
+        .space
+        .restore(&fresh.phone, restore, KitKind::Phrase)
+        .unwrap();
+    after(suite().kit_delay_ms);
+    fresh.space.restored(&fresh.phone, KitKind::Phrase).unwrap();
+    assert_eq!(fresh.space.status().unwrap().phase, Phase::Held);
+    let passed = lost.space.pass(vos_light::testing::wall()).unwrap();
+    assert_eq!(passed.stopped, None);
+    assert!(
+        passed.notices.contains(&vos_light::job::Notice::Removed),
+        "{:?}",
+        passed.notices
+    );
+    assert_eq!(lost.space.status().unwrap().phase, Phase::Removed);
+    let again = lost.space.pass(vos_light::testing::wall()).unwrap();
+    assert_eq!(again.stopped, None);
+}
+
 /// A joiner whose acknowledgement never left (its process killed at the
 /// put) pairs again on the same phone from a new code: the group it joined
 /// at that agent, never added, is left at the new offer.
@@ -455,8 +508,8 @@ fn a_joiner_cut_short_pairs_again_on_the_same_phone() {
 
 /// The pairing's check: both phones show the same, and an opener whose
 /// user does not confirm it puts nothing in the slot but the handshake's
-/// last message, which carries nothing, and closes it; confirmed, the
-/// pairing runs to its end.
+/// last message, which carries nothing, and closes it, which the joiner
+/// reads as the pairing declined; confirmed, the pairing runs to its end.
 #[test]
 fn a_pairing_hands_nothing_over_until_its_check_is_confirmed() {
     let world = world();
@@ -474,7 +527,11 @@ fn a_pairing_hands_nothing_over_until_its_check_is_confirmed() {
         let opener = scope.spawn(|| first.space.pair_await(&first.phone));
         let joined = joiner.space.pair_join(&joiner.phone, &code.code, "joiner");
         assert_eq!(opener.join().unwrap().unwrap_err(), Error::Declined);
-        assert!(joined.is_err(), "{joined:?}");
+        assert_eq!(
+            joined.unwrap_err(),
+            Error::PairingDeclined,
+            "said as the opener's"
+        );
     });
     let puts = world
         .trace(0xa1)

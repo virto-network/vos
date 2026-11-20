@@ -19,7 +19,7 @@ use vos_api::client::Answer;
 use vos_wire::credentials::{MAX_ONIONS, Onion};
 
 use super::connection::{Connection, OpenError};
-use super::dial::{Circuit, Dial, Target};
+use super::dial::{Circuit, Dial, Target, Unpublished};
 use super::tally::{self, Dialed, Hour, Tally};
 use super::{Config, SSH_PORT, onion_address};
 use crate::route::{Purpose, Refused, Route, Routes};
@@ -722,27 +722,37 @@ impl Client {
     ) -> Result<Arc<Connection>, Error> {
         let config = self.inner.config;
         let mut last = String::from("no attempt");
-        let turn = self
-            .inner
-            .next
-            .fetch_add(config.attempts as u64, Ordering::Relaxed);
-        for attempt in 0..config.attempts.max(1) as u64 {
+        let mut unpublished = true;
+        let attempts = config.attempts.max(1) as u64;
+        let turn = self.inner.next.fetch_add(attempts + 1, Ordering::Relaxed);
+        for attempt in 0..=attempts {
+            if attempt == attempts {
+                // Every attempt found the service unpublished: once more,
+                // after a pause.
+                if !unpublished {
+                    break;
+                }
+                tokio::time::sleep(config.again).await;
+            }
             let (target, host_key) = Self::target(routes, route, turn + attempt)?;
             let circuit = Circuit::new();
             let opened = async {
                 let stream =
                     tokio::time::timeout(config.connect, self.inner.dial.dial(&target, circuit))
                         .await
-                        .map_err(|_| "the connection's deadline passed".to_string())?
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|_| ("the connection's deadline passed".to_string(), false))?
+                        .map_err(|error| (error.to_string(), Unpublished::is(&error)))?;
                 tokio::time::timeout(config.handshake, Connection::open(stream, host_key))
                     .await
-                    .map_err(|_| "the SSH handshake's deadline passed".to_string())?
-                    .map_err(|error| match error {
-                        OpenError::Ssh(error) => error.to_string(),
-                        OpenError::Refused => "the gateway refused the SSH session".into(),
-                        OpenError::Randomness => "no randomness".into(),
+                    .map_err(|_| "the SSH handshake's deadline passed".to_string())
+                    .and_then(|opened| {
+                        opened.map_err(|error| match error {
+                            OpenError::Ssh(error) => error.to_string(),
+                            OpenError::Refused => "the gateway refused the SSH session".into(),
+                            OpenError::Randomness => "no randomness".into(),
+                        })
                     })
+                    .map_err(|why| (why, false))
             };
             let opened = opened.await;
             self.dialed(&target, purpose, opened.is_err());
@@ -755,7 +765,10 @@ impl Client {
                     state.live.push((space, Arc::downgrade(&connection)));
                     return Ok(connection);
                 }
-                Err(why) => last = why,
+                Err((why, was)) => {
+                    last = why;
+                    unpublished &= was;
+                }
             }
         }
         Err(Error::Unreachable(last))
@@ -771,11 +784,16 @@ impl Client {
     ) -> Result<(super::Stream, [u8; 32]), Error> {
         let config = self.inner.config;
         let mut last = io::Error::other("no attempt");
-        let turn = self
-            .inner
-            .next
-            .fetch_add(config.attempts as u64, Ordering::Relaxed);
-        for attempt in 0..config.attempts.max(1) as u64 {
+        let mut unpublished = true;
+        let attempts = config.attempts.max(1) as u64;
+        let turn = self.inner.next.fetch_add(attempts + 1, Ordering::Relaxed);
+        for attempt in 0..=attempts {
+            if attempt == attempts {
+                if !unpublished {
+                    break;
+                }
+                tokio::time::sleep(config.again).await;
+            }
             if self.is_dormant() {
                 return Err(Error::Dormant);
             }
@@ -788,8 +806,14 @@ impl Client {
             self.dialed(&target, Purpose::Screens, !matches!(dialed, Ok(Ok(_))));
             match dialed {
                 Ok(Ok(stream)) => return Ok((stream, host_key)),
-                Ok(Err(error)) => last = error,
-                Err(_) => last = io::Error::other("the connection's deadline passed"),
+                Ok(Err(error)) => {
+                    unpublished &= Unpublished::is(&error);
+                    last = error;
+                }
+                Err(_) => {
+                    unpublished = false;
+                    last = io::Error::other("the connection's deadline passed");
+                }
             }
         }
         Err(Error::Unreachable(last.to_string()))

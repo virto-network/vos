@@ -6,8 +6,8 @@ use ed25519_dalek::Signer as _;
 use vos_abi::Encode;
 use vos_abi::ids::MethodId;
 use vos_wire::personal::{
-    AdminClass, Attached, Attestation, Candidacy, DeviceView, NewAdmin, PersonalError, Recorded,
-    Standing, Status, method,
+    AdminClass, Attached, Attestation, Candidacy, DeviceView, NewAdmin, Overview, PersonalError,
+    Recorded, Standing, Status, method,
 };
 
 use super::link::{AgentLink, Signer, answer};
@@ -119,10 +119,22 @@ fn agent_refused(error: PersonalError) -> Error {
 }
 
 impl<H: Host> Personal<H> {
-    /// The device set as the agent holds it.
+    /// The device set as the agent holds it, at its batch time now: a home
+    /// whose batch time is older than [`crate::job::STALE_MS`] is woken
+    /// first, as a pass wakes it, since its reads are at its last batch's
+    /// time.
     pub fn devices(&self) -> Result<Vec<Device>, Error> {
         let mut held = self.held();
         let me = held.group.as_ref().and_then(crate::group::DeviceGroup::id);
+        let now = self.host.now();
+        let overview: Overview = self.with_link(&mut held, Purpose::Personal, |link, _| {
+            link.query(method::OVERVIEW, ())
+                .map_err(unreached)?
+                .map_err(agent_refused)
+        })?;
+        if overview.at.saturating_add(crate::job::STALE_MS) < now {
+            self.wake(&mut held)?;
+        }
         let views = self.views(&mut held)?;
         self.adopt_admin(&mut held, &views)?;
         Ok(views

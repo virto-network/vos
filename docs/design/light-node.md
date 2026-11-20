@@ -799,7 +799,23 @@ first settles one operation that fell due (a removal's device leaves
 more are due, which `wake` settles one a call; then the slots that expired
 and the pending candidate's timeout. A refused call writes nothing, so its
 settling waits for the next call that runs, and a read computes a device's
-standing from the time it reads at. The home's
+standing from the time it reads at. **Which time each reading uses**
+[built]: a node serves a query at its agent's last batch's time, and a
+quiet home runs no batch, so every reading of `Personal` (`overview`'s
+`at` and `lapsed`, `devices`' standing, seasoning and `seen`, an
+operation's state, the inbox and the slots) is at the time of the agent's
+last call, and nothing that fell due since is settled (a matured removal
+is logged, and its commit owed, by a call alone). A device's pass that
+posts nothing therefore wakes the agent (`wake`, a call that settles and
+counts no one seen) when the overview's batch time is older than ten
+minutes by the device's clock (`job::STALE_MS`), or an uncontested
+operation it holds open has matured by either clock, then reads the log
+and the overview again: the device set's standing, the clock alarm (the
+device's clock against the batch time read after the wake) and the commit
+owed are at most a pass old. The Devices screen's read wakes the agent
+the same way first (`space::Personal::devices`). `seen` stays each
+device's last call (below, "Seen means a call"). Delays and maturities
+themselves run on batch time alone, as below. The home's
 calls (`configure`, `assign`, `claim`, `renew`) take the role `homes`;
 `assign` answers its caller, and `claim` answers `Homes` by message
 (below, "`Homes` as built"). Bounds the rules above leave open: `alive` is logged at
@@ -1835,15 +1851,22 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   `evidence` and `alive`, named, nothing generic), refused before anything
   leaves unless it is the onion's: the log followed from the cursor and
   every vote, evidence and `alive` it asks for posted, `Settling` woken
-  through, until it asks for nothing; the head checked (`head`) and the
-  clock against the agent's batch time; each scope pushed (the log
+  through, until it asks for nothing; a quiet home woken (above, "Which
+  time each reading uses") and the log read again; the head checked
+  (`head`) and the clock against the agent's batch time (one clock alarm
+  kept, the latest skew's); each scope pushed (the log
   followed again on `StaleEpoch`) and read by its cursor (the log followed
   where a page waits for an epoch, the archive read where it waits for a
   key, four readings at most); the archive and the recovery envelopes
   kept; one of each scope's own pushes audited (`audit`); the device set
   read. A device stuck or
   out reads the log, the overview and the device set and leaves its
-  scopes alone. A post the agent refuses as held already (`Voted`,
+  scopes alone. A device added once whose key the agent turns away
+  (`NotAdmitted`, `Removed`) is out (`DeviceGroup::turned_away`): its
+  removal matured and was settled while it was off (the kit's, another
+  device's, a restore), and a removed device reads no log. That rests on
+  the agent's word, unsigned (B6): the operators could say it of a live
+  device, as they could deny it service, and its user pairs it again. A post the agent refuses as held already (`Voted`,
   `Evidenced`) or as decided meanwhile (`NoCandidate`, `NotConfirming`) is
   done, the log read on; a page withheld is read again once. A pass that
   stops on an error hands back what it found (`Stopped`), its alarms with
@@ -1863,10 +1886,12 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   pass killed or stopped after the request that raised one, or a request
   the operators fail after it, loses none (B3, B4, B19). `Personal`'s
   `devices` gives each device's last call (`DeviceView::seen`, the `seen`
-  table the confirming set is drawn from): each device's last sync as the
-  chrome shows it, for a device whose sync made a call (a push, a vote,
-  `alive`); a pass with nothing new makes none, so a quiet device's last
-  sync shows as its last call there, and the chrome says so.
+  table the confirming set is drawn from): each device's last call as the
+  chrome shows it ("last call at your agent"), for a device whose sync
+  made one (a push, a vote, `alive`); a pass with nothing new makes none
+  but a `wake`, which counts no device seen (the confirming set is the
+  devices that took part, not those that only read), so a quiet device's
+  last call is older than its last sync, and the chrome names it so.
 - **A pass killed anywhere** leaves the store consistent: every change is
   one synced batch of the group's or sealed sync's, and every request is
   one the agent answers alike when sent again. The test kills a pass
@@ -1887,8 +1912,11 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   as never finished; the device's last sync is the latest finished run.
   Notices are posted as local notifications by every sync of `:vos`,
   alerting once while they stand: an operation while a pass reads it open,
-  a pending restore and an alarm for a week after the pass that raised
-  them, every notice through a pass that reached nothing. The chrome asks
+  a restore stopped and an alarm for a week after the pass that raised
+  them, unless they are of an operation (the restore, the kit's signature
+  on one) a later pass reads open no more, which they go with (one clock
+  alarm at a time, the latest skew's), every notice through a pass that
+  reached nothing. The chrome asks
   for notifications once the facility keeps something, and recommends the
   exemption (Android's own prompt) when the user restricted the app's
   background work or no run finished for a day since the app was
@@ -3138,7 +3166,15 @@ nodes may ask the onion's mark of its proven calls, or of every request
   and the `vos-api` subsystem multiplexed; a kept-open one is closed
   after five minutes without a request. A fresh connection gets three
   attempts, each on a new circuit through the next onion of the pinned
-  set; deadlines: the onion stream 45 s, the SSH handshake 30 s, a
+  set, and one more after five seconds when all three found the onion
+  service unpublished or unreachable (arti's `OnionServiceNotFound`,
+  `…NotRunning`, `…ConnectionFailed`, `tor::Unpublished`): a service
+  just launched has no descriptor on its directories yet, and a burst of
+  attempts fails alike [measured, Fairphone 6 and Pixel against the demo
+  gateway, 2026-11-19: three of five first contacts with a home's onion
+  failed so ("Onion Service not found: Failed to obtain hidden service
+  circuit"), and the user's retry a few seconds on went through each
+  time]; deadlines: the onion stream 45 s, the SSH handshake 30 s, a
   request 30 s, a proven call 90 s, a missed one closing its
   connection. Each connection is made under its space's routes and the
   awake period: a change of either closes it, requests in flight

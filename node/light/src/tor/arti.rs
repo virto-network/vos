@@ -12,7 +12,7 @@ use arti_client::status::BlockageKind;
 use arti_client::{DormantMode, ErrorKind, HasKind, StreamPrefs, TorClient};
 use tor_rtcompat::PreferredRuntime;
 
-use super::dial::{Circuit, Dial, Dialing, Stream, Target};
+use super::dial::{Circuit, Dial, Dialing, Stream, Target, Unpublished};
 
 /// The onion address's version byte (rend-spec-v3 §6).
 const ONION_VERSION: u8 = 3;
@@ -297,7 +297,14 @@ impl Dial for Tor {
                     let stream = client
                         .connect_with_prefs((address.as_str(), port), &prefs)
                         .await
-                        .map_err(io::Error::other)?;
+                        .map_err(|error| match error.kind() {
+                            ErrorKind::OnionServiceNotFound
+                            | ErrorKind::OnionServiceNotRunning
+                            | ErrorKind::OnionServiceConnectionFailed => {
+                                Unpublished::error(error.to_string())
+                            }
+                            _ => io::Error::other(error),
+                        })?;
                     Ok(Box::new(stream) as Stream)
                 })
             }

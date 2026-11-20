@@ -5,8 +5,9 @@
 //!
 //! In order: the control log read from the device group's cursor and
 //! followed, every vote, evidence and `alive` it asks for posted until it
-//! asks for none (`alive` while a restore is pending, §3.5); the agent's
-//! head and batch time checked; each scope's queued operations pushed and
+//! asks for none (`alive` while a restore is pending, §3.5); a quiet home
+//! woken ([`STALE_MS`]) and the log followed again; the agent's head and
+//! batch time checked; each scope's queued operations pushed and
 //! its envelopes read by its cursor, the log followed again where a push or
 //! a page waits for an epoch, the archive read where a page waits for a
 //! key; the archive and the recovery envelopes kept; a sample of each
@@ -24,7 +25,8 @@
 //!
 //! **A device that cannot follow** (stuck, or out of the group) reads the
 //! log, the overview and the device set, and leaves its scopes alone: it
-//! is removed and pairs again, or regroups, first. A pass that stops on an error hands back
+//! is removed and pairs again, or regroups, first. One the agent turns
+//! away, once added, is out ([`DeviceGroup::turned_away`]). A pass that stops on an error hands back
 //! what it had found ([`Stopped`]), its alarms with it.
 //!
 //! **What the chrome raises** ([`Pass::notices`]): the device set's open
@@ -63,6 +65,10 @@ const READINGS: usize = 4;
 
 /// The own envelopes a pass audits in each scope.
 pub const AUDIT_SAMPLE: usize = 1;
+
+/// How old, by the device's clock, the agent's batch time may be before a
+/// pass that posts nothing wakes the agent ([`due`]).
+pub const STALE_MS: u64 = 10 * 60 * 1000;
 
 /// What a device posts to its agent under its sync key while following
 /// the log, each a named call of `Personal`.
@@ -154,6 +160,9 @@ pub trait Control: Link {
 pub enum Notice {
     /// A device-set operation open at `index`, maturing at `matures`
     /// unless vetoed: `at` is when the log took it, if this pass read it.
+    /// Contested, it waits for a resolution: none of this device's when it
+    /// is `targeted`, the kit's alone when it is `kit_only`
+    /// ([`group::Open`]).
     Operation {
         index: u64,
         by: Signer,
@@ -161,10 +170,15 @@ pub enum Notice {
         matures: u64,
         contested: bool,
         at: Option<u64>,
+        targeted: bool,
+        kit_only: bool,
     },
-    /// A restore is pending, which asserts every device lost: this device
-    /// posted `alive`, and its user rotates the kit.
-    Restore,
+    /// The kit opened a restore, at `index`, which asserts every device
+    /// lost: this device's `alive` stopped it, and its user rotates the
+    /// kit unless they made it.
+    Restore {
+        index: u64,
+    },
     /// This device is out of the group.
     Removed,
     /// This device cannot follow the confirmed epoch: removed from another
@@ -222,6 +236,8 @@ pub struct Pass {
     pub posts: usize,
     /// Whether it posted `alive`: a restore is pending.
     pub alive: bool,
+    /// The restore it answered with `alive`, by its log index.
+    pub restore: Option<u64>,
     /// The epochs confirmed or voided, and this device's removal, as read.
     pub events: Vec<Event>,
     /// Every alarm kept and not yet acknowledged
@@ -265,6 +281,8 @@ impl Pass {
                 kind: Kind::of(&open.op),
                 matures: open.matures,
                 contested: open.contested,
+                targeted: open.targeted,
+                kit_only: open.kit_only,
                 at: self
                     .taken
                     .iter()
@@ -272,8 +290,8 @@ impl Pass {
                     .map(|(_, at)| *at),
             })
             .collect();
-        if self.alive {
-            notices.push(Notice::Restore);
+        if let Some(index) = self.restore {
+            notices.push(Notice::Restore { index });
         }
         match self.course {
             group::Course::Out => notices.push(Notice::Removed),
@@ -290,6 +308,17 @@ impl Pass {
     fn raise(&mut self, alarm: Alarm) {
         if !self.alarms.contains(&alarm) {
             self.alarms.push(alarm);
+        }
+    }
+
+    /// `events` the device group gave outside the log's reading.
+    fn saw(&mut self, events: Vec<Event>) {
+        for event in events {
+            match event {
+                Event::Alarm(alarm) => self.raise(alarm),
+                other if !self.events.contains(&other) => self.events.push(other),
+                _ => {}
+            }
         }
     }
 }
@@ -313,7 +342,14 @@ pub fn run<L: Control>(
     now: u64,
 ) -> Result<Pass, Stopped<L::Error>> {
     let mut pass = Pass::default();
-    let done = passing(light, group, link, instances, now, &mut pass);
+    let mut done = passing(light, group, link, instances, now, &mut pass);
+    if let Err(SyncError::Refused(PersonalError::NotAdmitted | PersonalError::Removed)) = &done {
+        // Turned away though once added: out, its removal settled unread.
+        done = group
+            .turned_away()
+            .map(|events| pass.saw(events))
+            .map_err(SyncError::Group);
+    }
     pass.course = group.course();
     pass.operations = group.operations();
     pass.commit = owed_commit(group);
@@ -372,6 +408,17 @@ fn passing<L: Control>(
         return Ok(());
     }
     let mut overview = answer(link.overview())?;
+    if pass.posts == 0 && due(group, &overview, now) {
+        // A quiet home's reads are at its last batch's time, and what fell
+        // due since is settled by a call alone: a wake, then the log again
+        // for what it settled.
+        wake(link)?;
+        follow(light, group, link, pass)?;
+        if group.course() == group::Course::Out {
+            return Ok(());
+        }
+        overview = answer(link.overview())?;
+    }
     for alarm in group.head(overview.next, overview.chain)? {
         pass.raise(alarm);
     }
@@ -399,6 +446,32 @@ fn passing<L: Control>(
         .map(|view| (view.id, view.seen))
         .collect();
     Ok(())
+}
+
+/// Whether a pass that posted nothing wakes the agent: its batch time is
+/// older than [`STALE_MS`] by the device's clock (the device set's
+/// standing and the clock alarm read at that time); or an uncontested
+/// operation open has matured by either clock, which only a call settles
+/// (a removal's commit owed).
+fn due(group: &DeviceGroup, overview: &Overview, now: u64) -> bool {
+    overview.at.saturating_add(STALE_MS) < now
+        || group
+            .operations()
+            .iter()
+            .any(|open| !open.contested && open.matures <= now.max(overview.at))
+}
+
+/// Wake the agent until nothing due is left. A wake does not count the
+/// device seen: the confirming set is the devices that voted, pushed or
+/// lived (`alive`) in its window, not those that only read.
+fn wake<L: Link>(link: &mut L) -> Result<(), SyncError<L::Error>> {
+    for _ in 0..WAKES {
+        onion(link)?;
+        if answer(link.wake())?.settled {
+            return Ok(());
+        }
+    }
+    Err(SyncError::Settling)
 }
 
 /// The scopes pushed and read, the archive and the recovery envelopes
@@ -486,6 +559,12 @@ fn follow<L: Control>(
                 },
                 Event::Alive => {
                     pass.alive = true;
+                    pass.restore = group
+                        .operations()
+                        .iter()
+                        .find(|open| matches!(open.op, Op::Restore { .. }))
+                        .map(|open| open.index)
+                        .or(pass.restore);
                     Post::Alive
                 }
                 Event::Alarm(alarm) => {

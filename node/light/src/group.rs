@@ -933,7 +933,10 @@ pub fn restoring_with(
 /// An open operation of the device set as this device verified it, for
 /// the chrome: its index, signer and operation, when it matures, whether
 /// it is contested, the devices whose vetoes verified, and whether its
-/// own evidence did.
+/// own evidence did; and for a contest, whether this device is one of its
+/// targets (the devices its operation and its rival's name), which
+/// resolve nothing, and whether fewer than the two devices a resolution
+/// needs are left outside them, so the kit alone resolves it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Open {
     pub index: u64,
@@ -943,6 +946,18 @@ pub struct Open {
     pub contested: bool,
     pub vetoes: Vec<DeviceId>,
     pub verified: bool,
+    pub targeted: bool,
+    pub kit_only: bool,
+}
+
+/// The devices an operation names as its target: those it removes, or
+/// whose admin key it replaces.
+fn targets(op: &Op) -> Vec<DeviceId> {
+    match op {
+        Op::Remove(target) | Op::Replace { device: target, .. } => vec![*target],
+        Op::Regroup(named) => named.clone(),
+        _ => Vec::new(),
+    }
 }
 
 /// A candidate processed on a copy, in memory: after a restart the logged
@@ -1414,14 +1429,30 @@ impl DeviceGroup {
                         Signer::Kit(_) => None,
                     })
                     .collect::<Vec<_>>();
+                let contested = call.rival.is_some() || !vetoes.is_empty();
+                let mut named = targets(op);
+                if let Some(Act::Op { op: rival, .. }) = call
+                    .rival
+                    .and_then(|rival| state.call_at(rival))
+                    .map(|rival| &rival.act)
+                {
+                    named.extend(targets(rival));
+                }
+                let resolvers = state
+                    .devices
+                    .iter()
+                    .filter(|(id, _)| state.voiced(*id) && !named.contains(id))
+                    .count();
                 Some(Open {
                     index: call.index,
                     by: call.by,
                     op: op.clone(),
                     matures: *matures,
-                    contested: call.rival.is_some() || !vetoes.is_empty(),
+                    contested,
                     vetoes,
                     verified: call.evidence == Check::Valid && call.awaits.is_none(),
+                    targeted: contested && state.id.is_some_and(|me| named.contains(&me)),
+                    kit_only: contested && resolvers < 2,
                 })
             })
             .collect()
@@ -1560,6 +1591,22 @@ impl DeviceGroup {
     /// does, and nothing is pushed to the recovery scope meanwhile.
     pub fn reseal_owed(&self) -> bool {
         self.state.reseal && self.state.rekeyed.is_some()
+    }
+
+    /// The agent turns this device's sync key away (`NotAdmitted`, or
+    /// `Removed`) though its add was confirmed: its removal matured and was
+    /// settled before the device read it (a removal by the kit or by
+    /// another device while it was off, or a restore), and the log is no
+    /// longer served to it. It is out, on the agent's word, which the
+    /// operators could give of any device as they could deny it service:
+    /// it pairs again. Nothing to do for a device out already, or not yet
+    /// added.
+    pub fn turned_away(&mut self) -> Result<Vec<Event>, GroupError> {
+        let mut events = Vec::new();
+        if self.state.id.is_some() && self.state.course != Course::Out {
+            self.out(&mut events)?;
+        }
+        Ok(events)
     }
 
     /// The matured removals the next commit must carry.
@@ -2024,7 +2071,8 @@ fn stored_alarms(store: &Store) -> Result<Vec<Alarm>, StoreError> {
         .unwrap_or_default())
 }
 
-/// The row of the alarms kept with `raised` added, each once; none when
+/// The row of the alarms kept with `raised` added, each once, a clock
+/// alarm in the place of the one kept (its skew the latest); none when
 /// `raised` adds nothing. Past [`KEPT_ALARMS`], the oldest of a kind of
 /// which a later one is kept goes first, so a flood of one kind evicts no
 /// other.
@@ -2033,6 +2081,9 @@ pub(crate) fn raised_row(store: &Store, raised: &[Alarm]) -> Result<Option<Write
     let before = kept.clone();
     for alarm in raised {
         if !kept.contains(alarm) {
+            if matches!(alarm, Alarm::Clock { .. }) {
+                kept.retain(|kept| !matches!(kept, Alarm::Clock { .. }));
+            }
             kept.push(*alarm);
         }
     }

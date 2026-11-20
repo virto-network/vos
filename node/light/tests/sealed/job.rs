@@ -9,7 +9,7 @@
 //! twice (§2.2, D6).
 
 use vos_light::group::Alarm;
-use vos_light::job::{self, Control, Kind, Notice, Pass, Post};
+use vos_light::job::{self, Commit, Control, Kind, Notice, Pass, Post};
 use vos_light::kit::KitSecret;
 use vos_wire::personal::{Cancel, DeviceView, Entry, OpState, Operation, Overview};
 
@@ -225,7 +225,7 @@ fn a_pass_with_nothing_new_reads_little() {
     for phone in phones.iter_mut() {
         pass(&mut home, phone);
     }
-    home.pass(15 * MIN);
+    home.pass(5 * MIN);
     let quiet = pass(&mut home, &mut phones[1]);
     assert_eq!(quiet.pass.posts, 0);
     assert_eq!(quiet.pass.pushed, 0);
@@ -242,6 +242,49 @@ fn a_pass_with_nothing_new_reads_little() {
     );
     assert_eq!(quiet.requests, 6);
     assert!(quiet.down < 1 << 10, "{} bytes", quiet.down);
+}
+
+/// A quiet home, no call for hours: its agent reads at its last batch's
+/// time, before the removal one phone made of the other matured. The pass
+/// wakes it, which settles the removal: the commit it owes is raised on
+/// the pass after it matured, the device set read at the home's time now,
+/// and no clock alarm for the hours no call moved the batch time. The next
+/// pass, a minute on, wakes nothing.
+#[test]
+fn a_pass_wakes_a_quiet_home() {
+    let (mut home, mut phones, _) = household_with(2, vec![KitSecret::phrase().unwrap().key()]);
+    let (admin, sync) = (phones[0].admin.clone(), phones[0].sync.clone());
+    operate(&mut home, &admin, &sync, "remove", 1u32.encode(), None);
+    let open = pass(&mut home, &mut phones[0]);
+    assert_eq!(open.pass.commit, None);
+    home.pass(3 * 60 * MIN);
+    let now = home.now();
+    let run = pass(&mut home, &mut phones[0]);
+    assert_eq!(run.pass.commit, Some(Commit::Removals));
+    assert!(
+        run.pass
+            .notices()
+            .contains(&Notice::Commit(Commit::Removals)),
+        "{:?}",
+        run.pass.notices()
+    );
+    assert!(
+        run.pass.at >= now,
+        "the overview at {} before {now}",
+        run.pass.at
+    );
+    assert!(
+        !run.pass
+            .alarms
+            .iter()
+            .any(|alarm| matches!(alarm, Alarm::Clock { .. })),
+        "{:?}",
+        run.pass.alarms
+    );
+    home.pass(MIN);
+    let before = home.now();
+    let next = pass(&mut home, &mut phones[0]);
+    assert!(next.pass.at + MIN / 2 < before, "no wake a minute on");
 }
 
 /// A pass pushes the scope's queued operations and reads what the other
@@ -292,7 +335,7 @@ fn a_pending_restore_is_answered_with_alive() {
     let run = pass(&mut home, &mut phones[0]);
     assert!(run.pass.alive);
     let notices = run.pass.notices();
-    assert!(notices.contains(&Notice::Restore), "{notices:?}");
+    assert!(notices.contains(&Notice::Restore { index }), "{notices:?}");
     assert!(
         notices.contains(&Notice::Alarm(Alarm::Kit { index })),
         "{notices:?}"

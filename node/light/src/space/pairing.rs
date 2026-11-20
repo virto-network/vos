@@ -409,9 +409,18 @@ impl<H: Host> Personal<H> {
                     &slot,
                     &mut slot_signer,
                 );
-                link.query(method::INBOX, Option::<(u64, [u8; 16])>::None)
+                match link
+                    .query(method::INBOX, Option::<(u64, [u8; 16])>::None)
                     .map_err(unreached)?
-                    .map_err(agent_refused)?
+                {
+                    Ok(items) => items,
+                    // The slot's key admitted no more before it expired:
+                    // the opener closed it, declining.
+                    Err(PersonalError::NotAdmitted) if self.host.now() <= until => {
+                        return Err(Error::PairingDeclined);
+                    }
+                    Err(error) => return Err(agent_refused(error)),
+                }
             };
             match joiner.read(&items).map_err(failed)? {
                 Joined::Waiting => self.host.sleep(POLL),

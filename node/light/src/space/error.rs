@@ -91,6 +91,8 @@ pub enum Error {
     CommittedMeanwhile,
     /// The pairing's slot expired.
     SlotExpired,
+    /// The other device declined the pairing, which closed its slot.
+    PairingDeclined,
     /// The device is in that personal space already.
     InSetAlready,
     /// The agent's set holds no device of this sync key.
@@ -191,6 +193,7 @@ impl std::fmt::Display for Error {
                 f.write_str("another device committed during the pairing: pair again")
             }
             Error::SlotExpired => f.write_str("the pairing's slot expired"),
+            Error::PairingDeclined => f.write_str("the other device declined the pairing"),
             Error::InSetAlready => f.write_str("this device is in that personal space already"),
             Error::NotInAgentSet => f.write_str("the agent's set holds no device of this sync key"),
             Error::Regrouped { by } => write!(

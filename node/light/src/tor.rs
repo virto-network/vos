@@ -20,7 +20,11 @@
 //!   the next proven call takes; the next spare is built once it is.
 //! - **A fresh connection that fails is retried on a new circuit**, up to
 //!   [`Config::attempts`], through the next onion of the pinned set: 10–20%
-//!   of fresh onion connections failed on the phones (§6.4). Every step has
+//!   of fresh onion connections failed on the phones (§6.4). When every
+//!   attempt found the onion service unpublished or unreachable
+//!   ([`Unpublished`], a service just relaunched), one more is made after
+//!   [`Config::again`]: first contacts with a home's onion failed so on the
+//!   phones, where the user's retry a few seconds on went through. Every step has
 //!   its deadline ([`Config`]), as nothing in arti or SSH ends on its own;
 //!   a request that misses one loses its connection.
 //! - **Dormant** ([`Client::set_dormant`]): no connection, no spare, no
@@ -48,7 +52,7 @@ mod tally;
 
 pub use arti::{BootstrapError, BridgeError, Tor, TorConfig, bridge, onion_address, onion_key};
 pub use client::{Client, Error, FEED_PAGES, Registrar, Screens, SpaceId};
-pub use dial::{Circuit, Dial, Dialing, Io, Stream, Target};
+pub use dial::{Circuit, Dial, Dialing, Io, Stream, Target, Unpublished};
 pub use tally::{HOURS, Hour, Opened};
 
 use std::time::Duration;
@@ -72,6 +76,9 @@ pub struct Config {
     pub proven: Duration,
     /// A fresh connection's attempts, each on a new circuit.
     pub attempts: usize,
+    /// The pause before one more attempt when every attempt found the
+    /// onion service unpublished or unreachable ([`Unpublished`]).
+    pub again: Duration,
     /// How long a kept-open connection stays without a request.
     pub idle: Duration,
 }
@@ -88,6 +95,7 @@ impl Default for Config {
             request: Duration::from_secs(30),
             proven: Duration::from_secs(90),
             attempts: 3,
+            again: Duration::from_secs(5),
             idle: Duration::from_secs(300),
         }
     }

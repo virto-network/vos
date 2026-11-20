@@ -441,6 +441,12 @@ impl TreeKeeper {
         self.slot
     }
 
+    /// Whether the last page read ended the feed: the tree held is the
+    /// feed's as it stood then.
+    pub fn caught_up(&self) -> bool {
+        self.caught_up
+    }
+
     /// The timer's period now, before its jitter.
     pub fn period(&self) -> u64 {
         self.period

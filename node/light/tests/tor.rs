@@ -7,6 +7,9 @@
 //! (`StreamPrefs::set_isolation`) is the one line the capture does not
 //! reach; the onion example exercises it over the live network.
 
+#[path = "../src/testing/held.rs"]
+mod held;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +34,8 @@ use vos_light::{DeviceError, TreeKeeper, wire};
 use vos_wire::credentials::{Change, Feed, Onion, RootEntry};
 use vos_wire::ingress::{QueryCall, Response};
 
+use held::Held;
+
 /// What the gateway's capture holds of one connection.
 #[derive(Clone, Debug)]
 struct Seen {
@@ -51,6 +56,8 @@ enum Fault {
     Fail,
     /// Never answer, as a rendezvous that hangs.
     Hang,
+    /// Fail at once, the onion service not found: not yet published.
+    Unpublished,
 }
 
 struct Gateway {
@@ -168,9 +175,16 @@ impl Dial for Dialer {
                     ));
                 }
                 Some(Fault::Hang) => std::future::pending::<()>().await,
+                Some(Fault::Unpublished) => {
+                    return Err(vos_light::tor::Unpublished::error(
+                        "Onion Service not found: failed to obtain hidden service circuit",
+                    ));
+                }
                 None => {}
             }
+            // Each end holds its writes until flushed, as Tor's streams do.
             let (ours, theirs) = tokio::io::duplex(1 << 20);
+            let (ours, theirs) = (Held::new(ours), Held::new(theirs));
             let config = Arc::new(russh::server::Config {
                 keys: vec![gateway.host_key.clone()],
                 ..russh::server::Config::default()
@@ -301,6 +315,7 @@ fn config() -> Config {
         request: Duration::from_secs(5),
         proven: Duration::from_secs(5),
         attempts: 3,
+        again: Duration::from_millis(200),
         idle: Duration::from_secs(60),
     }
 }
@@ -459,6 +474,33 @@ async fn a_failed_connection_is_retried_on_a_new_circuit() {
         other => panic!("{other:?}"),
     }
     assert_eq!(gateway.dials(), 6);
+}
+
+/// An onion service not yet published fails every attempt of a burst:
+/// once each did, one more is made after a pause, and goes through. Past
+/// that one the request fails; a burst that failed otherwise is not tried
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpublished_onion_is_tried_once_more_after_a_pause() {
+    let gateway = Gateway::new();
+    let config = config();
+    let client = client(&gateway, config);
+    let a = space(1);
+    client.set_space(a, Routes::onions(vec![gateway.onion(1)]));
+    gateway.fault(&[Fault::Unpublished; 3]);
+    let started = std::time::Instant::now();
+    client.request(a, Purpose::Fetch, &query()).await.unwrap();
+    assert!(started.elapsed() >= config.again);
+    assert_eq!(gateway.dials(), 4);
+    gateway.fault(&[Fault::Unpublished; 4]);
+    match client.request(a, Purpose::Fetch, &query()).await {
+        Err(Error::Unreachable(why)) => assert!(why.contains("not found"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(gateway.dials(), 8);
+    gateway.fault(&[Fault::Unpublished, Fault::Fail, Fault::Unpublished]);
+    assert!(client.request(a, Purpose::Fetch, &query()).await.is_err());
+    assert_eq!(gateway.dials(), 11);
 }
 
 /// A gateway presenting another host key than the pinned one is not
