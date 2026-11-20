@@ -7,73 +7,180 @@ import android.os.Build;
 import android.widget.LinearLayout;
 
 /**
- * A restore from the recovery kit, in two steps: opened at the home the kit's card names (a new
- * kit made for it), it matures after the kit's delay unless a device of the set answers; then
- * finished with the same kit entered again, the personal space read back. A lost phone left on
- * answers every restore: the kit reads the device set, removes that phone (it matures after the
- * kit's delay, and its background sync cannot veto it) and resolves a contest, from this install.
+ * A restore from the recovery kit, laid out as its steps, only the next one's button shown: the
+ * home and the kit (both kept once this phone knows them: a restore under way, or the device set
+ * it holds), the restore opened (a new kit made for it), the kit's delay waited out unless a device
+ * of the set answers, then the restore finished. A lost phone left on answers every restore: the
+ * kit reads the device set, removes that phone (it matures after the kit's delay, and its
+ * background sync cannot veto it) and resolves a contest, from this install. The kit is entered
+ * once for the screen's life: {@code :vos} holds it between its flows (at most ten minutes, wiped
+ * when the screen closes or the app goes to the background).
  */
 final class RestoreScreen extends Screen {
+  /** Whether it opened on the kit's reading of the devices (a contest only the kit resolves). */
+  private final boolean byKit;
+
+  private PersonalStatus status;
   private String code = "";
   private String label = Words.label(Build.MODEL);
   private byte old = KitKind.PHRASE;
   private byte next = KitKind.PHRASE;
+  /** Whether the user asked to remove a lost phone first. */
+  private boolean lost;
   private KitView view;
+  /** The home's code field, while this phone knows no home. */
+  private HomeField homeField;
 
   RestoreScreen(PersonalActivity app) {
+    this(app, false);
+  }
+
+  RestoreScreen(PersonalActivity app, boolean byKit) {
     super(app);
+    this.byKit = byKit;
+    this.lost = byKit;
   }
 
   @Override
   String title() {
-    return "Restore from a recovery kit";
+    return byKit ? "Your recovery kit" : "Restore from a recovery kit";
+  }
+
+  @Override
+  void shown() {
+    app.holdKit();
+    app.read(
+        (personal, prompts, refused) -> personal.status(refused),
+        read -> {
+          status = read;
+          if (read.kitKnown) {
+            old = read.kit;
+          }
+          redraw();
+        },
+        refused -> redraw());
+  }
+
+  @Override
+  void resumed() {
+    // Back from the background, the sitting is opened anew: the kit is entered again.
+    app.holdKit();
+  }
+
+  @Override
+  void closed() {
+    app.forgetKit();
+  }
+
+  /** The home this phone knows: its restore's, or its personal space's; null when none. */
+  private Home known() {
+    if (status == null || status.home == null || status.home.onions == null) {
+      return null;
+    }
+    return status.home.onions.length == 0 ? null : status.home;
+  }
+
+  private boolean restoring() {
+    return status != null && status.phase == Phase.RESTORING;
   }
 
   @Override
   void build(LinearLayout into) {
+    if (status == null) {
+      into.addView(text("Reading…"));
+      return;
+    }
     into.addView(
         text(
-            "Every device lost: your kit restores your personal space at its home. The restore "
-                + "waits for the kit's delay, so a device of yours can still stop one it did not "
-                + "ask for; then finish it here."));
-    into.addView(heading("1. Open the restore"));
-    into.addView(text("The home your kit's card names: check its handle against the card."));
-    HomeField home = new HomeField(into, code, text -> code = text);
-    into.addView(text("This phone's name"));
-    into.addView(kept(field("Its name on your other devices", label, false), t -> label = t));
-    into.addView(text("The kit you have"));
-    into.addView(new KitChoice(this, old, kind -> old = kind).group);
-    into.addView(text("Your new kit, made for the restored space"));
-    into.addView(new KitChoice(this, next, kind -> next = kind).group);
-    into.addView(
-        button(
-            "Open the restore",
-            v -> {
-              Home at = home.home();
-              if (at != null) {
-                open(at);
-              }
-            }));
-    into.addView(heading("2. Finish it"));
-    into.addView(
-        text("Once the delay passed: enter the kit you opened it with again (chosen above)."));
-    into.addView(button("Finish the restore", v -> finish()));
-    into.addView(heading("A lost phone answers the restore"));
-    into.addView(
-        text(
-            "A lost phone left on answers every restore by itself. Read your devices with the kit "
-                + "(chosen above), remove that phone with the kit, and open the restore again once "
-                + "its removal matured."));
-    into.addView(
-        button(
-            "Read the devices with the kit",
-            v -> {
-              Home at = home.home();
-              if (at != null) {
-                read(at);
-              }
-            }));
+            byKit
+                ? "Your kit reads your devices and resolves what they cannot: enter it once here."
+                : "Every device lost: your kit restores your personal space at its home. The "
+                    + "restore waits for the kit's delay, so a device of yours can still stop one "
+                    + "it did not ask for."));
+    Home home = homeStep(into);
+    if (lost) {
+      devicesStep(into, home);
+      return;
+    }
+    if (!restoring()) {
+      into.addView(heading("2. Open the restore"));
+      into.addView(text("This phone's name"));
+      into.addView(kept(field("Its name on your other devices", label, false), t -> label = t));
+      into.addView(text("Your new kit, made for the restored space"));
+      into.addView(new KitChoice(this, next, kind -> next = kind).group);
+      into.addView(
+          button(
+              "Open the restore",
+              v -> {
+                Home at = home != null ? home : homeField.home();
+                if (at != null) {
+                  open(at);
+                }
+              }));
+      into.addView(
+          text("A lost phone of yours left on answers every restore: remove it with the kit first."));
+      into.addView(
+          button(
+              "Remove a lost phone first",
+              v -> {
+                lost = true;
+                redraw();
+              }));
+      return;
+    }
+    into.addView(heading("2. Opened ✓"));
+    long now = System.currentTimeMillis();
+    boolean matured = status.matures > 0 && status.matures <= now;
+    into.addView(heading("3. Wait for the kit's delay" + (matured ? " ✓" : "")));
+    if (!matured) {
+      into.addView(
+          text(
+              status.matures > 0
+                  ? "It takes effect " + Words.until(status.matures, now) + ", unless one of "
+                      + "your devices answers that it is alive. Come back then."
+                  : "The home has not shown the restore yet: finish it once its delay passed."));
+    }
+    into.addView(heading("4. Finish it"));
+    if (matured || status.matures == 0) {
+      into.addView(button("Finish the restore", v -> finish()));
+    }
+  }
+
+  /** The first step: the home and the kit, shown as kept when this phone knows them. */
+  private Home homeStep(LinearLayout into) {
+    Home home = known();
+    into.addView(heading("1. Your home and your kit"));
+    if (home != null) {
+      into.addView(text("Home " + Words.shortHex(home.handle) + ": check it against your card."));
+    } else {
+      into.addView(text("The home your kit's card names: check its handle against the card."));
+      homeField = new HomeField(into, code, text -> code = text);
+    }
+    if (status.kitKnown) {
+      into.addView(
+          text(
+              "Your kit: "
+                  + (old == KitKind.SECURITY_KEY ? "your security key" : "your recovery phrase")));
+    } else {
+      into.addView(text("The kit you have"));
+      into.addView(new KitChoice(this, old, kind -> old = kind).group);
+    }
+    return home;
+  }
+
+  /** The kit's reading of the devices, and its removal of a lost phone or resolution of a contest. */
+  private void devicesStep(LinearLayout into, Home known) {
+    into.addView(heading("2. Your devices, read with the kit"));
     if (view == null) {
+      into.addView(
+          button(
+              "Read the devices with the kit",
+              v -> {
+                Home at = home(known);
+                if (at != null) {
+                  read(at);
+                }
+              }));
       return;
     }
     for (Device device : view.devices) {
@@ -91,7 +198,7 @@ final class RestoreScreen extends Screen {
             button(
                 "Remove " + device.label + " with the kit",
                 v -> {
-                  Home at = home.home();
+                  Home at = home(known);
                   if (at != null) {
                     remove(at, device);
                   }
@@ -103,10 +210,34 @@ final class RestoreScreen extends Screen {
       if (notice.contested) {
         into.addView(
             buttons(
-                button("Uphold it with the kit", v -> resolve(home.home(), notice.index, true)),
-                button("Drop it with the kit", v -> resolve(home.home(), notice.index, false))));
+                button("Uphold it with the kit", v -> resolve(home(known), notice.index, true)),
+                button("Drop it with the kit", v -> resolve(home(known), notice.index, false))));
       }
     }
+    if (!byKit) {
+      into.addView(
+          text("Once the lost phone's removal matured (the kit's delay), open the restore."));
+      into.addView(
+          button(
+              "Back to the restore",
+              v -> {
+                lost = false;
+                redraw();
+              }));
+    }
+  }
+
+  private Home home(Home known) {
+    return known != null ? known : homeField == null ? null : homeField.home();
+  }
+
+  /** A refusal said, a kit no space at the home holds with the home's handle to check. */
+  private void refused(Home home, Refused refused) {
+    if (refused.why == Why.NO_AGENT_FOR_KIT && home != null) {
+      app.say("Not done: " + Words.noAgentForKit(home.handle) + ".");
+      return;
+    }
+    app.refused(refused);
   }
 
   private void read(Home home) {
@@ -117,7 +248,10 @@ final class RestoreScreen extends Screen {
         (KitView read) -> {
           view = read;
           redraw();
-        });
+        },
+        null,
+        true,
+        refused -> refused(home, refused));
   }
 
   private void remove(Home home, Device device) {
@@ -125,12 +259,16 @@ final class RestoreScreen extends Screen {
     app.run(
         "Removing " + device.label + " with the kit…",
         (personal, prompts, refused) -> personal.removeByKit(home, kit, device.id, prompts, refused),
-        (Posted posted) ->
-            app.say(
-                device.label
-                    + "'s removal is open (log entry "
-                    + posted.index
-                    + "). It matures after your kit's delay; then open the restore again."));
+        (Posted posted) -> {
+          app.say(
+              device.label
+                  + "'s removal is open. It matures after your kit's delay; then open the "
+                  + "restore.");
+          read(home);
+        },
+        null,
+        true,
+        refused -> refused(home, refused));
   }
 
   private void resolve(Home home, long index, boolean upheld) {
@@ -142,7 +280,13 @@ final class RestoreScreen extends Screen {
         "Resolving the contest with the kit…",
         (personal, prompts, refused) ->
             personal.resolveByKit(home, kit, index, upheld, prompts, refused),
-        (Posted posted) -> app.say("Resolved (log entry " + posted.index + ")."));
+        (Posted posted) -> {
+          app.say("Resolved.");
+          read(home);
+        },
+        null,
+        true,
+        refused -> refused(home, refused));
   }
 
   private void open(Home home) {
@@ -154,22 +298,29 @@ final class RestoreScreen extends Screen {
     app.run(
         "Opening the restore at the home…",
         (personal, prompts, refused) -> personal.restore(request, kit, prompts, refused),
-        (Posted posted) ->
-            app.say(
-                "The restore is open (log entry "
-                    + posted.index
-                    + "). It matures after your kit's delay unless one of your devices answers "
-                    + "that it is alive. Then finish it here with the same kit."));
+        (Posted posted) -> {
+          app.say(
+              "The restore is open. It matures after your kit's delay unless one of your "
+                  + "devices answers that it is alive; then finish it here.");
+          shown();
+        },
+        null,
+        true,
+        refused -> refused(home, refused));
   }
 
   private void finish() {
     byte kit = old;
+    Home home = known();
     app.run(
         "Reading your personal space back…",
         (personal, prompts, refused) -> personal.restored(kit, prompts, refused),
         (Claimed claimed) -> {
           app.home();
           app.say("Restored. This phone is device " + claimed.device + " of your personal space.");
-        });
+        },
+        null,
+        true,
+        refused -> refused(home, refused));
   }
 }

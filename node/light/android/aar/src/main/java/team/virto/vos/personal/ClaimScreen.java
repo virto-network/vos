@@ -57,7 +57,7 @@ final class ClaimScreen extends Screen {
     request.kit = kit;
     request.label = label.trim();
     app.run(
-        "Backing up at the home: the open claim's work takes about a minute…",
+        "Backing up at the home: about a minute…",
         (personal, prompts, refused) -> personal.claim(request, prompts, refused),
         (Claimed claimed) -> {
           app.home();

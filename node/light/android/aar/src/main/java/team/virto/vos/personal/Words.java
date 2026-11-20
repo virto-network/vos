@@ -208,6 +208,87 @@ public final class Words {
     }
   }
 
+  /** What a flow is doing at {@code stage}, while it runs. */
+  public static String stage(byte stage) {
+    switch (stage) {
+      case Stage.REACHING:
+        return "Reaching your home…";
+      case Stage.PROVING:
+        return "Proving your device…";
+      case Stage.WRITING_KIT:
+        return "Writing your kit…";
+      case Stage.JOINING:
+        return "Joining…";
+      case Stage.SCANNED:
+      case Stage.CHECKED:
+      case Stage.HANDING_OVER:
+      case Stage.APPROVING:
+        return pairing(stage, true);
+      case Stage.SENDING:
+        return "Sending…";
+      default:
+        return "Working…";
+    }
+  }
+
+  /**
+   * A pairing's steps on either phone, those done ticked and the one under way said: scan, check,
+   * the keys handed over, the new device approved (by this phone's admin key on the {@code
+   * opener}, on the other phone on the new one), done.
+   */
+  public static String pairing(byte stage, boolean opener) {
+    int at;
+    switch (stage) {
+      case Stage.SCANNED:
+        at = 1;
+        break;
+      case Stage.CHECKED:
+      case Stage.HANDING_OVER:
+        at = 2;
+        break;
+      case Stage.APPROVING:
+        at = 3;
+        break;
+      case Stage.JOINING:
+        at = 4;
+        break;
+      default:
+        at = 0;
+    }
+    String[] steps = {
+      "scan",
+      "check",
+      "handing over your keys",
+      opener ? "approve it with your admin key" : "approve on the other phone",
+      "done"
+    };
+    StringBuilder line = new StringBuilder();
+    for (int i = 0; i < steps.length; i++) {
+      if (i > 0) {
+        line.append(" · ");
+      }
+      line.append(steps[i]).append(i < at ? " ✓" : i == at ? "…" : "");
+    }
+    return line.toString();
+  }
+
+  /**
+   * A kit no personal space at the home holds: the home's code to check, by its handle, or the
+   * kit's being an older one.
+   */
+  public static String noAgentForKit(byte[] handle) {
+    return "no personal space at that home holds this kit: check the home's code (it is "
+        + shortHex(handle)
+        + "), or that these are your newest kit's words";
+  }
+
+  /** A personal sync that did not finish, with its reasons; empty when it finished. */
+  public static String failed(String failures) {
+    return failures == null || failures.isEmpty()
+        ? ""
+        : "The last sync did not finish: " + failures + ". It runs again later.";
+  }
+
   /** Tor as the facility last found it. */
   public static String tor(byte tor, String why) {
     switch (tor) {

@@ -26,6 +26,7 @@ import team.virto.vos.personal.Claimed;
 import team.virto.vos.personal.Device;
 import team.virto.vos.personal.Home;
 import team.virto.vos.personal.IVosPersonal;
+import team.virto.vos.personal.IVosWatcher;
 import team.virto.vos.personal.KitView;
 import team.virto.vos.personal.Membership;
 import team.virto.vos.personal.Notice;
@@ -79,6 +80,8 @@ public final class VosNode {
   private final Map<Integer, IBinder> tokens = new HashMap<>();
   /** When each session was granted, by the monotonic clock: how long it was open, the logs say. */
   private final Map<Long, Long> grants = new java.util.concurrent.ConcurrentHashMap<>();
+  /** The personal space's screens, told each flow's stage and each pass's end; null: none. */
+  private volatile IVosWatcher watcher;
 
   /** The process's facility, opened on first use. */
   public static synchronized VosNode get(Context context) {
@@ -187,7 +190,35 @@ public final class VosNode {
     }
     Log.i(TAG, "personal sync done: " + synced.failed + " failed" + why(synced));
     Notices.post(context, synced);
+    IVosWatcher watching = watcher;
+    if (watching != null) {
+      try {
+        watching.passed();
+      } catch (RemoteException gone) {
+        watcher = null;
+      }
+    }
     return synced;
+  }
+
+  /**
+   * A flow's stage, from the library: a sign-in's or a payment's said to its announcing prompts,
+   * a personal flow's to the screens' watcher. A stage carries no secret and no value.
+   */
+  void stage(IVosPrompts prompts, byte stage) {
+    if (prompts instanceof Announced) {
+      ((Announced) prompts).stage(stage);
+      return;
+    }
+    IVosWatcher watching = watcher;
+    if (watching == null) {
+      return;
+    }
+    try {
+      watching.stage(stage);
+    } catch (RemoteException gone) {
+      watcher = null;
+    }
   }
 
   /** Bootstrap Tor now: false when it refuses, {@code refused} naming why. */
@@ -543,6 +574,32 @@ public final class VosNode {
     }
 
     @Override
+    public int commitRemovals(IVosPrompts prompts, Refused refused) {
+      return nativeCommitRemovals(prompts, refused);
+    }
+
+    @Override
+    public void kitHold(IBinder token) {
+      nativeKitHold();
+      try {
+        // The UI's process gone, the kit it entered goes with it.
+        token.linkToDeath(VosNode::nativeKitForget, 0);
+      } catch (RemoteException dead) {
+        nativeKitForget();
+      }
+    }
+
+    @Override
+    public void kitForget() {
+      nativeKitForget();
+    }
+
+    @Override
+    public void watch(IVosWatcher watching) {
+      watcher = watching;
+    }
+
+    @Override
     public Posted restore(ClaimRequest request, byte old, IVosPrompts prompts, Refused refused) {
       return nativeRestore(request, old, prompts, refused);
     }
@@ -604,6 +661,14 @@ public final class VosNode {
       long now = SystemClock.elapsedRealtime() - start;
       Log.i(TAG, what + " " + stage + " at +" + now + " ms (+" + (now - last) + ")");
       last = now;
+    }
+
+    /**
+     * The facility's stage of the operation ({@code team.virto.vos.personal.Stage}: proving,
+     * sending), logged as the others are; s4's chrome shows none of them yet.
+     */
+    void stage(byte stage) {
+      stage(stage == team.virto.vos.personal.Stage.SENDING ? "sending" : "proving");
     }
 
     /** The end's time, for the done or refused line. */
@@ -758,6 +823,12 @@ public final class VosNode {
       Refused refused);
 
   private static native boolean nativeUpdate(IVosPrompts prompts, Refused refused);
+
+  private static native int nativeCommitRemovals(IVosPrompts prompts, Refused refused);
+
+  private static native void nativeKitHold();
+
+  private static native void nativeKitForget();
 
   private static native Posted nativeRestore(
       ClaimRequest request, byte old, IVosPrompts prompts, Refused refused);

@@ -172,6 +172,19 @@ searched for the secret by its `tests/leaks.rs`.
   phrase's words are returned once, zeroized on drop, for the app to show
   (never as a QR). The security key's output crosses the app's process as
   YubiKit's answer, as a member secret's does.
+- **The kit entered on the restore screen** is held in `:vos` for the
+  screen's sitting (the facility's `Sitting`), never in the UI's process
+  beyond the form that takes it, never written or logged, never handed
+  back: the words (or the security key's output) as entered, `Zeroizing`,
+  no `Clone` out of the facility and no `Debug`. It is zeroized when the
+  screen closes (`kitForget`), when the app goes to the background (the
+  UI's stop, and `foreground(false)`), when the UI's process dies (its
+  token's death), ten minutes after its entry at most (a timer, not a
+  check at the next use), and when a flow finds it not a kit or not the
+  space's. The other kit flows ask for it at each call. The form that
+  takes the words gives the keyboard no suggestion and nothing to learn
+  (`IME_FLAG_NO_PERSONALIZED_LEARNING`, a visible-password field), and the
+  words it checks as they are typed never leave the form.
 - **`R = R1 ⊕ R2`:** `R1` sealed to each kit entry's X25519 key (an
   ephemeral agreement, XChaCha20-Poly1305, the agent's identity bound),
   `R2` at the agent, released only to a matured restore's device. The kit

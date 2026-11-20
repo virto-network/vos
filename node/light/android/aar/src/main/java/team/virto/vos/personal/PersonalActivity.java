@@ -5,14 +5,18 @@ package team.virto.vos.personal;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
 import android.graphics.Typeface;
+import android.os.Binder;
 import android.os.Bundle;
 import android.os.RemoteException;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
+import android.view.Window;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.FrameLayout;
@@ -24,6 +28,7 @@ import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import team.virto.s4.KeySources;
 import team.virto.s4.VosClient;
 import team.virto.s4.VosPrompts;
@@ -34,7 +39,9 @@ import team.virto.s4.vos.Refusal;
  * IVosPersonal}, bound for the activity's life):
  * every operation runs off the main thread, one at a time, with the prompts it is lent (its forms
  * in {@link FormDialog}, its keys behind their own prompts in {@link KeySources}), and released
- * when it returns or the screen gives it up.
+ * when it returns or the screen gives it up. The facility tells it each flow's stage, said over the
+ * screen while the flow runs, and each background pass, after which the screen shown reads again.
+ * Its windows are never captured in a release build; a debuggable one's are, for its screenshots.
  */
 public final class PersonalActivity extends Activity {
   static final String TAG = "vos.personal";
@@ -45,6 +52,8 @@ public final class PersonalActivity extends Activity {
   private static final int CAMERA = 1;
 
   private final ExecutorService worker = Executors.newSingleThreadExecutor();
+  /** The facility's quick calls (its watcher, the sitting), in order, beside every operation. */
+  private final ExecutorService quick = Executors.newSingleThreadExecutor();
   private final Deque<Screen> back = new ArrayDeque<>();
   private Binding binding;
   private KeySources keys;
@@ -60,6 +69,33 @@ public final class PersonalActivity extends Activity {
   private Runnable cancelling;
   /** The same cancel, sent when the activity goes while the operation runs. */
   private Runnable cancelOnDestroy;
+  /** Whether the restore screen's sitting is open in {@code :vos}. */
+  private boolean sitting;
+
+  /** What {@code :vos} tells the screens: a stage of the flow under way, a pass ended. */
+  private final IVosWatcher.Stub watcher =
+      new IVosWatcher.Stub() {
+        @Override
+        public void stage(byte stage) {
+          runOnUiThread(
+              () -> {
+                // A stage after its flow ended is dropped.
+                if (!isDestroyed() && busy.getVisibility() == View.VISIBLE && shown != null) {
+                  busyText.setText(shown.stage(stage));
+                }
+              });
+        }
+
+        @Override
+        public void passed() {
+          runOnUiThread(
+              () -> {
+                if (!isDestroyed() && shown != null && busy.getVisibility() != View.VISIBLE) {
+                  shown.passed();
+                }
+              });
+        }
+      };
 
   /** One operation of the facility, its prompts lent, its refusal filled when it refuses. */
   interface Call<T> {
@@ -90,7 +126,7 @@ public final class PersonalActivity extends Activity {
   @Override
   protected void onCreate(Bundle state) {
     super.onCreate(state);
-    getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+    secure(this, getWindow());
     binding = new Binding(this);
     binding.bind();
     keys = new KeySources(this);
@@ -152,10 +188,13 @@ public final class PersonalActivity extends Activity {
   protected void onStart() {
     super.onStart();
     VosClient.get(this).started();
+    background(personal -> personal.watch(watcher));
   }
 
   @Override
   protected void onStop() {
+    // The app in the background: the kit a restore holds is wiped, entered again on return.
+    forgetKit();
     VosClient.get(this).stopped();
     super.onStop();
   }
@@ -188,9 +227,73 @@ public final class PersonalActivity extends Activity {
     }
     forms.dismissAll();
     keys.close();
+    forgetKit();
     worker.shutdown();
+    quick.shutdown();
+    try {
+      // The sitting's close delivered before the binding goes.
+      quick.awaitTermination(2, TimeUnit.SECONDS);
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+    }
     binding.close();
     super.onDestroy();
+  }
+
+  /** Whether a build whose application flags are {@code flags} keeps its screens from capture. */
+  static boolean secured(int flags) {
+    return (flags & ApplicationInfo.FLAG_DEBUGGABLE) == 0;
+  }
+
+  /**
+   * {@code window} kept from screenshots and the recents' preview, unless the app is a debuggable
+   * build, whose personal-space screens are captured for its screenshots.
+   */
+  static void secure(Context context, Window window) {
+    if (secured(context.getApplicationInfo().flags)) {
+      window.addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+    }
+  }
+
+  /** One call of the facility's own interface off the main thread, beside every operation. */
+  interface Quick {
+    void call(IVosPersonal personal) throws RemoteException;
+  }
+
+  private void background(Quick call) {
+    if (quick.isShutdown()) {
+      return;
+    }
+    quick.execute(
+        () -> {
+          try {
+            call.call(binding.personal());
+          } catch (RemoteException | RuntimeException gone) {
+            Log.w(TAG, "not delivered to the facility: " + gone);
+          }
+        });
+  }
+
+  /**
+   * The restore screen's sitting opened in {@code :vos}: the kit its flows enter held there for
+   * the next, until {@link #forgetKit}, this process's death, or ten minutes after its entry.
+   */
+  void holdKit() {
+    if (sitting) {
+      return;
+    }
+    sitting = true;
+    Binder token = new Binder();
+    background(personal -> personal.kitHold(token));
+  }
+
+  /** The sitting closed, the kit it held wiped in {@code :vos}. */
+  void forgetKit() {
+    if (!sitting) {
+      return;
+    }
+    sitting = false;
+    background(IVosPersonal::kitForget);
   }
 
   @Override
@@ -208,6 +311,7 @@ public final class PersonalActivity extends Activity {
       return;
     }
     shown.left();
+    shown.closed();
     show(back.pop());
   }
 
@@ -241,6 +345,7 @@ public final class PersonalActivity extends Activity {
       return;
     }
     shown.left();
+    shown.closed();
     show(back.pop());
   }
 
@@ -248,6 +353,7 @@ public final class PersonalActivity extends Activity {
   void replace(Screen screen) {
     if (shown != null) {
       shown.left();
+      shown.closed();
     }
     show(screen);
   }
@@ -256,6 +362,10 @@ public final class PersonalActivity extends Activity {
   void home() {
     if (shown != null) {
       shown.left();
+      shown.closed();
+    }
+    for (Screen under : back) {
+      under.closed();
     }
     back.clear();
     show(new OverviewScreen(this));
@@ -345,7 +455,10 @@ public final class PersonalActivity extends Activity {
           Refused refused = new Refused();
           T result = null;
           try {
-            result = call.call(binding.personal(), prompts, refused);
+            IVosPersonal personal = binding.personal();
+            // Told again each time: a `:vos` started anew knows no watcher.
+            personal.watch(watcher);
+            result = call.call(personal, prompts, refused);
           } catch (RemoteException | RuntimeException error) {
             Log.w(TAG, doing + " failed", error);
             refused.why = Why.FAILED;

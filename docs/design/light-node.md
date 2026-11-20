@@ -1565,6 +1565,25 @@ where the text above leaves a choice, this is the one taken]:
   posts `alive` (`Event::Alive`) until the log cancels it, and shows a
   kit-signed operation for as long as it is open (`Alarm::Kit`); the
   owner then rotates the kit.
+- **The kit's secrecy on the phone** [built, `node/light/android`'s
+  `personal::Sitting`; the owner, 2026-11-20, D2]: a phrase is shown once
+  and two of its words are asked back before the claim goes on (a wrong
+  one shows the phrase again). Entered, its words are checked one by one
+  against the list in the UI as they are typed (the bad word named, the
+  list's own completion row, the keyboard's suggestions and learning
+  off), then its checksum. The restore screen takes the kit once a
+  sitting: the words, or a security key's `hmac-secret` of the kit's
+  salt, are held in `:vos` alone (never the UI's process, never written
+  or logged) for the next of its flows (reading the devices, removing a
+  lost phone, resolving a contest, opening and finishing the restore), and
+  zeroized when the screen closes, when the app goes to the background
+  (the UI's stop, and `:vos`'s own background signal), when the UI's
+  process dies, at most ten minutes after the entry, and when a flow finds
+  it not a kit or not this space's. So the kit's secret lives minutes in
+  `:vos` instead of one call; a flow outside the restore screen (a
+  rotation, an admin key's replacement) still asks for it each time. The
+  kind of kit a restore was opened with is kept in the facility's
+  database (not a secret) so its finish asks only for the kit itself.
 - **Delayed admins:** a delayed admin's inline add is refused; its add
   operation waits the operation delay, then its own commit carries it.
 
@@ -3683,6 +3702,9 @@ device's crates faster); its size argument is small.
 - **The screens** [built]: one activity of plain views
   over `IVosPersonal`, each operation off the main thread with its
   prompts lent and released when it returns or the screen gives it up.
+  A release build keeps every one of them and their forms from capture
+  (`FLAG_SECURE`); a debuggable build does not, so its screenshots show
+  them [the owner, 2026-11-20].
   A home is entered as its code (`VOSHOME1:` and hex: the home as a device
   reaches it, which its operator publishes); a restore takes the home's
   code too, its handle checked against the card. A pairing's code is a QR
@@ -3729,12 +3751,29 @@ device's crates faster); its size argument is small.
   in the batch of the group change it describes (`Claim::prepare`,
   `DeviceGroup::join`, `group::restoring`), with no state file
   and nothing to reconcile at open. The facility's enrollments, routes,
-  bridges and jobs' runs are rows of its own database (`facility/`, its
-  layout 1), SCALE of its own types, read strictly. `IVosPersonal.status`
+  bridges, jobs' runs (with why the last personal pass failed) and a
+  restore's kit kind are rows of its own database (`facility/`, its
+  layout 2), SCALE of its own types, read strictly. `IVosPersonal.status`
   names the phase (with a restore's maturity), Tor's state, the
-  memberships owed and the notices standing; the personal flows refuse
-  with `Refused` (a `Why` per error kind); a notice carries who signed
-  it, whether it is contested, an alarm's kind and its `Remedy`. One test
+  memberships owed, the notices standing, the kind of kit a kit's call
+  enters and why the last pass did not finish (standing until a pass
+  changes it); the personal flows refuse with `Refused` (a `Why` per
+  error kind); a notice carries who signed it, whether it is contested,
+  an alarm's kind and its `Remedy`. While a flow runs, `:vos` tells the
+  screens its stages (`IVosWatcher.stage`, a `Stage`'s byte: the home
+  reached, the proof, the kit written, the log followed; a pairing's
+  scan, check, handover and approval; a sign-in's or payment's proof and
+  send), no value or secret in any, and each background pass's end
+  (`passed`), after which the overview reads its status again; it reads
+  it too on each return to the app, and the device list on each return,
+  never on a timer. A removed phone's overview offers pairing again and
+  a restore with the kit (which, from a device out of its group, leaves
+  it first as a pairing does); "Commit now" from a matured removal's
+  notice carries it and revokes the removed device in every space its
+  handles name in one flow (`commitRemovals`, one prompt a signature); a
+  phone leaves its personal space by signing its own removal with its
+  own admin key, which another device's commit carries, its pass then
+  reading it through to `Out`. One test
   double for all of it: `vos_light::testing` (`Phone`, `World`,
   `Reach`) and `vos_testkit::personal::Agent`.
 - **Pairing after the set changed** [built, `node/light/android`]: the

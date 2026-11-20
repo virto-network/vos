@@ -8,6 +8,7 @@ import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
 import android.view.View;
+import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -43,6 +44,17 @@ abstract class Screen {
 
   /** A permission the screen asked for was answered. */
   void permitted(boolean granted) {}
+
+  /** Gone for good: closed, or the screens under it left; not when one opens over it. */
+  void closed() {}
+
+  /** A background pass of the personal space ended: read again what it may have changed. */
+  void passed() {}
+
+  /** What the flow under way is doing, at {@code stage} (a {@link Stage}). */
+  String stage(byte stage) {
+    return Words.stage(stage);
+  }
 
   final void attach(LinearLayout into) {
     this.into = into;
@@ -133,12 +145,19 @@ abstract class Screen {
     return field;
   }
 
-  /** A text field: no suggestions learned from it. */
+  /**
+   * A text field: no suggestions offered, nothing of it learned by the keyboard (a pairing code is
+   * a bearer secret; a home's code and a label are kept out of the keyboard's history too).
+   */
   final EditText field(String hint, String value, boolean lines) {
     EditText field = new EditText(app);
     field.setHint(hint);
     field.setText(value);
-    int type = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+    field.setImeOptions(EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
+    int type =
+        InputType.TYPE_CLASS_TEXT
+            | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD;
     if (lines) {
       type |= InputType.TYPE_TEXT_FLAG_MULTI_LINE;
       field.setMinLines(3);
