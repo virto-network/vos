@@ -534,7 +534,7 @@ admitted. What its operators are trusted with, and the limits that stay
   kernel (about 870 KB) [measured, x86 development desktop (Intel Core
   Ultra 7 155H), one thread, load average 7–21 from other builds,
   2026-11-06; `cargo run --release -p vos-phone --example
-  device_ingress`]:
+  verify_cost`]:
   - verified in 16–48 ms by the load (11.7 ms on a quiet machine,
     2026-11-01);
   - a wrong interaction PoW, a main root changed, or the honest proof

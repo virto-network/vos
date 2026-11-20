@@ -2459,7 +2459,7 @@ picked the circuit; a proven call carries the kernel's claim:
   about 11.7 ms on one quiet x86 core [measured, `node/SECURITY.md`],
   about six times a format-44 proof's 2.0 ms. **Profiled** [measured,
   Intel Core Ultra 7 155H, one thread, load average 7–21, 2026-11-06;
-  `cargo run --release -p vos-phone --example device_ingress`]: the
+  `cargo run --release -p vos-phone --example verify_cost`]: the
   verifier's setup, the program's masked format and layout computed per
   proof, took 6.6 ms, and the canonical decode 4.2 ms, of which the
   re-encoding 2.5 ms; a wrong interaction PoW was refused after both. So

@@ -25,7 +25,7 @@ use vos_wire::personal::{
     AdminCall, AdminClass, Attestation, Body, DeviceId, Entry, NewDevice, chain,
 };
 
-use crate::light::AGENT;
+use crate::light::{AGENT, embedded, percentile};
 
 pub(crate) const IDENTITY: [u8; 32] = [0x1d; 32];
 const INSTANCE: InstanceId = InstanceId(5);
@@ -221,14 +221,6 @@ fn unread(device: &Device, script: &Script) -> Vec<(u64, Entry)> {
     script.entries[device.group.cursor() as usize..].to_vec()
 }
 
-fn quantile(times: &mut [u64], q: usize) -> u64 {
-    times.sort_unstable();
-    times
-        .get((times.len() * q / 100).min(times.len().saturating_sub(1)))
-        .copied()
-        .unwrap_or(0)
-}
-
 /// `size` devices, each a light node's store under `root`, the first
 /// claiming the agent and pairing the rest, each pairing confirmed by every
 /// device: the devices and the agent's log.
@@ -302,12 +294,7 @@ pub fn group(args: &[String]) {
         }
     }
     let dir = dir.expect("--dir DIR");
-    if AGENT.is_empty() {
-        eprintln!(
-            "built without the release artifacts: `just build-programs build-test-actors`, then build again"
-        );
-        std::process::exit(2);
-    }
+    embedded(&[AGENT]);
     for size in sizes {
         let root = Path::new(&dir).join(format!("group-{size}"));
         let (mut devices, mut script) = household(&root, size);
@@ -341,12 +328,12 @@ pub fn group(args: &[String]) {
         let (state, follow, archive) = devices[0].group.stored_bytes().unwrap();
         println!(
             r#"{{"group":"rounds","devices":{size},"rounds":{rounds},"commit_p50_us":{},"commit_p95_us":{},"process_p50_us":{},"process_p95_us":{},"confirm_p50_us":{},"confirm_p95_us":{},"handshake_bytes":{handshake},"mls_state_bytes":{state},"log_state_bytes":{follow},"archive_bytes":{archive},"log_entries":{}}}"#,
-            quantile(&mut commits, 50),
-            quantile(&mut commits, 95),
-            quantile(&mut processes, 50),
-            quantile(&mut processes, 95),
-            quantile(&mut confirms, 50),
-            quantile(&mut confirms, 95),
+            percentile(&mut commits, 50),
+            percentile(&mut commits, 95),
+            percentile(&mut processes, 50),
+            percentile(&mut processes, 95),
+            percentile(&mut confirms, 50),
+            percentile(&mut confirms, 95),
             script.entries.len(),
         );
     }
