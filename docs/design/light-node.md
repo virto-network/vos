@@ -1728,7 +1728,19 @@ the one taken]:
   whose route is not the onion, and checks it again before every
   request, so no request to the personal agent leaves over the clearnet
   [E17]. The onion transport is §6.2's.
-- **Not built here:** pipelined reads, re-reading an envelope passed
+- **Reads asked ahead** [built, `job::Read`, `AgentLink`]: a pass asks
+  the overview and the device set with its first log read, and every
+  scope's first `since` page together once the log is followed, each on
+  the link's one connection, all in flight at once; each answer is taken
+  by the read that asks it in its turn. A call the link sends meanwhile
+  drops what it may change (a push every answer but the other scopes'
+  pages, any other call every one), so a read is answered as it would
+  have been in its turn; an overview asked beside a log page that names
+  a head short of it is read again before it counts as a rollback. The
+  same queries, under the same key, on the same connection: only their
+  order in flight changes. A quiet pass is four round trips after the
+  node's time instead of nine.
+- **Not built here:** re-reading an envelope passed
   over once a later archive brings a key that opens it, and garbage
   collection of covered envelopes and of earlier epochs' archives
   (`open.md`).

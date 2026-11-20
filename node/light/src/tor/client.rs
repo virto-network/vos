@@ -496,6 +496,30 @@ impl Client {
         }
     }
 
+    /// `requests` to `space` under `purpose`, in order: on a kept-open
+    /// purpose's connection all in flight at once, each answered as
+    /// [`Client::request`] answers it; a one-shot purpose's one after
+    /// another, each on a connection of its own. No spare carries them.
+    pub async fn requests(
+        &self,
+        space: SpaceId,
+        purpose: Purpose,
+        requests: &[Vec<u8>],
+    ) -> Vec<Result<Answer, Error>> {
+        if purpose.one_shot() {
+            let mut answers = Vec::with_capacity(requests.len());
+            for request in requests {
+                answers.push(self.request_with(space, purpose, request, None).await);
+            }
+            return answers;
+        }
+        all(requests
+            .iter()
+            .map(|request| self.request_with(space, purpose, request, None))
+            .collect())
+        .await
+    }
+
     /// A kept-open group's connection, open under the space's current
     /// routes: the one held, or a new one. A request that waited while
     /// another's open failed fails with it, rather than trying again.
@@ -1022,6 +1046,34 @@ fn rand_u64() -> u64 {
 }
 
 /// A uniform draw below `period`.
+/// Every one of `futures` run at once on the calling task: their outputs,
+/// in order.
+async fn all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures: Vec<_> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if output.is_none() {
+                match future.as_mut().poll(cx) {
+                    std::task::Poll::Ready(done) => *output = Some(done),
+                    std::task::Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    outputs
+        .into_iter()
+        .map(|output| output.expect("every future done"))
+        .collect()
+}
+
 fn below(period: Duration) -> Duration {
     Duration::from_micros(rand_u64() % (period.as_micros() as u64).max(1))
 }

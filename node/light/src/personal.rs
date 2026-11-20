@@ -1110,6 +1110,37 @@ impl<'a, L: Link> SealedSync<'a, L> {
         ))
     }
 
+    /// The first page each scope's reading asks for, as the store holds
+    /// their cursors now: each data scope's, the archive's, and the
+    /// recovery scope's while this device holds `R`.
+    pub fn first_pages(&mut self) -> Result<Vec<(Scope, u64)>, SyncError<L::Error>> {
+        let mut pages = Vec::with_capacity(self.instances.len() + 2);
+        for instance in &self.instances {
+            let scope = self.light.scope_id(*instance)?.0;
+            pages.push((scope, self.light.cursor(*instance)?.unwrap_or(0)));
+        }
+        let archive: Reading = self.row(ARCHIVE_ROW)?;
+        pages.push((self.group.archive().scope(ARCHIVE_NAME), archive.cursor));
+        let since = self
+            .group
+            .archive()
+            .recovery
+            .as_ref()
+            .map(|recovery| recovery.since);
+        if self.group.holds_recovery()
+            && let Some(since) = since
+        {
+            let reading: Recovering = self.row(RECOVERY_ROW)?;
+            let cursor = if reading.since == Some(since) {
+                reading.cursor
+            } else {
+                0
+            };
+            pages.push((RECOVERY, cursor));
+        }
+        Ok(pages)
+    }
+
     /// Read the archive's scope from its cursor, merging every archive
     /// sealed at the confirmed epoch, its `R` only if the log made it the
     /// kit's; then, unless the agent holds one at this epoch that is this

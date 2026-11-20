@@ -71,6 +71,16 @@ impl Host for Reach {
             .block_on(self.facility.net().request(*space, purpose, request))
     }
 
+    fn requests(
+        &self,
+        space: &[u8; 32],
+        purpose: Purpose,
+        requests: &[Vec<u8>],
+    ) -> Vec<Result<Vec<u8>, String>> {
+        self.runtime
+            .block_on(self.facility.net().requests(*space, purpose, requests))
+    }
+
     fn pin(&self, home: &[u8; 32], onions: &[Onion]) {
         self.facility.net().pin(
             *home,

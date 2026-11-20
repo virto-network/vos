@@ -136,10 +136,24 @@ impl Post {
     }
 }
 
+/// A read a pass may ask ahead of its turn ([`Control::ahead`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Read {
+    Log(u64),
+    Overview,
+    Devices,
+    Since(vos_wire::personal::Scope, u64),
+}
+
 /// A connection to the personal agent with what a pass reads and posts
 /// beyond sealed sync's: the control log, the overview, the device set,
 /// and the posts. Each method one round trip.
 pub trait Control: Link {
+    /// `reads` asked now, all in one round trip, each answer kept for the
+    /// read that asks it in its turn while nothing the link sends since
+    /// may have changed it. A link that cannot asks nothing ahead.
+    fn ahead(&mut self, _reads: &[Read]) {}
+
     /// `log(from)`: the log's entries from `from`, as much as one answer
     /// holds.
     fn log(&mut self, from: u64) -> Answer<Vec<(u64, Entry)>, Self::Error>;
@@ -388,11 +402,16 @@ fn passing<L: Control>(
     pass: &mut Pass,
 ) -> Result<(), SyncError<L::Error>> {
     onion(link)?;
+    // The reads that follow the log's when it asks for no post, asked
+    // with it: a device out or stuck reads the log alone first.
+    if group.course() == group::Course::Following {
+        link.ahead(&[Read::Log(group.cursor()), Read::Overview, Read::Devices]);
+    }
     follow(light, group, link, pass)?;
     if group.course() == group::Course::Out {
         return Ok(());
     }
-    let mut overview = answer(link.overview())?;
+    let mut overview = head(group, link)?;
     if pass.posts == 0 && due(group, &overview, now) {
         // A quiet home's reads are at its last batch's time, and what fell
         // due since is settled by a call alone: a wake, then the log again
@@ -402,7 +421,7 @@ fn passing<L: Control>(
         if group.course() == group::Course::Out {
             return Ok(());
         }
-        overview = answer(link.overview())?;
+        overview = head(group, link)?;
     }
     for alarm in group.head(overview.next, overview.chain)? {
         pass.raise(alarm);
@@ -414,7 +433,7 @@ fn passing<L: Control>(
         if group.course() == group::Course::Out {
             return Ok(());
         }
-        overview = answer(link.overview())?;
+        overview = head(group, link)?;
         for alarm in group.head(overview.next, overview.chain)? {
             pass.raise(alarm);
         }
@@ -431,6 +450,23 @@ fn passing<L: Control>(
         .map(|view| (view.id, view.seen))
         .collect();
     Ok(())
+}
+
+/// The agent's overview, read again once if it names a head short of the
+/// log this device read: an overview asked beside a log page may be
+/// answered from before that page's last entry, which is no rollback; one
+/// read after the log is the agent's word.
+fn head<L: Control>(
+    group: &DeviceGroup,
+    link: &mut L,
+) -> Result<Overview, SyncError<L::Error>> {
+    onion(link)?;
+    let overview = answer(link.overview())?;
+    if overview.next >= group.cursor() {
+        return Ok(overview);
+    }
+    onion(link)?;
+    answer(link.overview())
 }
 
 /// Whether a pass that posted nothing wakes the agent: its batch time is
@@ -468,6 +504,14 @@ fn sealed<L: Control>(
     instances: &[InstanceId],
     pass: &mut Pass,
 ) -> Result<(), SyncError<L::Error>> {
+    // Every scope's first page asked at once: a push drops its own
+    // scope's alone, so the others' are taken in their turn.
+    let pages = SealedSync::new(light, group, link, instances.to_vec())?.first_pages()?;
+    let reads: Vec<Read> = pages
+        .into_iter()
+        .map(|(scope, position)| Read::Since(scope, position))
+        .collect();
+    link.ahead(&reads);
     for instance in instances {
         scope(light, group, link, instances, *instance, pass)?;
     }

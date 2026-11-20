@@ -25,6 +25,22 @@ pub trait Host: Send + Sync + 'static {
         request: &[u8],
     ) -> Result<Vec<u8>, String>;
 
+    /// `requests` sent as [`Host::request`] sends each, under `purpose`:
+    /// on a kept-open purpose's connection all in flight at once, so they
+    /// cost one round trip; a one-shot purpose's each on a connection of
+    /// its own. Each one's answer, in order.
+    fn requests(
+        &self,
+        space: &[u8; 32],
+        purpose: Purpose,
+        requests: &[Vec<u8>],
+    ) -> Vec<Result<Vec<u8>, String>> {
+        requests
+            .iter()
+            .map(|request| self.request(space, purpose, request))
+            .collect()
+    }
+
     /// The routes of a home, kept under its key `home`
     /// ([`crate::route::home`]): its `onions`, onion only.
     fn pin(&self, home: &[u8; 32], onions: &[Onion]);

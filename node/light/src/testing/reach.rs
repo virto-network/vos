@@ -86,6 +86,19 @@ impl Host for Reach {
             .map_err(|error| error.to_string())
     }
 
+    fn requests(
+        &self,
+        space: &[u8; 32],
+        purpose: Purpose,
+        requests: &[Vec<u8>],
+    ) -> Vec<Result<Vec<u8>, String>> {
+        self.runtime
+            .block_on(self.client.requests(*space, purpose, requests))
+            .into_iter()
+            .map(|answer| answer.map(|(_, body)| body).map_err(|error| error.to_string()))
+            .collect()
+    }
+
     fn pin(&self, home: &[u8; 32], onions: &[Onion]) {
         let _entered = self.runtime.enter();
         self.client
