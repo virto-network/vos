@@ -219,7 +219,7 @@ complexity, are cut before the device side's flows move into `vos-light`:
 - **Disk room** [built]: before an install, a call, an ingest or a
   replay, the light node asks the store's filesystem for its free room
   (`statvfs`) and refuses below a reserve, 64 MiB by default
-  (`Config::reserve_bytes`) [est], with `Error::Full` and nothing written;
+  (`RESERVE_BYTES`) [est], with `Error::Full` and nothing written;
   sync pauses, as the sealed read checks first and writes nothing, and
   both resume once room is freed. Cutoffs, the push queue and the device group's writes
   are exempt, being small and what removes a device or gets data off the

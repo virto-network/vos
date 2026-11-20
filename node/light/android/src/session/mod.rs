@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Virto
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The facility, one connection's use of it, and each enrollment's
 //! credential tree, kept for the process apart from every connection that
 //! proves.

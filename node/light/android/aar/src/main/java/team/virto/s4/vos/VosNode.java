@@ -120,7 +120,10 @@ public final class VosNode {
     return personal;
   }
 
-  /** A facility that opened nothing, its transactions' uid read from {@code callers}. */
+  /**
+   * A facility that opened nothing, its transactions' uid read from {@code callers} as well as
+   * from Binder: a test's way to refuse more, never fewer.
+   */
   VosNode(Callers callers) {
     this.context = null;
     this.callers = callers;
@@ -136,7 +139,7 @@ public final class VosNode {
    * code, refused before its dispatch when it comes from another uid.
    */
   private void caller() {
-    if (callers.uid() != Process.myUid()) {
+    if (Binder.getCallingUid() != Process.myUid() || callers.uid() != Process.myUid()) {
       throw new SecurityException("the VOS facility serves this app alone");
     }
   }
@@ -659,17 +662,21 @@ public final class VosNode {
 
   private static native void nativeClose(long session);
 
-  private static native Enrolled nativeEnroll(long session, EnrollRequest request, IVosPrompts prompts, Refusal refused);
+  private static native Enrolled nativeEnroll(
+      long session, EnrollRequest request, IVosPrompts prompts, Refusal refused);
 
-  private static native SignedIn nativeSignIn(long session, SignInRequest request, IVosPrompts prompts, Refusal refused);
+  private static native SignedIn nativeSignIn(
+      long session, SignInRequest request, IVosPrompts prompts, Refusal refused);
 
-  private static native Paid nativePay(long session, PayRequest request, IVosPrompts prompts, Refusal refused);
+  private static native Paid nativePay(
+      long session, PayRequest request, IVosPrompts prompts, Refusal refused);
 
   private static native boolean nativeRefresh(long session, Refusal refused);
 
   private static native Synced nativeSync(Refusal refused);
 
-  private static native EnrolledSpace[] nativeEnrollments(Class<EnrolledSpace> element, Refusal refused);
+  private static native EnrolledSpace[] nativeEnrollments(
+      Class<EnrolledSpace> element, Refusal refused);
 
   private static native JobRun[] nativeRuns(Class<JobRun> element, Refusal refused);
 
@@ -689,7 +696,8 @@ public final class VosNode {
 
   private static native boolean nativeOptOut(byte[] space, boolean optedOut, Refusal refused);
 
-  private static native Claimed nativeClaim(ClaimRequest request, IVosPrompts prompts, Refused refused);
+  private static native Claimed nativeClaim(
+      ClaimRequest request, IVosPrompts prompts, Refused refused);
 
   private static native PairCode nativePairOffer(IVosPrompts prompts, Refused refused);
 
@@ -697,13 +705,16 @@ public final class VosNode {
 
   private static native boolean nativePairCancel(Refused refused);
 
-  private static native Paired nativePairJoin(byte[] code, String label, IVosPrompts prompts, Refused refused);
+  private static native Paired nativePairJoin(
+      byte[] code, String label, IVosPrompts prompts, Refused refused);
 
   private static native Membership[] nativeMemberships(Class<Membership> element, Refused refused);
 
-  private static native boolean nativeEnrollDevice(Membership membership, IVosPrompts prompts, Refused refused);
+  private static native boolean nativeEnrollDevice(
+      Membership membership, IVosPrompts prompts, Refused refused);
 
-  private static native boolean nativeConfirmDevice(Membership membership, IVosPrompts prompts, Refused refused);
+  private static native boolean nativeConfirmDevice(
+      Membership membership, IVosPrompts prompts, Refused refused);
 
   private static native boolean nativeDropEnrollment(Membership membership, Refused refused);
 
@@ -719,7 +730,8 @@ public final class VosNode {
 
   private static native Posted nativeCosign(long index, IVosPrompts prompts, Refused refused);
 
-  private static native Posted nativeResolve(long index, boolean upheld, IVosPrompts prompts, Refused refused);
+  private static native Posted nativeResolve(
+      long index, boolean upheld, IVosPrompts prompts, Refused refused);
 
   private static native Posted nativeRotateKit(byte kit, IVosPrompts prompts, Refused refused);
 
@@ -727,13 +739,16 @@ public final class VosNode {
 
   private static native byte[] nativeAdminOffer(IVosPrompts prompts, Refused refused);
 
-  private static native Posted nativeReplaceAdminOf(byte[] code, IVosPrompts prompts, Refused refused);
+  private static native Posted nativeReplaceAdminOf(
+      byte[] code, IVosPrompts prompts, Refused refused);
 
   private static native Posted nativeRegroup(IVosPrompts prompts, Refused refused);
 
-  private static native KitView nativeKitView(Home home, byte kit, IVosPrompts prompts, Refused refused);
+  private static native KitView nativeKitView(
+      Home home, byte kit, IVosPrompts prompts, Refused refused);
 
-  private static native Posted nativeRemoveByKit(Home home, byte kit, long device, IVosPrompts prompts, Refused refused);
+  private static native Posted nativeRemoveByKit(
+      Home home, byte kit, long device, IVosPrompts prompts, Refused refused);
 
   private static native Posted nativeResolveByKit(Home home,
       byte kit,
@@ -744,11 +759,13 @@ public final class VosNode {
 
   private static native boolean nativeUpdate(IVosPrompts prompts, Refused refused);
 
-  private static native Posted nativeRestore(ClaimRequest request, byte old, IVosPrompts prompts, Refused refused);
+  private static native Posted nativeRestore(
+      ClaimRequest request, byte old, IVosPrompts prompts, Refused refused);
 
   private static native Claimed nativeRestored(byte kit, IVosPrompts prompts, Refused refused);
 
-  private static native Claimed nativeMoveHome(ClaimRequest request, IVosPrompts prompts, Refused refused);
+  private static native Claimed nativeMoveHome(
+      ClaimRequest request, IVosPrompts prompts, Refused refused);
 
   private static native PersonalStatus nativeStatus(Refused refused);
 }

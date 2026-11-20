@@ -331,7 +331,8 @@ natives! {
     /// The facility whose enrollments are kept under `directory`, arti's
     /// state under `tor`, the app's parcelables loaded through `loader`,
     /// the device read from `device` (the `VosNode`): opened once for the
-    /// process, never freed; false when it does not open.
+    /// process, never freed, an open after it the same facility; false when
+    /// it does not open.
     bare fn nativeOpen(
         directory: JString<'l>,
         tor: JString<'l>,
@@ -339,6 +340,9 @@ natives! {
         device: JObject<'l>,
     ) -> jboolean,
     |env| {
+        if NODE.get().is_some() {
+            return Ok(true);
+        }
         let directory = PathBuf::from(directory.try_to_string(env).map_err(failed)?);
         let tor = PathBuf::from(tor.try_to_string(env).map_err(failed)?);
         let _ = VM.set(env.get_java_vm().map_err(failed)?);
@@ -347,9 +351,6 @@ natives! {
         let device = Arc::new(JavaDevice {
             node: env.new_global_ref(&device).map_err(failed)?,
         });
-        if NODE.get().is_some() {
-            return Err(failed("the facility is open already"));
-        }
         let node = Node::open(directory, tor, device).map_err(failed)?;
         NODE.set(node).map_err(|_| failed("the facility is open already"))?;
         Ok(true)

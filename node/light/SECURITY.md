@@ -398,8 +398,8 @@ not (`light-node.md` §6.2–§6.7).
   anonymous calls and the personal space, which wait (§8, H2).
 - **Rendezvous are counted** (`Client::opened`): each hour's onion
   connections by purpose, the foreground's apart from the background's,
-  so a phone shows what its schedule costs (PG5: at most 30 an hour in
-  the foreground). A kept-open purpose costs one rendezvous while it is
+  so a phone shows what its schedule costs (the bound: at most 30 an hour
+  in the foreground). A kept-open purpose costs one rendezvous while it is
   used within its idle limit; a proven call and a fetch one each; the
   spare one ahead. Each rendezvous is a descriptor fetch, an
   introduction and a rendezvous circuit of its own.
