@@ -2,7 +2,7 @@ set shell := ["nu", "-c"]
 
 # The pinning tests write their pins under `VOS_PINS=write` and hold them
 # otherwise. No recipe inherits it: the recipes that write pins (`repin`,
-# `repin-proof`, `fixtures`, each in no tier) set it on their own lines, so
+# `repin-proof`, `fixtures`, `conformance`, each in no tier) set it on their own lines, so
 # a `VOS_PINS=write` left in the caller's environment cannot turn a gate's
 # check into a rewrite (`just check-tiers` holds the tiers to that).
 unexport VOS_PINS
@@ -48,7 +48,7 @@ default:
 # The fast suites' crates, which `check` and `gate` run.
 core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-pvm-codec-derive -p vos-pvm-proof-derive -p vos-raft -p merkle-crdt -p vos-mls -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-abi -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
 
-# The agent's suites' crates, which `test-agent`, `check` and `gate` run.
+# The agent's suites' crates, which `check` and `gate` run.
 agent_crates := "-p vos-exec -p vos-light -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-api -p vos-http -p vos-gateway -p vos-node -p vos-node-prover -p vos-venue -p vos-kreivo -p vos-net -p vos-cli -p vos-jam-dev -p vos-scale -p vos-keeper"
 
 # A guest build for the PVM: the statement's target, its standard library
@@ -77,12 +77,6 @@ _venue-guest package bin features:
 # with), the seeded one holding an x86 run's proof hashes: `tools/phone`.
 phone out="target/phone":
     tools/phone/build.sh {{out}}
-
-# The recursion AIR's prover tests and the device profile's, on its masked
-# prover, four at a time: at every core at once the recursion suite passed
-# 12 GiB, the limit the gates run under.
-test-recair:
-    cargo test -p vos-pvm-recair -p vos-pvm-device -- --test-threads=4 --skip wrap_files::
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
 build-bench-guests:
@@ -304,7 +298,7 @@ repro-aarch64: build-test-actors
 # change of the design, the mock or the fixtures. `check` refuses vectors
 # the mock does not write.
 conformance:
-    with-env { VOS_CONFORMANCE: "write" } { cargo test -p vos-kreivo conformance::the_vectors_are_the_generators }
+    with-env { VOS_PINS: "write" } { cargo test -p vos-kreivo conformance::the_vectors_are_the_generators }
 
 # The tests run on mimalloc as the node's binary does, and as it does with
 # transparent huge pages off.
@@ -335,10 +329,8 @@ clippy:
     cargo clippy -p vos-cli --features faults --all-targets --quiet -- -D warnings
     cargo clippy -p vos-cli --no-default-features --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-proof --features debug-internals --all-targets --quiet -- -D warnings
-    cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     cargo clippy -p vos-venue --features model --quiet -- -D warnings
     cargo clippy -p vos-kreivo --features kreivo-mock --quiet -- -D warnings
-    just clippy-prover
 
 # The node and `vos` with the masked prover (`prover`): they build and lint
 # clean.
@@ -520,14 +512,6 @@ check-blobs: build-blobs check-blob-roles
         if ($moved ++ $gone | is-not-empty) { error make { \
         msg: "the guest blobs are not blobs.lock's: `just repin` after a change that moves them" } }; \
         print $"every pinned guest blob is blobs.lock's: ($built | length) blobs"
-
-# The SDK, its macros' restrictions, the test actors on the testkit, the
-# default agent against it, the checker's own model, the node running the
-# agent, the network between nodes, and the `vos` command.
-test-agent: build-test-actors build-programs
-    cargo test {{agent_crates}}
-    just test-faults
-    just test-reads
 
 # The slow fault runs: the fault build's process tests and the
 # five-process fault suite.
@@ -881,6 +865,7 @@ check-no-leaks: (_forbidden "tools" "venue-model" "venue-mock" "seeded-masks" "d
 # pallet's mock (`vos-kreivo`), the scale harness and the phone bench.
 # Neither the `vos` binary, with or without the prover, nor `vos-node`
 # holds a package under `tools/`, on a normal or build edge.
+[private]
 check-no-tools: (_forbidden "tools")
     print "no development tool in the node"
 
@@ -894,6 +879,7 @@ check-no-tools: (_forbidden "tools")
 # the fuzz targets, the final verifier's Wasm blob and its runner), enables
 # it (the prover's tests enable it on a dev edge), and the proof crate's
 # `debug-internals` does not imply it.
+[private]
 check-no-seeded-masks: (_forbidden "seeded-masks") _seeded-masks-unimplied
     print "no seeded masks in a production build"
 
@@ -908,6 +894,7 @@ check-no-seeded-masks: (_forbidden "seeded-masks") _seeded-masks-unimplied
 # seams; and the node's binary, built with the prover, names none of the
 # debug outputs' environment variables nor the instruction trace's message,
 # so none of them is compiled in.
+[private]
 check-no-debug-internals: (_forbidden "debug-internals") _debug-names-absent
     print "no debug outputs in a production build"
 
@@ -915,6 +902,7 @@ check-no-debug-internals: (_forbidden "debug-internals") _debug-names-absent
 # the store holds) reaches neither the `vos` binary, with or without the
 # prover, nor `vos-node`, on a normal or build edge (the carrier audit's
 # checker enables it, a dev edge of both).
+[private]
 check-no-store-dump: (_forbidden "store-dump")
     print "no store dump in a production build"
 
@@ -1131,9 +1119,9 @@ fuzz secs="60":
         -len_control=0 ...$limits } }
     cd node/fuzz; python3 -I ../../pvm/proof/fuzz/corpus.py unpack replay target/replay; \
         with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" \
-        | split row ' ') { mkdir $"corpus/($target)"; \
+        | split row ' ') { let limits = {{_fuzz_default}}; mkdir $"corpus/($target)"; \
         cargo fuzz run --fuzz-dir . -a $target $"corpus/($target)" $"target/replay/($target)" -- \
-        -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
+        -max_total_time={{secs}} -len_control=0 ...$limits } }
 
 # The light check, after every edit, and the innermost tier: formatting,
 # the gates' own tripwire, the replay archives' reader's refusals

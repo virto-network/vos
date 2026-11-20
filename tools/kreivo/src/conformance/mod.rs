@@ -57,7 +57,7 @@ const SPACES: &str = "spaces.json";
 /// The mutation lists' file.
 const MUTATIONS: &str = "mutations.json";
 /// Set to `write` to write the vectors instead of comparing them.
-const MODE: &str = "VOS_CONFORMANCE";
+const MODE: &str = "VOS_PINS";
 
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
