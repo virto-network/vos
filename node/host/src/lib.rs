@@ -49,6 +49,8 @@ pub use space::{Space, SpaceNode, write_genesis};
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::ops::Deref;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -73,6 +75,28 @@ pub(crate) async fn timeout<T>(
         None
     })
     .await
+}
+
+/// A place among those `counter` bounds, given back when dropped, however
+/// its holder ends.
+pub(crate) struct Held<C: Deref<Target = AtomicUsize>>(C);
+
+impl<C: Deref<Target = AtomicUsize>> Held<C> {
+    /// A place, if fewer than `most` are held.
+    pub(crate) fn take(counter: C, most: usize) -> Option<Self> {
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                (held < most).then_some(held + 1)
+            })
+            .ok()?;
+        Some(Self(counter))
+    }
+}
+
+impl<C: Deref<Target = AtomicUsize>> Drop for Held<C> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// `mutex`, locked. A lock a panic poisoned panics here too.

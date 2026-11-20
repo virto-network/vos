@@ -1,6 +1,7 @@
 //! The demo's host service: the app's operations over the node API.
 
 use super::*;
+use vos_wire::payments::PaymentError;
 
 /// What the app learned of the space, once.
 #[derive(Clone, Copy)]
@@ -83,23 +84,6 @@ pub(super) fn method_error(_detail: &[u8]) -> String {
     "the method refused".into()
 }
 
-/// The names of the ledger's errors, by index.
-const PAYMENT_ERRORS: [&str; 13] = [
-    "a bad account name",
-    "the account exists",
-    "no such account",
-    "not invited",
-    "the invitation expired",
-    "this device holds no account",
-    "the account is frozen",
-    "insufficient balance",
-    "the balance would overflow",
-    "the ledger refused",
-    "not an owner digest",
-    "a payment to your own account",
-    "an amount of nothing",
-];
-
 /// A method's outcome, as the screen says it.
 fn outcome(outcome: &Outcome, errors: Errors) -> Result<Vec<u8>, String> {
     match outcome {
@@ -114,10 +98,25 @@ fn outcome(outcome: &Outcome, errors: Errors) -> Result<Vec<u8>, String> {
 }
 
 pub(super) fn payment_error(detail: &[u8]) -> String {
-    detail
-        .first()
-        .and_then(|index| PAYMENT_ERRORS.get(usize::from(*index)))
-        .map_or_else(|| "the ledger refused".into(), |name| (*name).into())
+    let Ok((error, _)) = PaymentError::decode(detail) else {
+        return "the ledger refused".into();
+    };
+    match error {
+        PaymentError::BadName => "a bad account name",
+        PaymentError::Exists => "the account exists",
+        PaymentError::NoAccount => "no such account",
+        PaymentError::NotInvited => "not invited",
+        PaymentError::Expired => "the invitation expired",
+        PaymentError::NotOwner => "this device holds no account",
+        PaymentError::Frozen => "the account is frozen",
+        PaymentError::Insufficient => "insufficient balance",
+        PaymentError::Overflow => "the balance would overflow",
+        PaymentError::Refused(_) => "the ledger refused",
+        PaymentError::BadOwner => "not an owner digest",
+        PaymentError::SamePayee => "a payment to your own account",
+        PaymentError::NoAmount => "an amount of nothing",
+    }
+    .into()
 }
 
 fn credential_error(detail: &[u8]) -> String {

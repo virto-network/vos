@@ -15,7 +15,6 @@ use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
 use vos_abi::message::Body;
 use vos_abi::result::{Outcome, Outgoing, Run};
 use vos_abi::{Decode, Encode, SpaceId};
-use vos_testkit::programs::program_elf;
 use vos_testkit::{World, answer};
 use vos_wire::batch::{Input, Message};
 use vos_wire::credentials::{CredentialError, Open, RootEntry, meets, open_work};
@@ -128,8 +127,7 @@ impl Space {
             (CREDENTIALS, "vos-credentials", "registrar"),
             (HOMES, "vos-homes", "operator"),
         ] {
-            let elf = std::fs::read(program_elf(name)).unwrap();
-            let derived = vos_pvm_compiler::derive(&elf).expect("derives");
+            let derived = vos_testkit::programs::program_derived(name);
             world
                 .agent(HOME)
                 .install_in(SPACE, instance, &derived, &[(role, ROLE)]);

@@ -11,10 +11,10 @@
 //! channel, each frame within [`DEADLINE`] of its first byte.
 //!
 //! A proven call's body, up to a device proof's 1.5 MiB, is read only once
-//! it holds its places: on a capped port (the onion's) its connection's
-//! and circuit's, then its port's ([`crate::caps`]), the channel reading
+//! it holds its places ([`crate::caps`]): on a capped port (the onion's)
+//! its connection's and circuit's, then its port's, the channel reading
 //! nothing while it waits for the port's and closed past the others; on
-//! an uncapped one a place among the port's own proven bodies
+//! an uncapped one a place among the port's proven bodies
 //! ([`crate::caps::PROVEN_BODIES`]). Its header takes its address's rate
 //! token. The body must then arrive within [`LARGE_DEADLINE`], at a pace
 //! ([`Pace`]): after a first [`PROGRESS`], as much of it as that share of
@@ -81,28 +81,24 @@ pub const ONION_HOST_CALLS: usize = 4;
 
 /// What a port's relay counts and caps: the transport it marks, its limits
 /// per address (an onion's: per circuit, each stream a port of its
-/// circuit's address, [`crate::circuits`]), its caps on calls, and the
-/// proven calls' bodies it shares with the gateway's other ports.
+/// circuit's address, [`crate::circuits`]), and its caps on calls.
 #[derive(Clone)]
 pub struct Port {
     pub mark: Mark,
     pub limits: Arc<Limits>,
     pub caps: Arc<Caps>,
-    pub bodies: Arc<Semaphore>,
     /// The SSH server's connections at once, the handshake included:
     /// s4-server's default unless set.
     pub connections: Option<usize>,
 }
 
 impl Port {
-    /// A port marking `mark`, its limits and caps as given, and the bodies
-    /// it shares.
-    pub fn new(mark: Mark, limits: Arc<Limits>, caps: Arc<Caps>, bodies: Arc<Semaphore>) -> Self {
+    /// A port marking `mark`, its limits and caps as given.
+    pub fn new(mark: Mark, limits: Arc<Limits>, caps: Arc<Caps>) -> Self {
         Self {
             mark,
             limits,
             caps,
-            bodies,
             connections: None,
         }
     }
@@ -266,11 +262,28 @@ fn large(kind: u16, body: u32) -> bool {
     kind == Kind::Credentialed as u16 && body > Kind::Call.limit()
 }
 
-/// The places a proven call's large body holds from its header on.
-#[derive(Default)]
-struct Placed {
-    held: Option<crate::caps::Held>,
-    body: Option<tokio::sync::OwnedSemaphorePermit>,
+/// Whether a frame from `connection` passes its address's rate on `port`:
+/// past it, the channel closes.
+fn rated(port: &Port, connection: SocketAddr) -> bool {
+    let passes = port.limits.request(connection.ip());
+    if !passes {
+        tracing::debug!(?connection, mark = ?port.mark, "a channel past its address's rate, closed");
+    }
+    passes
+}
+
+/// Write `bytes` whole to the channel, an answer never interleaving
+/// another; then end the channel's side if `close`.
+async fn write<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &tokio::sync::Mutex<W>,
+    bytes: &[u8],
+    close: bool,
+) {
+    let mut writer = writer.lock().await;
+    let _ = writer.write_all(bytes).await;
+    if close {
+        let _ = writer.shutdown().await;
+    }
 }
 
 /// Relay one channel's frames until it ends, or a frame error closes it,
@@ -296,7 +309,7 @@ pub async fn relay(
     // A large body's pace, once it holds its places.
     let mut pace: Option<Pace> = None;
     // The places the frame part read holds, if it is a large body.
-    let mut placed: Option<Placed> = None;
+    let mut placed: Option<crate::caps::Held> = None;
     let mut requests = tokio::task::JoinSet::new();
     loop {
         let read = match due {
@@ -316,11 +329,7 @@ pub async fn relay(
         if read == 0 {
             while requests.join_next().await.is_some() {}
             if let Some(Event::Error { error, id }) = reader.finish() {
-                let _ = writer
-                    .lock()
-                    .await
-                    .write_all(&error_frame(Framing::Stream, id, error))
-                    .await;
+                write(&writer, &error_frame(Framing::Stream, id, error), false).await;
             }
             return;
         }
@@ -340,62 +349,44 @@ pub async fn relay(
                     let placed = placed.take();
                     // A large body's token was taken at its header.
                     let charged = placed.is_some();
-                    let placed = placed.unwrap_or_default();
                     let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
                         return;
                     };
                     let mut place = None;
                     if let Some(connection) = connection {
-                        if !charged && !port.limits.request(connection.ip()) {
-                            tracing::debug!(
-                                ?connection,
-                                ?mark,
-                                "a channel past its address's rate, closed"
-                            );
+                        if !charged && !rated(port, connection) {
                             return;
                         }
                         place = port.limits.in_flight(connection.ip());
                         if place.is_none() {
                             let bytes =
                                 error_frame(Framing::Stream, request.id, FrameError::Unavailable);
-                            let _ = writer.lock().await.write_all(&bytes).await;
+                            write(&writer, &bytes, false).await;
                             continue;
                         }
                     }
                     let kind = Kind::from_u16(request.kind).expect("the reader's kinds");
-                    let admitted = match placed.held {
-                        // Its places taken at its header: its agent's rate
-                        // is left.
-                        Some(held) => port
-                            .caps
-                            .agent(kind, &request.body, connection)
-                            .then_some(Some(held))
-                            .ok_or(crate::caps::Capped),
-                        None => port.caps.admit(kind, &request.body, connection),
-                    };
-                    let Ok(held) = admitted else {
+                    let Ok(held) = port
+                        .caps
+                        .admit_held(kind, &request.body, connection, placed)
+                    else {
                         let (answered, answer) = busy(kind);
                         let bytes = frame(Framing::Stream, answered, request.id, &answer);
-                        let _ = writer.lock().await.write_all(&bytes).await;
+                        write(&writer, &bytes, false).await;
                         continue;
                     };
-                    let body = placed.body;
                     let (gateway, writer) = (Arc::clone(&gateway), Arc::clone(&writer));
                     requests.spawn(async move {
-                        let (_place, _body, _held) = (place, body, held);
+                        let (_place, _held) = (place, held);
                         let (answered, answer) = gateway.relay(kind, mark, &request.body).await;
                         let bytes = frame(Framing::Stream, answered, request.id, &answer);
                         // Whole: an answer never interleaves another.
-                        let _ = writer.lock().await.write_all(&bytes).await;
+                        write(&writer, &bytes, false).await;
                         drop(slot);
                     });
                 }
                 Event::Error { error, id } => {
-                    let mut writer = writer.lock().await;
-                    let _ = writer
-                        .write_all(&error_frame(Framing::Stream, id, error))
-                        .await;
-                    let _ = writer.shutdown().await;
+                    write(&writer, &error_frame(Framing::Stream, id, error), true).await;
                     return;
                 }
             }
@@ -417,38 +408,18 @@ pub async fn relay(
             // Its header takes its address's token: a header whose body
             // never comes costs one, as a whole frame does.
             if let Some(connection) = connection
-                && !port.limits.request(connection.ip())
+                && !rated(port, connection)
             {
-                tracing::debug!(
-                    ?connection,
-                    ?mark,
-                    "a channel past its address's rate, closed"
-                );
                 return;
             }
-            let taken = if port.caps.caps() {
-                match tokio::time::timeout(DEADLINE, port.caps.proven_wait(connection)).await {
-                    Ok(Ok(held)) => Some(Placed { held, body: None }),
-                    _ => None,
-                }
-            } else {
-                tokio::time::timeout(DEADLINE, Arc::clone(&port.bodies).acquire_owned())
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .map(|body| Placed {
-                        held: None,
-                        body: Some(body),
-                    })
-            };
-            let Some(taken) = taken else {
+            let Ok(Ok(taken)) =
+                tokio::time::timeout(DEADLINE, port.caps.proven_wait(connection)).await
+            else {
                 // Past its connection's or circuit's proven calls: the
                 // body is not read, so the channel's framing ends here.
                 let (answered, answer) = busy(Kind::Credentialed);
                 let bytes = frame(Framing::Stream, answered, header.id, &answer);
-                let mut writer = writer.lock().await;
-                let _ = writer.write_all(&bytes).await;
-                let _ = writer.shutdown().await;
+                write(&writer, &bytes, true).await;
                 return;
             };
             placed = Some(taken);

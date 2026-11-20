@@ -165,7 +165,7 @@ impl Namespace {
 }
 
 /// A group's state, by its id.
-fn state_row(group: &[u8]) -> Vec<u8> {
+pub(crate) fn state_row(group: &[u8]) -> Vec<u8> {
     [b"state/".as_slice(), group].concat()
 }
 

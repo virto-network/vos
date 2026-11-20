@@ -453,15 +453,15 @@ admitted. What its operators are trusted with, and the limits that stay
   keys, each scope's opaque id, the sizes, counts and times of its
   envelopes and commits (padded, not hidden, C8), its quota and lease; not
   a byte of the user's data. At a home-only space the claim's open claim
-  names no member the operators know elsewhere (a joiner makes none, the
-  owner's decision 16 of 2026-11-17, E28 moving to slice 9); a home
+  names no member the operators know elsewhere (a joiner makes none,
+  E28); a home
   that is the user's own space links the agent to the member (L1, L5),
   which the app states.
 - **The lease and the pool.** An agent lapses when its yearly re-proof
   stops (an expelled member's included), 13 months after the last, into
   180 days of grace in which it serves reads, a restore and a removal,
   and refuses pushes (B14); reaping after the grace is later work.
-  No device makes the re-proof in slice 8 (decision 16), so every agent
+  No device makes the re-proof yet (`light-node.md` §1.1), so every agent
   lapses 13 months after its claim unless the home sets a longer lease
   (`docs/design/open.md`). A move home is a leave and a new claim: the
   old home keeps what it held, and its agent lapses in time. Open claims are bounded by a daily cap

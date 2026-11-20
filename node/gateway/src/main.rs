@@ -1,14 +1,13 @@
 //! `vos-gateway --config gateway.toml`: serve until interrupted.
 
 use std::path::PathBuf;
+#[cfg(feature = "ssh")]
 use std::sync::Arc;
 
 use clap::Parser;
-use vos_gateway::Gateway;
 use vos_gateway::config::{Config, seed};
 use vos_gateway::front::{self, Http};
 use vos_gateway::limits::Limits;
-use vos_gateway::upstream::Upstream;
 
 #[derive(Parser)]
 #[command(
@@ -37,12 +36,7 @@ fn run(cli: Cli) -> Result<(), String> {
     config.check()?;
     let secret = seed(&config.key)?;
     let tls = config.http_tls(&secret)?;
-    let upstreams = config
-        .upstreams()?
-        .into_iter()
-        .map(|(key, address)| Upstream::new(key, address, secret))
-        .collect();
-    let gateway = Arc::new(Gateway::new(upstreams));
+    let gateway = config.gateway(secret)?;
     let limits = Limits::new(config.per_address());
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     runtime.block_on(async {
@@ -63,7 +57,6 @@ fn run(cli: Cli) -> Result<(), String> {
                 vos_api::Mark::Clearnet,
                 Arc::clone(&limits),
                 vos_gateway::caps::Caps::none(),
-                vos_gateway::caps::bodies(),
             )
             .with_connections(config.ssh_connections),
             &vos_gateway::ssh::Placeholder,

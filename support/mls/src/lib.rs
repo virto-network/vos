@@ -51,7 +51,6 @@ use mls_rs_core::crypto::SignatureSecretKey;
 use mls_rs_core::error::IntoAnyError;
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
-pub use mls_rs;
 pub use policy::{Expected, Identity, Refused, Rules};
 pub use storage::{Namespace, Store, Writes};
 
@@ -314,6 +313,15 @@ pub struct Mls {
     group: Option<Group<Config>>,
 }
 
+/// An mls-rs error as this layer's: `namespace`'s store read's failure if
+/// one happened under it.
+fn failure(namespace: &Namespace, error: MlsError) -> Error {
+    match namespace.take_failure() {
+        Some(error) => Error::Store(error),
+        None => Error::Mls(error),
+    }
+}
+
 fn client(
     namespace: &Namespace,
     rules: Rules,
@@ -416,10 +424,7 @@ impl Mls {
     /// An mls-rs error as this layer's: a store read's failure if one
     /// happened under it.
     fn failure(&self, error: MlsError) -> Error {
-        match self.namespace.take_failure() {
-            Some(error) => Error::Store(error),
-            None => Error::Mls(error),
-        }
+        failure(&self.namespace, error)
     }
 
     fn group(&self) -> Result<&Group<Config>, Error> {
@@ -455,7 +460,7 @@ impl Mls {
     /// The persisted group state's bytes.
     pub fn state_bytes(&self) -> Result<usize, Error> {
         let id = self.namespace.get(GROUP)?.ok_or(Error::NoGroup)?;
-        let state = self.namespace.get(&[b"state/".as_slice(), &id].concat())?;
+        let state = self.namespace.get(&storage::state_row(&id))?;
         Ok(state.map_or(0, |state| state.len()))
     }
 
@@ -541,17 +546,30 @@ impl Mls {
         time: u64,
         rows: impl FnOnce(&Commit) -> Writes,
     ) -> Result<Commit, Error> {
+        self.hold(
+            |member| member.held_commit(renewed, adds, removes, time),
+            rows,
+        )
+    }
+
+    /// The commit `build` makes, held: its state, the held commit and the
+    /// caller's `rows` of it in one batch, written before this returns; on
+    /// a failure, which may have spent a generation in memory alone, the
+    /// group as the store holds it again. Refused while one is held.
+    fn hold(
+        &mut self,
+        build: impl FnOnce(&mut Self) -> Result<Commit, Error>,
+        rows: impl FnOnce(&Commit) -> Writes,
+    ) -> Result<Commit, Error> {
         if self.held_row()?.is_some() {
             return Err(Error::Held);
         }
-        match self.held_commit(renewed, adds, removes, time) {
+        match build(self) {
             Ok(commit) => {
                 self.flush(rows(&commit))?;
                 Ok(commit)
             }
             Err(error) => {
-                // Building it may have spent a generation in memory alone:
-                // the group as the store holds it again.
                 self.namespace.unstage();
                 self.reload()?;
                 Err(error)
@@ -641,20 +659,7 @@ impl Mls {
         time: u64,
         rows: impl FnOnce(&Commit) -> Writes,
     ) -> Result<Commit, Error> {
-        if self.held_row()?.is_some() {
-            return Err(Error::Held);
-        }
-        match self.started(time) {
-            Ok(commit) => {
-                self.flush(rows(&commit))?;
-                Ok(commit)
-            }
-            Err(error) => {
-                self.namespace.unstage();
-                self.reload()?;
-                Err(error)
-            }
-        }
+        self.hold(|member| member.started(time), rows)
     }
 
     fn started(&mut self, time: u64) -> Result<Commit, Error> {
@@ -695,10 +700,7 @@ impl Mls {
         let client = client(&namespace, rules, None, identity);
         let group = client
             .load_group(&id)
-            .map_err(|error| match namespace.take_failure() {
-                Some(error) => Error::Store(error),
-                None => Error::Mls(error),
-            })?;
+            .map_err(|error| failure(&namespace, error))?;
         Ok((group, namespace))
     }
 
@@ -713,10 +715,7 @@ impl Mls {
             let namespace = self.namespace.copy();
             let group = client(&namespace, Rules::default(), None, Identity::default())
                 .load_group(&next)
-                .map_err(|error| match namespace.take_failure() {
-                    Some(error) => Error::Store(error),
-                    None => Error::Mls(error),
-                })?;
+                .map_err(|error| failure(&namespace, error))?;
             return Ok(Candidate {
                 group,
                 namespace,
@@ -850,8 +849,7 @@ impl Mls {
         match kind {
             Kind::Removed => {
                 let id = self.group()?.group_id().to_vec();
-                self.namespace
-                    .put(&[b"state/".as_slice(), &id].concat(), None);
+                self.namespace.put(&storage::state_row(&id), None);
                 self.namespace.put(GROUP, None);
             }
             Kind::Own | Kind::Received if group.current_epoch() != self.epoch()? + 1 => {
@@ -867,8 +865,7 @@ impl Mls {
                     && current.group_id() != group.group_id()
                 {
                     let id = current.group_id().to_vec();
-                    self.namespace
-                        .put(&[b"state/".as_slice(), &id].concat(), None);
+                    self.namespace.put(&storage::state_row(&id), None);
                 }
                 group.write_to_storage()?;
                 self.namespace.stage(namespace.take_copy());
@@ -885,8 +882,7 @@ impl Mls {
     /// `rows`: a held restart's new group with it.
     pub fn void(&mut self, rows: Writes) -> Result<(), Error> {
         if let Some(next) = self.namespace.get(NEXT)? {
-            self.namespace
-                .put(&[b"state/".as_slice(), &next].concat(), None);
+            self.namespace.put(&storage::state_row(&next), None);
             self.namespace.put(NEXT, None);
         }
         self.namespace.put(HELD, None);

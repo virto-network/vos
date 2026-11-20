@@ -263,8 +263,7 @@ impl Credentials {
     ) -> Result<u32, CredentialError> {
         self.founded()?;
         let leaf = self.admit(&member)?;
-        let slot = self.place(&member, true)?;
-        self.write(ctx.now(), BTreeMap::from([(slot, leaf)]));
+        let slot = self.seat_member(ctx.now(), &member, leaf)?;
         Ok(slot)
     }
 
@@ -329,8 +328,7 @@ impl Credentials {
         if ctx.now() > expires {
             return Err(CredentialError::Expired);
         }
-        let slot = self.place(&member, true)?;
-        self.write(ctx.now(), BTreeMap::from([(slot, leaf)]));
+        let slot = self.seat_member(ctx.now(), &member, leaf)?;
         Ok(slot)
     }
 
@@ -417,8 +415,7 @@ impl Credentials {
         }
         opening.count += 1;
         self.opening.set(&opening);
-        let slot = self.place(&member, true)?;
-        self.write(now, BTreeMap::from([(slot, leaf)]));
+        let slot = self.seat_member(now, &member, leaf)?;
         Ok(slot)
     }
 
@@ -490,7 +487,7 @@ impl Credentials {
             return Err(CredentialError::Terms);
         }
         let id = self.devices.get(&member).ok_or(CredentialError::NoPerson)?;
-        let mut person = self.persons.get(&id).expect("a device's person");
+        let mut person = self.person(id);
         person.limit = limit;
         self.persons.insert(&id, &person);
         Ok(())
@@ -507,7 +504,7 @@ impl Credentials {
     ) -> Result<(), CredentialError> {
         self.founded()?;
         let id = self.devices.get(&member).ok_or(CredentialError::NoPerson)?;
-        let mut person = self.persons.get(&id).expect("a device's person");
+        let mut person = self.person(id);
         person.period = ctx.now() / ENROLLMENT_PERIOD_MS;
         person.enrolled = person.devices.len() as u8;
         self.persons.insert(&id, &person);
@@ -525,7 +522,7 @@ impl Credentials {
     ) -> Result<(), CredentialError> {
         self.founded()?;
         let id = self.devices.get(&member).ok_or(CredentialError::NoPerson)?;
-        let person = self.persons.get(&id).expect("a device's person");
+        let person = self.person(id);
         let mut leaves = BTreeMap::new();
         for device in &person.devices {
             if let Ok(Some(slot)) = self.vacate(&device.member) {
@@ -574,8 +571,7 @@ impl Credentials {
         {
             return Err(CredentialError::Held);
         }
-        let slot = self.place(&member, true)?;
-        self.write(now, BTreeMap::from([(slot, leaf)]));
+        let slot = self.seat_member(now, &member, leaf)?;
         person.enrolled += 1;
         self.seat(id, person, Device { member, owner });
         self.pending
@@ -704,7 +700,7 @@ impl Credentials {
     /// The space's onion set; empty until the registrar sets one.
     #[msg]
     pub async fn onions(&self) -> Vec<Onion> {
-        self.onions.get().unwrap_or_default()
+        self.onions.get_or_default()
     }
 
     /// The space's handle; zeros before `found`.
@@ -802,7 +798,7 @@ impl Credentials {
             self.write(time, BTreeMap::from([(slot, EMPTY[0])]));
         }
         if let Some(id) = self.devices.get(member) {
-            let mut person = self.persons.get(&id).expect("a device's person");
+            let mut person = self.person(id);
             person.roll(time);
             let at = person
                 .devices
@@ -847,6 +843,24 @@ impl Credentials {
         if self.pending.get(&device.owner).map(|(person, _)| person) == Some(id) {
             self.pending.remove(&device.owner);
         }
+    }
+
+    /// `member`, whose leaf is `leaf`, placed at the lowest free slot and
+    /// written at `now`: its slot.
+    fn seat_member(
+        &mut self,
+        now: u64,
+        member: &Digest,
+        leaf: Words,
+    ) -> Result<u32, CredentialError> {
+        let slot = self.place(member, true)?;
+        self.write(now, BTreeMap::from([(slot, leaf)]));
+        Ok(slot)
+    }
+
+    /// The person a device's row names.
+    fn person(&self, id: u32) -> Person {
+        self.persons.get(&id).expect("a device's person")
     }
 
     /// `member`'s leaf, for a member neither enrolled nor malformed.
@@ -959,7 +973,7 @@ impl Credentials {
             root: tree::digest(&changed[&0]),
             since: time,
         };
-        let mut ring = self.ring.get().unwrap_or_default();
+        let mut ring = self.ring.get_or_default();
         ring.record(root.root, time);
         self.ring.set(&ring);
         let length = self.changed.get_or_default();

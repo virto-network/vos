@@ -12,7 +12,7 @@ use vos_abi::ids::{InstanceId, Principal};
 use vos_abi::result::{Outcome, Step, WorkResult};
 use vos_abi::{Decode, Encode};
 use vos_pvm_poseidon2::{M31, P};
-use vos_testkit::programs::{method, program, program_elf};
+use vos_testkit::programs::{method, program};
 use vos_wire::batch::{Admin, Input};
 use vos_wire::credentials::{
     Change, CredentialError, FEED_BYTES, Feed, MAX_ONIONS, Onion, Path, RootEntry,
@@ -186,8 +186,7 @@ struct Actor {
 
 impl Actor {
     fn on(mut node: Node, target: Target) -> Self {
-        let elf = std::fs::read(program_elf("vos-credentials")).unwrap();
-        let derived = vos_pvm_compiler::derive(&elf).expect("derives");
+        let derived = vos_testkit::programs::program_derived("vos-credentials");
         node.add(&derived.actor);
         let mut actor = Self {
             node,
@@ -524,14 +523,7 @@ fn the_feed_reads_on_after_a_root() {
 
 /// A step's result: its reply, or the actor's error.
 fn answer<T: Decode>(step: &Step) -> Result<T, CredentialError> {
-    match &ran(step).outcome {
-        Outcome::Done(bytes) => Ok(decode(bytes)),
-        Outcome::Failed {
-            code: Failure::Handler,
-            detail,
-        } => Err(decode(detail)),
-        other => panic!("{other:?}"),
-    }
+    vos_testkit::answer(&ran(step).outcome)
 }
 
 /// A founded actor on a VOS host, with `members` enrolled at time 1.

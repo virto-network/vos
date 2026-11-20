@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -105,15 +105,6 @@ pub(crate) fn serve(
     })
 }
 
-/// A connection's place among the open ones, given back when it ends.
-struct Place(Arc<AtomicUsize>);
-
-impl Drop for Place {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// A handshake's place among its address's, given back when it ends.
 struct Shaking {
     by: Arc<Mutex<HashMap<IpAddr, usize>>>,
@@ -156,15 +147,6 @@ impl Drop for Shaking {
     }
 }
 
-/// A place among `open`, if fewer than `most` hold one.
-fn take(open: &Arc<AtomicUsize>, most: usize) -> Option<Place> {
-    open.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-        (held < most).then_some(held + 1)
-    })
-    .ok()
-    .map(|_| Place(Arc::clone(open)))
-}
-
 async fn accept(api: Arc<Api>, endpoint: quinn::Endpoint, spawner: Spawner, limits: Limits) {
     let limits = Arc::new(limits);
     let (open, handshaking) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
@@ -180,7 +162,7 @@ async fn accept(api: Arc<Api>, endpoint: quinn::Endpoint, spawner: Spawner, limi
             incoming.refuse();
             continue;
         };
-        let Some(shaking) = take(&handshaking, HANDSHAKES) else {
+        let Some(shaking) = crate::Held::take(Arc::clone(&handshaking), HANDSHAKES) else {
             incoming.refuse();
             continue;
         };
@@ -198,7 +180,7 @@ async fn accept(api: Arc<Api>, endpoint: quinn::Endpoint, spawner: Spawner, limi
             drop((shaking, own));
             // Past the connections allowed, one is closed once it shook
             // hands: a listed client's, as the handshake checked its key.
-            let Some(_place) = take(&open, limits.connections) else {
+            let Some(_place) = crate::Held::take(Arc::clone(&open), limits.connections) else {
                 connection.close(FULL, b"");
                 return;
             };

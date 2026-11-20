@@ -15,8 +15,8 @@ impl Poll {
         self.votes.set(&(self.votes.get_or_default() + weight));
     }
 
-    /// The stock `owner` kernel's guard, by its name.
-    #[msg(proven = owner)]
+    /// The stock `owner` kernel's guard.
+    #[msg(credential = Owner)]
     pub fn pay(&mut self) {}
 
     /// Sized on a run of its reference, with a size's headroom.

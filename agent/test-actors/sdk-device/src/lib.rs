@@ -1,81 +1,38 @@
-//! The credential statements as device kernels written with the SDK
-//! (`light-node.md` §4.2): `auth` and `owner` as a developer writes them,
-//! their arguments by reference read in place and their hashes
-//! `vos_sdk::p2`'s, measured against the hand-lean kernels' steps (the
-//! `device` test actor's `auth`, and `owner_lean` here: owner by hand over
-//! `p2`'s call and word accesses alone).
-//!
-//! Each claim is the kernel's public arguments: auth's `map_root`,
-//! `scope`, `nullifier` and the call's `binding`, owner's `owner` and
+//! A hand-lean device kernel beside the SDK's (`light-node.md` §4.2):
+//! `owner_lean`, owner's statement by hand over `vos_sdk::p2`'s call and
+//! word accesses alone, the baseline the stock `owner` kernel's steps are
+//! measured against (as the `device` test actor's `auth` is the stock
+//! `auth`'s). Its claim is owner's public arguments, `owner` and the call's
 //! `binding`, the binding carried without being read.
 
 #![no_std]
 
 extern crate alloc;
 
-use vos_sdk::p2::{Digest, InPlace, Path, Secret, Tag, TagHash};
+use vos_sdk::p2::{Tag, TagHash};
 use vos_sdk::prelude::*;
 
-/// The kernels' reference runs: the credential kernels' public reference
-/// statement (`vos_sdk::p2::reference`), each in its kernel's arguments.
+/// The kernel's reference run: the credential kernels' public reference
+/// statement (`vos_sdk::p2::reference`) in its arguments, the stock
+/// `owner` kernel's bytes, decoded where they lie.
 mod reference {
     use alloc::vec::Vec;
 
-    use vos_sdk::p2::reference::{BINDING, PATH, SCOPE, SECRET};
+    use vos_sdk::p2::reference::{BINDING, SECRET};
 
     use super::*;
 
-    pub fn auth() -> sdk_device::Auth {
-        let member = Tag::Member.hash(&SECRET);
-        sdk_device::Auth {
-            path: PATH,
-            secret: SECRET,
-            claim: AuthClaim {
-                map_root: PATH.root(&Tag::Leaf.hash(&member)),
-                scope: SCOPE,
-                nullifier: Tag::Nf.hash(&SECRET).hash(&SCOPE),
-                binding: BINDING,
-            },
-        }
-    }
-
-    pub fn owner() -> sdk_device::Owner {
-        sdk_device::Owner {
-            secret: SECRET,
-            claim: OwnerClaim {
-                owner: Tag::Owner.hash(&SECRET),
-                binding: BINDING,
-            },
-        }
-    }
-
-    /// Owner's reference in `owner_lean`'s arguments: their bytes, kept for
-    /// the run, decoded where they lie.
     pub fn owner_lean() -> sdk_device::OwnerLean {
-        let bytes: &'static [u8] = Vec::leak(owner().encode());
+        let owner = [
+            SECRET.encode(),
+            Tag::Owner.hash(&SECRET).encode(),
+            BINDING.encode(),
+        ];
+        let bytes: &'static [u8] = Vec::leak(owner.concat());
         sdk_device::OwnerLean::decode(bytes)
             .expect("owner's arguments are owner_lean's")
             .0
     }
-}
-
-/// Auth's claim: the member's leaf under `map_root`, and `nullifier` its
-/// pseudonym in `scope`.
-#[derive(Clone, Copy, InPlace)]
-#[repr(C)]
-pub struct AuthClaim {
-    pub map_root: Digest,
-    pub scope: Digest,
-    pub nullifier: Digest,
-    pub binding: Digest,
-}
-
-/// Owner's claim: `owner` the secret's owner digest.
-#[derive(Clone, Copy, InPlace)]
-#[repr(C)]
-pub struct OwnerClaim {
-    pub owner: Digest,
-    pub binding: Digest,
 }
 
 /// `N` bytes of a kernel's arguments where its witness input left them,
@@ -116,21 +73,6 @@ pub struct SdkDevice {}
 
 #[messages]
 impl SdkDevice {
-    /// The secret's member's leaf lies under `map_root` by `path`, and
-    /// `nullifier` is its nullifier in `scope`.
-    #[attestable(device, reference = reference::auth)]
-    pub fn auth(path: &Path, secret: &Secret, #[public] claim: &AuthClaim) {
-        let member = Tag::Member.hash(secret);
-        assert_eq!(path.root(&Tag::Leaf.hash(&member)), claim.map_root);
-        assert_eq!(Tag::Nf.hash(secret).hash(&claim.scope), claim.nullifier);
-    }
-
-    /// The secret's owner digest is `owner`.
-    #[attestable(device, reference = reference::owner)]
-    pub fn owner(secret: &Secret, #[public] claim: &OwnerClaim) {
-        assert_eq!(Tag::Owner.hash(secret), claim.owner);
-    }
-
     /// Owner's statement by hand: the secret's 8-aligned words and the
     /// tag's written into one block, the call, and the result compared with
     /// the claim's word by word, never stopping early.

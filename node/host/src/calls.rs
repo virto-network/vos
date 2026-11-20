@@ -196,6 +196,41 @@ enum Next {
     Queue,
 }
 
+/// What a forward does with a leader's answer to its call, after a send
+/// the leader ran or took.
+enum Then {
+    /// Ask again, after at most this long.
+    Pause(Duration),
+    /// The call's binding record decides: apply refused it so.
+    Recorded(Refusal),
+    Answer(Response),
+}
+
+/// What a forward does with `answer`, its `first` send's or that of a send
+/// `again` after another: a leader that does not lead, asked again; a full
+/// one, answered `Busy` at the first send, when nothing ran, and asked
+/// again after it, as an earlier send may be running elsewhere; a session
+/// stale or a call not consumed, about one send of several, `TimedOut`, as
+/// another may still run it; `Replayed`, a credentialed call that ran
+/// already, by an earlier send of this forward's or by another copy; past
+/// its expiry about one send of several, as an earlier one may have run
+/// before it.
+fn then(answer: Response, first: bool, again: bool) -> Then {
+    match answer {
+        Response::NotLeader { .. } => Then::Pause(PAUSE),
+        Response::Busy if first => Then::Answer(Response::Busy),
+        Response::Busy => Then::Pause(REASK),
+        Response::Rejected(Rejection::StaleSession { .. }) | Response::NotConsumed if again => {
+            Then::Answer(Response::TimedOut)
+        }
+        Response::Refused(Refusal::Replayed) => Then::Recorded(Refusal::Replayed),
+        Response::Refused(Refusal::CredentialExpired) if again => {
+            Then::Recorded(Refusal::CredentialExpired)
+        }
+        answer => Then::Answer(answer),
+    }
+}
+
 /// What a client is answered for the node's reply.
 pub(crate) fn answer_of(reply: Result<Answered, CallError>) -> Response {
     match reply {
@@ -564,25 +599,17 @@ impl Inner {
                 }
                 let term = state.term;
                 let moved = |state: &crate::group::State| state.stopped || state.term > term;
-                match answer {
-                    None => return Response::TimedOut,
-                    Some(Response::NotLeader { .. }) => pause(run, PAUSE, until, moved).await,
-                    // Full, the call not queued: nothing ran, unless an
-                    // earlier send is running elsewhere.
-                    Some(Response::Busy) if sent == 0 => return Response::Busy,
-                    Some(Response::Busy) => pause(run, REASK, until, moved).await,
-                    Some(
-                        Response::Rejected(Rejection::StaleSession { .. }) | Response::NotConsumed,
-                    ) if sent > 1 => return Response::TimedOut,
-                    Some(Response::Refused(Refusal::Replayed)) => {
+                let Some(answer) = answer else {
+                    return Response::TimedOut;
+                };
+                match then(answer, sent == 0, sent > 1) {
+                    Then::Pause(most) => pause(run, most, until, moved).await,
+                    Then::Recorded(refusal) => {
                         return self
-                            .replayed(run, agent, &call, until, watch.as_ref())
+                            .recorded_or(run, agent, &call, until, watch.as_ref(), refusal)
                             .await;
                     }
-                    Some(Response::Refused(Refusal::CredentialExpired)) if sent > 1 => {
-                        return self.expired(run, agent, &call, until, watch.as_ref()).await;
-                    }
-                    Some(answer) => return answer,
+                    Then::Answer(answer) => return answer,
                 }
                 continue;
             }
@@ -649,83 +676,41 @@ impl Inner {
                 // after a pause.
                 Some((
                     _,
-                    Response::NotLeader { .. }
-                    | Response::Elsewhere { .. }
-                    | Response::Stopped
-                    | Response::Unavailable,
+                    Response::Elsewhere { .. } | Response::Stopped | Response::Unavailable,
                 )) => pause(run, PAUSE, until, changed).await,
-                // The leader is full: at the first send nothing ran, and
-                // the client may wait and send again. After that, an
-                // earlier send may be running elsewhere: wait here.
-                Some((_, Response::Busy)) if sent == 1 => return Response::Busy,
-                Some((_, Response::Busy)) => pause(run, REASK, until, changed).await,
-                // Answers that say the call did not run, about one send of
-                // several: another may still run it.
-                Some((
-                    _,
-                    Response::Rejected(Rejection::StaleSession { .. }) | Response::NotConsumed,
-                )) if sent > 1 => {
-                    return Response::TimedOut;
-                }
                 Some((_, Response::TimedOut)) | None => {}
-                // A credentialed call that ran already: by an earlier send
-                // of this forward's, or by another copy.
-                Some((_, Response::Refused(Refusal::Replayed))) => {
-                    return self
-                        .replayed(run, agent, &call, until, watch.as_ref())
-                        .await;
-                }
-                // A credentialed call past its expiry, about one send of
-                // several: an earlier one may have run before it.
-                Some((_, Response::Refused(Refusal::CredentialExpired))) if sent > 1 => {
-                    return self.expired(run, agent, &call, until, watch.as_ref()).await;
-                }
-                Some((_, answer)) => return answer,
+                Some((_, answer)) => match then(answer, sent == 1, sent > 1) {
+                    Then::Pause(most) => pause(run, most, until, changed).await,
+                    Then::Recorded(refusal) => {
+                        return self
+                            .recorded_or(run, agent, &call, until, watch.as_ref(), refusal)
+                            .await;
+                    }
+                    Then::Answer(answer) => return answer,
+                },
             }
         }
     }
 
-    /// The answer to a forwarded call apply refused `Replayed`, by
-    /// `until`: for a credentialed call one of whose own sends `watch` saw
-    /// run here, that run, once applied; else `Replayed`, once this replica
-    /// has applied the call's binding record, so a client reading state
-    /// here reads the run's effects.
-    async fn replayed(
+    /// The answer to a forwarded call apply refused `refusal` (`Replayed`,
+    /// or `CredentialExpired` after an earlier send), by `until`: for a
+    /// credentialed call, `recorded`'s answer (the run of one of its own sends
+    /// `watch` saw, once applied; `Replayed` if a copy ran; else `refusal`);
+    /// for a call, `refusal`.
+    async fn recorded_or(
         &self,
         run: &Arc<Run>,
         agent: AgentId,
         call: &Forwardable,
         until: Instant,
         watch: Option<&Watch<'_>>,
+        refusal: Refusal,
     ) -> Response {
         match call {
             Forwardable::Credentialed(call) => {
-                self.recorded(run, agent, call, until, watch, Refusal::Replayed)
-                    .await
+                self.recorded(run, agent, call, until, watch, refusal).await
             }
-            Forwardable::Call(_) => Response::Refused(Refusal::Replayed),
-        }
-    }
-
-    /// The answer to a forwarded credentialed call apply refused
-    /// `CredentialExpired` after an earlier send, by `until`: the run of
-    /// one of its own sends `watch` saw, once applied; `Replayed` if
-    /// another copy ran; else `CredentialExpired`, nothing of it having
-    /// run.
-    async fn expired(
-        &self,
-        run: &Arc<Run>,
-        agent: AgentId,
-        call: &Forwardable,
-        until: Instant,
-        watch: Option<&Watch<'_>>,
-    ) -> Response {
-        match call {
-            Forwardable::Credentialed(call) => {
-                self.recorded(run, agent, call, until, watch, Refusal::CredentialExpired)
-                    .await
-            }
-            Forwardable::Call(_) => Response::Refused(Refusal::CredentialExpired),
+            Forwardable::Call(_) => Response::Refused(refusal),
         }
     }
 

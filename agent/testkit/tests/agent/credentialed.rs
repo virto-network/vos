@@ -22,6 +22,7 @@ use vos_wire::batch::{Admin, CredentialedInput, Input, Request};
 use vos_wire::credentials::{self, AuthClaim, CredentialError, OwnerClaim, Ring, RootEntry};
 use vos_wire::defaults::{self, BINDING_KEPT_MS, CREDENTIAL_HORIZON_MS, ROOT_GRACE_MS};
 use vos_wire::ingress::Grant;
+use vos_wire::payments::PaymentError;
 
 use crate::common::{AGENT, ALICE, BOB, Node, failed, ran, refused};
 
@@ -277,19 +278,7 @@ impl Agent {
     }
 }
 
-/// The ledger's errors and the poll's, by their codec index.
-const NOT_INVITED: u8 = 3;
-const EXPIRED: u8 = 4;
-const NOT_OWNER: u8 = 5;
-const FROZEN: u8 = 6;
-const EXISTS: u8 = 1;
-const NO_ACCOUNT: u8 = 2;
-const INSUFFICIENT: u8 = 7;
-const BAD_NAME: u8 = 0;
-const OVERFLOW: u8 = 8;
-const BAD_OWNER: u8 = 10;
-const SAME_PAYEE: u8 = 11;
-const NO_AMOUNT: u8 = 12;
+/// The poll's error, by its codec index.
 const NO_CHOICE: u8 = 0;
 
 /// The handler's failure detail: its error's one byte.
@@ -299,6 +288,17 @@ fn detail(step: &Step) -> u8 {
             code: Failure::Handler,
             detail,
         } if detail.len() == 1 => detail[0],
+        other => panic!("not a handler's failure: {other:?}"),
+    }
+}
+
+/// The ledger's error a step failed with.
+fn payment_error(step: &Step) -> PaymentError {
+    match &ran(step).outcome {
+        Outcome::Failed {
+            code: Failure::Handler,
+            detail,
+        } => PaymentError::decode_exact(detail).expect("a payment error"),
         other => panic!("not a handler's failure: {other:?}"),
     }
 }
@@ -342,11 +342,11 @@ fn owner_proofs_pay_from_the_accounts_they_hold() {
         (Some(70), Some(30))
     );
     let stranger = pay(&mut agent, owner(7), "bob", 1);
-    assert_eq!(detail(&stranger), NOT_OWNER);
+    assert_eq!(payment_error(&stranger), PaymentError::NotOwner);
     // Its binding digest recorded all the same, and its due row.
     assert_eq!(writes(&stranger), 2);
     let short = pay(&mut agent, bob, "alice", 31);
-    assert_eq!(detail(&short), INSUFFICIENT);
+    assert_eq!(payment_error(&short), PaymentError::Insufficient);
     assert_eq!(
         agent.balance("bob"),
         Some(30),
@@ -354,13 +354,13 @@ fn owner_proofs_pay_from_the_accounts_they_hold() {
     );
 
     let nowhere = pay(&mut agent, alice, "nobody", 5);
-    assert_eq!(detail(&nowhere), NO_ACCOUNT);
+    assert_eq!(payment_error(&nowhere), PaymentError::NoAccount);
     assert_eq!(agent.balance("alice"), Some(70), "the payer's balance kept");
 
     let freeze = agent.request(ALICE, PAYMENTS, "freeze", b"alice".to_vec(), time);
     agent.done(time, vec![freeze]);
     let frozen = pay(&mut agent, alice, "bob", 1);
-    assert_eq!(detail(&frozen), FROZEN);
+    assert_eq!(payment_error(&frozen), PaymentError::Frozen);
 
     // A rekey moves the account to a new owner, its balance kept, the
     // freeze lifted: the old owner's proof holds nothing, the new one's
@@ -369,7 +369,7 @@ fn owner_proofs_pay_from_the_accounts_they_hold() {
     let rekey = agent.request(ALICE, PAYMENTS, "rekey", (b"alice".to_vec(), renewed), time);
     agent.done(time, vec![rekey]);
     let old = pay(&mut agent, alice, "bob", 1);
-    assert_eq!(detail(&old), NOT_OWNER);
+    assert_eq!(payment_error(&old), PaymentError::NotOwner);
     assert!(matches!(
         ran(&pay(&mut agent, renewed, "bob", 20)).outcome,
         Outcome::Done(_)
@@ -397,9 +397,9 @@ fn owner_proofs_pay_from_the_accounts_they_hold() {
     let wrong = agent.request(BOB, PAYMENTS, "open", (name.clone(), owner(4)), time);
     let late = agent.request(BOB, PAYMENTS, "open", (name.clone(), owner(3)), time + 6);
     let result = agent.node.batch(time, vec![wrong]);
-    assert_eq!(detail(&result.steps[0]), NOT_INVITED);
+    assert_eq!(payment_error(&result.steps[0]), PaymentError::NotInvited);
     let result = agent.node.batch(time + 6, vec![late]);
-    assert_eq!(detail(&result.steps[0]), EXPIRED);
+    assert_eq!(payment_error(&result.steps[0]), PaymentError::Expired);
 }
 
 /// The ledger's own refusals: a name or an owner it does not take, a
@@ -417,38 +417,44 @@ fn the_ledger_refuses_what_its_rules_refuse_and_conserves() {
     let refusal = |agent: &mut Agent, caller, name: &str, arguments: Vec<u8>| {
         let request = agent.request_raw(caller, name, arguments, time);
         let result = agent.node.batch(time, vec![request]);
-        detail(&result.steps[0])
+        payment_error(&result.steps[0])
     };
     let invite = |name: &[u8], owner: Digest| (name.to_vec(), owner, time + 5).encode();
     assert_eq!(
         refusal(&mut agent, ALICE, "invite", invite(b"", owner(3))),
-        BAD_NAME
+        PaymentError::BadName
     );
     assert_eq!(
         refusal(&mut agent, ALICE, "invite", invite(b"a b", owner(3))),
-        BAD_NAME
+        PaymentError::BadName
     );
     assert_eq!(
         refusal(&mut agent, ALICE, "invite", invite(b"carol", [0xff; 32])),
-        BAD_OWNER
+        PaymentError::BadOwner
     );
     assert_eq!(
         refusal(&mut agent, ALICE, "invite", invite(b"bob2", bob)),
-        EXISTS
+        PaymentError::Exists
     );
     let rekey = |name: &[u8], owner: Digest| (name.to_vec(), owner).encode();
     assert_eq!(
         refusal(&mut agent, ALICE, "rekey", rekey(b"alice", bob)),
-        EXISTS
+        PaymentError::Exists
     );
     assert_eq!(
         refusal(&mut agent, ALICE, "rekey", rekey(b"alice", [0xff; 32])),
-        BAD_OWNER
+        PaymentError::BadOwner
     );
     let mint = (b"bob".to_vec(), u64::MAX).encode();
-    assert_eq!(refusal(&mut agent, ALICE, "mint", mint), OVERFLOW);
+    assert_eq!(
+        refusal(&mut agent, ALICE, "mint", mint),
+        PaymentError::Overflow
+    );
     let mint = (b"bob".to_vec(), 0u64).encode();
-    assert_eq!(refusal(&mut agent, ALICE, "mint", mint), NO_AMOUNT);
+    assert_eq!(
+        refusal(&mut agent, ALICE, "mint", mint),
+        PaymentError::NoAmount
+    );
 
     let pay = |agent: &mut Agent, to: &str, amount: u64| {
         let call = agent.call(
@@ -461,8 +467,14 @@ fn the_ledger_refuses_what_its_rules_refuse_and_conserves() {
         );
         agent.step(time, &call)
     };
-    assert_eq!(detail(&pay(&mut agent, "alice", 1)), SAME_PAYEE);
-    assert_eq!(detail(&pay(&mut agent, "bob", 0)), NO_AMOUNT);
+    assert_eq!(
+        payment_error(&pay(&mut agent, "alice", 1)),
+        PaymentError::SamePayee
+    );
+    assert_eq!(
+        payment_error(&pay(&mut agent, "bob", 0)),
+        PaymentError::NoAmount
+    );
 
     // A frozen account takes credits; its debits wait for a rekey.
     let freeze = agent.request(ALICE, PAYMENTS, "freeze", b"bob".to_vec(), time);

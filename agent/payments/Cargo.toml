@@ -23,4 +23,5 @@ bench = false
 
 [dependencies]
 vos-sdk = { path = "../sdk" }
+vos-wire = { path = "../wire" }
 cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", tag = "v0.3.0", default-features = false }
