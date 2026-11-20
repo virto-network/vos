@@ -55,7 +55,9 @@ use vos_wire::personal::{
     Voted, Woken, commit_id, envelope_id, r2_hash, welcome_hash,
 };
 
-use rows::{Candidate, Charge, Group, Head, Lease, Recovery, Share, Slot, Stored, Usage};
+use rows::{
+    By, Candidate, Charge, Due, Group, Head, Kind, Lease, Recovery, Share, Slot, Stored, Usage,
+};
 
 /// The layout's version, which `version` answers: the keeper upgrades
 /// agents a batch at a time and reads it back.
@@ -89,16 +91,17 @@ pub struct Personal {
     operations: Table<u64, Operation>,
     /// The operations pending or contested.
     open: Table<u64, (), Ordered>,
-    /// The pending operations by their maturity.
-    due: Table<(u64, u64), (), Ordered>,
+    /// What falls due, by its time: the pending operations by their
+    /// maturity, and the chores of a removal and of a kit replaced.
+    due: Table<(u64, Due), (), Ordered>,
     /// The open operations removing each device.
     against: Table<(DeviceId, u64), (), Ordered>,
     /// The open operation of each kind of which one is open at a time, by
     /// the kind and its target.
-    kinds: Table<(u8, DeviceId), u64>,
+    kinds: Table<(Kind, DeviceId), u64>,
     /// The open operations by their signer: whether each counts against
     /// its signer's open operations, as all but a removal do.
-    signed: Table<(u64, u64), bool, Ordered>,
+    signed: Table<(By, u64), bool, Ordered>,
     /// The devices' vetoes of each operation, and by each device.
     vetoes: Table<(u64, DeviceId), (), Ordered>,
     vetoed: Table<(DeviceId, u64), (), Ordered>,

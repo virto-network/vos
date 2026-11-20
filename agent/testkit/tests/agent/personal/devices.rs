@@ -1097,3 +1097,32 @@ fn the_released_r2_is_deleted_at_the_restored_devices_first_commit() {
         "the kit reads what follows the re-seal"
     );
 }
+
+/// The rows of an open removal, by their keys: the due index's under its
+/// maturity, its tag (an operation's, before a silencing's or a kit's
+/// retirement at one time) and its index; the signer's under its tag and
+/// its device, then the index; its kind's under the kind's byte and its
+/// target.
+#[test]
+fn an_open_removal_is_keyed_by_its_maturity_its_signer_and_its_kind() {
+    use vos_abi::keys::{self, Transform};
+    use vos_testkit::programs::table_tag;
+
+    let mut home = seasoned(3);
+    let removal = home.operate(admin(0), "remove", 2u32).unwrap();
+    let matures = home.operation(sync(0), removal).matures;
+    let row = |table: &str, transform: Transform, key: &[u8]| {
+        let mut row = keys::table_rows(PERSONAL, table_tag(table), transform);
+        transform.append(key, &mut row);
+        home.node().get(&row)
+    };
+    let due = [&matures.to_be_bytes()[..], &[0], &removal.to_be_bytes()].concat();
+    assert_eq!(row("due", Transform::Ordered, &due), Some(Vec::new()));
+    let signed = [&[0, 0, 0, 0, 0][..], &removal.to_be_bytes()].concat();
+    assert_eq!(row("signed", Transform::Ordered, &signed), Some(vec![0]));
+    let kind = [&[0][..], &2u32.to_be_bytes()].concat();
+    assert_eq!(
+        row("kinds", Transform::Hashed, &kind),
+        Some(removal.encode())
+    );
+}

@@ -1475,7 +1475,12 @@ where the rules above leave a choice, this is the one taken]:
   settles four **steps** before it runs: an operation's maturity, or one
   row of a silencing or of a replaced kit's cancelling, each queued in
   the due index at the time it takes effect, so everything settles in
-  time order and no step grows with what an adversary queued. Every
+  time order and no step grows with what an adversary queued. The index
+  is keyed by the time, then what falls due (`Due`: an operation's
+  maturity by its index, a device's silencing, the kit's retirement, in
+  that order at one time), and the open operations by their signer
+  (`By`, a device's before the kit's entries), each an enum whose key
+  encoding sorts as it does. Every
   handler that settles declares 40M gas [measured, the agent suite on a
   debug build, x86-64 Core Ultra 7 155H, 2026-11-06; gas is
   deterministic]: the worst call in a full set (eight seasoned devices,

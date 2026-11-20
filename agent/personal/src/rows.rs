@@ -4,7 +4,8 @@
 use alloc::vec::Vec;
 
 use vos_sdk::prelude::*;
-use vos_wire::personal::{DeviceId, KitEntry, NewKit, Pending};
+use vos_sdk::table::{FixedKey, TableKey};
+use vos_wire::personal::{DeviceId, KitEntry, NewKit, Pending, Signer};
 
 /// The control log's next index and its chain so far.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
@@ -136,4 +137,148 @@ pub struct Slot {
     pub expires: u64,
     /// The items its holder wrote.
     pub items: u32,
+}
+
+/// What the due index holds at a time: an operation's maturity, a removed
+/// device's silencing (its operations cancelled and its vetoes lifted, a
+/// row a step), or a replaced kit's retirement (its operations cancelled).
+/// At one time they settle in that order: operations by their index, then
+/// silencings by the device, then the retirement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Due {
+    Op(u64),
+    Silence(DeviceId),
+    Retire,
+}
+
+impl Due {
+    const OP: u8 = 0;
+    const SILENCE: u8 = 1;
+    const RETIRE: u8 = 2;
+}
+
+/// Its tag, then its operation's index or its device, big-endian: keys
+/// compare as the values do.
+impl TableKey for Due {
+    fn encode_key(&self, out: &mut Vec<u8>) {
+        match self {
+            Due::Op(index) => {
+                out.push(Due::OP);
+                index.encode_key(out);
+            }
+            Due::Silence(device) => {
+                out.push(Due::SILENCE);
+                device.encode_key(out);
+            }
+            Due::Retire => out.push(Due::RETIRE),
+        }
+    }
+
+    fn decode_key(bytes: &[u8]) -> Option<Self> {
+        let (tag, rest) = bytes.split_first()?;
+        match *tag {
+            Due::OP => u64::decode_key(rest).map(Due::Op),
+            Due::SILENCE => DeviceId::decode_key(rest).map(Due::Silence),
+            Due::RETIRE if rest.is_empty() => Some(Due::Retire),
+            _ => None,
+        }
+    }
+}
+
+/// An operation's signer as the first part of a key: a device's id, or a
+/// kit entry's, each after its tag and big-endian in four bytes, so the
+/// devices' keys sort before the kit's and each signer's rows are a range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct By(pub Signer);
+
+impl By {
+    const DEVICE: u8 = 0;
+    const KIT: u8 = 1;
+}
+
+impl TableKey for By {
+    fn encode_key(&self, out: &mut Vec<u8>) {
+        let (tag, id) = match self.0 {
+            Signer::Device(device) => (By::DEVICE, device),
+            Signer::Kit(entry) => (By::KIT, u32::from(entry)),
+        };
+        out.push(tag);
+        id.encode_key(out);
+    }
+
+    fn decode_key(bytes: &[u8]) -> Option<Self> {
+        let (tag, rest) = bytes.split_first()?;
+        let id = u32::decode_key(rest)?;
+        match *tag {
+            By::DEVICE => Some(By(Signer::Device(id))),
+            By::KIT => u8::try_from(id).ok().map(|entry| By(Signer::Kit(entry))),
+            _ => None,
+        }
+    }
+}
+
+impl FixedKey for By {
+    const WIDTH: usize = 5;
+}
+
+/// The kinds of operation of which one is open at a time, for a target or
+/// for the agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Kind {
+    Remove = 0,
+    Replace = 1,
+    /// A kit rotation or a restore.
+    Kit = 2,
+    Regroup = 3,
+}
+
+/// Its one byte.
+impl TableKey for Kind {
+    fn encode_key(&self, out: &mut Vec<u8>) {
+        (*self as u8).encode_key(out);
+    }
+
+    fn decode_key(bytes: &[u8]) -> Option<Self> {
+        Some(match u8::decode_key(bytes)? {
+            0 => Kind::Remove,
+            1 => Kind::Replace,
+            2 => Kind::Kit,
+            3 => Kind::Regroup,
+            _ => return None,
+        })
+    }
+}
+
+impl FixedKey for Kind {
+    const WIDTH: usize = 1;
+}
+
+/// The key just before every key that starts with a value: so the rows of
+/// an ordered table keyed `(A, B)` whose first part is `a` start after
+/// `(a.before(), B::MAX)`.
+pub trait Before: Sized {
+    fn before(&self) -> Option<Self>;
+}
+
+impl Before for u32 {
+    fn before(&self) -> Option<Self> {
+        self.checked_sub(1)
+    }
+}
+
+impl Before for u64 {
+    fn before(&self) -> Option<Self> {
+        self.checked_sub(1)
+    }
+}
+
+impl Before for By {
+    fn before(&self) -> Option<Self> {
+        Some(By(match self.0 {
+            Signer::Device(device) => Signer::Device(device.checked_sub(1)?),
+            Signer::Kit(0) => Signer::Device(DeviceId::MAX),
+            Signer::Kit(entry) => Signer::Kit(entry - 1),
+        }))
+    }
 }
