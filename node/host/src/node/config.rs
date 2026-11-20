@@ -176,11 +176,6 @@ pub struct Config {
     /// apply refuses a format the release does not admit, or retired,
     /// whatever any node admits.
     pub device_formats: Vec<(u32, Option<u64>)>,
-    /// The device formats this node's ingress refuses, each from its time
-    /// in ms, where that is earlier than its release's (`light-node.md`
-    /// §4.4). The operator's `Retire` of a format retires it in an agent's
-    /// log instead, for every replica.
-    pub retired_formats: Vec<(u32, u64)>,
     /// What every agent of the node's space asks of the gateway's mark
     /// (`light-node.md` §6.5): its proven calls, or every request read of
     /// an agent, only through the onion. An agent may ask more of its own
@@ -247,7 +242,6 @@ impl Config {
             operator_nonces: 1 << 16,
             verifications: None,
             device_formats: crate::DEVICE_FORMATS.to_vec(),
-            retired_formats: Vec::new(),
             onion: crate::admission::OnionPolicy::Any,
         }
     }

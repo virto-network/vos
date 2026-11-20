@@ -78,12 +78,11 @@ const _: () = assert!(DEVICE_FORMATS[0].0 == device::FORMAT.number);
 type Place = Arc<smol::lock::OnceCell<Option<Arc<Verifier>>>>;
 
 /// The device programs this node holds, their verifiers alone, by release
-/// and format; the device formats it admits, each with its release's
-/// retirement; and the retirements its configuration set.
+/// and format; and the device formats it admits, each with its release's
+/// retirement.
 pub(crate) struct DevicePrograms {
     programs: Mutex<HashMap<(DeviceRelease, u32), Place>>,
     formats: Vec<(u32, Option<u64>)>,
-    retired: Mutex<HashMap<u32, u64>>,
 }
 
 impl Default for DevicePrograms {
@@ -106,7 +105,6 @@ impl DevicePrograms {
         (known && distinct && (1..=2).contains(&formats.len())).then(|| Self {
             programs: Mutex::default(),
             formats: formats.to_vec(),
-            retired: Mutex::default(),
         })
     }
 
@@ -126,27 +124,6 @@ impl DevicePrograms {
         Arc::clone(lock(&self.programs).entry((release, format)).or_default())
     }
 
-    /// Retires device format `format` at `at_ms`, if that is earlier than
-    /// its retirement: its date kept, if this node admits the format.
-    pub(crate) fn retire_format(&self, format: u32, at_ms: u64) -> Option<u64> {
-        let (_, released) = self
-            .formats
-            .iter()
-            .copied()
-            .find(|(number, _)| *number == format)?;
-        let mut retired = lock(&self.retired);
-        let date = retired
-            .get(&format)
-            .copied()
-            .into_iter()
-            .chain(released)
-            .chain([at_ms])
-            .min()
-            .expect("a date");
-        retired.insert(format, date);
-        Some(date)
-    }
-
     /// The device formats admitted at `now` in an agent whose log retires
     /// each at `logged`'s date, if any, newest first, each with its
     /// retirement, if one is set.
@@ -155,19 +132,12 @@ impl DevicePrograms {
         now: u64,
         logged: impl Fn(u32) -> Option<u64>,
     ) -> Vec<FormatWindow> {
-        let retired = lock(&self.retired);
         self.formats
             .iter()
             .copied()
             .map(|(format, released)| FormatWindow {
                 format,
-                retires_ms: retired
-                    .get(&format)
-                    .copied()
-                    .into_iter()
-                    .chain(released)
-                    .chain(logged(format))
-                    .min(),
+                retires_ms: released.into_iter().chain(logged(format)).min(),
             })
             .filter(|window| window.retires_ms.is_none_or(|date| date > now))
             .collect()

@@ -2575,8 +2575,8 @@ format, the chips, the sizes and the root.
     format is refused `Format` at ingress before anything is decoded, and
     the proven input carries its format, so apply refuses it on every
     replica too (`Refusal::Format`): a node whose configuration admits
-    more (`Config::device_formats`, a test's) or retires earlier
-    (`Config::retired_formats`) only changes what its own ingress takes,
+    more or fewer, or retires earlier (`Config::device_formats`, a test's)
+    only changes what its own ingress takes,
     never what the space runs [decided].
   - **The proof names its program:** ingress computes the binding under
     each program the window admits, and the request's binding must be one
