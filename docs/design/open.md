@@ -278,7 +278,8 @@ The scale results are in `core-model.md` §14, "The scale test".
   aarch64 host runs the suites: a test leg on one.
 - **The external audit's scope:** the device shape, the stock kernels, the
   Poseidon2 chip and their masking, with the recursion AIR, the final
-  verifier, `derive` and the security tool's counts. Engage before any
+  verifier, `derive` and the security tool's counts; the personal agent's
+  protocol and `vos-mls`'s use of MLS (`light-node.md` §3). Engage before any
   value rides on VOS.
 
 ## Identity and privacy
@@ -309,10 +310,12 @@ The scale results are in `core-model.md` §14, "The scale test".
   removing it moves the actor's ELF. The feed is kept whole on the actor
   and on every device, about 77 bytes a write: a compaction (a snapshot of the leaves, then the changes since)
   is later work, should a space's history outgrow it.
-- **Full privacy** (`identity-and-authority.md` §8): personal spaces, the
-  shared pool, the relay layer and the holder-side prover, postponed; where
-  the shared pool first runs (a JAM agent or a proving space run by the
-  root space) is decided when it is taken up.
+- **Full privacy** (`identity-and-authority.md` §8): a shielded pool
+  shared by many spaces, whose integrity does not trust any one space's
+  operators (it verifies each spend's proof in its guest), postponed;
+  where it first runs (a JAM agent or a proving space run by the root
+  space) is decided when it is taken up. A space's own pool is P2's
+  (below).
 - **Authenticators and attestations:** authenticators beyond ed25519 at
   ingress (SSH keys, P-256, hardware tokens) and device-signed sessions;
   grants, delegation and narrowed authority sets with revocation epochs;
@@ -564,12 +567,12 @@ merge commit `b841640`, `Cargo.toml:239`, and uses its codec, `Account`, `Layer`
 `Value` and `settlement::window` in the `accounts` and `window` test
 actors) has a sound transparent kernel (its tests are most of the 315 the
 workspace runs with every feature; about 114 are the privacy modules') and a notes
-prototype that is not for value (`STATUS.md`): Pedersen commitments on
+prototype that is not for value (its status file says so): Pedersen commitments on
 Ristretto, a BLAKE2b nullifier, a pool that rebuilds its tree on every
 insert (F21), no spend proof, and a `pvm-precompile` feature that routes
 scalar multiplication to a Ristretto chip VOS removed as unsound
 (`core-model.md` §11.2), pinned by a git dependency on VOS at
-`9f5337fb`. Its own Phase 3 entry criteria (`docs/viability-plan.md`)
+`9f5337fb`. Its own Phase 3 entry criteria (its viability plan)
 name what a private tier must settle; this design answers them.
 
 **What changes, released as v0.4.0 (breaking) with P2, from cipher-clerk's own

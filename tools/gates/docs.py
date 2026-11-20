@@ -4,8 +4,7 @@
     python3 -I tools/gates/docs.py
 
 It fails when
-- a design doc (a slice's plan, a record of its steps, aside) or a doc
-  under `pvm/` names deleted code as built: the retired device format's
+- a design doc or a doc under `pvm/` names deleted code as built: the retired device format's
   chip and configuration names, and `javm`, the interpreter `vos-pvm`
   replaced;
 - a path `pvm/proof/AUDIT.md` names (in backticks, braces expanded) is no
@@ -97,9 +96,7 @@ def expand(token: str) -> list[str]:
 
 
 def stale() -> list[str]:
-    docs = [
-        path for path in (ROOT / "docs/design").glob("*.md") if not re.match(r"slice-\d+-plan\.md$", path.name)
-    ] + [
+    docs = list((ROOT / "docs/design").glob("*.md")) + [
         path for path in (ROOT / "pvm").rglob("*.md") if "target" not in path.parts
     ]
     return [
