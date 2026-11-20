@@ -33,6 +33,13 @@ use s4_credential_contract::{TRANSFER, account};
 /// How far past the node's time a proof's expiry is set: within VOS's
 /// `CREDENTIAL_HORIZON_MS`, which ingress allows, room for the proof and
 /// the trip.
+mod answer;
+mod clock;
+
+use answer::root_refused;
+pub(crate) use answer::update_refused;
+use clock::{CLOCK_SPREAD, CLOCK_TICK, SessionClock};
+
 const EXPIRY_MS: u64 = 60_000;
 const _: () = assert!(EXPIRY_MS < vos_wire::defaults::CREDENTIAL_HORIZON_MS);
 /// How often a refresher asks its keeper whether the feed is due: the
@@ -64,28 +71,6 @@ const WINDOW_TTL: Duration = Duration::from_secs(600);
 /// A window this old is read again by the tree's refresher, so a sign-in
 /// or a payment never waits for it.
 const WINDOW_RENEW: Duration = Duration::from_secs(400);
-/// The furthest the node's time may be from the device's: past it, a relay
-/// that lies about the time could keep a confirmed proof for later.
-const CLOCK_SKEW_MS: u64 = 300_000;
-/// How long a session uses its reading of the node's clock. A reading
-/// is an offset from the device's clock, which drifts a few milliseconds
-/// in that time; what makes it wrong is a step of the device's clock,
-/// which [`CLOCK_STEP_MS`] catches. The bound is on rendezvous an hour
-/// (at most 30 in the foreground): each reading is a fetch, a rendezvous,
-/// so a session reads again every 4 to 12 minutes ([`CLOCK_EVERY`]), about
-/// seven an hour.
-const CLOCK_LIFE: Duration = Duration::from_secs(15 * 60);
-/// How often a session reads the node's clock again, about: each reading
-/// draws its renewal between half and one and a half of it.
-const CLOCK_EVERY: Duration = Duration::from_secs(8 * 60);
-/// The most the device's clock may move apart from its monotonic clock
-/// while a reading is used: past it the clock was set, or the device
-/// slept, and the node's clock is read again.
-const CLOCK_STEP_MS: u64 = 2_000;
-/// The spread of a session's first reading after its grant.
-const CLOCK_SPREAD: Duration = Duration::from_secs(2);
-/// How often a session's clock task looks at its reading.
-const CLOCK_TICK: Duration = Duration::from_secs(5);
 /// Each session's number, which its spares are kept under.
 static SESSIONS: AtomicU64 = AtomicU64::new(1);
 /// The least time between two `refresh` requests the facility honours, and
@@ -122,8 +107,8 @@ impl Stock {
     /// actor (`just facility-release`).
     pub fn embedded() -> Self {
         Self {
-            auth: include_bytes!("../release/auth.device").to_vec(),
-            owner: include_bytes!("../release/owner.device").to_vec(),
+            auth: include_bytes!("../../release/auth.device").to_vec(),
+            owner: include_bytes!("../../release/owner.device").to_vec(),
         }
     }
 }
@@ -763,126 +748,6 @@ fn live(inner: &Weak<Inner>, cancelled: &AtomicBool) -> Option<Arc<Inner>> {
         return None;
     }
     inner.upgrade()
-}
-
-/// The node's clock as a session read it: its offset from the device's
-/// clock, and when it was read, by the device's clock and its monotonic
-/// one.
-#[derive(Clone, Copy, Debug)]
-struct Clock {
-    offset_ms: i64,
-    wall_ms: u64,
-    at: Instant,
-    /// When the session reads it again.
-    renew: Duration,
-}
-
-impl Clock {
-    /// The node's time now: its time at the reading, moved on by the
-    /// monotonic clock, which a step of the device's clock does not move;
-    /// none past [`CLOCK_LIFE`], or once the device's clock moved apart from
-    /// the monotonic one (it was set, or the device slept, which the
-    /// monotonic clock does not count).
-    fn now(&self) -> Option<u64> {
-        let elapsed = self.at.elapsed();
-        if elapsed >= CLOCK_LIFE {
-            return None;
-        }
-        let elapsed_ms = elapsed.as_millis() as u64;
-        let moved = now_ms() as i64 - self.wall_ms as i64;
-        if moved.abs_diff(elapsed_ms as i64) > CLOCK_STEP_MS {
-            return None;
-        }
-        self.wall_ms
-            .checked_add_signed(self.offset_ms)?
-            .checked_add(elapsed_ms)
-    }
-
-    fn due(&self) -> bool {
-        self.now().is_none() || self.at.elapsed() >= self.renew
-    }
-}
-
-/// A session's reading of the node's clock, its own: the time a gateway
-/// answered reaches every expiry set from it, so a reading is shared only
-/// among the calls of the one session that asked them, which its server
-/// joins anyway (`light-node.md` §6.2).
-#[derive(Default)]
-struct SessionClock {
-    reading: Mutex<Option<Clock>>,
-    /// Held while the clock is read, so a call waits for a read in flight
-    /// rather than making another.
-    read: tokio::sync::Mutex<()>,
-    /// The task reading it again while the session is open.
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// A read made while a form is read.
-    meanwhile: Mutex<Option<tokio::task::JoinHandle<()>>>,
-}
-
-impl SessionClock {
-    fn current(&self) -> Option<u64> {
-        self.reading
-            .lock()
-            .expect("clock poisoned")
-            .as_ref()
-            .and_then(Clock::now)
-    }
-
-    /// The node's time now: this session's reading, or one read now.
-    async fn now(&self, net: &Net, space: [u8; 32], session: u64) -> Result<u64, String> {
-        if let Some(now) = self.current() {
-            return Ok(now);
-        }
-        self.renew(net, space, session).await?;
-        self.current()
-            .ok_or_else(|| "the device's clock moved while the node's time was read".into())
-    }
-
-    /// The clock read again, if its reading is due.
-    async fn renew(&self, net: &Net, space: [u8; 32], session: u64) -> Result<(), String> {
-        let _reading = self.read.lock().await;
-        let due = self
-            .reading
-            .lock()
-            .expect("clock poisoned")
-            .as_ref()
-            .is_none_or(Clock::due);
-        if due {
-            let clock = read_clock(net, space, session).await?;
-            *self.reading.lock().expect("clock poisoned") = Some(clock);
-        }
-        Ok(())
-    }
-
-    fn stop(&self) {
-        for task in [&self.task, &self.meanwhile] {
-            if let Some(task) = task.lock().expect("clock poisoned").take() {
-                task.abort();
-            }
-        }
-    }
-}
-
-/// The node's clock, read on a fetch of its own (the session's fetch spare
-/// if one is built), refused when it is further from the device's than
-/// [`CLOCK_SKEW_MS`]. The device's clock is taken as the answer arrives, so
-/// the reading errs early by the trip and an expiry set from it never
-/// later than the node's time says.
-async fn read_clock(net: &Net, space: [u8; 32], session: u64) -> Result<Clock, String> {
-    let answer = net
-        .request_for(space, Purpose::Fetch, &wire::time_request(), Some(session))
-        .await?;
-    let (wall_ms, at) = (now_ms(), Instant::now());
-    let node = wire::time_answer(&answer).map_err(|error| error.to_string())?;
-    if node.abs_diff(wall_ms) > CLOCK_SKEW_MS {
-        return Err("the node's time is minutes off this device's".into());
-    }
-    Ok(Clock {
-        offset_ms: node as i64 - wall_ms as i64,
-        wall_ms,
-        at,
-        renew: jittered(CLOCK_EVERY),
-    })
 }
 
 /// The facility on one connection.
@@ -1871,48 +1736,6 @@ fn describe(method: &Method) -> (String, String) {
             "Pay".into(),
             format!("{} (from this device's account)", method.name),
         ),
-    }
-}
-
-/// Whether the node answered a proof as one on a root it does not judge
-/// current: `Some(false)` for one its ring does not hold (`RootUnknown`),
-/// `Some(true)` for one superseded past its grace, at ingress
-/// (`RootStale`) or at apply (`StaleRoot`).
-fn root_refused(answer: &[u8]) -> Option<bool> {
-    use vos_abi::abi::Refusal as Refused;
-    use vos_wire::ingress::Response;
-    match wire::credentialed_answer(answer) {
-        Ok(wire::Answer::RootUnknown) => Some(false),
-        Ok(wire::Answer::RootStale) => Some(true),
-        Ok(wire::Answer::Other(body)) => matches!(
-            <Response as vos_abi::Decode>::decode_exact(&body),
-            Some(Response::Refused(Refused::StaleRoot))
-        )
-        .then_some(true),
-        _ => None,
-    }
-}
-
-/// Refused, as an app to update, when the node refused a proof for its
-/// device format: one its ingress does not admit, or one the release or
-/// the agent's log retired by the batch's time.
-pub(crate) fn update_refused(answer: &[u8]) -> Result<(), Refusal> {
-    match format_refused(answer) {
-        true => Err(refused(Code::Refused, UPDATE)),
-        false => Ok(()),
-    }
-}
-
-fn format_refused(answer: &[u8]) -> bool {
-    use vos_abi::abi::Refusal as Refused;
-    use vos_wire::ingress::{CredentialRefusal, Response};
-    match wire::credentialed_answer(answer) {
-        Ok(wire::Answer::Refused(CredentialRefusal::Format)) => true,
-        Ok(wire::Answer::Other(body)) => matches!(
-            <Response as vos_abi::Decode>::decode_exact(&body),
-            Some(Response::Refused(Refused::Format))
-        ),
-        _ => false,
     }
 }
 
