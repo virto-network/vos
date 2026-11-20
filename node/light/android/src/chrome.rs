@@ -14,6 +14,10 @@ use crate::source::BoxFuture;
 /// The trusted chrome the client lends the facility.
 pub trait Chrome: Send + Sync {
     fn confirm(&self, form: Form) -> BoxFuture<'_, Answer>;
+
+    /// What the operation is doing while the user waits, in words: shown
+    /// beside it, never answered. Nothing where the client shows none.
+    fn progress(&self, _text: &str) {}
 }
 
 /// The first bytes of a digest in hex, as the chrome names it.

@@ -56,6 +56,8 @@ pub struct Scripted {
     pub read: Duration,
     pub shown_at: Mutex<Vec<std::time::Instant>>,
     pub answered_at: Mutex<Vec<std::time::Instant>>,
+    /// Every progress text shown, in order.
+    pub progress: Mutex<Vec<String>>,
 }
 
 impl Scripted {
@@ -94,6 +96,10 @@ impl Chrome for Scripted {
                 .push(std::time::Instant::now());
             answer.unwrap_or(Answer::Declined)
         })
+    }
+
+    fn progress(&self, text: &str) {
+        self.progress.lock().unwrap().push(text.to_owned());
     }
 }
 

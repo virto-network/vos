@@ -79,6 +79,16 @@ static SESSIONS: AtomicU64 = AtomicU64::new(1);
 /// The least time between two `refresh` requests the facility honours, and
 /// the spread of the read one schedules.
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
+/// How long a sign-in with no path waits for the space to list the
+/// member (the operator's invitation), and how often it reads the feed
+/// meanwhile.
+const LISTED_WAIT: Duration = Duration::from_secs(60);
+const LISTED_EVERY: Duration = Duration::from_secs(5);
+/// What a sign-in says while it waits for the space to list the device.
+pub const WAITING_FOR_LIST: &str =
+    "Waiting for the space to list your device (the operator's invitation)…";
+/// Why a sign-in found no leaf of the member's after its wait.
+const NOT_INVITED: &str = "Your device is enrolled; the operator has not invited it yet.";
 const REFRESH_SPREAD: Duration = Duration::from_secs(5);
 
 /// The release artifacts of VOS's stock kernels, each an encoded
@@ -133,6 +143,9 @@ pub(crate) struct Inner {
     /// Held for a proof: two at once would hold a proof's memory twice.
     device_proof: Mutex<()>,
     tick: Duration,
+    /// How long a sign-in with no path waits for the space to list the
+    /// member, and how often it reads the feed meanwhile.
+    listed: (Duration, Duration),
     /// The one client every request to a space goes through.
     pub(crate) net: Arc<Net>,
     /// Each enrollment's tree and its refresher, by origin, for the
@@ -267,6 +280,7 @@ impl Facility {
                 programs: Programs::default(),
                 device_proof: Mutex::new(()),
                 tick: TICK,
+                listed: (LISTED_WAIT, LISTED_EVERY),
                 net,
                 trees: Mutex::new(HashMap::new()),
                 personal: Mutex::new(None),
@@ -295,6 +309,13 @@ impl Facility {
     /// The same, its refreshers asking their keepers every `tick` (tests).
     pub fn with_tick(mut self, tick: Duration) -> Self {
         self.inner_mut().tick = tick;
+        self
+    }
+
+    /// The same, a sign-in with no path waiting `wait` for its leaf and
+    /// reading the feed `every` meanwhile (tests).
+    pub fn with_listed_wait(mut self, wait: Duration, every: Duration) -> Self {
+        self.inner_mut().listed = (wait, every);
         self
     }
 
@@ -1206,11 +1227,42 @@ impl Session {
         }
     }
 
-    /// Why the member has no path: its tree read to the feed's end holds
-    /// no leaf of its (its invitation not claimed yet, or claimed since
-    /// that read: the tree's own timer reads it again within a minute, no
-    /// read made now, so none follows the sign-in); or the tree is not read
-    /// to its end yet.
+    /// The member's path once the space lists it: a sign-in with none
+    /// yet (its invitation not claimed when the tree was read, or the
+    /// tree not read to its end) says it waits and reads the feed now and
+    /// every [`LISTED_EVERY`] for up to [`LISTED_WAIT`] (a read that has
+    /// a path makes none), so the user need not tap again. Past the wait,
+    /// why there is none: the tree read to the feed's end holds no leaf of
+    /// the member's, or is not read to its end yet. The gateway can join a
+    /// sign-in made seconds after the first root holding a new leaf to the
+    /// newest member, as it can a sign-in tapped again (`light-node.md`
+    /// §6.2).
+    async fn listed(&self, enrollment: &Enrollment, chrome: &dyn Chrome) -> Result<AuthWitness, Refusal> {
+        if let Some(witness) = self.witness() {
+            return Ok(witness);
+        }
+        chrome.progress(WAITING_FOR_LIST);
+        let (wait, every) = self.inner.listed;
+        let until = Instant::now() + wait;
+        if let Some(tree) = self.inner.tree_of(enrollment) {
+            loop {
+                // The read fails or is due again at the next turn alike.
+                let _ = read_now(&self.inner.net, &tree, enrollment).await;
+                if let Some(witness) = self.witness() {
+                    return Ok(witness);
+                }
+                if Instant::now() + every > until {
+                    break;
+                }
+                tokio::time::sleep(every).await;
+            }
+        }
+        Err(self.pathless().await)
+    }
+
+    /// Why the member has no path after the wait: its tree read to the
+    /// feed's end holds no leaf of its (the operator has not invited the
+    /// device yet); or the tree is not read to its end yet.
     async fn pathless(&self) -> Refusal {
         let leafless = match self.tree() {
             Some(tree) => {
@@ -1220,11 +1272,7 @@ impl Session {
             None => false,
         };
         if leafless {
-            refused(
-                Code::Unclaimed,
-                "claim your invitation first: the space's tree holds no leaf of this device's \
-                 member (claimed just now? the device reads the tree again within a minute)",
-            )
+            refused(Code::Unclaimed, NOT_INVITED)
         } else {
             refused(
                 Code::NoPath,
@@ -1257,9 +1305,7 @@ impl Session {
             ));
         }
         self.inner.admits(&enrollment, Kernel::Auth).await?;
-        let Some(witness) = self.witness() else {
-            return Err(self.pathless().await);
-        };
+        let witness = self.listed(&enrollment, chrome).await?;
         self.apart(Learned::SignedIn)?;
         self.read_clock_meanwhile(&enrollment);
         let form = Form {
@@ -1641,11 +1687,27 @@ impl Session {
     }
 }
 
-/// The feed read into `tree` if its keeper says so, on the space's feed
+/// The feed read into `tree` now, due or not: a sign-in waiting for the
+/// space to list its member ([`Session::listed`]).
+async fn read_now(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<(), String> {
+    read_feed(net, tree, enrollment, true).await
+}
+
+/// The feed read into `tree` if its keeper says so (`read_feed`).
+async fn read_once(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<(), String> {
+    read_feed(net, tree, enrollment, false).await
+}
+
+/// The feed read into `tree` if its keeper says so, or `now`, on the space's feed
 /// connection, and the keeper kept if the read changed it (a change
 /// applied, or the tree dropped to start over from the feed's start); a
 /// `refresh` asked for and due makes it so first.
-async fn read_once(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<(), String> {
+async fn read_feed(
+    net: &Net,
+    tree: &Tree,
+    enrollment: &Enrollment,
+    now: bool,
+) -> Result<(), String> {
     let registrar = registrar(enrollment)?;
     let mut keeper = tree.keeper.lock().await;
     {
@@ -1656,7 +1718,7 @@ async fn read_once(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<()
             *tree.last_refresh.lock().expect("refresh poisoned") = Some(Instant::now());
         }
     }
-    if !keeper.due(now_ms()) {
+    if !now && !keeper.due(now_ms()) {
         return Ok(());
     }
     let before = keeper.encode();
