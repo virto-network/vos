@@ -101,7 +101,7 @@ impl Homes {
             self.agents.insert(agent, &held);
             self.pool.insert(agent, &());
         }
-        let mut counts = self.tallied();
+        let mut counts = self.counts.get_or_default();
         counts.pooled += fresh.len() as u32;
         self.counts.set(&counts);
         Ok(counts.pooled)
@@ -198,7 +198,7 @@ impl Homes {
                 kit: indexes,
             },
         );
-        let mut counts = self.tallied();
+        let mut counts = self.counts.get_or_default();
         counts.pooled -= 1;
         counts.claimed += 1;
         self.counts.set(&counts);
@@ -235,7 +235,7 @@ impl Homes {
         let (agent, mut held) = self.claimed_by(ctx.caller())?;
         held.standing = Standing::Assigned;
         self.agents.insert(&agent, &held);
-        let mut counts = self.tallied();
+        let mut counts = self.counts.get_or_default();
         counts.claimed -= 1;
         counts.assigned += 1;
         self.counts.set(&counts);
@@ -352,7 +352,7 @@ impl Homes {
     /// The pool's agents pooled, sent and assigned.
     #[msg]
     pub async fn tally(&self) -> Counts {
-        self.counts.get().unwrap_or_default()
+        self.counts.get_or_default()
     }
 
     /// The stocked agents by id, from after `after`, [`PAGE`] at most: the
@@ -377,10 +377,6 @@ impl Homes {
 }
 
 impl Homes {
-    fn tallied(&self) -> Counts {
-        self.counts.get().unwrap_or_default()
-    }
-
     /// `agent`'s claim dropped: its nullifier and kit indexes, the agent
     /// left `standing`, pooled again when that is `Pooled`.
     fn drop_claim(&mut self, agent: u32, held: &Held, standing: Standing) {
@@ -390,7 +386,7 @@ impl Homes {
         for index in &held.kit {
             self.kits.remove(index);
         }
-        let mut counts = self.tallied();
+        let mut counts = self.counts.get_or_default();
         counts.claimed -= 1;
         if standing == Standing::Pooled {
             self.pool.insert(&agent, &());

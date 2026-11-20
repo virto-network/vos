@@ -75,6 +75,22 @@ pub struct Usage {
     pub kit_operations: u32,
 }
 
+impl Usage {
+    /// The usage as of `day`: today's counts started afresh on a later day.
+    pub fn on(self, day: u64) -> Self {
+        if self.day == day {
+            return self;
+        }
+        Self {
+            day,
+            envelopes: 0,
+            commits: 0,
+            kit_operations: 0,
+            ..self
+        }
+    }
+}
+
 /// A device's share: its bytes held and its counted calls today.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct Share {

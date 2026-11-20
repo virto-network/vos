@@ -275,14 +275,7 @@ impl Personal {
         ctx: &mut Command<Self>,
         target: DeviceId,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Remove::ID,
-            arguments: personal::Remove { target }.encode(),
-        };
+        let (now, call, by) = self.admin(ctx, &personal::Remove { target })?;
         self.open_operation(now, call, by, Op::Remove(target))
     }
 
@@ -294,17 +287,12 @@ impl Personal {
         ctx: &mut Command<Self>,
         device: NewDevice,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Add::ID,
-            arguments: personal::Add {
+        let (now, call, by) = self.admin(
+            ctx,
+            &personal::Add {
                 device: device.clone(),
-            }
-            .encode(),
-        };
+            },
+        )?;
         self.open_operation(now, call, by, Op::Add(device))
     }
 
@@ -318,18 +306,13 @@ impl Personal {
         device: DeviceId,
         admin: NewAdmin,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Replace::ID,
-            arguments: personal::Replace {
+        let (now, call, by) = self.admin(
+            ctx,
+            &personal::Replace {
                 device,
                 admin: admin.clone(),
-            }
-            .encode(),
-        };
+            },
+        )?;
         self.open_operation(now, call, by, Op::Replace { device, admin })
     }
 
@@ -341,14 +324,7 @@ impl Personal {
         ctx: &mut Command<Self>,
         kit: NewKit,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Rotate::ID,
-            arguments: personal::Rotate { kit: kit.clone() }.encode(),
-        };
+        let (now, call, by) = self.admin(ctx, &personal::Rotate { kit: kit.clone() })?;
         self.open_operation(now, call, by, Op::Rotate(kit))
     }
 
@@ -360,17 +336,12 @@ impl Personal {
         ctx: &mut Command<Self>,
         remove: Vec<DeviceId>,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Regroup::ID,
-            arguments: personal::Regroup {
+        let (now, call, by) = self.admin(
+            ctx,
+            &personal::Regroup {
                 remove: remove.clone(),
-            }
-            .encode(),
-        };
+            },
+        )?;
         self.open_operation(now, call, by, Op::Regroup(remove))
     }
 
@@ -385,18 +356,13 @@ impl Personal {
         device: NewDevice,
         kit: NewKit,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Restore::ID,
-            arguments: personal::Restore {
+        let (now, call, by) = self.admin(
+            ctx,
+            &personal::Restore {
                 device: device.clone(),
                 kit: kit.clone(),
-            }
-            .encode(),
-        };
+            },
+        )?;
         self.open_operation(now, call, by, Op::Restore { device, kit })
     }
 
@@ -430,14 +396,7 @@ impl Personal {
         ctx: &mut Command<Self>,
         op: u64,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Cosign::ID,
-            arguments: personal::Cosign { op }.encode(),
-        };
+        let (now, call, by) = self.admin(ctx, &personal::Cosign { op })?;
         self.cosign_operation(now, call, by, op)
     }
 
@@ -450,14 +409,7 @@ impl Personal {
         op: u64,
         upheld: bool,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Resolve::ID,
-            arguments: personal::Resolve { op, upheld }.encode(),
-        };
+        let (now, call, by) = self.admin(ctx, &personal::Resolve { op, upheld })?;
         self.resolve_operation(now, call, by, op, upheld)
     }
 
@@ -979,7 +931,7 @@ impl Personal {
         let now = ctx.now();
         self.reader(ctx.caller(), now)?.device_or_kit()?;
         let group = self.group();
-        let head = self.head.get().unwrap_or_default();
+        let head = self.head.get_or_default();
         Ok(Overview {
             at: now,
             confirmed: group.confirmed,
@@ -1047,7 +999,7 @@ impl Personal {
     pub async fn recovery(&self, ctx: &Query<Self>) -> Result<RecoveryView, PersonalError> {
         let reader = self.reader(ctx.caller(), ctx.now())?;
         reader.device_or_kit()?;
-        let recovery = self.recovery.get().unwrap_or_default();
+        let recovery = self.recovery.get_or_default();
         let released = recovery
             .released
             .filter(|(device, _)| reader == rules::Reader::Device(*device))
@@ -1072,7 +1024,7 @@ impl Personal {
         from: u64,
     ) -> Result<Vec<(u64, Entry)>, PersonalError> {
         self.reader(ctx.caller(), ctx.now())?.device_or_kit()?;
-        let next = self.head.get().unwrap_or_default().next;
+        let next = self.head.get_or_default().next;
         let rows = (from..next).filter_map(|index| Some((index, self.log.get(&index)?)));
         Ok(rules::bounded(rows, |row| row.encode().len()))
     }
@@ -1090,7 +1042,7 @@ impl Personal {
         let position = match self.reader(ctx.caller(), ctx.now())? {
             rules::Reader::Device(_) => position,
             rules::Reader::Kit if scope == RECOVERY => {
-                position.max(self.recovery.get().unwrap_or_default().from)
+                position.max(self.recovery.get_or_default().from)
             }
             _ => return Err(PersonalError::NotAdmitted),
         };

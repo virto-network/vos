@@ -704,7 +704,7 @@ impl Credentials {
     /// The space's onion set; empty until the registrar sets one.
     #[msg]
     pub async fn onions(&self) -> Vec<Onion> {
-        self.onions.get().unwrap_or_default()
+        self.onions.get_or_default()
     }
 
     /// The space's handle; zeros before `found`.
@@ -959,7 +959,7 @@ impl Credentials {
             root: tree::digest(&changed[&0]),
             since: time,
         };
-        let mut ring = self.ring.get().unwrap_or_default();
+        let mut ring = self.ring.get_or_default();
         ring.record(root.root, time);
         self.ring.set(&ring);
         let length = self.changed.get_or_default();

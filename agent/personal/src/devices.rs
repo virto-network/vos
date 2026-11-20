@@ -164,19 +164,37 @@ impl Personal {
             self.operations.get(&index).is_some_and(|operation| {
                 operation.state == OpState::Pending
                     && operation.matures <= now
-                    && self.evidenced.contains(&index)
-                    && (!needs_r2(&operation.op) || self.deposits.contains(&index))
+                    && self.holds_evidence(index, &operation.op)
             })
         };
-        let restore = self.kinds.get(&(Kind::Kit as u8, 0)).filter(|index| {
-            self.operations
-                .get(index)
-                .is_some_and(|operation| matches!(operation.op, Op::Restore { .. }))
-        });
         prefixed!(self.against, id, u64::MAX)
             .into_iter()
             .any(|(index, ())| due(index))
-            || restore.is_some_and(due)
+            || self.open_restore().is_some_and(due)
+    }
+
+    /// The kit's open operation, if it is a restore.
+    fn open_restore(&self) -> Option<u64> {
+        self.kinds.get(&(Kind::Kit as u8, 0)).filter(|index| {
+            self.operations
+                .get(index)
+                .is_some_and(|operation| matches!(operation.op, Op::Restore { .. }))
+        })
+    }
+
+    /// Whether the operation `op` at `index` holds what it matures with:
+    /// its evidence, and its `R2` where it carries one.
+    fn holds_evidence(&self, index: u64, op: &Op) -> bool {
+        self.evidenced.contains(&index) && (!needs_r2(op) || self.deposits.contains(&index))
+    }
+
+    /// Release what the operation at `index` holds: its place among its
+    /// signer's, and the keys it brings.
+    fn release(&mut self, index: u64, operation: &Operation) {
+        self.signed.remove(&(signer_key(operation.by), index));
+        for key in claims(&operation.op) {
+            self.claimed.remove(&key);
+        }
     }
 
     /// Active for the policy's seasoning.
@@ -213,6 +231,25 @@ impl Personal {
                 .admin_caller(caller, now)
                 .map(|(key, device)| (key, Signer::Device(device))),
         }
+    }
+
+    /// An admin call's start: what fell due settled at the call's time,
+    /// the agent assigned, and its signer's; with the call as the log
+    /// carries it, `message` its arguments.
+    pub(crate) fn admin<M: vos_sdk::context::Method>(
+        &mut self,
+        ctx: &Command<Self>,
+        message: &M,
+    ) -> Result<(u64, AdminCall, Signer), PersonalError> {
+        let now = self.settle(ctx.now())?;
+        self.assigned()?;
+        let (origin, by) = self.signer(ctx.caller(), now)?;
+        let call = AdminCall {
+            origin,
+            method: M::ID,
+            arguments: message.encode(),
+        };
+        Ok((now, call, by))
     }
 
     fn open_at(&self, index: u64) -> Result<Operation, PersonalError> {
@@ -616,12 +653,11 @@ impl Personal {
         Ok(Recorded { at: now, index: at })
     }
 
-    /// Whether the operation `op` at `index` holds what it matures with:
-    /// its evidence, and its `R2` where it carries one. A cosign or a
+    /// [`Personal::holds_evidence`], else `Unevidenced`. A cosign or a
     /// resolution that would make one without them mature is refused, so
     /// it is not cancelled for want of them (reopening its rival) at once.
     fn evidenced_op(&self, index: u64, op: &Op) -> Result<(), PersonalError> {
-        if !self.evidenced.contains(&index) || needs_r2(op) && !self.deposits.contains(&index) {
+        if !self.holds_evidence(index, op) {
             return Err(PersonalError::Unevidenced);
         }
         Ok(())
@@ -630,10 +666,7 @@ impl Personal {
     /// A device's `alive` cancels a pending restore, which asserts every
     /// device lost.
     pub(crate) fn cancel_restore(&mut self, now: u64) {
-        if let Some(index) = self.kinds.get(&(Kind::Kit as u8, 0))
-            && let Some(operation) = self.operations.get(&index)
-            && matches!(operation.op, Op::Restore { .. })
-        {
+        if let Some(index) = self.open_restore() {
             self.cancel(index, Cancel::Alive, now);
         }
     }
@@ -705,10 +738,7 @@ impl Personal {
     fn drop_ready(&mut self, index: u64, now: u64) {
         self.ready.remove(&index);
         if let Some(mut operation) = self.operations.get(&index) {
-            self.signed.remove(&(signer_key(operation.by), index));
-            for key in claims(&operation.op) {
-                self.claimed.remove(&key);
-            }
+            self.release(index, &operation);
             operation.state = OpState::Cancelled {
                 at: now,
                 why: Cancel::Signer,
@@ -757,10 +787,7 @@ impl Personal {
     fn close(&mut self, index: u64, operation: &Operation, now: u64) -> Option<u64> {
         self.open.remove(&index);
         self.due.remove(&(operation.matures, index));
-        self.signed.remove(&(signer_key(operation.by), index));
-        for key in claims(&operation.op) {
-            self.claimed.remove(&key);
-        }
+        self.release(index, operation);
         if let Some(key) = kind(&operation.op) {
             self.kinds.remove(&key);
         }
@@ -971,7 +998,7 @@ impl Personal {
             self.kit.insert(&(i as u8), entry);
         }
         self.secrets.set(&r2);
-        let mut recovery = self.recovery.get().unwrap_or_default();
+        let mut recovery = self.recovery.get_or_default();
         recovery.from = self.scopes.get(&RECOVERY).unwrap_or(0);
         self.recovery.set(&recovery);
     }
@@ -1038,10 +1065,7 @@ impl Personal {
     pub(crate) fn carried(&mut self, index: u64, epoch: u64) {
         self.ready.remove(&index);
         if let Some(mut operation) = self.operations.get(&index) {
-            self.signed.remove(&(signer_key(operation.by), index));
-            for key in claims(&operation.op) {
-                self.claimed.remove(&key);
-            }
+            self.release(index, &operation);
             operation.state = OpState::Carried { epoch };
             self.operations.insert(&index, &operation);
         }
