@@ -341,8 +341,8 @@ The scale results are in `core-model.md` §14, "The scale test".
   most four host-service calls in flight, which bounds one circuit's by its
   connections and sessions, but s4's host-service requests name no peer,
   so no rate a circuit holds them to; and the onion's SSH server's
-  connections (`[onion] ssh_connections`, 128 by default, each given 30 s
-  to authenticate) have no idle close (russh's inactivity timeout is reset
+  connections (`[onion] ssh_connections`, `docs/operations.md`) have no
+  idle close (russh's inactivity timeout is reset
   by the keepalives a live client answers, so an idle close needs
   s4-server to count a connection's channels and close one holding none
   for a while). Both need s4-server's work.

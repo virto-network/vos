@@ -2739,7 +2739,8 @@ its claims marked onion) beside the `vos-api` subsystem; no loopback port
 carries them. The screens' own calls (the demo's host service) pass no
 per-circuit limit: s4's host-service requests name no peer, so only the
 server's bound per session holds them; and the onion's SSH server has
-s4-server's connection cap (128) and no idle timeout of its own, both
+s4-server's connection cap (`[onion] ssh_connections`) and no idle
+timeout of its own, both
 open (§6.6). arti in process is the onion's one host (E30). The
 `vos-api` relay set holds `Call` and `Credentialed`. A proven call's
 body is read only once it holds its places, the port's, its connection's
@@ -3242,13 +3243,13 @@ place:
   as public once one member leaks it. A space small enough for per-member
   keys may turn it on later.
 
-**The caps as built** [built, `node-api.md` §6]: each circuit counts as
-an address of its own (4 connections, 16 requests in flight over them,
-20 requests a second, a burst of 40); 8 streams at once a circuit, 1,024
-circuits at once, a circuit with no stream let go after 60 s; the onion's
-SSH server takes 128 connections at once unless `[onion] ssh_connections`
-says otherwise, each given 30 s to authenticate; 16 proven calls in
-flight through the onion, 2 from one connection and 4 from one circuit,
+**The caps as built** [built, `node-api.md` §6; each a key of `[onion]`
+with its default, `docs/operations.md`, "The onion service"]: each
+circuit counts as an address of its own (its connections, requests in
+flight and a second, and streams capped), the circuits at once capped, a
+circuit with no stream let go after 60 s; the onion's SSH server's
+connections capped, each given 30 s to authenticate; proven calls capped
+in flight through the onion, from one connection and from one circuit,
 taken from a proven call's header before its body is read: its
 connection's and circuit's first (past either the channel is closed),
 then the onion's, for which one call a circuit waits (another is closed
@@ -3257,8 +3258,8 @@ takes its circuit's request token, and the body must then keep its pace:
 by 5 s plus its share of 30 s, as much of it as that share, the whole
 within 30 s, so a header whose body never comes, or comes a byte at a
 time, gives its places back after about 5 s; an agent's calls
-and proven calls from one circuit 4 a second, a burst of 16. *Known
-limit:* the members' wait still grows with the circuits an attacker
+and proven calls from one circuit rated. *Known limit:* at the defaults,
+the members' wait still grows with the circuits an attacker
 holds: with one waiter each and 16 places freed every 5 s, a member waits
 about C × 5 / 16 s behind C attacker circuits, inside the 60 s a call
 waits for up to about 190 circuits (the 1,024-circuit cap would mean
