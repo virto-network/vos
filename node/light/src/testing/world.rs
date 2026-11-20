@@ -120,6 +120,17 @@ impl Step {
     }
 }
 
+/// A dial or a request as the world saw it come.
+#[derive(Clone, Copy, Debug)]
+pub struct Logged {
+    pub at: std::time::Instant,
+    pub tag: u8,
+    /// The connection's index in [`State::seen`].
+    pub connection: usize,
+    /// The request's step; `None` for the dial that opened the connection.
+    pub step: Option<Step>,
+}
+
 /// Where a phone's process dies, as Android kills `:vos`: at the `nth`
 /// request (from 1) asking `step`, before the world takes it, or after the
 /// world took it and before its answer leaves. From then on the phone's
@@ -305,6 +316,9 @@ pub struct State {
     pub windows_asked: Vec<(u32, u32)>,
     /// Each phone's requests, by its tag, as it asked them.
     pub traces: HashMap<u8, Vec<Step>>,
+    /// Every dial and every request the world took, as it came, with the
+    /// phone's tag and its connection's index: the flows' timings.
+    pub log: Vec<Logged>,
     kills: HashMap<u8, Kill>,
     /// The next call each phone asks of a step, answered as taken and never
     /// applied ([`World::forge`]).
@@ -1162,9 +1176,16 @@ impl World {
     fn connection(self: &Arc<Self>, target: &Target, circuit: Circuit, tag: u8) -> Connection {
         let mut state = self.state.lock().unwrap();
         state.seen.push(Seen::new(target, circuit));
+        let index = state.seen.len() - 1;
+        state.log.push(Logged {
+            at: std::time::Instant::now(),
+            tag,
+            connection: index,
+            step: None,
+        });
         Connection {
             world: Arc::clone(self),
-            index: state.seen.len() - 1,
+            index,
             tag,
         }
     }
@@ -1185,10 +1206,17 @@ impl ssh::Connection for Connection {
     /// A request as its fate says: answered by the world, forged, or the
     /// phone's process dying before the world takes it or after.
     fn answer(&self, kind: u16, body: &[u8]) -> Answer {
-        let fate = self.world.fate(self.tag, Step::of(kind, body));
+        let step = Step::of(kind, body);
+        let fate = self.world.fate(self.tag, step);
         if matches!(fate, Fate::Drop) {
             return Answer::Cut;
         }
+        self.world.state.lock().unwrap().log.push(Logged {
+            at: std::time::Instant::now(),
+            tag: self.tag,
+            connection: self.index,
+            step: Some(step),
+        });
         self.seen(|seen| seen.carried(kind, body));
         let answer = match fate {
             Fate::Forge => self.world.forged(body),
