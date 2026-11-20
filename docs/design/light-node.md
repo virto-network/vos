@@ -2948,8 +2948,8 @@ nodes may ask the onion's mark of its proven calls, or of every request
   sign-in's and a payment's form name their stages in s4's chrome while
   they run ("Proving…", "Sending…", `IVosPrompts.stage`). The digests
   show as a code a camera reads (`VOSENROLL1:`, member ‖ owner) and a
-  six-digit check the operator's tool shows too (`vos_api::
-  enrollment_check`): the check catches a misread code or the wrong
+  six-digit check the operator's tool shows too
+  (`vos_api::enrollment_check`): the check catches a misread code or the wrong
   screen, and proves nothing of who chose the digests (a million tries
   find six digits), so the operator still takes them from the device's
   chrome alone.

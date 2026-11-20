@@ -34,6 +34,8 @@ pub struct Screens {
     /// server so once the device is enrolled here, so its screens offer no
     /// enrollment.
     carried: bool,
+    /// A sign-in of this session's went through.
+    signed_in: bool,
     screen: Screen,
     payee: String,
     amount: String,
@@ -52,6 +54,7 @@ impl Screens {
         Self {
             demo,
             carried,
+            signed_in: false,
             screen: if carried {
                 Screen::SignIn
             } else {
@@ -208,6 +211,7 @@ impl Screens {
                 let pseudonym = Option::<[u8; 32]>::decode_exact(&reply)
                     .flatten()
                     .map_or_else(|| "a member".into(), |nullifier| short(&nullifier));
+                self.signed_in = true;
                 self.status = format!("Signed in as {pseudonym}{proving}");
             }
         }
@@ -223,9 +227,12 @@ impl App for Screens {
             .padding(2.0)
             .text("VOS: a member's device proves; this server only shows")
             .row(|row| {
-                row.gap(1.0)
-                    .button("Enroll", Message::Show(Screen::Enroll))
-                    .button("Sign in", Message::Show(Screen::SignIn))
+                // A carried session offers no enrollment at all.
+                let row = match self.carried {
+                    true => row.gap(1.0),
+                    false => row.gap(1.0).button("Enroll", Message::Show(Screen::Enroll)),
+                };
+                row.button("Sign in", Message::Show(Screen::SignIn))
                     .button("Pay", Message::Show(Screen::Pay))
             });
         page = match self.screen {
@@ -258,7 +265,9 @@ impl App for Screens {
                 let page = page
                     .text("Sign in with your device")
                     .button("Sign in with my device", Message::SignIn);
-                match self.carried {
+                // Until this session signs in: after that the device is
+                // known invited.
+                match self.carried && !self.signed_in {
                     true => page.text(ENROLLED_WAITING),
                     false => page,
                 }

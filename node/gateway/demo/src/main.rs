@@ -133,7 +133,11 @@ fn command(space: &LocalSpace, line: &str, asked: &mut Option<Asked>) -> Result<
     }) = asked.take()
     {
         if words.as_slice() != ["yes"] {
-            return Ok(format!("not invited: {account}"));
+            // Not a yes: nothing invited, and the line is a command of its own.
+            let then = command(space, line, asked)?;
+            return Ok(format!("not invited: {account}\n{then}")
+                .trim_end()
+                .to_owned());
         }
         let claimed = space.invite(member, &account, owner)?;
         return Ok(match claimed {

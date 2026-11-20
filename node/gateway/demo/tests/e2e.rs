@@ -607,16 +607,10 @@ async fn the_session_after_the_enrollment_signs_in_once_invited() {
         phone.has_button("Sign in with my device"),
         "it opens on Sign in"
     );
-    let at = phone.click("Enroll").await;
-    phone
-        .settle(at, &["Enrolled. Waiting for the operator's invitation"])
-        .await;
     assert!(
-        !phone.has_button("Enroll this device"),
+        !phone.has_button("Enroll") && !phone.has_button("Enroll this device"),
         "no second enrollment in the carried session"
     );
-    let at = phone.click("Sign in").await;
-    phone.settle(at, &["Sign in with your device"]).await;
     let unclaimed = loop {
         user.will(confirm(&[]));
         let at = phone.click("Sign in with my device").await;

@@ -5558,7 +5558,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s4-credential-contract"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=64ec572873addc3d1d5e23fe64a12970258aec75#64ec572873addc3d1d5e23fe64a12970258aec75"
+source = "git+https://codeberg.org/Virto/s4?rev=67f70c4972b68b228bea80ad6d00cc74da75f02e#67f70c4972b68b228bea80ad6d00cc74da75f02e"
 dependencies = [
  "hex",
  "s4-protocol",
@@ -5569,7 +5569,7 @@ dependencies = [
 [[package]]
 name = "s4-protocol"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=64ec572873addc3d1d5e23fe64a12970258aec75#64ec572873addc3d1d5e23fe64a12970258aec75"
+source = "git+https://codeberg.org/Virto/s4?rev=67f70c4972b68b228bea80ad6d00cc74da75f02e#67f70c4972b68b228bea80ad6d00cc74da75f02e"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
@@ -5581,7 +5581,7 @@ dependencies = [
 [[package]]
 name = "s4-rui"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=64ec572873addc3d1d5e23fe64a12970258aec75#64ec572873addc3d1d5e23fe64a12970258aec75"
+source = "git+https://codeberg.org/Virto/s4?rev=67f70c4972b68b228bea80ad6d00cc74da75f02e#67f70c4972b68b228bea80ad6d00cc74da75f02e"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -5599,7 +5599,7 @@ dependencies = [
 [[package]]
 name = "s4-server"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=64ec572873addc3d1d5e23fe64a12970258aec75#64ec572873addc3d1d5e23fe64a12970258aec75"
+source = "git+https://codeberg.org/Virto/s4?rev=67f70c4972b68b228bea80ad6d00cc74da75f02e#67f70c4972b68b228bea80ad6d00cc74da75f02e"
 dependencies = [
  "rand 0.10.3",
  "russh",
@@ -5612,7 +5612,7 @@ dependencies = [
 [[package]]
 name = "s4-widgets"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=64ec572873addc3d1d5e23fe64a12970258aec75#64ec572873addc3d1d5e23fe64a12970258aec75"
+source = "git+https://codeberg.org/Virto/s4?rev=67f70c4972b68b228bea80ad6d00cc74da75f02e#67f70c4972b68b228bea80ad6d00cc74da75f02e"
 dependencies = [
  "s4-protocol",
  "serde",
