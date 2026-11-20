@@ -3753,7 +3753,7 @@ device's crates faster); its size argument is small.
   and nothing to reconcile at open. The facility's enrollments, routes,
   bridges, jobs' runs (with why the last personal pass failed) and a
   restore's kit kind are rows of its own database (`facility/`, its
-  layout 2), SCALE of its own types, read strictly. `IVosPersonal.status`
+  layout 1), SCALE of its own types, read strictly. `IVosPersonal.status`
   names the phase (with a restore's maturity), Tor's state, the
   memberships owed, the notices standing, the kind of kit a kit's call
   enters and why the last pass did not finish (standing until a pass

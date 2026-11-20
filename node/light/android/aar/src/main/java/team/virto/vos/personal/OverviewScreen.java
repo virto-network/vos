@@ -28,7 +28,12 @@ final class OverviewScreen extends Screen {
   }
 
   @Override
-  void resumed() {
+  void shown() {
+    reload();
+  }
+
+  @Override
+  void started() {
     reload();
   }
 

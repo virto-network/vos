@@ -60,6 +60,10 @@ const STANDING: usize = 16;
 /// The runs' row of the facility's database ([`crate::kept`]).
 const RUNS_ROW: &[u8] = b"runs";
 
+/// The row naming why the last personal pass failed (empty when it did
+/// not), standing until a pass changes it.
+const FAILED_ROW: &[u8] = b"runs/personal-failed";
+
 /// The device's personal space, as a pass syncs it.
 pub trait Personal: Send + Sync {
     /// One pass at the device's time `now` (milliseconds), called beside
@@ -99,13 +103,11 @@ struct Raised {
     since: u64,
 }
 
-/// The runs, the latest last, the notices standing, and why the last
-/// personal pass failed (empty when it did not).
+/// The runs, the latest last, and the notices standing.
 #[derive(Debug, Default)]
 struct State {
     runs: Vec<JobRun>,
     raised: Vec<Raised>,
-    failed: String,
 }
 
 /// A run as its row keeps it.
@@ -142,7 +144,6 @@ struct Stood {
 struct Row {
     runs: Vec<Run>,
     raised: Vec<Stood>,
-    failed: String,
 }
 
 impl From<&State> for Row {
@@ -179,7 +180,6 @@ impl From<&State> for Row {
                     since: raised.since,
                 })
                 .collect(),
-            failed: state.failed.clone(),
         }
     }
 }
@@ -231,11 +231,7 @@ impl Row {
                 apart: run.apart,
             })
             .collect();
-        Ok(State {
-            runs,
-            raised,
-            failed: self.failed,
-        })
+        Ok(State { runs, raised })
     }
 }
 
@@ -271,6 +267,14 @@ impl Runs {
 
     fn write(&self, state: &State) -> Result<(), String> {
         self.kept()?.put(RUNS_ROW, &Row::from(state))
+    }
+
+    fn failed(&self) -> Result<Option<String>, String> {
+        self.kept()?.get(FAILED_ROW)
+    }
+
+    fn write_failed(&self, failures: &str) -> Result<(), String> {
+        self.kept()?.put(FAILED_ROW, &failures.to_owned())
     }
 
     /// The runs kept, the latest last.
@@ -348,7 +352,7 @@ impl Job {
     /// Why the last personal pass failed, as its run's failures say; empty
     /// when it did not.
     pub fn failed(&self) -> Result<String, Refusal> {
-        Ok(self.runs.read().map_err(job_error)?.failed)
+        Ok(self.runs.failed().map_err(job_error)?.unwrap_or_default())
     }
 
     /// The notices standing after the last pass.
@@ -432,9 +436,7 @@ impl Job {
             }
         }
         state.raised = standing(std::mem::take(&mut state.raised), found, now);
-        if part == Part::Personal {
-            state.failed = synced.failures.clone();
-        }
+
         synced.notices = state
             .raised
             .iter()
@@ -461,6 +463,11 @@ impl Job {
             };
         }
         self.runs.write(&state).map_err(job_error)?;
+        if part == Part::Personal {
+            self.runs
+                .write_failed(&synced.failures)
+                .map_err(job_error)?;
+        }
         // Kept: the group may let them go. One not acknowledged is raised
         // again, and stands as one already raised.
         if let Some(personal) = acknowledging

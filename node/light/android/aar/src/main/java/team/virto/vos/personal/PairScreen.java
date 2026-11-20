@@ -148,9 +148,9 @@ final class PairScreen extends Screen {
   }
 
   /**
-   * The memberships a pairing left, offered right after it: each enrollment of the new device (on
-   * the phone that showed the code) or confirmation of this one (on the new one), in one flow,
-   * one prompt each; left for Devices, changes and keys when the user waits.
+   * The memberships a pairing left on the phone that showed the code, offered right after it: the
+   * new device enrolled in each, in one flow, one prompt each; left for Devices, changes and keys
+   * when the user waits.
    */
   private void memberships(String paired, int count) {
     app.ask(
@@ -158,15 +158,12 @@ final class PairScreen extends Screen {
         paired
             + " Confirm it in your "
             + count
-            + " other space(s) now: "
-            + (opener
-                ? "it is enrolled there by this phone's proof."
-                : "once your other phone enrolled it there, this phone confirms it.")
-            + " Later, from Devices, changes and keys.",
+            + " other space(s) now: it is enrolled there by this phone's proof. Later, from"
+            + " Devices, changes and keys.",
         "Now",
         () ->
             app.run(
-                opener ? "Enrolling the new device…" : "Confirming this phone…",
+                "Enrolling the new device…",
                 (personal, prompts, refused) -> {
                   Membership[] owed = personal.memberships(refused);
                   if (owed == null) {
@@ -227,11 +224,13 @@ final class PairScreen extends Screen {
         (Paired paired) -> {
           app.home();
           String joined = "Paired: this phone is device " + paired.device + " of your space.";
-          if (paired.memberships > 0) {
-            memberships(joined, paired.memberships);
-          } else {
-            app.say(joined);
-          }
+          app.say(
+              joined
+                  + (paired.memberships > 0
+                      ? " Once your other phone enrolled it in your "
+                          + paired.memberships
+                          + " other space(s), confirm it there from Devices, changes and keys."
+                      : ""));
         },
         (personal, prompts, refused) -> {
           personal.pairCancel();

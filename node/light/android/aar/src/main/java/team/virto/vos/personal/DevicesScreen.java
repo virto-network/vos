@@ -28,7 +28,12 @@ final class DevicesScreen extends Screen {
   }
 
   @Override
-  void resumed() {
+  void shown() {
+    reload();
+  }
+
+  @Override
+  void started() {
     reload();
   }
 
@@ -90,7 +95,15 @@ final class DevicesScreen extends Screen {
       if (device.me) {
         // Left alone, no other device would commit it: a move or a regroup is the way.
         if (!device.removed && others() > 0) {
-          into.addView(button("Leave this personal space", v -> leave(device)));
+          if (device.standing == 0) {
+            // On probation its admin key signs nothing, its own removal neither.
+            into.addView(
+                text(
+                    "This phone can leave once its probation ends; until then another of your"
+                        + " devices retires it."));
+          } else {
+            into.addView(button("Leave this personal space", v -> leave(device)));
+          }
         }
         continue;
       }

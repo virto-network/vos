@@ -23,7 +23,7 @@ use crate::route::Purpose;
 
 impl<H: Host> Personal<H> {
     /// A fresh device's restore from the kit of `old` at the request's
-    /// home (a device out of its group leaves it first, as a fresh install): the agent the kit's index names, a new kit split for it, the
+    /// home: the agent the kit's index names, a new kit split for it, the
     /// restore signed by the kit. It matures after the kit's delay unless a
     /// device of the set answers `alive`; then [`Personal::restored`]. What
     /// the restore makes is kept before its call: called again with the

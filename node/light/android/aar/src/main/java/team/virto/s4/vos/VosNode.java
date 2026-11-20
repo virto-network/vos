@@ -82,6 +82,9 @@ public final class VosNode {
   private final Map<Long, Long> grants = new java.util.concurrent.ConcurrentHashMap<>();
   /** The personal space's screens, told each flow's stage and each pass's end; null: none. */
   private volatile IVosWatcher watcher;
+  /** The token of the UI whose restore screen holds the kit, watched for its death. */
+  private IBinder sitting;
+  private final IBinder.DeathRecipient sittingDied = VosNode::nativeKitForget;
 
   /** The process's facility, opened on first use. */
   public static synchronized VosNode get(Context context) {
@@ -581,17 +584,31 @@ public final class VosNode {
     @Override
     public void kitHold(IBinder token) {
       nativeKitHold();
-      try {
-        // The UI's process gone, the kit it entered goes with it.
-        token.linkToDeath(VosNode::nativeKitForget, 0);
-      } catch (RemoteException dead) {
-        nativeKitForget();
+      synchronized (sittingDied) {
+        unwatchSitting();
+        try {
+          // The UI's process gone, the kit it entered goes with it.
+          token.linkToDeath(sittingDied, 0);
+          sitting = token;
+        } catch (RemoteException dead) {
+          nativeKitForget();
+        }
       }
     }
 
     @Override
     public void kitForget() {
       nativeKitForget();
+      synchronized (sittingDied) {
+        unwatchSitting();
+      }
+    }
+
+    private void unwatchSitting() {
+      if (sitting != null) {
+        sitting.unlinkToDeath(sittingDied, 0);
+        sitting = null;
+      }
     }
 
     @Override

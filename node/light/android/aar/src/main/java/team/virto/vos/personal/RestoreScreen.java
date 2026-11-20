@@ -62,7 +62,7 @@ final class RestoreScreen extends Screen {
   }
 
   @Override
-  void resumed() {
+  void started() {
     // Back from the background, the sitting is opened anew: the kit is entered again.
     app.holdKit();
   }
@@ -138,7 +138,8 @@ final class RestoreScreen extends Screen {
               status.matures > 0
                   ? "It takes effect " + Words.until(status.matures, now) + ", unless one of "
                       + "your devices answers that it is alive. Come back then."
-                  : "The home has not shown the restore yet: finish it once its delay passed."));
+                  : "The home has not shown its delay yet: try finishing it; if it is too early, "
+                      + "the home says so."));
     }
     into.addView(heading("4. Finish it"));
     if (matured || status.matures == 0) {
@@ -156,7 +157,9 @@ final class RestoreScreen extends Screen {
       into.addView(text("The home your kit's card names: check its handle against the card."));
       homeField = new HomeField(into, code, text -> code = text);
     }
-    if (status.kitKnown) {
+    // The kit a restore under way was opened with is the one its finish takes; any other kit's
+    // kind is offered again, defaulted to the one this phone last knew.
+    if (status.kitKnown && restoring()) {
       into.addView(
           text(
               "Your kit: "
@@ -200,7 +203,13 @@ final class RestoreScreen extends Screen {
                 v -> {
                   Home at = home(known);
                   if (at != null) {
-                    remove(at, device);
+                    app.ask(
+                        "Remove " + device.label,
+                        "Your kit signs its removal: it matures after your kit's delay unless "
+                            + device.label
+                            + " vetoes it.",
+                        "Remove",
+                        () -> remove(at, device));
                   }
                 }));
       }
@@ -210,8 +219,8 @@ final class RestoreScreen extends Screen {
       if (notice.contested) {
         into.addView(
             buttons(
-                button("Uphold it with the kit", v -> resolve(home(known), notice.index, true)),
-                button("Drop it with the kit", v -> resolve(home(known), notice.index, false))));
+                button("Uphold it with the kit", v -> resolving(home(known), notice, true)),
+                button("Drop it with the kit", v -> resolving(home(known), notice, false))));
       }
     }
     if (!byKit) {
@@ -269,6 +278,18 @@ final class RestoreScreen extends Screen {
         null,
         true,
         refused -> refused(home, refused));
+  }
+
+  /** A contest resolved by the kit, at once, once the user confirms it. */
+  private void resolving(Home home, Notice notice, boolean upheld) {
+    app.ask(
+        upheld ? "Uphold it" : "Drop it",
+        Words.notice(notice)
+            + ": your kit signs that it is "
+            + (upheld ? "upheld" : "dropped")
+            + ", which takes effect at once.",
+        upheld ? "Uphold" : "Drop",
+        () -> resolve(home, notice.index, upheld));
   }
 
   private void resolve(Home home, long index, boolean upheld) {

@@ -45,6 +45,9 @@ abstract class Screen {
   /** A permission the screen asked for was answered. */
   void permitted(boolean granted) {}
 
+  /** The app came back to the foreground with this screen shown. */
+  void started() {}
+
   /** Gone for good: closed, or the screens under it left; not when one opens over it. */
   void closed() {}
 

@@ -24,7 +24,7 @@ use vos_abi::{Decode, Encode};
 pub const DIRECTORY: &str = "facility";
 
 /// The number of the database's layout: its rows and how they encode.
-pub const LAYOUT: u32 = 2;
+pub const LAYOUT: u32 = 1;
 
 const LAYOUT_ROW: &[u8] = b"layout";
 

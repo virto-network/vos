@@ -191,6 +191,9 @@ pub struct Sitting(Mutex<Holding>);
 #[derive(Default)]
 struct Holding {
     open: bool,
+    /// Counted at each open and close: a flow that began in one sitting
+    /// keeps nothing in the next.
+    opened: u64,
     /// Counted at each change, so a wipe timed for one kit wipes no later.
     generation: u64,
     kit: Option<Entered>,
@@ -206,6 +209,7 @@ impl Sitting {
     fn open(&self) {
         let mut holding = self.lock();
         holding.generation += 1;
+        holding.opened += 1;
         holding.open = true;
         holding.kit = None;
     }
@@ -214,6 +218,7 @@ impl Sitting {
     fn close(&self) {
         let mut holding = self.lock();
         holding.generation += 1;
+        holding.opened += 1;
         holding.open = false;
         holding.kit = None;
     }
@@ -226,11 +231,11 @@ impl Sitting {
         holding.kit = None;
     }
 
-    /// `kit` held while the sitting is open: the generation and life to
-    /// time its wipe at.
-    fn keep(&self, kit: Entered) -> Option<(u64, u64)> {
+    /// `kit`, entered in the sitting `opened`, held while that sitting is
+    /// still open: the generation and life to time its wipe at.
+    fn keep(&self, kit: Entered, opened: u64) -> Option<(u64, u64)> {
         let mut holding = self.lock();
-        if !holding.open {
+        if !holding.open || holding.opened != opened {
             return None;
         }
         holding.generation += 1;
@@ -823,7 +828,9 @@ impl From<Membership> for space::Membership {
 pub struct Space {
     personal: space::Personal<Reach>,
     sitting: Arc<Sitting>,
-    kept: Option<Kept>,
+    /// The facility's directory, whose database is opened at each use:
+    /// held open, it would outlive the facility that opened it.
+    directory: std::path::PathBuf,
 }
 
 /// The prompts a flow is lent.
@@ -844,7 +851,7 @@ impl Space {
         Ok(Space {
             personal,
             sitting: Arc::default(),
-            kept: Kept::open(directory).ok(),
+            directory: directory.to_path_buf(),
         })
     }
 
@@ -879,13 +886,14 @@ impl Space {
         prompts: Lent<'_>,
         flow: impl FnOnce(&Asked<'_>) -> Result<T, Error>,
     ) -> Result<T, Refused> {
+        let opened = self.sitting.lock().opened;
         let asked = Asked::within(prompts, &self.sitting);
         let done = flow(&asked);
         let entered = crate::lock(&asked.entered).take();
         match &done {
             Err(Error::NotAKit | Error::WrongKit | Error::NoAgentForKit) => self.sitting.wipe(),
             _ => {
-                if let Some((generation, life)) = entered.and_then(|kit| self.sitting.keep(kit)) {
+                if let Some((generation, life)) = entered.and_then(|kit| self.sitting.keep(kit, opened)) {
                     let sitting = Arc::clone(&self.sitting);
                     self.personal.host().runtime.spawn(async move {
                         tokio::time::sleep(Duration::from_millis(life)).await;
@@ -1146,16 +1154,17 @@ impl Space {
         })?;
         // The finish enters the same kit: its kind is named to the screen,
         // which the device holds nowhere else while it restores.
-        if let Some(kept) = &self.kept {
-            kept.put(RESTORE_KIT, &(old as u8))
-                .map_err(|error| Refused::from(Error::Store(error)))?;
+        // Not kept, the finish shows the kit's choice again: the restore
+        // stands at the home whatever this row is.
+        if let Ok(kept) = Kept::open(&self.directory) {
+            let _ = kept.put(RESTORE_KIT, &(old as u8));
         }
         Ok(posted.into())
     }
 
     pub fn restored(&self, prompts: Lent<'_>, kind: KitKind) -> Result<Claimed, Refused> {
         let claimed = self.with_kit(prompts, |asked| self.personal.restored(asked, kind.into()))?;
-        if let Some(kept) = &self.kept {
+        if let Ok(kept) = Kept::open(&self.directory) {
             let _ = kept.remove(RESTORE_KIT);
         }
         Ok(claimed.into())
@@ -1163,7 +1172,7 @@ impl Space {
 
     /// The kind of kit the restore under way was opened with.
     fn restore_kit(&self) -> Option<KitKind> {
-        let byte: u8 = self.kept.as_ref()?.get(RESTORE_KIT).ok()??;
+        let byte: u8 = Kept::open(&self.directory).ok()?.get(RESTORE_KIT).ok()??;
         KitKind::from_byte(byte)
     }
 
@@ -1308,6 +1317,23 @@ mod tests {
         let asked: Vec<&str> = seen[1].fields.iter().map(|f| f.label.as_str()).collect();
         assert_eq!(asked.len(), 2);
         assert_ne!(asked[0], asked[1]);
+    }
+
+    /// A kit entered in a sitting the app's going to the background closed
+    /// is not held by the sitting opened on its return.
+    #[test]
+    fn a_kit_entered_before_the_background_is_not_held_after() {
+        let sitting = Sitting::default();
+        sitting.open();
+        let opened = sitting.lock().opened;
+        sitting.close();
+        sitting.open();
+        let words = Entered::Words(Zeroizing::new("zoo".into()));
+        assert!(sitting.keep(words, opened).is_none());
+        assert!(sitting.lock().kit.is_none());
+        let now = sitting.lock().opened;
+        let words = Entered::Words(Zeroizing::new("zoo".into()));
+        assert!(sitting.keep(words, now).is_some());
     }
 
     #[test]

@@ -71,6 +71,23 @@ public final class WordsTest {
   }
 
   @Test
+  public void aFlowSaysWhereItIs() {
+    assertEquals("Writing your kit…", Words.stage(Stage.WRITING_KIT));
+    assertEquals(
+        "scan ✓ · check ✓ · handing over your keys… · approve on the other phone · done",
+        Words.pairing(Stage.HANDING_OVER, false));
+    assertEquals(
+        "scan ✓ · check ✓ · handing over your keys ✓ · approve it with your admin key… · done",
+        Words.pairing(Stage.APPROVING, true));
+    assertEquals("", Words.failed(""));
+    assertEquals(
+        "The last sync did not finish: not reached over Tor. It runs again later.",
+        Words.failed("not reached over Tor"));
+    byte[] handle = new byte[32];
+    assertTrue(Words.noAgentForKit(handle).contains("(it is 00000000…00000000)"));
+  }
+
+  @Test
   public void aHandleIsShortened() {
     byte[] handle = new byte[32];
     handle[0] = (byte) 0xab;

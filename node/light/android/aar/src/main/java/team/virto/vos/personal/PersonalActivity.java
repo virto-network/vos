@@ -71,6 +71,8 @@ public final class PersonalActivity extends Activity {
   private Runnable cancelOnDestroy;
   /** Whether the restore screen's sitting is open in {@code :vos}. */
   private boolean sitting;
+  /** Whether the activity was started before: a start after it is a return to the app. */
+  private boolean restarted;
 
   /** What {@code :vos} tells the screens: a stage of the flow under way, a pass ended. */
   private final IVosWatcher.Stub watcher =
@@ -189,12 +191,18 @@ public final class PersonalActivity extends Activity {
     super.onStart();
     VosClient.get(this).started();
     background(personal -> personal.watch(watcher));
+    if (restarted && shown != null) {
+      shown.started();
+    }
+    restarted = true;
   }
 
   @Override
   protected void onStop() {
-    // The app in the background: the kit a restore holds is wiped, entered again on return.
+    // The app in the background: the kit a restore holds is wiped, entered again on return, and
+    // `:vos` keeps no watcher of a screen not shown.
     forgetKit();
+    background(personal -> personal.watch(null));
     VosClient.get(this).stopped();
     super.onStop();
   }
