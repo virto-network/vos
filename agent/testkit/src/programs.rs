@@ -175,13 +175,24 @@ pub fn package(name: &str) -> Vec<u8> {
 /// Test actor `name`, derived from its ELF as an install derives it: its
 /// program, its kernels by method, and its schema. Derived once a process.
 pub fn derived(name: &str) -> Derived {
-    static DERIVED: Mutex<BTreeMap<String, Derived>> = Mutex::new(BTreeMap::new());
+    derived_once(actor_elf(name))
+}
+
+/// The agent's guest program `name`, derived from its ELF as an install
+/// derives it. Derived once a process.
+pub fn program_derived(name: &str) -> Derived {
+    derived_once(program_elf(name))
+}
+
+/// The ELF at `elf`, derived once a process.
+fn derived_once(elf: PathBuf) -> Derived {
+    static DERIVED: Mutex<BTreeMap<PathBuf, Derived>> = Mutex::new(BTreeMap::new());
     let mut derived = DERIVED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     derived
-        .entry(name.to_string())
-        .or_insert_with(|| vos_pvm_compiler::derive(&package(name)).expect("derives"))
+        .entry(elf)
+        .or_insert_with_key(|elf| vos_pvm_compiler::derive(&read(elf)).expect("derives"))
         .clone()
 }
 

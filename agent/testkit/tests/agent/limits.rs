@@ -288,8 +288,7 @@ fn a_device_kernels_gas_is_not_held_to_jams_kernel_cap() {
     let declared = schema.method(auth).and_then(|method| method.gas);
     assert!(declared > JAM.kernel_gas(), "{declared:?}");
     vos_jam::programs::derive(&package("device")).expect("a JAM builder derives it");
-    let elf = std::fs::read(vos_testkit::programs::program_elf("vos-credentials")).unwrap();
-    let credentials = vos_pvm_compiler::derive(&elf).expect("derives");
+    let credentials = vos_testkit::programs::program_derived("vos-credentials");
     for mut node in hosts() {
         node.add(&credentials.actor);
         let mut kit = Model::new(AGENT);
