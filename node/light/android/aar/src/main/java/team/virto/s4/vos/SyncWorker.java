@@ -21,7 +21,7 @@ import team.virto.vos.personal.Synced;
  * The background jobs, run by WorkManager in {@code :vos} with no UI process: one pass of the
  * facility's sync ({@link VosNode#sync}), or of the personal space's ({@link
  * VosNode#syncPersonal}), each posting its notices. Its line in {@code
- * logcat -s vos.job} is PG6's record of the run: its length, the bytes the app's uid read and wrote
+ * logcat -s vos.job} is the record of the run: its length, the bytes the app's uid read and wrote
  * meanwhile and those the pass's own connections did, the standby bucket, and whether the device
  * was idle and locked.
  */

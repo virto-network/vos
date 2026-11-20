@@ -98,7 +98,7 @@ impl Default for Config {
     /// new circuit beats the tail; the SSH handshake's 3–5 s at p95 given
     /// 30 s; a 1 MiB upload's slowest 26 s given 90 s. A spare is built
     /// within 4 s of being wanted, and lives 5 to 15 minutes unused
-    /// (`light-node.md` §6.2: PG5's rendezvous an hour).
+    /// (`light-node.md` §6.2: the bound on rendezvous an hour).
     fn default() -> Self {
         Self {
             connect: Duration::from_secs(45),

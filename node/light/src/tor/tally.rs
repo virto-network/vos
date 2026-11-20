@@ -1,5 +1,5 @@
 //! The connections the client opens, an hour at a time, in the foreground
-//! and in the background, for PG5's bound on rendezvous (at most 30 an
+//! and in the background, for the bound on rendezvous (at most 30 an
 //! hour in the foreground, `light-node.md` §6.7).
 //!
 //! Each onion connection is one rendezvous: its stream goes under an
