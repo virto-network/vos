@@ -38,6 +38,10 @@ pub struct Phone {
     pub cards: Mutex<Vec<Card>>,
     /// The words to enter when asked.
     pub words: Mutex<Option<String>>,
+    /// How many times the kit's words were asked.
+    pub entered: Mutex<usize>,
+    /// Every stage a flow said, by its byte, in order.
+    pub stages: Mutex<Vec<u8>>,
     /// The admin key that signed last.
     pub signed: Mutex<Option<[u8; 32]>>,
     /// Every approval asked.
@@ -80,6 +84,8 @@ impl Phone {
             phrases: Mutex::new(Vec::new()),
             cards: Mutex::new(Vec::new()),
             words: Mutex::new(None),
+            entered: Mutex::new(0),
+            stages: Mutex::new(Vec::new()),
             signed: Mutex::new(None),
             approvals: Mutex::new(Vec::new()),
             declines: Mutex::new(0),
@@ -199,6 +205,10 @@ impl Phone {
 }
 
 impl Prompts for Phone {
+    fn stage(&self, stage: crate::space::Stage) {
+        self.stages.lock().unwrap().push(stage as u8);
+    }
+
     fn show_phrase(&self, words: &str, card: &Card) -> bool {
         assert_eq!(words.split(' ').count(), 24, "a phrase's 24 words");
         self.phrases.lock().unwrap().push(words.to_owned());
@@ -212,6 +222,7 @@ impl Prompts for Phone {
     }
 
     fn enter_phrase(&self) -> Option<Zeroizing<String>> {
+        *self.entered.lock().unwrap() += 1;
         if self.declines() {
             return None;
         }

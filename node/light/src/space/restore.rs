@@ -23,7 +23,7 @@ use crate::route::Purpose;
 
 impl<H: Host> Personal<H> {
     /// A fresh device's restore from the kit of `old` at the request's
-    /// home: the agent the kit's index names, a new kit split for it, the
+    /// home (a device out of its group leaves it first, as a fresh install): the agent the kit's index names, a new kit split for it, the
     /// restore signed by the kit. It matures after the kit's delay unless a
     /// device of the set answers `alive`; then [`Personal::restored`]. What
     /// the restore makes is kept before its call: called again with the
@@ -36,13 +36,23 @@ impl<H: Host> Personal<H> {
         old: KitKind,
     ) -> Result<Posted, Error> {
         let mut held = self.held();
-        if held.group.is_some() {
+        // A device out of its group (its removal read through) restores as
+        // a fresh install, as it pairs again: what it kept is left once the
+        // kit is entered.
+        let out = held
+            .group
+            .as_ref()
+            .map(|group| group.course() == crate::group::Course::Out);
+        if out == Some(false) {
             return Err(Error::AlreadyHeld);
         }
         let kept = request.home.clone();
         self.pin(&kept);
         let home = kept.home.clone();
         let kit = entered_kit(prompts, old)?;
+        if out == Some(true) {
+            self.leave(&mut held)?;
+        }
         let signing = kit.signing();
         let mut session = Signer::new(signing.verifying_key().to_bytes());
         let mut resumed = match (&held.state.restoring, &held.state.home, held.state.agent) {

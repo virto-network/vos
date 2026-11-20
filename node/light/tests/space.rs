@@ -778,3 +778,51 @@ fn a_pass_reads_the_homes_onions_again_and_keeps_them() {
     space.pass(later).unwrap();
     assert_eq!(keys(&space), vec![5]);
 }
+
+/// A phone leaving its personal space signs its own removal with its own
+/// admin key: the removal matures after the operation's delay, another
+/// device's commit carries it, and the phone's next pass reads it through
+/// to `Out`, as a removed device's does. Out, it opens a restore with the
+/// kit as a fresh install would, what it kept left.
+#[test]
+fn a_phone_leaves_by_its_own_removal_and_reads_it_through() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let staying = device(&world, 0x91);
+    let words = staying.claim_phrase(&world, home);
+    let leaving = device(&world, 0x92);
+    let id = staying.pair(&leaving);
+    leaving.space.remove(&leaving.phone, id).unwrap();
+    // Its own pass does not veto what it signed.
+    let passed = leaving.pass();
+    assert!(
+        !passed.notices.contains(&vos_light::job::Notice::Removed),
+        "{:?}",
+        passed.notices
+    );
+    after(suite().operation_delay_ms);
+    staying.space.update(&staying.phone).unwrap();
+    assert_eq!(staying.standing(id), Some(Standing::Removed));
+    let passed = leaving.pass();
+    assert!(
+        passed.notices.contains(&vos_light::job::Notice::Removed),
+        "{:?}",
+        passed.notices
+    );
+    assert_eq!(leaving.space.status().unwrap().phase, Phase::Removed);
+
+    leaving.phone.will_enter(words);
+    let restore = Claim {
+        home: world.home_of(home),
+        kit: KitKind::Phrase,
+        label: "back".into(),
+    };
+    leaving
+        .space
+        .restore(&leaving.phone, restore, KitKind::Phrase)
+        .unwrap();
+    assert!(matches!(
+        leaving.space.status().unwrap().phase,
+        Phase::Restoring { .. }
+    ));
+}

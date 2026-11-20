@@ -435,10 +435,11 @@ impl<H: Host> Personal<H> {
     }
 
     /// A commit now, carrying every matured removal and this device's leaf
-    /// update. After a matured regroup it is the regrouper's new group, of
-    /// it alone.
-    pub fn update(&self, prompts: &dyn Prompts) -> Result<(), Error> {
+    /// update: the devices it carried out. After a matured regroup it is
+    /// the regrouper's new group, of it alone.
+    pub fn update(&self, prompts: &dyn Prompts) -> Result<Vec<u32>, Error> {
         let mut held = self.held();
+        let mut carried = Vec::new();
         // A removal that matured between the reading and the call is
         // refused as the commit's to carry: read again, commit once more.
         for again in [true, false] {
@@ -450,6 +451,7 @@ impl<H: Host> Personal<H> {
             self.drop_unsent(&mut held)?;
             let now = self.host.now();
             let group = held.group.as_mut().ok_or(Error::NoSpace)?;
+            carried = group.owed();
             let prepared = match group.regrouper() {
                 Some(regrouper) if Some(regrouper) == group.id() => group.regroup(now),
                 Some(regrouper) => return Err(Error::Regrouped { by: regrouper }),
@@ -469,7 +471,7 @@ impl<H: Host> Personal<H> {
         for _ in 0..3 {
             self.follow(&mut held)?;
         }
-        Ok(())
+        Ok(carried)
     }
 
     /// The admin call of `method` with `arguments`, signed by the admin key

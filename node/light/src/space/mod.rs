@@ -75,7 +75,7 @@ use link::{Agent, AgentLink, Signer};
 
 pub use error::Error;
 pub(crate) use error::{answered, failed, logged, store_failed, unreached};
-pub use host::{AdminKey, Approval, Card, Enrolled, Host, Prompts, Proof};
+pub use host::{AdminKey, Approval, Card, Enrolled, Host, Prompts, Proof, Stage};
 pub use kit::KitView;
 pub use pairing::PairCode;
 pub use set::{AdminOffer, Device};

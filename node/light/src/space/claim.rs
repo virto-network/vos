@@ -248,6 +248,7 @@ impl<H: Host> Personal<H> {
             }
         };
         let member = crate::member(&secret).to_bytes();
+        prompts.stage(super::Stage::Reaching);
         self.open_claim(&home, &member)?;
         let claim = match pending {
             Some(claim) => claim,
@@ -274,6 +275,7 @@ impl<H: Host> Personal<H> {
             }
         };
         let agent = claim.agent();
+        prompts.stage(super::Stage::Proving);
         let witness = self.home_witness(&home, &member)?;
         let now = self.time(To::Home(home.handle), Purpose::Fetch)?;
         let call = claim.call(&home, now + EXPIRY_MS).map_err(failed)?;
@@ -290,6 +292,7 @@ impl<H: Host> Personal<H> {
             }
         }
         let kept = held.state.home.clone().unwrap_or(kept);
+        prompts.stage(super::Stage::WritingKit);
         let entries = self.assigned(held, &kept, agent)?;
         let group = claim
             .claimed(held.light.store(), PERSONAL, &entries, self.host.now())
@@ -297,6 +300,7 @@ impl<H: Host> Personal<H> {
         let device = group.id().unwrap_or(0);
         held.group = Some(group);
         self.book(&held.light, device);
+        prompts.stage(super::Stage::Joining);
         self.follow(held)?;
         Ok(Claimed {
             agent: agent.0,

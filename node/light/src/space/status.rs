@@ -38,6 +38,9 @@ pub struct Status {
     pub device: Option<u32>,
     /// The memberships owed on this device: enrollments, confirmations.
     pub owed: u32,
+    /// The kind of the kit the device set holds, as this device verified
+    /// it: what a kit's call from this install enters.
+    pub kit: Option<vos_wire::personal::KitKind>,
 }
 
 impl<H: Host> Personal<H> {
@@ -56,6 +59,11 @@ impl<H: Host> Personal<H> {
             agent: held.state.agent,
             device: held.group.as_ref().and_then(|group| group.id()),
             owed: owed as u32,
+            kit: held
+                .group
+                .as_ref()
+                .and_then(|group| group.kit().first())
+                .map(|key| key.kind),
         })
     }
 }

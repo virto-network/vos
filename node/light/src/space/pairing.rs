@@ -204,6 +204,7 @@ impl<H: Host> Personal<H> {
             match opener.read(&items).map_err(failed)? {
                 Opened::Waiting => self.host.sleep(POLL),
                 Opened::Check { check, put } => {
+                    prompts.stage(super::Stage::Scanned);
                     self.put(held, &put.arguments())?;
                     // Nothing more, the offer included, leaves until the
                     // user confirms the new device shows this check.
@@ -217,10 +218,12 @@ impl<H: Host> Personal<H> {
                         self.put(held, &put.arguments())?;
                         return Err(Error::Declined);
                     }
+                    prompts.stage(super::Stage::Checked);
                     let put = opener.offer().map_err(failed)?;
                     self.put(held, &put.arguments())?;
                 }
                 Opened::Hello(heard) => {
+                    prompts.stage(super::Stage::HandingOver);
                     // The commit is made on what the log decided, its admin
                     // key the one the set shows.
                     self.settle(held)?;
@@ -241,6 +244,7 @@ impl<H: Host> Personal<H> {
                 }
                 Opened::Received => {
                     let made = prepared.take().ok_or_else(|| failed("no commit made"))?;
+                    prompts.stage(super::Stage::Approving);
                     // Refused, the commit is abandoned; one taken past
                     // another device's commit since the hello is pairing's
                     // to make again.
@@ -377,6 +381,7 @@ impl<H: Host> Personal<H> {
             answered(link.call::<u64>(method::PUT, arguments)).map(drop)
         };
         slot_put(&mut slot_signer, put.arguments())?;
+        prompts.stage(super::Stage::Scanned);
         let mut home = None;
         let until = code.expires;
         let (pairing, ack, offer, device) = loop {
@@ -421,6 +426,7 @@ impl<H: Host> Personal<H> {
                     if !prompts.show_pairing(&check) {
                         return Err(Error::Declined);
                     }
+                    prompts.stage(super::Stage::Checked);
                 }
                 Joined::Declined => return Err(Error::PairingDeclined),
                 Joined::Offer(offer) => {
@@ -454,6 +460,7 @@ impl<H: Host> Personal<H> {
                         })
                         .map_err(failed)?;
                     slot_put(&mut slot_signer, put.arguments())?;
+                    prompts.stage(super::Stage::HandingOver);
                     home = Some((offer, device));
                 }
                 Joined::Handover(pairing, ack) => {
@@ -493,6 +500,7 @@ impl<H: Host> Personal<H> {
         self.adopt(&mut held, next);
         held.sync = Signer::new(held.light.sync_key().verifying_key().to_bytes());
         slot_put(&mut slot_signer, ack.arguments())?;
+        prompts.stage(super::Stage::Approving);
         held.state.acked = None;
         self.keep(&held.light, &held.state)?;
         self.joined(&mut held)?;
