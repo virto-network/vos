@@ -20,6 +20,6 @@ pub mod world;
 pub use phone::{Phone, hmac};
 pub use reach::Reach;
 pub use world::{
-    Death, Kernels, Loopback, Seen, Step, World, address, onion_of, personal_package, policy,
-    program, wall,
+    Death, Delays, Kernels, Loopback, Seen, Step, World, address, onion_of, personal_package,
+    policy, program, wall,
 };

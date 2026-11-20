@@ -326,7 +326,42 @@ pub struct State {
     /// The next dials of each phone that find the onion service
     /// unpublished ([`World::unpublished`]).
     unpublished: HashMap<u8, usize>,
+    /// What Tor's delays the world's streams take ([`World::delay`]).
+    delays: Delays,
+    /// Each connection's `Time` answered this far ahead of the world's
+    /// ([`World::skew_times`]), its connection's index times this.
+    time_skew_ms: u64,
     next_agent: u32,
+}
+
+/// Tor's delays as the world's streams take them: a new connection's
+/// (the descriptor, the introduction and the rendezvous before the stream
+/// opens), and each byte's way across the circuit, so the SSH handshake's
+/// round trips and a proof's upload cost what they do over an onion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Delays {
+    /// From the dial to the stream.
+    pub connect: std::time::Duration,
+    /// Each write's way to the other end: half a round trip.
+    pub one_way: std::time::Duration,
+    /// The circuit's rate, bytes a second, each way (0: unbounded).
+    pub rate: u64,
+}
+
+impl Delays {
+    /// The desktop's onion figures (`light-node.md` §6.3, a warm client):
+    /// a connection 4 s to the stream, a round trip 0.5 s, so the SSH
+    /// handshake's six round trips take about 3 s; the rate unbounded, as a
+    /// proof's upload is measured on the phone.
+    pub const ONION: Delays = Delays {
+        connect: std::time::Duration::from_secs(4),
+        one_way: std::time::Duration::from_millis(250),
+        rate: 0,
+    };
+
+    fn none(&self) -> bool {
+        *self == Delays::default()
+    }
 }
 
 /// The release artifacts of the stock kernels a space's ingress checks
@@ -669,6 +704,18 @@ impl World {
         self.state.lock().unwrap().unpublished.insert(tag, dials);
     }
 
+    /// Every stream from now on takes `delays`.
+    pub fn delay(&self, delays: Delays) {
+        self.state.lock().unwrap().delays = delays;
+    }
+
+    /// Each connection's `Time` answered `ms` times its index ahead of the
+    /// world's time: a gateway marking each connection's answer, to find it
+    /// again in a proof's expiry.
+    pub fn skew_times(&self, ms: u64) {
+        self.state.lock().unwrap().time_skew_ms = ms;
+    }
+
     /// Whether the phone tagged `tag` died.
     pub fn died(&self, tag: u8) -> bool {
         self.state
@@ -747,13 +794,14 @@ impl World {
             .collect()
     }
 
-    /// The world's answer to a request of `kind` with `body`.
-    fn answer(&self, kind: u16, body: &[u8]) -> Vec<u8> {
+    /// The world's answer to a request of `kind` with `body`, on the
+    /// connection `index`.
+    fn answer(&self, kind: u16, body: &[u8], index: usize) -> Vec<u8> {
         let now = self.now();
         let mut state = self.state.lock().unwrap();
         match Kind::from_u16(kind) {
             Some(Kind::Time) if state.bad_time => vec![0xff],
-            Some(Kind::Time) => now.encode(),
+            Some(Kind::Time) => (now + state.time_skew_ms * index as u64).encode(),
             Some(Kind::AgentInfo) => {
                 let agent = AgentId::decode_exact(body).expect("an agent");
                 state
@@ -1022,12 +1070,69 @@ impl Dial for Gateway {
                     "Onion Service not found: failed to obtain hidden service circuit",
                 ));
             }
+            let delays = world.state.lock().unwrap().delays;
+            tokio::time::sleep(delays.connect).await;
             let (ours, theirs) = tokio::io::duplex(1 << 20);
             let theirs = Held::new(theirs);
             serve_ssh(world, &target, circuit, theirs, tag);
-            Ok(Box::new(Held::new(ours)) as Stream)
+            if delays.none() {
+                return Ok(Box::new(Held::new(ours)) as Stream);
+            }
+            Ok(Box::new(Held::new(delayed(ours, delays))) as Stream)
         })
     }
+}
+
+/// `stream` behind a circuit taking `delays`: each write reaches the other
+/// end its one-way delay later, at the circuit's rate, in order.
+fn delayed(stream: tokio::io::DuplexStream, delays: Delays) -> tokio::io::DuplexStream {
+    let (ours, relay) = tokio::io::duplex(1 << 20);
+    let (relay_read, relay_write) = tokio::io::split(relay);
+    let (stream_read, stream_write) = tokio::io::split(stream);
+    tokio::spawn(carry(relay_read, stream_write, delays));
+    tokio::spawn(carry(stream_read, relay_write, delays));
+    ours
+}
+
+/// What `from` reads, written to `to` as the circuit's delays say.
+async fn carry(
+    mut from: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    mut to: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+    delays: Delays,
+) {
+    let (send, mut receive) =
+        tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+    let reading = tokio::spawn(async move {
+        let mut chunk = vec![0u8; 16 << 10];
+        let mut free = tokio::time::Instant::now();
+        loop {
+            let read = match from.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => read,
+            };
+            let now = tokio::time::Instant::now();
+            // The circuit carries one chunk at a time at its rate.
+            let carried = match delays.rate {
+                0 => std::time::Duration::ZERO,
+                rate => std::time::Duration::from_micros(read as u64 * 1_000_000 / rate),
+            };
+            free = free.max(now) + carried;
+            if send
+                .send((free + delays.one_way, chunk[..read].to_vec()))
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    while let Some((at, bytes)) = receive.recv().await {
+        tokio::time::sleep_until(at).await;
+        if to.write_all(&bytes).await.is_err() || to.flush().await.is_err() {
+            break;
+        }
+    }
+    reading.abort();
+    let _ = to.shutdown().await;
 }
 
 /// An SSH server of the gateway's on `stream`, its connection recorded.
@@ -1169,7 +1274,7 @@ async fn serve(
             let forge = matches!(fate, Fate::Forge);
             let answer = tokio::task::spawn_blocking(move || match forge {
                 true => answering.forged(&body),
-                false => answering.answer(kind, &body),
+                false => answering.answer(kind, &body, index),
             })
             .await
             .expect("the world answered");
