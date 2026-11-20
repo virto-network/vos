@@ -67,7 +67,7 @@ const READINGS: usize = 4;
 pub const AUDIT_SAMPLE: usize = 1;
 
 /// How old, by the device's clock, the agent's batch time may be before a
-/// pass that posts nothing wakes the agent ([`due`]).
+/// pass that posts nothing wakes the agent.
 pub const STALE_MS: u64 = 30 * 60 * 1000;
 
 /// What a device posts to its agent under its sync key while following
