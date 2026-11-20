@@ -136,7 +136,7 @@ pub fn text(summary: &Summary) -> String {
         for kind in REPORTED {
             if let Some(stats) = driver.kinds.get(kind) {
                 text += &format!(
-                    "    {kind:<9} {:>9} sent {:>9} ok {:>7} errors {:?}, {:.1}/s, p50 {} us, p99 {} us, p99.9 {} us{}\n",
+                    "    {kind:<9} {:>9} sent {:>9} ok {:>7} errors {:?}, {:.1}/s, p50 {} us, p99 {} us, p99.9 {} us (fine: {} / {} / {} us){}\n",
                     stats.sent,
                     stats.ok,
                     stats.errors,
@@ -145,6 +145,9 @@ pub fn text(summary: &Summary) -> String {
                     stats.p50_us,
                     stats.p99_us,
                     stats.p999_us,
+                    stats.fine_us[0],
+                    stats.fine_us[1],
+                    stats.fine_us[2],
                     match stats.not_closed {
                         0 => String::new(),
                         open => format!("; {open} not closed in the run"),

@@ -142,7 +142,7 @@ pub fn summary(run: &Run) -> Option<String> {
             } else {
                 let _ = writeln!(
                     out,
-                    "    {:<6} {:>8} sent {:>8} ok {:>6} errors {}, p50 {} us, p99 {} us, p99.9 {} us, {:.1} MiB",
+                    "    {:<6} {:>8} sent {:>8} ok {:>6} errors {}, p50 {} us, p99 {} us, p99.9 {} us (fine: {} / {} / {} us), {:.1} MiB",
                     line["kind"].as_str().unwrap_or("?"),
                     line["sent"],
                     line["ok"],
@@ -151,6 +151,9 @@ pub fn summary(run: &Run) -> Option<String> {
                     line["p50_us"],
                     line["p99_us"],
                     line["p999_us"],
+                    line["fine"]["p50_us"],
+                    line["fine"]["p99_us"],
+                    line["fine"]["p999_us"],
                     line["bytes"].as_f64().unwrap_or(0.0) / (1 << 20) as f64
                 );
             }

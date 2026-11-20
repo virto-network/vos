@@ -136,6 +136,9 @@ pub struct KindSummary {
     pub p50_us: u64,
     pub p99_us: u64,
     pub p999_us: u64,
+    /// The same quantiles at the driver's fine buckets, within 1%.
+    #[serde(default)]
+    pub fine_us: [u64; 3],
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -507,6 +510,8 @@ fn driver_summary(
                 p50_us: line["p50_us"].as_u64().unwrap_or(0),
                 p99_us: line["p99_us"].as_u64().unwrap_or(0),
                 p999_us: line["p999_us"].as_u64().unwrap_or(0),
+                fine_us: ["p50_us", "p99_us", "p999_us"]
+                    .map(|quantile| line["fine"][quantile].as_u64().unwrap_or(0)),
             },
         );
     }
