@@ -27,8 +27,8 @@
 //! replaced (`Installed::window`), and the binding names which; ingress
 //! admits the device formats this node verifies, the current and the
 //! previous, each until its retirement ([`DEVICE_FORMATS`] or the node's
-//! configured ones, with an earlier date if the configuration or the
-//! agent's log sets one), and verifies a proof against each release's
+//! configured ones, with an earlier date if the agent's log sets one), and
+//! verifies a proof against each release's
 //! program in the proof's format. A proof of a retired release names a
 //! program no guard admits (`Binding`); one of a retired format is refused
 //! at once (`Format`). The call carries its format to apply, which refuses
