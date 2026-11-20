@@ -24,15 +24,14 @@ use ed25519_dalek::SigningKey;
 use tree::Digest;
 use vos_abi::abi::{Failure, Refusal};
 use vos_abi::credentials as tree;
-use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_abi::ids::{AgentId, InstanceId, MethodId};
 use vos_abi::records::RETIREMENT_MS;
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode, SpaceId, WindowClock};
 use vos_checker::Nodes;
-use vos_checker::calls::installed;
 use vos_checker::programs::{actor, actor_elf, method, program_elf};
 use vos_light::release::Release;
-use vos_light::{AuthWitness, Call, DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
+use vos_light::{Call, DEVICE_FORMAT, DeviceProgram, Prover, ProverConfig, Threads};
 use vos_net::Class;
 use vos_node::client::{self, Client};
 use vos_wire::credentials::{
@@ -44,7 +43,7 @@ use vos_wire::ingress::{
 };
 use vos_wire::peer::{NodeNumber, PeerMessage};
 
-use crate::harness::{Cluster, NODES};
+use crate::harness::{Cluster, NODES, assert_done, witness};
 
 /// The hub's seed: odd, so clients reach the nodes over the API's sockets.
 const SEED: u64 = 11;
@@ -83,16 +82,6 @@ fn stock(elf: &[u8], kernel: &str) -> Release {
     vos_light::release::device(elf, kernel).expect("a stock kernel's release artifact")
 }
 
-/// A path as the device library holds it.
-fn witness(path: &Path) -> AuthWitness {
-    let digest = |bytes: &Digest| vos_light::Digest::from_bytes(bytes).expect("a digest");
-    AuthWitness {
-        root: digest(&path.root),
-        slot: path.slot,
-        siblings: path.siblings.0.map(|sibling| digest(&sibling)),
-    }
-}
-
 /// The founded space's agent: the credential actor, the poll and the
 /// ledger installed, the operator's key their registrar and
 /// operator, the actor founded; the stock kernels' programs, from their
@@ -114,32 +103,18 @@ struct Founded {
 impl Founded {
     fn new() -> Self {
         let cluster = Cluster::founded(SEED, Some(WindowClock::DEFAULT));
-        let agent = cluster
-            .node(1)
-            .unwrap()
-            .create_replicated((1..=NODES).collect())
-            .unwrap();
         let elf = |path: std::path::PathBuf| std::fs::read(path).unwrap();
         let credentials_elf = elf(program_elf("vos-credentials"));
+        let (poll, payments) = (elf(actor_elf("poll")), elf(program_elf("vos-payments")));
         let installs = [
-            (CREDENTIALS, credentials_elf.clone(), "registrar"),
-            (POLL, elf(actor_elf("poll")), "operator"),
-            (PAYMENTS, elf(program_elf("vos-payments")), "operator"),
+            (CREDENTIALS, &credentials_elf[..], "registrar"),
+            (POLL, &poll[..], "operator"),
+            (PAYMENTS, &payments[..], "operator"),
         ];
-        for (instance, elf, role) in installs {
-            install(&cluster, agent, instance, &elf, role);
-        }
-        let key = SigningKey::from_bytes(&OPERATOR);
-        let principal = Principal::Client(key.verifying_key().to_bytes());
-        installed(smol::block_on(cluster.leading(agent).set_role(
-            agent,
-            principal,
-            Some(ROLE),
-        )));
         // At the leader: a follower answers a call once it has applied it,
         // and a test holds one back.
-        let leader = cluster.leader(agent).unwrap();
-        let operator = Client::new(cluster.target(leader), key).with_routes(cluster.routes());
+        let (agent, operator) =
+            cluster.found_agent(&installs, ROLE, SigningKey::from_bytes(&OPERATOR));
         let space = cluster.space.id();
         assert_ne!(space, SpaceId::NONE);
         let program =
@@ -163,6 +138,14 @@ impl Founded {
         };
         founded.write(CREDENTIALS, "found", HANDLE);
         founded
+    }
+
+    /// Install `elf` at `instance`, its schema's role `role` mapped to
+    /// [`ROLE`], at the leader.
+    fn install(&self, instance: InstanceId, elf: &[u8], role: &str) {
+        let roles = vec![(role.as_bytes().to_vec(), ROLE)];
+        self.cluster
+            .install_at_leader(self.agent, instance, elf, roles);
     }
 
     fn program(&self, instance: InstanceId) -> &[u8] {
@@ -191,16 +174,7 @@ impl Founded {
                 &arguments.encode(),
             )
             .unwrap();
-        assert!(
-            matches!(
-                answer,
-                Response::Ran {
-                    outcome: Outcome::Done(_),
-                    ..
-                }
-            ),
-            "{name}: {answer:?}"
-        );
+        assert_done(name, &answer);
     }
 
     fn read<A: Encode, R: Decode>(&self, instance: InstanceId, name: &str, arguments: A) -> R {
@@ -383,25 +357,6 @@ fn request(call: &Call, proof: vos_light::Proven) -> Credentialed {
         claim: proof.claim,
         proof: proof.proof,
     }
-}
-
-/// Install `elf` at `instance` of `agent`, its schema's role `role` mapped
-/// to [`ROLE`], at the leader.
-fn install(cluster: &Cluster, agent: AgentId, instance: InstanceId, elf: &[u8], role: &str) {
-    let roles = vec![(role.as_bytes().to_vec(), ROLE)];
-    vos_checker::spaces::wait_in_process("an install", || {
-        match smol::block_on(
-            cluster
-                .leading(agent)
-                .install(agent, instance, elf, roles.clone()),
-        ) {
-            Err(vos_node::CallError::NotLeader(_) | vos_node::CallError::TimedOut) => false,
-            answer => {
-                installed(answer);
-                true
-            }
-        }
-    });
 }
 
 #[track_caller]
@@ -1295,7 +1250,7 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
     let founded = Founded::new();
     let agent = founded.agent;
     let elf = |name: &str| std::fs::read(actor_elf(name)).unwrap();
-    install(&founded.cluster, agent, DEVICE, &elf("device"), "operator");
+    founded.install(DEVICE, &elf("device"), "operator");
     let device = actor("device");
     let login = method(&device, "login");
     let at = founded.follower();
@@ -1439,13 +1394,7 @@ fn an_actor_kernels_proof_is_checked_by_its_handler_at_apply() {
     // Upgraded: both releases' proofs admitted, one nullifier once.
     let two = vos_light::release::device(&elf("device-next"), "auth").unwrap();
     assert_ne!(one.id, two.id);
-    install(
-        &founded.cluster,
-        agent,
-        DEVICE,
-        &elf("device-next"),
-        "operator",
-    );
+    founded.install(DEVICE, &elf("device-next"), "operator");
     vos_checker::spaces::wait_in_process("the upgrade applied", || {
         window(&founded, at, DEVICE).kernels[0].programs.len() == 2
     });
@@ -1567,13 +1516,7 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     // The space upgrades its credential actor to release two: both are
     // admitted, release one for 60 days.
     let upgraded = time();
-    install(
-        &founded.cluster,
-        agent,
-        CREDENTIALS,
-        &release_two,
-        "registrar",
-    );
+    founded.install(CREDENTIALS, &release_two, "registrar");
     let applied = |first: [u8; 32]| {
         vos_checker::spaces::wait_in_process("the install applied", || {
             programs(&window(&founded, at, CREDENTIALS))[0].0 == first
@@ -1658,13 +1601,7 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
 
     // A rollback to release one keeps release two until its date; then the
     // clock alone closes the window on it.
-    install(
-        &founded.cluster,
-        agent,
-        CREDENTIALS,
-        &release_one,
-        "registrar",
-    );
+    founded.install(CREDENTIALS, &release_one, "registrar");
     applied(one.id);
     let two_only = vec![two.clone()];
     assert_eq!(sign_in(&two_only).map(|(id, _, _)| id), Ok(two.id));

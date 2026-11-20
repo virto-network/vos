@@ -122,16 +122,19 @@ fn device_steps(blob: &[u8], input: &[u8], public: &[u8]) -> usize {
 }
 
 /// The credential statements written with the SDK (`light-node.md` §4.2,
-/// the `sdk-device` test actor) run within 1.15× the hand-lean kernels'
-/// steps: auth beside the `device` actor's, the same credential statement
-/// in its own layout (an eight-byte slot, a claim with no kind byte), and
-/// owner beside `owner_lean`; a wrong claim traps each.
+/// the stock kernels of `vos-credentials`) run within 1.15× the hand-lean
+/// kernels' steps: auth beside the `device` actor's, the same credential
+/// statement in its own layout (an eight-byte slot, a claim with no kind
+/// byte), and owner beside the `sdk-device` actor's `owner_lean`; a wrong
+/// claim traps each.
 #[test]
 fn sdk_form_kernels_run_within_the_lean_kernels_steps() {
     let lean = kernel("device", "auth");
     let (input, public) = vos_testkit::model::device_auth_input();
     let lean_auth = device_steps(&lean, &input, &public);
-    let sdk = kernel("sdk-device", "auth");
+    let credentials = credentials();
+    let sdk = release(&credentials, "auth").0;
+    let owner = release(&credentials, "owner").0;
     let (input, public) =
         vos_testkit::model::device_sdk_auth_arguments(0x0123_4567, 0x1234_5678, &[0, 5, 17]);
     let sdk_auth = device_steps(&sdk, &input, &public);
@@ -141,7 +144,7 @@ fn sdk_form_kernels_run_within_the_lean_kernels_steps() {
         &owner_input,
         &owner_public,
     );
-    let sdk_owner = device_steps(&kernel("sdk-device", "owner"), &owner_input, &owner_public);
+    let sdk_owner = device_steps(&owner, &owner_input, &owner_public);
     println!("auth: {sdk_auth} steps in SDK form, {lean_auth} by hand");
     println!("owner: {sdk_owner} steps in SDK form, {lean_owner} by hand");
     assert!(
@@ -162,10 +165,10 @@ fn sdk_form_kernels_run_within_the_lean_kernels_steps() {
     }
     let mut wrong = owner_input.clone();
     wrong[32] ^= 1;
-    assert!(trace_kernel(&kernel("sdk-device", "owner"), &wrong, 50_000_000).is_err());
+    assert!(trace_kernel(&owner, &wrong, 50_000_000).is_err());
 }
 
-/// Each SDK-form kernel proves under the program its reference run gives,
+/// Each stock kernel proves under the program its reference run gives,
 /// a witness of another path shape too, and verifies against its claim's
 /// io-hash alone.
 #[test]
@@ -185,8 +188,9 @@ fn sdk_form_kernels_prove_under_their_programs() {
             vos_testkit::model::device_owner_arguments(0x0202_0202),
         ),
     ];
+    let credentials = credentials();
     for (method, (reference, _), (input, public)) in cases {
-        let blob = kernel("sdk-device", method);
+        let blob = release(&credentials, method).0;
         let program = Program::sized_for(
             FORMAT.number,
             &blob,
@@ -239,8 +243,8 @@ fn credentials() -> Vec<u8> {
 /// A device kernel's reference program returns its reference arguments:
 /// the `device` actor's, auth's reference statement in the hand-lean
 /// layout (`auth_reference`), and its program is the one those arguments
-/// size; the stock kernels' and the SDK-form test kernels' each give a
-/// program their own arguments prove under.
+/// size; the stock kernels' and `owner_lean`'s each give a program their
+/// own arguments prove under.
 #[test]
 fn a_reference_program_returns_its_kernels_reference_arguments() {
     use vos_pvm_device::{FORMAT, Program, ReferenceProgram, auth_reference};
@@ -270,8 +274,6 @@ fn a_reference_program_returns_its_kernels_reference_arguments() {
     for (elf, method) in [
         (&credentials, "auth"),
         (&credentials, "owner"),
-        (&sdk_device, "auth"),
-        (&sdk_device, "owner"),
         (&sdk_device, "owner_lean"),
     ] {
         let (kernel, reference, headroom) = release(elf, method);
@@ -288,31 +290,15 @@ fn a_reference_program_returns_its_kernels_reference_arguments() {
         program.fits(&arguments).expect("its reference fits");
         println!("{method}: log sizes {:?}", program.log_sizes());
     }
-    // The stock kernels are the SDK-form test kernels: one program each.
-    for method in ["auth", "owner"] {
-        let (stock, stock_reference, _) = release(&credentials, method);
-        let (test, test_reference, _) = release(&sdk_device, method);
-        assert_eq!(
-            ReferenceProgram(&stock_reference).arguments().unwrap(),
-            ReferenceProgram(&test_reference).arguments().unwrap(),
-            "{method}'s reference arguments"
-        );
-        let stock = Program::from_kernel(
-            FORMAT.number,
-            &stock,
-            vos_pvm_device::ReferenceProgram(&stock_reference),
-            0,
-        )
-        .unwrap();
-        let test = Program::from_kernel(
-            FORMAT.number,
-            &test,
-            vos_pvm_device::ReferenceProgram(&test_reference),
-            0,
-        )
-        .unwrap();
-        assert_eq!(stock.log_sizes(), test.log_sizes(), "{method}");
-    }
+    // `owner_lean` runs on the stock `owner` kernel's reference arguments.
+    let reference = |elf, method| {
+        let (_, reference, _) = release(elf, method);
+        ReferenceProgram(&reference).arguments().unwrap()
+    };
+    assert_eq!(
+        reference(&sdk_device, "owner_lean"),
+        reference(&credentials, "owner")
+    );
 }
 
 /// A headroom of one raises each of the program's log sizes by one: a new

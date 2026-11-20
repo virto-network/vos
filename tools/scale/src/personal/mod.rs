@@ -1,6 +1,7 @@
 //! Personal agents (`light-node.md` §3.3–§3.7) at scale: `N` agents, each
-//! with `Personal` installed and assigned by a home's stand-in (the `home`
-//! test actor, in an agent of its own granted the role `homes`) to a test
+//! with `Personal` installed and claimed by a home's stand-in (the `home`
+//! test actor, in an agent of its own granted the role `homes`, sending the
+//! claim `Homes` sends, without a member's proof) for a test
 //! device whose sync and admin keys the harness derives from the seed.
 //! Each device then wakes every period, a new session each time, and sends
 //! `alive`, `since` and `push` (`load`); one agent more is filled to its
@@ -305,7 +306,6 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Personals, Str
             )?;
             grant(operators, agent, &replicas, home)?;
             let identity = identity(readers, agent, &replicas)?;
-            home_call(caller, home, agent, "configure", policy)?;
             let kit = Kit {
                 entries: Vec::new(),
                 r2: vos_pvm::precompile::blake2b_256(&u64::from(at).to_le_bytes()),
@@ -314,8 +314,8 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Personals, Str
                 caller,
                 home,
                 agent,
-                "assign",
-                (device(request.seed, u64::from(at)), kit),
+                "claim",
+                (device(request.seed, u64::from(at)), kit, policy),
             )?;
             Ok(Member {
                 index: u64::from(at),

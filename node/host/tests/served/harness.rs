@@ -7,18 +7,25 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ed25519_dalek::SigningKey;
+use vos_abi::abi::Failure;
+use vos_abi::credentials::Digest;
 use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, Session, SessionId};
 use vos_abi::keys;
 use vos_abi::records::{SessionMark, unstored};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, WindowClock};
+use vos_checker::calls::installed;
 use vos_checker::hooks::Gate;
 use vos_checker::programs::agent;
 use vos_checker::spaces::space;
 use vos_checker::{Log, Nodes};
+use vos_light::AuthWitness;
 use vos_net::memory::Hub;
-use vos_node::client::Target;
+use vos_node::client::{Client, Target};
 use vos_node::{CallError, Config, Hooks, Node, Peers, Space};
+use vos_wire::credentials::Path;
+use vos_wire::ingress::Response;
 use vos_wire::peer::NodeNumber;
 
 pub const NODES: NodeNumber = 3;
@@ -282,6 +289,63 @@ impl Cluster {
             .collect()
     }
 
+    /// A new agent replicated on every node: each `(instance, elf, role)`
+    /// installed at its leader, the schema's role `role` mapped to `byte`,
+    /// and `operator`'s key given `byte`; with the operator's client at the
+    /// leader, which answers a call once it applied it.
+    pub fn found_agent(
+        &self,
+        installs: &[(InstanceId, &[u8], &str)],
+        byte: u8,
+        operator: SigningKey,
+    ) -> (AgentId, Client) {
+        let agent = self
+            .node(1)
+            .unwrap()
+            .create_replicated((1..=NODES).collect())
+            .unwrap();
+        for (instance, elf, role) in installs {
+            self.install_at_leader(
+                agent,
+                *instance,
+                elf,
+                vec![(role.as_bytes().to_vec(), byte)],
+            );
+        }
+        let principal = Principal::Client(operator.verifying_key().to_bytes());
+        installed(smol::block_on(self.leading(agent).set_role(
+            agent,
+            principal,
+            Some(byte),
+        )));
+        let leader = self.leader(agent).unwrap();
+        let client = Client::new(self.target(leader), operator).with_routes(self.routes());
+        (agent, client)
+    }
+
+    /// Install `elf` at `instance` of `agent` with `roles`, at its leader,
+    /// asking again while a leader moves.
+    pub fn install_at_leader(
+        &self,
+        agent: AgentId,
+        instance: InstanceId,
+        elf: &[u8],
+        roles: Vec<(Vec<u8>, u8)>,
+    ) {
+        vos_checker::spaces::wait_in_process("an install", || {
+            match smol::block_on(
+                self.leading(agent)
+                    .install(agent, instance, elf, roles.clone()),
+            ) {
+                Err(CallError::NotLeader(_) | CallError::TimedOut) => false,
+                answer => {
+                    installed(answer);
+                    true
+                }
+            }
+        });
+    }
+
     /// `agent`'s identity, from the record node `at` serves.
     pub fn identity(&self, at: NodeNumber, agent: AgentId) -> [u8; 32] {
         let record = vos_node::client::agent_info(self.target(at), agent)
@@ -400,6 +464,62 @@ pub fn query(
         method,
         Vec::new(),
     ))
+}
+
+/// A handler's answer from its outcome: its reply, or its error.
+#[track_caller]
+pub fn answer<T: Decode, E: Decode + std::fmt::Debug>(outcome: &Outcome) -> Result<T, E> {
+    match outcome {
+        Outcome::Done(bytes) => Ok(T::decode_exact(bytes).expect("the reply decodes")),
+        Outcome::Failed {
+            code: Failure::Handler,
+            detail,
+        } => Err(E::decode_exact(detail).expect("the error decodes")),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The answer to a call of `name` that ran: its reply, or the handler's
+/// error.
+#[track_caller]
+pub fn done<T: Decode, E: Decode + std::fmt::Debug>(name: &str, answer: Response) -> Result<T, E> {
+    match answer {
+        Response::Ran {
+            outcome:
+                outcome @ (Outcome::Done(_)
+                | Outcome::Failed {
+                    code: Failure::Handler,
+                    ..
+                }),
+            ..
+        } => self::answer(&outcome),
+        other => panic!("{name}: {other:?}"),
+    }
+}
+
+/// The answer to a call of `name`, run to `Done`.
+#[track_caller]
+pub fn assert_done(name: &str, answer: &Response) {
+    assert!(
+        matches!(
+            answer,
+            Response::Ran {
+                outcome: Outcome::Done(_),
+                ..
+            }
+        ),
+        "{name}: {answer:?}"
+    );
+}
+
+/// A path as the device library holds it.
+pub fn witness(path: &Path) -> AuthWitness {
+    let digest = |bytes: &Digest| vos_light::Digest::from_bytes(bytes).expect("a digest");
+    AuthWitness {
+        root: digest(&path.root),
+        slot: path.slot,
+        siblings: path.siblings.0.map(|sibling| digest(&sibling)),
+    }
 }
 
 /// A request to a down node fails at once rather than waiting out its

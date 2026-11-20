@@ -73,12 +73,22 @@ pub struct Counts {
     pub streams_refused: u64,
 }
 
+/// What [`Circuits`] counts ([`Counts`]).
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum Count {
+    Circuits,
+    CircuitsRefused,
+    Streams,
+    StreamsRefused,
+}
+
 /// The onion's circuits and the streams open on each.
 pub struct Circuits {
     per: PerCircuit,
     open: Mutex<HashMap<u32, Open>>,
     circuits: Mutex<usize>,
-    counts: [AtomicU64; 4],
+    counts: [AtomicU64; Count::StreamsRefused as usize + 1],
 }
 
 /// A circuit's open streams: the ports of its address they hold, and the
@@ -129,8 +139,8 @@ impl Circuits {
         })
     }
 
-    fn count(&self, at: usize) {
-        self.counts[at].fetch_add(1, Ordering::Relaxed);
+    fn count(&self, count: Count) {
+        self.counts[count as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// A place for a circuit, while fewer than the onion's limit hold one.
@@ -138,12 +148,12 @@ impl Circuits {
         let mut held = self.circuits.lock().expect("the circuits");
         if *held >= self.per.circuits {
             drop(held);
-            self.count(1);
+            self.count(Count::CircuitsRefused);
             return None;
         }
         *held += 1;
         drop(held);
-        self.count(0);
+        self.count(Count::Circuits);
         Some(CircuitPlace(Arc::clone(self)))
     }
 
@@ -154,7 +164,7 @@ impl Circuits {
         let streams = open.entry(circuit).or_default();
         if streams.ports.len() >= self.per.streams {
             drop(open);
-            self.count(3);
+            self.count(Count::StreamsRefused);
             return None;
         }
         // A port no live stream of the circuit holds.
@@ -165,7 +175,7 @@ impl Circuits {
         streams.next = port.wrapping_add(1);
         streams.ports.push(port);
         drop(open);
-        self.count(2);
+        self.count(Count::Streams);
         Some(StreamPlace {
             circuits: Arc::clone(self),
             circuit,
@@ -184,17 +194,17 @@ impl Circuits {
 
     /// A stream refused as it arrived, for a port the onion does not serve.
     pub fn refused(&self) {
-        self.count(3);
+        self.count(Count::StreamsRefused);
     }
 
     /// What was counted so far.
     pub fn counts(&self) -> Counts {
-        let count = |at: usize| self.counts[at].load(Ordering::Relaxed);
+        let count = |count: Count| self.counts[count as usize].load(Ordering::Relaxed);
         Counts {
-            circuits: count(0),
-            circuits_refused: count(1),
-            streams: count(2),
-            streams_refused: count(3),
+            circuits: count(Count::Circuits),
+            circuits_refused: count(Count::CircuitsRefused),
+            streams: count(Count::Streams),
+            streams_refused: count(Count::StreamsRefused),
         }
     }
 }

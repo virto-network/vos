@@ -25,9 +25,12 @@
 //!
 //! **A device that cannot follow** (stuck, or out of the group) reads the
 //! log, the overview and the device set, and leaves its scopes alone: it
-//! is removed and pairs again, or regroups, first. One the agent turns
-//! away, once added, is out ([`DeviceGroup::turned_away`]). A pass that stops on an error hands back
-//! what it had found ([`Stopped`]), its alarms with it.
+//! is removed and pairs again, or regroups, first. A removed device reads
+//! the log through its removal (the agent serves a removed sync key that
+//! far) and is out once its own reading of the evidence says so; a
+//! refusal alone (`NotAdmitted`, unsigned) turns no device away, the pass
+//! stopping on it as on any failure. A pass that stops on an error hands
+//! back what it had found ([`Stopped`]), its alarms with it.
 //!
 //! **What the chrome raises** ([`Pass::notices`]): the device set's open
 //! operations, each a local notification while it can be vetoed; a
@@ -147,8 +150,9 @@ pub trait Control: Link {
     /// `devices()`: the device set, each device's standing and last call.
     fn devices(&mut self) -> Answer<Vec<DeviceView>, Self::Error>;
 
-    /// `post` under the sync key in the link's session: the batch time it
-    /// was taken at.
+    /// `post` under the sync key in the link's session, sent once (the pass
+    /// wakes the agent and posts again while it answers `Settling`): the
+    /// batch time it was taken at.
     fn post(&mut self, post: &Post) -> Answer<u64, Self::Error>;
 }
 
@@ -293,7 +297,7 @@ impl Pass {
             });
         }
         match self.course {
-            group::Course::Out | group::Course::TurnedAway => notices.push(Notice::Removed),
+            group::Course::Out => notices.push(Notice::Removed),
             group::Course::Stuck { .. } => notices.push(Notice::Stuck),
             group::Course::Following => {}
         }
@@ -330,19 +334,7 @@ pub fn run<L: Control>(
     now: u64,
 ) -> Result<Pass, Stopped<L::Error>> {
     let mut pass = Pass::default();
-    // A device turned away follows on, unless the agent turns it away
-    // again.
-    let mut done = group
-        .turned_away(false)
-        .map_err(SyncError::Group)
-        .and_then(|_| passing(light, group, link, instances, now, &mut pass));
-    let refused = matches!(done, Err(SyncError::Refused(PersonalError::NotAdmitted)));
-    match group.turned_away(refused) {
-        // Turned away though once added: its removal settled unread.
-        Ok(true) if refused => done = Ok(()),
-        Ok(_) => {}
-        Err(error) => done = done.and(Err(SyncError::Group(error))),
-    }
+    let done = passing(light, group, link, instances, now, &mut pass);
     pass.course = group.course();
     pass.operations = group.operations();
     pass.commit = owed_commit(group);
@@ -571,6 +563,11 @@ fn follow<L: Control>(
                     continue;
                 }
             };
+            // A device out has no voice: what it read is kept, and its
+            // removal's refusals are not asked for.
+            if group.course() == group::Course::Out {
+                continue;
+            }
             // Taken before (a kill between the post and its answer), or its
             // candidate decided meanwhile: the log says which, read on. An
             // evidence the agent refuses is posted no more, and the pass
@@ -595,8 +592,12 @@ fn follow<L: Control>(
     Ok(())
 }
 
-/// The log from `from` to its head, page by page.
-fn log<L: Control>(link: &mut L, from: u64) -> Result<Vec<(u64, Entry)>, SyncError<L::Error>> {
+/// The log from `from` to its head, page by page, each page read through
+/// the onion and past the one before.
+pub(crate) fn log<L: Control>(
+    link: &mut L,
+    from: u64,
+) -> Result<Vec<(u64, Entry)>, SyncError<L::Error>> {
     let mut entries = Vec::new();
     let mut next = from;
     loop {
@@ -614,10 +615,14 @@ fn log<L: Control>(link: &mut L, from: u64) -> Result<Vec<(u64, Entry)>, SyncErr
 }
 
 /// `post`, the agent woken and the post made again while it answers
-/// `Settling`: the batch time it was taken at, or `None` when the agent
-/// holds it already or decided its candidate meanwhile.
-fn post_settled<L: Control>(link: &mut L, post: &Post) -> Result<Option<u64>, SyncError<L::Error>> {
-    for _ in 0..=WAKES {
+/// `Settling`, at most `WAKES` times: the batch time it was taken at, or
+/// `None` when the agent holds it already or decided its candidate
+/// meanwhile.
+pub(crate) fn post_settled<L: Control>(
+    link: &mut L,
+    post: &Post,
+) -> Result<Option<u64>, SyncError<L::Error>> {
+    for woken in 0..=WAKES {
         onion(link)?;
         match link.post(post).map_err(SyncError::Link)? {
             Ok(at) => return Ok(Some(at)),
@@ -627,10 +632,11 @@ fn post_settled<L: Control>(link: &mut L, post: &Post) -> Result<Option<u64>, Sy
                 | PersonalError::NoCandidate
                 | PersonalError::NotConfirming,
             ) => return Ok(None),
-            Err(PersonalError::Settling) => {
+            Err(PersonalError::Settling) if woken < WAKES => {
                 onion(link)?;
                 answer(link.wake())?;
             }
+            Err(PersonalError::Settling) => return Err(SyncError::Settling),
             Err(error) => return Err(SyncError::Refused(error)),
         }
     }

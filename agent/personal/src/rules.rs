@@ -102,11 +102,11 @@ impl Personal {
     }
 
     pub(crate) fn group(&self) -> Group {
-        self.group.get().unwrap_or_default()
+        self.group.get_or_default()
     }
 
     pub(crate) fn usage(&self) -> Usage {
-        self.usage.get().unwrap_or_default()
+        self.usage.get_or_default()
     }
 
     /// Refuse every call until a claim assigned the agent.
@@ -125,7 +125,7 @@ impl Personal {
 
     /// Append `body` to the control log at `at`: its index.
     pub(crate) fn append(&mut self, at: u64, body: Body) -> u64 {
-        let mut head: Head = self.head.get().unwrap_or_default();
+        let mut head: Head = self.head.get_or_default();
         let index = head.next;
         let linked = chain(&head.chain, index, at, &body);
         self.log.insert(
@@ -175,6 +175,22 @@ impl Personal {
             Principal::Client(key) => self.admitted.get(&key).map(|holder| (key, holder)),
             _ => None,
         }
+    }
+
+    /// How far a removed device's sync key reads the log: through the
+    /// entry that logged its removal, and on to the end of the confirming
+    /// window after its maturity; any other key is not admitted.
+    pub(crate) fn gone_reach(&self, caller: Principal) -> Result<(u64, u64), PersonalError> {
+        let Principal::Client(key) = caller else {
+            return Err(PersonalError::NotAdmitted);
+        };
+        let gone = self.gone.get(&key).ok_or(PersonalError::NotAdmitted)?;
+        let removal = self
+            .removals
+            .get(&gone.device)
+            .ok_or(PersonalError::NotAdmitted)?;
+        let window = self.policy().confirm_window_ms;
+        Ok((gone.logged, removal.at.saturating_add(window)))
     }
 
     /// The device whose sync key calls, in probation or active.
@@ -452,7 +468,7 @@ impl Personal {
                 }
                 // The previous R2 is released until the restore's device
                 // commits a group of its own.
-                let mut recovery = self.recovery.get().unwrap_or_default();
+                let mut recovery = self.recovery.get_or_default();
                 if recovery
                     .released
                     .is_some_and(|(device, _)| device == candidate.by)
@@ -504,16 +520,7 @@ impl Personal {
     ) -> Result<(), PersonalError> {
         let policy = self.policy();
         let day = now / DAY_MS;
-        let mut usage = self.usage();
-        if usage.day != day {
-            usage = Usage {
-                day,
-                envelopes: 0,
-                commits: 0,
-                kit_operations: 0,
-                ..usage
-            };
-        }
+        let mut usage = self.usage().on(day);
         let reproved = self.lease.get().is_some_and(|lease| lease.reproved);
         let quota = if reproved {
             policy.bytes_full
@@ -558,21 +565,10 @@ impl Personal {
         Ok(())
     }
 
-    /// The devices in probation or active, once a call settled what was
-    /// due.
     /// Count one of the kit's operations against its daily allowance.
     pub(crate) fn charge_kit(&mut self, now: u64) -> Result<(), PersonalError> {
         let day = now / DAY_MS;
-        let mut usage = self.usage();
-        if usage.day != day {
-            usage = Usage {
-                day,
-                envelopes: 0,
-                commits: 0,
-                kit_operations: 0,
-                ..usage
-            };
-        }
+        let mut usage = self.usage().on(day);
         if usage.kit_operations >= self.policy().kit_operations_per_day {
             return Err(PersonalError::Quota);
         }
@@ -581,6 +577,8 @@ impl Personal {
         Ok(())
     }
 
+    /// The devices in probation or active, once a call settled what was
+    /// due.
     pub(crate) fn live_devices(&self) -> usize {
         self.live.iter(None).count()
     }

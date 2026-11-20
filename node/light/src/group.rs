@@ -860,6 +860,16 @@ impl DeviceGroup {
         self.merge_archive(&taken)
     }
 
+    /// Whether the log asserted a maturity removing `device` that its
+    /// evidence has not supported: one waiting for evidence never posted,
+    /// or refused for want of it. Not a removal pending its delay.
+    pub fn removal_unsupported(&self, device: DeviceId) -> bool {
+        self.state.set.claims.iter().any(|claim| {
+            matches!(claim.support, Support::Waiting | Support::Refused)
+                && (claim.every || claim.removes.contains(&device))
+        })
+    }
+
     /// The device set's open operations, as this device verified them.
     pub fn operations(&self) -> Vec<Open> {
         let state = &self.state;
@@ -1054,25 +1064,6 @@ impl DeviceGroup {
         self.state.reseal && self.state.rekeyed.is_some()
     }
 
-    /// Whether the agent turns this device's sync key away, as `admitted`
-    /// says: once it was added and while it follows, a key the agent
-    /// admits no more is one whose removal matured and was settled before
-    /// the device read it (a removal by the kit or by another device while
-    /// it was off, or a restore), the log no longer served to it; the
-    /// operators could say as much of any device, as they could deny it
-    /// service. Nothing is dropped, and a key admitted again follows on:
-    /// whether the course changed.
-    pub fn turned_away(&mut self, away: bool) -> Result<bool, GroupError> {
-        let course = match (self.state.course, away) {
-            (Course::Following, true) if self.state.id.is_some() => Course::TurnedAway,
-            (Course::TurnedAway, false) => Course::Following,
-            _ => return Ok(false),
-        };
-        self.state.course = course;
-        self.mls.write(rows(&self.state, None))?;
-        Ok(true)
-    }
-
     /// The matured removals the next commit must carry.
     pub fn owed(&self) -> Vec<DeviceId> {
         self.state.owed()
@@ -1225,7 +1216,7 @@ impl DeviceGroup {
         match self.state.course {
             Course::Following => {}
             Course::Stuck { .. } => return Err(GroupError::Stuck),
-            Course::Out | Course::TurnedAway => return Err(GroupError::Out),
+            Course::Out => return Err(GroupError::Out),
         }
         self.idle()
     }

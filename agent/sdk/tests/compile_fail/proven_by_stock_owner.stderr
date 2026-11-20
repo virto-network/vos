@@ -1,0 +1,27 @@
+error: the stock `owner` kernel's guard is `credential = Owner`
+  --> tests/compile_fail/proven_by_stock_owner.rs:11:11
+   |
+11 |     #[msg(proven = owner)]
+   |           ^^^^^^
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `poll`
+  --> tests/compile_fail/proven_by_stock_owner.rs:22:19
+   |
+22 | fn reference() -> poll::Proof {
+   |                   ^^^^
+   |                   |
+   |                   use of unresolved module or unlinked crate `poll`
+   |                   help: a struct with a similar name exists: `Poll`
+   |
+   = help: if you wanted to use a crate named `poll`, use `cargo add poll` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `poll`
+  --> tests/compile_fail/proven_by_stock_owner.rs:23:5
+   |
+23 |     poll::Proof { root: [0; 32] }
+   |     ^^^^
+   |     |
+   |     use of unresolved module or unlinked crate `poll`
+   |     help: a struct with a similar name exists: `Poll`
+   |
+   = help: if you wanted to use a crate named `poll`, use `cargo add poll` to add it to your `Cargo.toml`

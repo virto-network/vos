@@ -508,7 +508,7 @@ operator makes ahead of time**:
   over with `homes.stock(ids)`, an operator-role call.
 - **The keeper** (`tools/`, holding an operator key) tops the pool up in
   bulk: create, install `Personal`, and grant `Principal::Agent(homes)`
-  the role under which `Personal` takes `assign` (`Grant`; `Install`
+  the role under which `Personal` takes `claim` (`Grant`; `Install`
   carries no configuration, `agent/wire/src/ingress.rs`). Creating an agent
   costs about 2 s, 0.15–0.17 s each sixteen at a time [measured,
   `core-model.md` §14.1], so a pool of a few hundred hides creation from
@@ -595,8 +595,9 @@ this is the one taken]:
   and sent `claim(device, kit, policy,
   homes)`, `Personal`'s entry for its home: the policy and the claim
   checked whole, answered by message, `assigned`, or `refused` with the
-  error and nothing written (`assign` and `configure` stay for a home's
-  stand-in, and answer only their caller). The reply is the agent's id.
+  error and nothing written: the one way an agent is assigned and its
+  policy set [decided 2026-11-20, built: no `assign` or `configure`]. The
+  reply is the agent's id.
   The same claim again (its nullifier and kit) while its answer is awaited
   is sent again, and `Personal` answers `assigned` again to a claim it
   took from the same home, so an answer lost is recovered by the device's
@@ -665,10 +666,14 @@ this is the one taken]:
   and every claim was assigned [measured, the served suite on a debug build
   with the prover's crates optimized, Core Ultra 7 155H, 2026-11-07, two
   runs].
-- **The `home` test actor stays, for tests alone** (`agent/test-actors/
-  home`): it passes a client's `assign`, `configure` and `renew` on to a
-  personal agent with no proof, for the suites of `Personal` itself, the
-  light node's and the scale harness's; a home runs `Homes`.
+- **The `home` test actor stays, for the node's suites and the scale
+  harness alone** (`agent/test-actors/home`): it sends a client's `claim`
+  and `renew` on to a personal agent as `Homes` does, without the member's
+  proof `Homes` asks first (a proof a claim, about 1.6 s each on a debug
+  build, above, for each of the scale harness's thousands of agents), and
+  takes `Personal`'s answers. `Personal`'s own suite and the light node's
+  claim as the home's agent in process (`vos_testkit::personal::Agent::
+  claim`); a home runs `Homes`.
 
 **Replicas:** three by default, the space's policy, fixed when the keeper
 makes the agent. One replica is allowed for small spaces and shown in the
@@ -792,7 +797,7 @@ sealed scopes, acknowledgements, the recovery scope, quotas, the inbox,
 pairing slots, the lease and its grace, and gated reads, over the device
 set of §3.5 (its rules as built are there): devices with their keys,
 class, attestation, nullifier, sealed label, probation, seasoning and
-status; the claiming device active at `assign`, a strong admin's add
+status; the claiming device active at its claim, a strong admin's add
 inline in its commit, and the operations with their vetoes, contests,
 resolutions and second signatures. Batch time decides lazily: each call
 first settles one operation that fell due (a removal's device leaves
@@ -820,9 +825,8 @@ owed are at most a pass old. The Devices screen's read wakes the agent
 the same way first (`space::Personal::devices`). `seen` stays each
 device's last call (below, "Seen means a call"). Delays and maturities
 themselves run on batch time alone, as below. The home's
-calls (`configure`, `assign`, `claim`, `renew`) take the role `homes`;
-`assign` answers its caller, and `claim` answers `Homes` by message
-(above, "`Homes` as built"). Bounds the rules above leave open: `alive` is logged at
+calls (`claim`, `renew`) take the role `homes`; `claim` answers
+`Homes` by message (above, "`Homes` as built"). Bounds the rules above leave open: `alive` is logged at
 most once an hour a device (the entry logged last answers between), a
 vote's signed message names its candidate's log index as well as its
 epoch (an epoch's number is free again after a void), an opener holds one
@@ -1088,7 +1092,16 @@ arm64-v8a build; the phones' timings below of 2026-11-06]:
   the window deciding as of the window's end as the agent does. The
   agent's verdict is advisory: one this device cannot count raises an
   alarm, and the next candidate stops it (re-pair). A call refused with
-  `Settling` is made again after a `wake`.
+  `Settling` is made again after a `wake`, sent at most nine times with
+  eight wakes between (`WAKES`), by one owner: a flow's call by the link
+  (`AgentLink::settled`), a pass's post by the pass (`job::post_settled`),
+  a push by sealed sync (`SealedSync::send`, the rest pushed again after
+  each of at most eight wakes); the link sends a post and each push once,
+  a push stopping at the first `Settling`. The sync key's calls and its wakes share
+  one session and one sequence count, so no wake reuses a call's
+  sequence. A flow reads the log as a pass does (`job::log`): each page
+  through the onion, a page that does not move past the one before
+  refused (`Disordered`).
 - **Regroup and restore:** a matured regroup voids the pending candidate
   and removes every device but its regrouper, one added while it was open
   too, and the next commit is the regrouper's new group of it alone
@@ -1468,7 +1481,14 @@ where the rules above leave a choice, this is the one taken]:
   settles four **steps** before it runs: an operation's maturity, or one
   row of a silencing or of a replaced kit's cancelling, each queued in
   the due index at the time it takes effect, so everything settles in
-  time order and no step grows with what an adversary queued. Every
+  time order and no step grows with what an adversary queued. The index
+  is keyed by the time, then what falls due (`Due`: an operation's
+  maturity by its index, a device's silencing, the kit's retirement, in
+  that order at one time), and the open operations by their signer
+  (`By`, a device's before the kit's entries), each an enum whose key
+  encoding sorts as it does. These keys, and the removed keys' table
+  `gone`, are the layout of `Personal`'s first version: a home founded
+  on an earlier build is founded again, and a phone clears its data. Every
   handler that settles declares 40M gas [measured, the agent suite on a
   debug build, x86-64 Core Ultra 7 155H, 2026-11-06; gas is
   deterministic]: the worst call in a full set (eight seasoned devices,
@@ -1844,16 +1864,47 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   kept; one of each scope's own pushes audited (`audit`); the device set
   read. A device stuck or
   out reads the log, the overview and the device set and leaves its
-  scopes alone. A device added once whose key the agent admits no more
-  (`NotAdmitted`) is turned away (`Course::TurnedAway`,
-  `DeviceGroup::turned_away`), which the chrome shows as removed: its
-  removal matured and was settled while it was off (the kit's, another
-  device's, a restore), and a removed device reads no log. That rests on
-  the agent's word, unsigned (B6), so nothing is dropped: the operators
-  could say it of a live device, and a later pass the agent serves again
-  follows on. `Removed` (a removal due, not yet settled, which what falls
-  due before it may still cancel) turns no device away (a removed
-  device's course on the signed log: `open.md`). A post the agent refuses as held already (`Voted`,
+  scopes alone. **A device is removed on the log it verifies, never on a
+  refusal** [decided 2026-11-20, built]: an agent's answer is signed by
+  nobody, so a gateway on the route could make up `NotAdmitted` for a
+  live device, and a device that took it as its removal would show a
+  removal that never happened. So a refusal (`NotAdmitted`, `Removed`)
+  stops a pass as any failure does, the device still in the set, and the
+  next pass tries again. A removal that matured while the device was off
+  (the kit's, another device's, a regroup, a restore) is read on the
+  log: the agent serves a removed device's sync key the log through the
+  entry that logged its removal (`Matured`) and on while the entries are
+  within the confirming window after its maturity (`Personal::log`, the
+  table `gone`), where any evidence the maturity rests on is (a cosign's
+  or a resolution's, posted after the call that matured it); the device
+  follows it as any device does, verifying each operation's and
+  confirmation's signature against the keys its own log gave it (B6), and
+  is out (`Course::Out`) once that evidence supports its removal, which
+  the chrome shows as removed. Its other reads and calls stay refused,
+  and past the window it reads nothing more: the same window bounds what
+  any device accepts as a maturity's evidence. The choice over a signed
+  refusal: the agent holds no key the operators do not (its state is
+  replicated on their nodes, and an actor has no secret of its own), so
+  an agent's signature would only be the operators' word, while the
+  log's evidence is the user's devices' and kit's signatures, which no
+  operator or gateway can make. The cost: a removed device's key reads,
+  for good, the log through its removal (for a restore or a regroup, the
+  operation that removed it: the restored device's keys, its "home"
+  nullifier and label, the new kit's public keys), and up to a confirming
+  window past it (an add's keys, nullifier and label, the votes, the
+  candidates, `alive`), which before it read none of: a stolen phone
+  removed and then replaced learns the new phone's nullifier. A device
+  whose removal's maturity the log asserted but whose evidence never
+  supported it (a cosign's evidence never posted) stays in the set by its
+  rules, and pairs again from a code of its own space
+  (`DeviceGroup::removal_unsupported`); a removal pending its delay lets
+  no device in the set pair again. The Devices screen's own row says
+  removed only once the device is out (`space::Personal::devices`). What
+  a gateway can still do is withhold, which any route can, and replay: an
+  operation's evidence binds its call, not its place in the log, so a
+  route forking the log a device reads from its cursor can log again a
+  removal of it that was once signed and vetoed or cancelled, and mature
+  it unvetoed (`open.md`, "The control log's head in an admin call"). A post the agent refuses as held already (`Voted`,
   `Evidenced`) or as decided meanwhile (`NoCandidate`, `NotConfirming`) is
   done, the log read on; a page withheld is read again once. A pass that
   stops on an error hands back what it found (`Stopped`), its alarms with
@@ -1956,7 +2007,13 @@ skip expired items, each write deletes a few; no timer).
    written and read, both devices show a six-digit check derived from the
    whole handshake's hash, and A's user confirms that B shows the same
    before A sends anything more (its offer is the channel's first message);
-   declined, A closes the slot. Someone who photographed the QR and answered
+   declined, A sends its decline over the channel instead (its first
+   message there, as the offer would be), which B authenticates as A's, and
+   leaves the slot open until it expires, so B can read it (A's next
+   offer closes it). A refusal of B's slot reads (`NotAdmitted`, as a
+   closed slot's are, and which nobody signs) does not end B's pairing: B
+   reads the slot again until its expiry [decided 2026-11-20, built].
+   Someone who photographed the QR and answered
    first holds a handshake of its own, which A's last message ends: B
    cannot read that message and shows no check. No side has a check before
    that message, which A writes after the one it answers, so no answer is
@@ -2241,8 +2298,8 @@ each a short Rust function in the actor whose state it concerns:
 - any actor's own, under the same rules.
 
 ```rust
-// vos-credentials, beside the tree it proves membership of [built]: the
-// `sdk-device` test actor's (below), each sized on its reference run.
+// vos-credentials, beside the tree it proves membership of [built], each
+// sized on its reference run.
 #[attestable(device, reference = reference::auth)]
 pub fn auth(path: &Path, secret: &Secret, #[public] claim: &AuthClaim) {
     let member = Tag::Member.hash(secret);
@@ -2266,7 +2323,7 @@ walked in one lane (`agent/test-actors/device/src/lib.rs`); the same
 statement written plainly took 18,733 steps [measured, `proving.md` §8],
 about ×11, which the cell model puts at about 3 s on the phone [model].
 The tricks are in the SDK [built], so the code above is what a developer
-writes (the `sdk-device` test actor's `auth` and `owner`):
+writes (the stock `auth` and `owner` above):
 - **in-place arguments by the macro:** a device kernel's arguments by
   reference, `&T` with `T: vos_sdk::p2::InPlace` (`Digest`, `[T; N]`,
   `Path`, integers, and `#[derive(InPlace)]` `#[repr(C)]` structs of them
@@ -2324,7 +2381,7 @@ writes (the `sdk-device` test actor's `auth` and `owner`):
   form's auth at the hand-lean one's sizes but one chip a size smaller
   (2^12 rows where it had 2^13), owner two chips a size smaller; proofs
   about 0.88 MB and 0.85 MB as before. The stock kernels in the credential
-  actor are these, one program each with the `sdk-device` actor's.
+  actor are these.
 - **The transpiler and `unaligned-scalar-mem`** [measured, 2026-11-02, on
   a side branch]: LLVM emits plain misaligned `ld`/`sd`/`lw`/`sw`
   where it emitted byte loops, and the transpiler takes them: the test actors,
@@ -2349,13 +2406,12 @@ picked the circuit; a proven call carries the kernel's claim:
   in their SCALE encoding. The format is a device format the node admits:
   47 alone by release (§4.4).
 - **The guard names the kernel:** `#[msg(proven = spend)]`, naming a
-  device kernel of this actor, or `#[msg(proven = owner)]`, the
-  credential actor's. `#[msg(credential = Auth("login"))]` and
-  `#[msg(credential = Owner)]` stay as the SDK's sugar for the stock
-  kernels, so purses-style code reads as it did. The stock auth kernel is
-  named through `credential = Auth("name")` alone, since its scope needs
-  the guard's name: `proven = auth` is refused, naming that form, unless
-  the actor has its own kernel `auth`, whose name comes first [built].
+  device kernel of this actor. `#[msg(credential = Auth("login"))]` and
+  `#[msg(credential = Owner)]` name the stock kernels, so purses-style
+  code reads as it did: the stock auth kernel's scope needs the guard's
+  name, and one spelling serves both. `proven = auth` and `proven = owner`
+  are refused, naming that form, unless the actor has its own kernel of
+  that name, whose name comes first [built].
 - **Ingress's generic checks,** in order: the frame, the decode, the
   agent, the space, the format, the sizes, the expiry, the method and its
   guard; then **the binding**: the claim's last field is `C(T(binding),
@@ -2506,8 +2562,8 @@ format, the chips, the sizes and the root.
     format is refused `Format` at ingress before anything is decoded, and
     the proven input carries its format, so apply refuses it on every
     replica too (`Refusal::Format`): a node whose configuration admits
-    more (`Config::device_formats`, a test's) or retires earlier
-    (`Config::retired_formats`) only changes what its own ingress takes,
+    more or fewer, or retires earlier (`Config::device_formats`, a test's)
+    only changes what its own ingress takes,
     never what the space runs [decided].
   - **The proof names its program:** ingress computes the binding under
     each program the window admits, and the request's binding must be one
@@ -3659,9 +3715,10 @@ device's crates faster); its size argument is small.
   asked first for all it could refuse (its open claim, an agent to give,
   no agent under the device's nullifier); a pairing
   leaves first when the device holds another personal space, or this
-  one's while the set no longer holds it live (the agent admits its key
-  no more), and is refused while the set holds it live. The light node's
-  store is laid out anew (`LAYOUT` 8): a phone of an earlier build clears
+  one's once it is out of it on the log it verifies (its removal read
+  through, the log followed first) or was never added, and is refused
+  while it is in the set, whatever a refusal says. The light node's
+  store is laid out anew (`LAYOUT` 10): a phone of an earlier build clears
   the facility's data and claims or pairs again.
 - **One engine, the flows in `vos-light`** [built, `vos_light::space`]:
   every flow is `vos_light::space::Personal`'s, over a `Host` (requests,
@@ -3892,7 +3949,11 @@ replayed one is a duplicate; a replayed commit breaks the epoch rule.
 **B6. The operators forge device-set operations.** *Mitigation:* every
 device verifies every operation's and confirmation's signature itself,
 from the evidence stored beside it; an operation without evidence moves no
-device.
+device. Nor does a refusal: a removed device is out on its removal's
+evidence, which the agent serves its key (§3.6, the pass), and a refusal
+the route makes up stops a pass, never removes a device (`NotAdmitted`).
+*Known limit:* evidence binds a call, not its place in the log, so a
+signed removal once vetoed can be logged again on a forked log (§3.6).
 
 **B7. The operators advance the agent's clock,** maturing a hostile
 removal or a restore early. *Known limit:* delays trust the operators'

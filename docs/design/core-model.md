@@ -671,7 +671,7 @@ Why handlers run to completion:
 - **The guards** live in the method's schema (`MethodSchema::credential`):
   `#[msg(credential = Auth("login"))]` admits `Anonymous` origins of that
   scope name, proven by the stock auth kernel; `#[msg(credential =
-  Owner)]` or `#[msg(proven = owner)]` admits `Owner` origins, proven by
+  Owner)]` admits `Owner` origins, proven by
   the stock owner kernel (the handler compares the digest with the live
   row it debits); `#[msg(proven = k)]` names one of the actor's own device
   kernels and admits `Kernel` origins, the handler taking the claim first;

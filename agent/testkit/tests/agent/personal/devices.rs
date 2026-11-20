@@ -1097,3 +1097,98 @@ fn the_released_r2_is_deleted_at_the_restored_devices_first_commit() {
         "the kit reads what follows the re-seal"
     );
 }
+
+/// The rows of an open removal, by their keys: the due index's under its
+/// maturity, its tag (an operation's, before a silencing's or a kit's
+/// retirement at one time) and its index; the signer's under its tag and
+/// its device, then the index; its kind's under the kind's byte and its
+/// target.
+#[test]
+fn an_open_removal_is_keyed_by_its_maturity_its_signer_and_its_kind() {
+    use vos_abi::keys::{self, Transform};
+    use vos_testkit::programs::table_tag;
+
+    let mut home = seasoned(3);
+    let removal = home.operate(admin(0), "remove", 2u32).unwrap();
+    let matures = home.operation(sync(0), removal).matures;
+    let row = |table: &str, transform: Transform, key: &[u8]| {
+        let mut row = keys::table_rows(PERSONAL, table_tag(table), transform);
+        transform.append(key, &mut row);
+        home.node().get(&row)
+    };
+    let due = [&matures.to_be_bytes()[..], &[0], &removal.to_be_bytes()].concat();
+    assert_eq!(row("due", Transform::Ordered, &due), Some(Vec::new()));
+    let signed = [&[0, 0, 0, 0, 0][..], &removal.to_be_bytes()].concat();
+    assert_eq!(row("signed", Transform::Ordered, &signed), Some(vec![0]));
+    let kind = [&[0][..], &2u32.to_be_bytes()].concat();
+    assert_eq!(
+        row("kinds", Transform::Hashed, &kind),
+        Some(removal.encode())
+    );
+}
+
+/// The whole log `reader` reads, page by page.
+fn log_read(home: &Home, reader: Principal) -> Result<Vec<(u64, Entry)>, PersonalError> {
+    let mut log: Vec<(u64, Entry)> = Vec::new();
+    loop {
+        let from = log.last().map_or(0, |(index, _)| index + 1);
+        let page: Vec<(u64, Entry)> = home.query(reader, "log", from)?;
+        if page.is_empty() {
+            return Ok(log);
+        }
+        log.extend(page);
+    }
+}
+
+/// A removed device's sync key reads the log through its removal's entry
+/// and on within the confirming window after its maturity, where the
+/// evidence its removal rests on is, so the device leaves on the log it
+/// verifies; past the window nothing, and nothing else at all. A key never
+/// admitted reads nothing.
+#[test]
+fn a_removed_device_reads_the_log_its_removal_rests_on() {
+    let mut home = seasoned(3);
+    home.operate(admin(0), "remove", 2u32).unwrap();
+    home.pass(3 * MINUTE);
+    home.call::<Recorded>(sync(0), "alive", ()).unwrap();
+    assert_eq!(standing(&home, sync(0), 2), Standing::Removed);
+    let removed = log_read(&home, sync(2)).unwrap();
+    assert!(
+        removed
+            .iter()
+            .any(|(_, entry)| entry.body == Body::Matured { device: 2 }),
+        "its removal's entry"
+    );
+    assert_eq!(removed, log_read(&home, sync(0)).unwrap());
+    // Within the window, the set's entries after its removal too.
+    let within = home.operate(admin(0), "remove", 1u32).unwrap();
+    let removed = log_read(&home, sync(2)).unwrap();
+    assert!(removed.iter().any(|(index, _)| *index == within));
+    assert_eq!(
+        home.query::<Overview>(sync(2), "overview", ()),
+        Err(PersonalError::NotAdmitted)
+    );
+    assert_eq!(
+        home.query::<Vec<(u64, Entry)>>(admin(2), "log", 0u64),
+        Err(PersonalError::NotAdmitted),
+        "its admin key reads nothing"
+    );
+
+    home.pass(4 * MINUTE);
+    let later = home.operate(KIT, "remove", 0u32).unwrap();
+    assert_eq!(
+        log_read(&home, sync(2)).unwrap(),
+        removed,
+        "nothing past the window"
+    );
+    assert!(
+        log_read(&home, sync(0))
+            .unwrap()
+            .iter()
+            .any(|(index, _)| *index == later)
+    );
+    assert_eq!(
+        home.query::<Vec<(u64, Entry)>>(Principal::Client([0x77; 32]), "log", 0u64),
+        Err(PersonalError::NotAdmitted)
+    );
+}

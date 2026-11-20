@@ -74,7 +74,7 @@ use files::create_private;
 use link::{Agent, AgentLink, Signer};
 
 pub use error::Error;
-pub(crate) use error::{answered, failed, store_failed, unreached};
+pub(crate) use error::{answered, failed, logged, store_failed, unreached};
 pub use host::{AdminKey, Approval, Card, Enrolled, Host, Prompts, Proof};
 pub use kit::KitView;
 pub use pairing::PairCode;
@@ -931,7 +931,10 @@ impl<H: Host> Personal<H> {
             return Err(Error::NoSpace);
         };
         let key = held.light.sync_key().clone();
-        let mut sync = held.sync;
+        // Taken out while the link holds it: a nested link starts a session
+        // of its own rather than a sequence this one uses.
+        let mut sync =
+            std::mem::replace(&mut held.sync, Signer::new(key.verifying_key().to_bytes()));
         let mut link = link(&self.host, &kept, purpose, agent, &key, &mut sync);
         let done = f(&mut link, held);
         held.sync = sync;

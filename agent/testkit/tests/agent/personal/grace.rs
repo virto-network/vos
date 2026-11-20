@@ -85,7 +85,7 @@ fn the_lease_counts_re_proofs_not_uptime() {
     let retried = home.push(0, bytes).unwrap();
     assert_eq!(retried.position, first.position);
     let until = home.overview().lease_until;
-    assert_eq!(until, T0 + 395 * DAY + 1, "from the assignment's batch");
+    assert_eq!(until, T0 + 395 * DAY, "from the claim's batch");
     home.pass(until - home.now());
     assert!(!home.overview().lapsed);
     home.push(0, envelope(scope(1), 0, 2, 500)).unwrap();

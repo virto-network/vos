@@ -39,6 +39,14 @@ pub type Sign<'a> = &'a dyn Fn(&[u8]) -> Result<[u8; 64], String>;
 /// leaves: a commit's, so its evidence is posted again after a crash.
 pub type Hold<'a> = &'a mut dyn FnMut(&[u8], &[u8; 64]) -> Result<(), String>;
 
+/// The key a call is signed by: the sync key, in the link's own session,
+/// which every wake shares; or a key the link does not hold, in its
+/// caller's session.
+pub enum Key<'k> {
+    Sync,
+    Lent(&'k mut Signer, Sign<'k>),
+}
+
 /// A key's session at the agent, and its next call's sequence.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Signer {
@@ -136,21 +144,25 @@ impl<'a, H: Host> AgentLink<'a, H> {
         Ok(node)
     }
 
-    /// The call of `name` with `arguments` at the agent, signed by `sign` in
-    /// `signer`'s session, its message and signature given to `hold` before
+    /// The call of `method` with `arguments` at the agent, signed by `key`
+    /// in its session, its message and signature given to `hold` before
     /// the call is sent (a call `hold` refuses is not): its outcome, and
     /// what was signed. A call whose answer was lost keeps its sequence, so
     /// it is sent again as it was.
     fn signed(
         &mut self,
-        signer: &mut Signer,
-        sign: Sign<'_>,
+        key: &mut Key<'_>,
         method: MethodId,
         arguments: Vec<u8>,
         hold: Hold<'_>,
     ) -> Result<Called, String> {
         let now = self.now()?;
-        let stale = signer.agent != self.agent.agent
+        let agent = self.agent;
+        let signer = match key {
+            Key::Sync => &mut *self.signer,
+            Key::Lent(signer, _) => &mut **signer,
+        };
+        let stale = signer.agent != agent.agent
             || signer
                 .session
                 .is_none_or(|session| session.t0 + SESSION_EXPIRY_MS / 2 < now);
@@ -162,25 +174,30 @@ impl<'a, H: Host> AgentLink<'a, H> {
                 name: session_name,
                 t0: now,
             });
-            signer.agent = self.agent.agent;
+            signer.agent = agent.agent;
             signer.next = 1;
         }
-        let session = signer.session.expect("a session");
         let mut call = ingress::Call {
-            session,
+            session: signer.session.expect("a session"),
             sequence: signer.next,
-            instance: self.agent.instance,
+            instance: agent.instance,
             method,
             arguments,
             signature: [0; 64],
         };
-        let message = call.message(&self.agent.identity);
-        call.signature = sign(&message)?;
+        let message = call.message(&agent.identity);
+        call.signature = match key {
+            Key::Sync => self.sync.sign(&message).to_bytes(),
+            Key::Lent(_, sign) => sign(&message)?,
+        };
         hold(&message, &call.signature)?;
-        let request = wire::request(Kind::Call as u16, (AgentId(self.agent.agent), call.clone()));
+        let request = wire::request(Kind::Call as u16, (AgentId(agent.agent), call.clone()));
         match Response::decode_exact(&self.send(&request)?) {
             Some(Response::Ran { outcome, .. }) => {
-                signer.next += 1;
+                match key {
+                    Key::Sync => self.signer.next += 1,
+                    Key::Lent(signer, _) => signer.next += 1,
+                }
                 Ok(Called {
                     outcome,
                     message,
@@ -195,45 +212,24 @@ impl<'a, H: Host> AgentLink<'a, H> {
     /// The sync key's call of `name`, sent again after a `wake` while the
     /// agent answers `Settling`.
     pub fn call<T: Decode>(&mut self, method: MethodId, arguments: Vec<u8>) -> Answer<T, String> {
-        answer(&self.sync_call(method, arguments, true)?.outcome)
+        let called = self.settled(&mut Key::Sync, method, arguments, &mut |_, _| Ok(()))?;
+        answer(&called.outcome)
     }
 
-    /// The sync key's call of `name` in the link's session, its outcome as
-    /// it came; sent again after a `wake` while the agent answers
-    /// `Settling` if `settle`.
-    fn sync_call(
-        &mut self,
-        method: MethodId,
-        arguments: Vec<u8>,
-        settle: bool,
-    ) -> Result<Called, String> {
-        let key = self.sync.clone();
-        let sign = move |message: &[u8]| Ok(key.sign(message).to_bytes());
-        let mut signer = *self.signer;
-        let hold = &mut |_: &[u8], _: &[u8; 64]| Ok(());
-        let called = if settle {
-            self.settled(&mut signer, &sign, method, arguments, hold)
-        } else {
-            self.signed(&mut signer, &sign, method, arguments, hold)
-        };
-        *self.signer = signer;
-        called
-    }
-
-    /// `name` signed by `sign` in `signer`'s session, sent again after a
-    /// `wake` (the sync key's) while the agent answers `Settling`, each
-    /// call's message held before it is sent (as `AgentLink::signed` holds): a
-    /// call signed again after `Settling` is held again.
+    /// `method` signed by `key` in its session, sent again after a `wake`
+    /// (the sync key's) while the agent answers `Settling`, at most
+    /// `WAKES` times, each call's message held before it is sent (as
+    /// `AgentLink::signed` holds): a call signed again after `Settling` is
+    /// held again.
     pub fn settled(
         &mut self,
-        signer: &mut Signer,
-        sign: Sign<'_>,
+        key: &mut Key<'_>,
         method: MethodId,
         arguments: Vec<u8>,
         hold: Hold<'_>,
     ) -> Result<Called, String> {
-        for _ in 0..WAKES {
-            let called = self.signed(signer, sign, method, arguments.clone(), &mut *hold)?;
+        for woken in 0..=WAKES {
+            let called = self.signed(key, method, arguments.clone(), &mut *hold)?;
             let settling = matches!(
                 answer::<()>(&called.outcome),
                 Ok(Err(PersonalError::Settling))
@@ -241,7 +237,9 @@ impl<'a, H: Host> AgentLink<'a, H> {
             if !settling {
                 return Ok(called);
             }
-            self.wake().map_err(|error| error.to_string())?.ok();
+            if woken < WAKES {
+                self.wake().map_err(|error| error.to_string())?.ok();
+            }
         }
         Err("the agent is still settling".into())
     }
@@ -281,23 +279,6 @@ impl<'a, H: Host> AgentLink<'a, H> {
         let outcome = wire::outcome(&self.send(&request)?).map_err(|error| error.to_string())?;
         answer(&outcome)
     }
-
-    /// The control log from `from` to its head.
-    pub fn log_all(&mut self, from: u64) -> Answer<Vec<(u64, Entry)>, String> {
-        let mut entries = Vec::new();
-        let mut next = from;
-        loop {
-            let page: Vec<(u64, Entry)> = match self.query(method::LOG, next)? {
-                Ok(page) => page,
-                Err(error) => return Ok(Err(error)),
-            };
-            let Some((last, _)) = page.last() else {
-                return Ok(Ok(entries));
-            };
-            next = last + 1;
-            entries.extend(page);
-        }
-    }
 }
 
 impl<H: Host> Link for AgentLink<'_, H> {
@@ -311,10 +292,24 @@ impl<H: Host> Link for AgentLink<'_, H> {
         &mut self,
         envelopes: &[Vec<u8>],
     ) -> Result<Vec<Result<Pushed, PersonalError>>, String> {
-        envelopes
-            .iter()
-            .map(|envelope| self.call::<Pushed>(method::PUSH, envelope.encode()))
-            .collect()
+        // Each sent once, up to the first `Settling`: sealed sync wakes the
+        // agent and pushes the rest again.
+        let mut answers = Vec::with_capacity(envelopes.len());
+        for envelope in envelopes {
+            let called = self.signed(
+                &mut Key::Sync,
+                method::PUSH,
+                envelope.encode(),
+                &mut |_, _| Ok(()),
+            )?;
+            let pushed = answer::<Pushed>(&called.outcome)?;
+            let settling = pushed == Err(PersonalError::Settling);
+            answers.push(pushed);
+            if settling {
+                break;
+            }
+        }
+        Ok(answers)
     }
 
     fn since(&mut self, scope: Scope, position: u64) -> Answer<Vec<Envelope>, String> {
@@ -322,7 +317,8 @@ impl<H: Host> Link for AgentLink<'_, H> {
     }
 
     fn wake(&mut self) -> Answer<Woken, String> {
-        answer(&self.sync_call(method::WAKE, Vec::new(), false)?.outcome)
+        let called = self.signed(&mut Key::Sync, method::WAKE, Vec::new(), &mut |_, _| Ok(()))?;
+        answer(&called.outcome)
     }
 
     fn frontier(&mut self, device: u32) -> Answer<Frontier, String> {
@@ -343,13 +339,160 @@ impl<H: Host> Control for AgentLink<'_, H> {
         self.query(method::DEVICES, ())
     }
 
+    /// Sent once: [`crate::job`] wakes the agent and posts again while it
+    /// answers `Settling`.
     fn post(&mut self, post: &Post) -> Answer<u64, String> {
-        let called = self.sync_call(post.method(), post.arguments(), true)?;
+        let called = self.signed(
+            &mut Key::Sync,
+            post.method(),
+            post.arguments(),
+            &mut |_, _| Ok(()),
+        )?;
         Ok(match &called.outcome {
             Outcome::Done(reply) => {
                 Ok(post.at(reply).ok_or("the agent's reply does not decode")?)
             }
             outcome => Err(answer::<()>(outcome)?.expect_err("a refusal")),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use vos_abi::abi::Failure;
+    use vos_abi::ids::{InstanceId, Session};
+    use vos_wire::credentials::Onion;
+
+    use super::*;
+    use crate::space::{Enrolled, Error, Proof};
+
+    /// A home whose agent answers `Settling` to a call's first `settling`
+    /// sendings and runs everything else, each call's session and
+    /// sequence recorded.
+    struct Recording {
+        settling: usize,
+        calls: Mutex<Vec<(Session, u64, MethodId)>>,
+    }
+
+    impl Recording {
+        fn new(settling: usize) -> Self {
+            Self {
+                settling,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn sent(&self, method: MethodId) -> usize {
+            let calls = self.calls.lock().unwrap();
+            let mut sent: Vec<_> = calls
+                .iter()
+                .map(|(session, sequence, _)| (session.name, *sequence))
+                .collect();
+            sent.sort();
+            sent.dedup();
+            assert_eq!(sent.len(), calls.len(), "a sequence sent twice: {calls:?}");
+            calls.iter().filter(|(_, _, sent)| *sent == method).count()
+        }
+    }
+
+    impl Host for Recording {
+        fn request(&self, _: &[u8; 32], _: Purpose, request: &[u8]) -> Result<Vec<u8>, String> {
+            let (kind, body) = request.split_at(2);
+            if u16::from_le_bytes([kind[0], kind[1]]) == Kind::Time as u16 {
+                return Ok(0u64.encode());
+            }
+            let (_, call) = <(AgentId, ingress::Call)>::decode_exact(body).ok_or("a call")?;
+            let mut calls = self.calls.lock().unwrap();
+            let before = calls
+                .iter()
+                .filter(|(_, _, sent)| *sent == call.method)
+                .count();
+            calls.push((call.session, call.sequence, call.method));
+            let outcome = if call.method == method::WAKE {
+                Outcome::Done(
+                    Woken {
+                        at: 0,
+                        settled: true,
+                    }
+                    .encode(),
+                )
+            } else if before < self.settling {
+                Outcome::Failed {
+                    code: Failure::Handler,
+                    detail: PersonalError::Settling.encode(),
+                }
+            } else if call.method == method::ALIVE {
+                Outcome::Done(vos_wire::personal::Recorded { at: 0, index: 0 }.encode())
+            } else {
+                Outcome::Done(0u64.encode())
+            };
+            Ok(Response::Ran { outcome, at: 0 }.encode())
+        }
+
+        fn pin(&self, _: &[u8; 32], _: &[Onion]) {}
+
+        fn route(&self, _: &[u8; 32], _: Purpose) -> Route {
+            Route::Onion
+        }
+
+        fn prove(&self, _: Proof) -> Result<Vec<u8>, Error> {
+            Err(Error::Failed("no prover".into()))
+        }
+
+        fn enrollments(&self) -> Result<Vec<Enrolled>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn link<'a>(
+        host: &'a Recording,
+        sync: &'a SigningKey,
+        signer: &'a mut Signer,
+    ) -> AgentLink<'a, Recording> {
+        let agent = Agent {
+            agent: 1,
+            identity: [1; 32],
+            instance: InstanceId(1),
+        };
+        AgentLink::new(host, [0; 32], Purpose::Personal, agent, sync, signer)
+    }
+
+    #[test]
+    fn a_call_woken_through_settling_and_a_wake_never_reuse_a_sequence() {
+        let host = Recording::new(1);
+        let sync = SigningKey::from_bytes(&[7; 32]);
+        let mut signer = Signer::new(sync.verifying_key().to_bytes());
+        let mut link = link(&host, &sync, &mut signer);
+        link.wake().unwrap().unwrap();
+        let put: u64 = link.call(method::PUT, Vec::new()).unwrap().unwrap();
+        assert_eq!(put, 0);
+        link.wake().unwrap().unwrap();
+        assert_eq!(signer.next, 6);
+        assert_eq!(host.sent(method::PUT), 2);
+    }
+
+    /// A call is sent at most `WAKES + 1` times, a wake between each two;
+    /// a post once by the link, its retries the pass's, as many.
+    #[test]
+    fn a_settling_agent_is_woken_a_bounded_number_of_times() {
+        let host = Recording::new(usize::MAX);
+        let sync = SigningKey::from_bytes(&[7; 32]);
+        let mut signer = Signer::new(sync.verifying_key().to_bytes());
+        let mut link = link(&host, &sync, &mut signer);
+        let put = link.call::<u64>(method::PUT, Vec::new());
+        assert_eq!(put, Err("the agent is still settling".into()));
+        assert_eq!(
+            Control::post(&mut link, &Post::Alive),
+            Ok(Err(PersonalError::Settling))
+        );
+        assert!(matches!(
+            crate::job::post_settled(&mut link, &Post::Alive),
+            Err(crate::personal::SyncError::Settling)
+        ));
+        assert_eq!(host.sent(method::PUT), WAKES + 1);
+        assert_eq!(host.sent(method::ALIVE), 1 + WAKES + 1);
+        assert_eq!(host.sent(method::WAKE), 2 * WAKES);
     }
 }

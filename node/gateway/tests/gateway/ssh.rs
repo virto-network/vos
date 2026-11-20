@@ -7,8 +7,6 @@
 //! held to the port's caps, answered `Busy` past them, while a member's
 //! calls are served.
 
-#![cfg(feature = "ssh")]
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,19 +15,19 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use russh::keys::{PublicKeyOrCertificate, ssh_key};
 use russh::{ChannelMsg, client};
-use vos_abi::ids::InstanceId;
+use vos_abi::ids::{AgentId, InstanceId, MethodId};
 use vos_abi::{Decode, Encode};
 use vos_api::{FRAME_ERROR, FrameError, Framing, Kind, frame};
 use vos_checker::programs::Programs;
 use vos_gateway::Gateway;
 use vos_gateway::limits::{Limits, PerAddress};
+use vos_gateway::ssh::Port;
 use vos_gateway::upstream::{Address, Upstream};
+use vos_node::Node;
 use vos_node::client::{Client, Operator, Target, signed_query};
-use vos_node::{Config, Node};
 use vos_wire::ingress::{Consistency, Rejection, Response};
 
-const OPERATOR: [u8; 32] = [31; 32];
-const COUNTER: InstanceId = InstanceId(1);
+use super::{COUNTER, GATEWAY, OPERATOR, config};
 
 struct AcceptAll;
 
@@ -56,14 +54,7 @@ fn served() -> Served {
     let programs = Programs::load();
     let dir = tempfile::tempdir().unwrap();
     let clock = Arc::new(AtomicU64::new(vos_node::wall_clock()));
-    let mut config = Config::new(programs.agent.clone());
-    config.executors = 2;
-    config.clock = {
-        let clock = Arc::clone(&clock);
-        Arc::new(move || clock.load(Ordering::SeqCst))
-    };
-    config.operators = vec![SigningKey::from_bytes(&OPERATOR).verifying_key().to_bytes()];
-    let node = Node::open(dir.path(), config).unwrap();
+    let node = Node::open(dir.path(), config(&programs, &clock)).unwrap();
     let socket = dir.path().join("api.sock");
     node.serve_socket(&socket, 0o600).unwrap();
     Served {
@@ -72,6 +63,60 @@ fn served() -> Served {
         clock,
         _dir: dir,
     }
+}
+
+impl Served {
+    /// A new agent with the counter installed, by the operator: its id,
+    /// its identity and the counter's `value`.
+    async fn counter(&self) -> (AgentId, [u8; 32], MethodId) {
+        let target = Target::socket(self.socket.clone());
+        let operator =
+            Operator::signing(&target, SigningKey::from_bytes(&OPERATOR), self.node.id());
+        tokio::task::spawn_blocking(move || {
+            let programs = Programs::load();
+            let Ok(Response::Created(agent)) = operator.create_agent(Vec::new()) else {
+                panic!("an agent")
+            };
+            vos_checker::calls::installed(
+                operator
+                    .install(
+                        agent,
+                        &vos_checker::calls::install_of(COUNTER, &programs.counter_elf),
+                    )
+                    .unwrap(),
+            );
+            let client = Client::new(&target, SigningKey::from_bytes(&[9; 32]));
+            let identity = client.identity(agent).unwrap();
+            let value = client
+                .schema(agent, COUNTER)
+                .unwrap()
+                .unwrap()
+                .method_id("value")
+                .unwrap();
+            (agent, identity, value)
+        })
+        .await
+        .unwrap()
+    }
+}
+
+/// An SSH port relaying to node `node` at `socket`, counted and capped as
+/// `port`, under the host key of `seed`'s bytes, and its address.
+async fn ssh_port(node: [u8; 32], socket: PathBuf, port: Port, seed: u8) -> std::net::SocketAddr {
+    let gateway = Arc::new(Gateway::new(vec![Upstream::new(
+        node,
+        Address::Socket(socket),
+        GATEWAY,
+    )]));
+    let host_key =
+        ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[seed; 32]));
+    let server = vos_gateway::ssh::server(host_key, gateway, port, &vos_gateway::ssh::Placeholder);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = server.serve_on(listener).await;
+    });
+    address
 }
 
 /// An SSH port relaying to the node at `socket`, and its address.
@@ -93,25 +138,8 @@ async fn port_limited(
     mark: vos_api::Mark,
     per: PerAddress,
 ) -> std::net::SocketAddr {
-    let gateway = Arc::new(Gateway::new(vec![Upstream::new(
-        key,
-        Address::Socket(socket),
-        [41; 32],
-    )]));
-    let host_key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]));
-    let port = vos_gateway::ssh::Port::new(
-        mark,
-        Limits::new(per),
-        vos_gateway::caps::Caps::none(),
-        vos_gateway::caps::bodies(),
-    );
-    let server = vos_gateway::ssh::server(host_key, gateway, port, &vos_gateway::ssh::Placeholder);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = server.serve_on(listener).await;
-    });
-    address
+    let port = Port::new(mark, Limits::new(per), vos_gateway::caps::Caps::none());
+    ssh_port(key, socket, port, 3).await
 }
 
 /// The subsystem's channel, under an ephemeral key.
@@ -276,33 +304,7 @@ async fn sixteen_requests_in_flight_a_channel_of_a_circuit() {
 
 async fn sixteen_in_flight(mark: vos_api::Mark, per: PerAddress) {
     let served = served();
-    let target = Target::socket(served.socket.clone());
-    let operator = Operator::signing(&target, SigningKey::from_bytes(&OPERATOR), served.node.id());
-    let (agent, identity, value) = tokio::task::spawn_blocking(move || {
-        let programs = Programs::load();
-        let Ok(Response::Created(agent)) = operator.create_agent(Vec::new()) else {
-            panic!("an agent")
-        };
-        vos_checker::calls::installed(
-            operator
-                .install(
-                    agent,
-                    &vos_checker::calls::install_of(COUNTER, &programs.counter_elf),
-                )
-                .unwrap(),
-        );
-        let client = Client::new(&target, SigningKey::from_bytes(&[9; 32]));
-        let identity = client.identity(agent).unwrap();
-        let value = client
-            .schema(agent, COUNTER)
-            .unwrap()
-            .unwrap()
-            .method_id("value")
-            .unwrap();
-        (agent, identity, value)
-    })
-    .await
-    .unwrap();
+    let (agent, identity, value) = served.counter().await;
     let address = port_limited(served.node.id().0, served.socket.clone(), mark, per).await;
     let mut channel = channel(address).await;
     let mut answers = Answers { buffer: Vec::new() };
@@ -494,33 +496,7 @@ async fn verifying(node: [u8; 32], socket: PathBuf, hold: Duration) -> Verifying
 async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
     use vos_gateway::caps::{Caps, PerPort};
     let served = served();
-    let target = Target::socket(served.socket.clone());
-    let operator = Operator::signing(&target, SigningKey::from_bytes(&OPERATOR), served.node.id());
-    let (agent, identity, value) = tokio::task::spawn_blocking(move || {
-        let programs = Programs::load();
-        let Ok(Response::Created(agent)) = operator.create_agent(Vec::new()) else {
-            panic!("an agent")
-        };
-        vos_checker::calls::installed(
-            operator
-                .install(
-                    agent,
-                    &vos_checker::calls::install_of(COUNTER, &programs.counter_elf),
-                )
-                .unwrap(),
-        );
-        let client = Client::new(&target, SigningKey::from_bytes(&[9; 32]));
-        let identity = client.identity(agent).unwrap();
-        let value = client
-            .schema(agent, COUNTER)
-            .unwrap()
-            .unwrap()
-            .method_id("value")
-            .unwrap();
-        (agent, identity, value)
-    })
-    .await
-    .unwrap();
+    let (agent, identity, value) = served.counter().await;
     let standing = verifying(
         served.node.id().0,
         served.socket.clone(),
@@ -536,24 +512,12 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
         agent_rate: 1_000,
         agent_burst: 1_000,
     });
-    let gateway = Arc::new(Gateway::new(vec![Upstream::new(
-        served.node.id().0,
-        Address::Socket(standing.socket.clone()),
-        [41; 32],
-    )]));
-    let host_key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]));
-    let port = vos_gateway::ssh::Port::new(
+    let port = Port::new(
         vos_api::Mark::Onion,
         Limits::new(PerAddress::default()),
         Arc::clone(&caps),
-        vos_gateway::caps::bodies(),
     );
-    let server = vos_gateway::ssh::server(host_key, gateway, port, &vos_gateway::ssh::Placeholder);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = server.serve_on(listener).await;
-    });
+    let address = ssh_port(served.node.id().0, standing.socket.clone(), port, 3).await;
     // Junk in shape: a credentialed call whose proof is 900 KB of noise.
     let junk = |at: u64| {
         let call = vos_wire::ingress::Credentialed {
@@ -612,29 +576,12 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
         agent_rate: 1_000,
         agent_burst: 1_000,
     });
-    let roomy_address = {
-        let gateway = Arc::new(Gateway::new(vec![Upstream::new(
-            served.node.id().0,
-            Address::Socket(slow.socket.clone()),
-            [41; 32],
-        )]));
-        let host_key =
-            ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[4; 32]));
-        let port = vos_gateway::ssh::Port::new(
-            vos_api::Mark::Onion,
-            Limits::new(PerAddress::default()),
-            Arc::clone(&roomy),
-            vos_gateway::caps::bodies(),
-        );
-        let server =
-            vos_gateway::ssh::server(host_key, gateway, port, &vos_gateway::ssh::Placeholder);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = server.serve_on(listener).await;
-        });
-        address
-    };
+    let port = Port::new(
+        vos_api::Mark::Onion,
+        Limits::new(PerAddress::default()),
+        Arc::clone(&roomy),
+    );
+    let roomy_address = ssh_port(served.node.id().0, slow.socket.clone(), port, 4).await;
     let mut greedy = channel(roomy_address).await;
     for at in 1..=3 {
         greedy.data(&junk(900 + at)[..]).await.unwrap_or(());
@@ -753,25 +700,13 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_port_takes_the_ssh_connections_its_file_names() {
     let served = served();
-    let gateway = Arc::new(Gateway::new(vec![Upstream::new(
-        served.node.id().0,
-        Address::Socket(served.socket.clone()),
-        [41; 32],
-    )]));
-    let host_key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[6; 32]));
-    let port = vos_gateway::ssh::Port::new(
+    let port = Port::new(
         vos_api::Mark::Onion,
         Limits::new(PerAddress::default()),
         vos_gateway::caps::Caps::none(),
-        vos_gateway::caps::bodies(),
     )
     .with_connections(Some(1));
-    let server = vos_gateway::ssh::server(host_key, gateway, port, &vos_gateway::ssh::Placeholder);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = server.serve_on(listener).await;
-    });
+    let address = ssh_port(served.node.id().0, served.socket.clone(), port, 6).await;
     let first = channel(address).await;
     let second = tokio::time::timeout(
         Duration::from_secs(2),
@@ -803,32 +738,7 @@ async fn trickled_bodies_hold_no_members_proven_call_back() {
 async fn starved(trickle: bool) {
     use vos_gateway::caps::{Caps, PerPort};
     let served = served();
-    let target = Target::socket(served.socket.clone());
-    let operator = Operator::signing(&target, SigningKey::from_bytes(&OPERATOR), served.node.id());
-    let (agent, value) = tokio::task::spawn_blocking(move || {
-        let programs = Programs::load();
-        let Ok(Response::Created(agent)) = operator.create_agent(Vec::new()) else {
-            panic!("an agent")
-        };
-        vos_checker::calls::installed(
-            operator
-                .install(
-                    agent,
-                    &vos_checker::calls::install_of(COUNTER, &programs.counter_elf),
-                )
-                .unwrap(),
-        );
-        let client = Client::new(&target, SigningKey::from_bytes(&[9; 32]));
-        let value = client
-            .schema(agent, COUNTER)
-            .unwrap()
-            .unwrap()
-            .method_id("value")
-            .unwrap();
-        (agent, value)
-    })
-    .await
-    .unwrap();
+    let (agent, _, value) = served.counter().await;
     let standing = verifying(
         served.node.id().0,
         served.socket.clone(),
@@ -843,13 +753,7 @@ async fn starved(trickle: bool) {
         agent_rate: 1_000,
         agent_burst: 1_000,
     });
-    let gateway = Arc::new(Gateway::new(vec![Upstream::new(
-        served.node.id().0,
-        Address::Socket(standing.socket.clone()),
-        [41; 32],
-    )]));
-    let host_key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[5; 32]));
-    let port = vos_gateway::ssh::Port::new(
+    let port = Port::new(
         vos_api::Mark::Onion,
         Limits::new(PerAddress {
             connections: 8,
@@ -858,14 +762,8 @@ async fn starved(trickle: bool) {
             burst: 1_000,
         }),
         Arc::clone(&caps),
-        vos_gateway::caps::bodies(),
     );
-    let server = vos_gateway::ssh::server(host_key, gateway, port, &vos_gateway::ssh::Placeholder);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = server.serve_on(listener).await;
-    });
+    let address = ssh_port(served.node.id().0, standing.socket.clone(), port, 5).await;
     let junk = |at: u64| {
         let call = vos_wire::ingress::Credentialed {
             instance: COUNTER,
@@ -976,14 +874,7 @@ circuit_streams = {streams}
         socket = socket.display(),
     );
     let config: vos_gateway::config::Config = toml::from_str(&text).unwrap();
-    let gateway = Arc::new(Gateway::new(
-        config
-            .upstreams()
-            .unwrap()
-            .into_iter()
-            .map(|(key, address)| Upstream::new(key, address, [41; 32]))
-            .collect(),
-    ));
+    let gateway = config.gateway(GATEWAY).unwrap();
     let front = vos_gateway::served::front(
         &config,
         config.onion.as_ref().unwrap(),

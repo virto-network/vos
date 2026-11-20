@@ -192,6 +192,16 @@ impl Config {
         }
     }
 
+    /// The gateway in front of the nodes, its key's seed `secret`.
+    pub fn gateway(&self, secret: [u8; 32]) -> Result<std::sync::Arc<crate::Gateway>, String> {
+        let upstreams = self
+            .upstreams()?
+            .into_iter()
+            .map(|(key, address)| crate::upstream::Upstream::new(key, address, secret))
+            .collect();
+        Ok(std::sync::Arc::new(crate::Gateway::new(upstreams)))
+    }
+
     /// The nodes, each its key and address.
     pub fn upstreams(&self) -> Result<Vec<([u8; 32], Address)>, String> {
         self.nodes

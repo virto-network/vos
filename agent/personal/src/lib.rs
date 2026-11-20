@@ -8,7 +8,8 @@
 //!   request only through the onion. A key admitted no more keeps its
 //!   sessions until they expire, so every handler checks its caller
 //!   against the device set as well, and every query answers only keys it
-//!   admits.
+//!   admits, bar `log`: a removed device's sync key reads it through its
+//!   removal, so the device leaves on the log it verifies.
 //! - **Admin calls** (commits and device-set operations) are client calls
 //!   signed by a device's admin key, verified at ingress; the agent checks
 //!   the origin, `Principal::Client(key)`, against the device set and
@@ -55,7 +56,10 @@ use vos_wire::personal::{
     Voted, Woken, commit_id, envelope_id, r2_hash, welcome_hash,
 };
 
-use rows::{Candidate, Charge, Group, Head, Lease, Recovery, Share, Slot, Stored, Usage};
+use rows::{
+    By, Candidate, Charge, Due, Gone, Group, Head, Kind, Lease, Recovery, Share, Slot, Stored,
+    Usage,
+};
 
 /// The layout's version, which `version` answers: the keeper upgrades
 /// agents a batch at a time and reads it back.
@@ -85,20 +89,23 @@ pub struct Personal {
     live: Table<DeviceId, (), Ordered>,
     /// Each device's matured removal, then carried.
     removals: Table<DeviceId, Removal>,
+    /// Each removed device's sync key: the log it reads.
+    gone: Table<[u8; 32], Gone>,
     /// The device-set operations, by their log index.
     operations: Table<u64, Operation>,
     /// The operations pending or contested.
     open: Table<u64, (), Ordered>,
-    /// The pending operations by their maturity.
-    due: Table<(u64, u64), (), Ordered>,
+    /// What falls due, by its time: the pending operations by their
+    /// maturity, and the chores of a removal and of a kit replaced.
+    due: Table<(u64, Due), (), Ordered>,
     /// The open operations removing each device.
     against: Table<(DeviceId, u64), (), Ordered>,
     /// The open operation of each kind of which one is open at a time, by
     /// the kind and its target.
-    kinds: Table<(u8, DeviceId), u64>,
+    kinds: Table<(Kind, DeviceId), u64>,
     /// The open operations by their signer: whether each counts against
     /// its signer's open operations, as all but a removal do.
-    signed: Table<(u64, u64), bool, Ordered>,
+    signed: Table<(By, u64), bool, Ordered>,
     /// The devices' vetoes of each operation, and by each device.
     vetoes: Table<(u64, DeviceId), (), Ordered>,
     vetoed: Table<(DeviceId, u64), (), Ordered>,
@@ -163,46 +170,15 @@ pub struct Personal {
 impl Personal {
     // ===== The home's =====
 
-    /// Set the space's policy for this agent: delays, windows and quotas.
-    /// Once a claim assigned the agent, a configuration lowers no delay or
-    /// window of the device set's rules ([`Policy::over`]): those are the
-    /// claim's.
-    #[msg(role = "homes")]
-    pub async fn configure(
-        &mut self,
-        ctx: &mut Command<Self>,
-        policy: Policy,
-    ) -> Result<Recorded, PersonalError> {
-        let now = ctx.now();
-        let policy = if self.assigned().is_ok() {
-            policy.over(&self.policy())
-        } else {
-            policy
-        };
-        self.policy.set(&policy);
-        let index = self.append(now, Body::Configured(policy));
-        Ok(Recorded { at: now, index })
-    }
-
-    /// Assign the agent to a claim: its device, the first, active at once,
-    /// and its recovery kit. The lease runs from now.
-    #[msg(role = "homes")]
-    pub async fn assign(
-        &mut self,
-        ctx: &mut Command<Self>,
-        device: NewDevice,
-        kit: Kit,
-    ) -> Result<Recorded, PersonalError> {
-        self.take(ctx.now(), device, kit)
-    }
-
-    /// [`Personal::configure`] then [`Personal::assign`] for the home's
-    /// `Homes` at `homes` in the calling agent, answered by message (a send
-    /// is one-way): `assigned`, or `refused` with the error, writing
-    /// nothing. The same claim again, from the same home, is answered
-    /// `assigned` again. From then on the agent tells `Homes` each device's
-    /// nullifier as its add is confirmed and as its removal matures, and
-    /// each new kit's keys.
+    /// The home's `Homes` at `homes` in the calling agent assigns the agent
+    /// to a claim: its device, the first, active at once, its recovery kit
+    /// and the space's policy (delays, windows and quotas, set here alone,
+    /// so no later word lowers them); the lease runs from now. Answered by
+    /// message (a send is one-way): `assigned`, or `refused` with the
+    /// error, writing nothing. The same claim again, from the same home,
+    /// is answered `assigned` again. From then on the agent tells `Homes`
+    /// each device's nullifier as its add is confirmed and as its removal
+    /// matures, and each new kit's keys.
     #[msg(role = "homes")]
     pub async fn claim(
         &mut self,
@@ -275,14 +251,7 @@ impl Personal {
         ctx: &mut Command<Self>,
         target: DeviceId,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Remove::ID,
-            arguments: personal::Remove { target }.encode(),
-        };
+        let (now, call, by) = self.admin(ctx, &personal::Remove { target })?;
         self.open_operation(now, call, by, Op::Remove(target))
     }
 
@@ -294,17 +263,12 @@ impl Personal {
         ctx: &mut Command<Self>,
         device: NewDevice,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Add::ID,
-            arguments: personal::Add {
+        let (now, call, by) = self.admin(
+            ctx,
+            &personal::Add {
                 device: device.clone(),
-            }
-            .encode(),
-        };
+            },
+        )?;
         self.open_operation(now, call, by, Op::Add(device))
     }
 
@@ -318,18 +282,13 @@ impl Personal {
         device: DeviceId,
         admin: NewAdmin,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Replace::ID,
-            arguments: personal::Replace {
+        let (now, call, by) = self.admin(
+            ctx,
+            &personal::Replace {
                 device,
                 admin: admin.clone(),
-            }
-            .encode(),
-        };
+            },
+        )?;
         self.open_operation(now, call, by, Op::Replace { device, admin })
     }
 
@@ -341,14 +300,7 @@ impl Personal {
         ctx: &mut Command<Self>,
         kit: NewKit,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Rotate::ID,
-            arguments: personal::Rotate { kit: kit.clone() }.encode(),
-        };
+        let (now, call, by) = self.admin(ctx, &personal::Rotate { kit: kit.clone() })?;
         self.open_operation(now, call, by, Op::Rotate(kit))
     }
 
@@ -360,17 +312,12 @@ impl Personal {
         ctx: &mut Command<Self>,
         remove: Vec<DeviceId>,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Regroup::ID,
-            arguments: personal::Regroup {
+        let (now, call, by) = self.admin(
+            ctx,
+            &personal::Regroup {
                 remove: remove.clone(),
-            }
-            .encode(),
-        };
+            },
+        )?;
         self.open_operation(now, call, by, Op::Regroup(remove))
     }
 
@@ -385,18 +332,13 @@ impl Personal {
         device: NewDevice,
         kit: NewKit,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Restore::ID,
-            arguments: personal::Restore {
+        let (now, call, by) = self.admin(
+            ctx,
+            &personal::Restore {
                 device: device.clone(),
                 kit: kit.clone(),
-            }
-            .encode(),
-        };
+            },
+        )?;
         self.open_operation(now, call, by, Op::Restore { device, kit })
     }
 
@@ -430,14 +372,7 @@ impl Personal {
         ctx: &mut Command<Self>,
         op: u64,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Cosign::ID,
-            arguments: personal::Cosign { op }.encode(),
-        };
+        let (now, call, by) = self.admin(ctx, &personal::Cosign { op })?;
         self.cosign_operation(now, call, by, op)
     }
 
@@ -450,14 +385,7 @@ impl Personal {
         op: u64,
         upheld: bool,
     ) -> Result<Recorded, PersonalError> {
-        let now = self.settle(ctx.now())?;
-        self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
-        let call = AdminCall {
-            origin,
-            method: personal::Resolve::ID,
-            arguments: personal::Resolve { op, upheld }.encode(),
-        };
+        let (now, call, by) = self.admin(ctx, &personal::Resolve { op, upheld })?;
         self.resolve_operation(now, call, by, op, upheld)
     }
 
@@ -979,7 +907,7 @@ impl Personal {
         let now = ctx.now();
         self.reader(ctx.caller(), now)?.device_or_kit()?;
         let group = self.group();
-        let head = self.head.get().unwrap_or_default();
+        let head = self.head.get_or_default();
         Ok(Overview {
             at: now,
             confirmed: group.confirmed,
@@ -1047,7 +975,7 @@ impl Personal {
     pub async fn recovery(&self, ctx: &Query<Self>) -> Result<RecoveryView, PersonalError> {
         let reader = self.reader(ctx.caller(), ctx.now())?;
         reader.device_or_kit()?;
-        let recovery = self.recovery.get().unwrap_or_default();
+        let recovery = self.recovery.get_or_default();
         let released = recovery
             .released
             .filter(|(device, _)| reader == rules::Reader::Device(*device))
@@ -1064,17 +992,32 @@ impl Personal {
         })
     }
 
-    /// The control log from `from`, as much as one answer holds.
+    /// The control log from `from`, as much as one answer holds. A removed
+    /// device's sync key reads it through its removal's entry and on while
+    /// the entries are within the confirming window after the maturity,
+    /// where the evidence its removal rests on is (a cosign's or a
+    /// resolution's, posted after the call that matured it): so the device
+    /// leaves on the log it verifies, not on a refusal.
     #[msg]
     pub async fn log(
         &self,
         ctx: &Query<Self>,
         from: u64,
     ) -> Result<Vec<(u64, Entry)>, PersonalError> {
-        self.reader(ctx.caller(), ctx.now())?.device_or_kit()?;
-        let next = self.head.get().unwrap_or_default().next;
+        let next = self.head.get_or_default().next;
         let rows = (from..next).filter_map(|index| Some((index, self.log.get(&index)?)));
-        Ok(rules::bounded(rows, |row| row.encode().len()))
+        match self.reader(ctx.caller(), ctx.now()) {
+            Ok(reader) => {
+                reader.device_or_kit()?;
+                Ok(rules::bounded(rows, |row| row.encode().len()))
+            }
+            Err(PersonalError::NotAdmitted) => {
+                let (logged, until) = self.gone_reach(ctx.caller())?;
+                let rows = rows.take_while(|(index, entry)| *index <= logged || entry.at <= until);
+                Ok(rules::bounded(rows, |row| row.encode().len()))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// `scope`'s envelopes after `position`, in order, as much as one answer
@@ -1090,7 +1033,7 @@ impl Personal {
         let position = match self.reader(ctx.caller(), ctx.now())? {
             rules::Reader::Device(_) => position,
             rules::Reader::Kit if scope == RECOVERY => {
-                position.max(self.recovery.get().unwrap_or_default().from)
+                position.max(self.recovery.get_or_default().from)
             }
             _ => return Err(PersonalError::NotAdmitted),
         };

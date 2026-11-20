@@ -364,7 +364,8 @@ fn a_restore_starts_a_new_group_under_its_new_kit() {
         signed(std::slice::from_ref(&events));
         assert!(events.contains(&Event::Removed), "{events:?}");
         assert_eq!(
-            home.log(phone.sync_key(), 0).map(|_| ()),
+            home.query::<Overview>(phone.sync_key(), "overview", Vec::new())
+                .map(|_| ()),
             Err(PersonalError::NotAdmitted)
         );
     }
@@ -618,10 +619,9 @@ fn a_device_that_cannot_follow_regroups() {
 /// own commit carries it, and every device confirms the new phone.
 #[test]
 fn a_delayed_admins_add_waits_its_delay() {
-    let homes = crate::homes();
-    let mut home = Home::new(&homes, policy());
+    let mut home = Home::new(policy());
     let mut first = Phone::new(1);
-    first.claim(&mut home, &homes);
+    first.claim(&mut home);
     let mut delayed = Phone::delayed(2);
     first.pair(&mut home, &mut delayed);
     settle(&mut home, &mut [&mut first, &mut delayed]);

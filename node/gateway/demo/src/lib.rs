@@ -35,7 +35,7 @@ pub const CREDENTIALS: InstanceId = InstanceId(9);
 pub const PAYMENTS: InstanceId = InstanceId(2);
 pub const POLL: InstanceId = InstanceId(3);
 /// The operator's role byte, the registrar's too: one key holds both.
-const ROLE: u8 = 1;
+pub(crate) const ROLE: u8 = 1;
 /// How long an invitation stands.
 pub const INVITATION_MS: u64 = 600_000;
 
@@ -60,6 +60,38 @@ fn ran(name: &str, answer: Result<Response, client::ClientError>) -> Result<Vec<
             ..
         }) => Ok(reply),
         other => Err(format!("{name}: {other:?}")),
+    }
+}
+
+/// A new agent at `signed`'s node holding each `(instance, ELF path,
+/// role)`, its schema's role mapped to [`ROLE`], which the operator's
+/// `key` is granted; `what` names the agent in an error.
+pub(crate) fn agent_with(
+    signed: &Operator,
+    key: &SigningKey,
+    what: &str,
+    installs: &[(InstanceId, PathBuf, &str)],
+) -> Result<AgentId, String> {
+    let agent = match signed.create_agent(vec![1]) {
+        Ok(Response::Created(agent)) => agent,
+        other => return Err(format!("{what}: {other:?}")),
+    };
+    for (instance, path, role) in installs {
+        let elf = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let install = Install {
+            instance: *instance,
+            elf,
+            roles: vec![(role.as_bytes().to_vec(), ROLE)],
+        };
+        match signed.install(agent, &install) {
+            Ok(Response::Ran { .. }) => {}
+            other => return Err(format!("installing {role}: {other:?}")),
+        }
+    }
+    let principal = Principal::Client(key.verifying_key().to_bytes());
+    match signed.grant(agent, principal, Some(ROLE)) {
+        Ok(Response::Ran { .. }) => Ok(agent),
+        other => Err(format!("the operator's role: {other:?}")),
     }
 }
 
@@ -98,41 +130,24 @@ impl LocalSpace {
             .map_err(|error| format!("{error:?}"))?;
         let target = Target::socket(socket.clone());
         let signed = Operator::signing(&target, key.clone(), node.id());
-        let agent = match signed.create_agent(vec![1]) {
-            Ok(Response::Created(agent)) => agent,
-            other => return Err(format!("the agent: {other:?}")),
-        };
-        let elf =
-            |path: PathBuf| std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()));
-        let installs = [
-            (
-                CREDENTIALS,
-                elf(vos_testkit::programs::program_elf("vos-credentials"))?,
-                "registrar",
-            ),
-            (POLL, elf(actor_elf("poll"))?, "operator"),
-            (
-                PAYMENTS,
-                elf(vos_testkit::programs::program_elf("vos-payments"))?,
-                "operator",
-            ),
-        ];
-        for (instance, elf, role) in &installs {
-            let install = Install {
-                instance: *instance,
-                elf: elf.clone(),
-                roles: vec![(role.as_bytes().to_vec(), ROLE)],
-            };
-            match signed.install(agent, &install) {
-                Ok(Response::Ran { .. }) => {}
-                other => return Err(format!("installing {role}: {other:?}")),
-            }
-        }
-        let principal = Principal::Client(key.verifying_key().to_bytes());
-        match signed.grant(agent, principal, Some(ROLE)) {
-            Ok(Response::Ran { .. }) => {}
-            other => return Err(format!("the operator's role: {other:?}")),
-        }
+        let agent = agent_with(
+            &signed,
+            &key,
+            "the agent",
+            &[
+                (
+                    CREDENTIALS,
+                    vos_testkit::programs::program_elf("vos-credentials"),
+                    "registrar",
+                ),
+                (POLL, actor_elf("poll"), "operator"),
+                (
+                    PAYMENTS,
+                    vos_testkit::programs::program_elf("vos-payments"),
+                    "operator",
+                ),
+            ],
+        )?;
         let space = Self {
             node,
             socket,
@@ -325,7 +340,6 @@ impl LocalSpace {
             vos_api::Mark::Clearnet,
             Limits::new(PerAddress::default()),
             vos_gateway::caps::Caps::none(),
-            vos_gateway::caps::bodies(),
         );
         let demo = Demo {
             onions,
@@ -489,13 +503,7 @@ key = "{onion}"
 
     /// A gateway in front of this node as the file `config` names it.
     fn front_gateway(config: &vos_gateway::config::Config) -> Result<Arc<Gateway>, String> {
-        Ok(Arc::new(Gateway::new(
-            config
-                .upstreams()?
-                .into_iter()
-                .map(|(key, address)| Upstream::new(key, address, random()))
-                .collect(),
-        )))
+        config.gateway(random())
     }
 
     /// `served`'s onion, hosted by arti over the live Tor network, its keys
@@ -537,7 +545,6 @@ key = "{onion}"
             vos_api::Mark::Clearnet,
             Limits::new(PerAddress::default()),
             vos_gateway::caps::Caps::none(),
-            vos_gateway::caps::bodies(),
         )
         .with_connections(config.ssh_connections);
         let listener = tokio::net::TcpListener::bind(ssh)

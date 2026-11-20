@@ -102,7 +102,7 @@ pub enum CredentialGuard {
     /// it its own, so a member once a device.
     #[codec(index = 0)]
     Auth { name: Vec<u8>, once: bool },
-    /// `#[msg(credential = Owner)]` or `#[msg(proven = owner)]`: the stock
+    /// `#[msg(credential = Owner)]`: the stock
     /// `owner` kernel, an `Owner` origin, whose digest the handler compares
     /// with the row it debits.
     #[codec(index = 1)]

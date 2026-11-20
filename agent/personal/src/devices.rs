@@ -23,17 +23,12 @@ use vos_wire::personal::{
     Verdict, Void,
 };
 
-use crate::rows::Recovery;
+use crate::rows::{Before, By, Due, Gone, Kind, Recovery};
 use crate::{KIT_ENTRIES, Personal};
 
 /// The steps a call settles before it runs: with the one maturity its own
 /// work may make, each bounded, within its gas.
 pub const SETTLE: usize = 4;
-
-/// A due row that is a chore, not an operation: `CHORE | device` silences
-/// a device, [`RETIRE`] cancels a replaced kit's operations.
-const CHORE: u64 = 1 << 63;
-const RETIRE: u64 = CHORE | 1 << 32;
 
 /// The open operations a signer holds at once, removals aside: a device's,
 /// or a kit entry's. A removal is one open a target.
@@ -42,20 +37,8 @@ pub const OPEN_OPERATIONS: usize = 2;
 /// The live devices a set holds.
 pub const DEVICES: usize = 8;
 
-/// The kinds of operation of which one is open at a time, for a target or
-/// for the agent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Kind {
-    Remove = 0,
-    Replace = 1,
-    /// A kit rotation or a restore.
-    Kit = 2,
-    Regroup = 3,
-}
-
 /// The kind an operation is one open of, and its target.
-fn kind(op: &Op) -> Option<(u8, DeviceId)> {
+fn kind(op: &Op) -> Option<(Kind, DeviceId)> {
     let (kind, target) = match op {
         Op::Remove(target) => (Kind::Remove, *target),
         Op::Replace { device, .. } => (Kind::Replace, *device),
@@ -63,7 +46,7 @@ fn kind(op: &Op) -> Option<(u8, DeviceId)> {
         Op::Regroup(_) => (Kind::Regroup, 0),
         Op::Add(_) => return None,
     };
-    Some((kind as u8, target))
+    Some((kind, target))
 }
 
 /// The devices an operation acts on: a removal's and a regroup's targets,
@@ -91,14 +74,6 @@ fn needs_r2(op: &Op) -> bool {
     matches!(op, Op::Rotate(_) | Op::Restore { .. })
 }
 
-/// A signer as the key of the operations it holds open.
-fn signer_key(by: Signer) -> u64 {
-    match by {
-        Signer::Device(device) => u64::from(device),
-        Signer::Kit(entry) => 1 << 32 | u64::from(entry),
-    }
-}
-
 /// The keys an operation brings, which no one else may take while it is
 /// open, or while a matured add waits for its commit.
 fn claims(op: &Op) -> Vec<[u8; 32]> {
@@ -121,7 +96,7 @@ fn claims(op: &Op) -> Vec<[u8; 32]> {
 macro_rules! prefixed {
     ($table:expr, $first:expr, $max:expr) => {{
         let first = $first;
-        let after = first.checked_sub(1).map(|before| (before, $max));
+        let after = Before::before(&first).map(|before| (before, $max));
         $table
             .iter(after.as_ref())
             .take_while(|((at, _), _)| *at == first)
@@ -164,19 +139,37 @@ impl Personal {
             self.operations.get(&index).is_some_and(|operation| {
                 operation.state == OpState::Pending
                     && operation.matures <= now
-                    && self.evidenced.contains(&index)
-                    && (!needs_r2(&operation.op) || self.deposits.contains(&index))
+                    && self.holds_evidence(index, &operation.op)
             })
         };
-        let restore = self.kinds.get(&(Kind::Kit as u8, 0)).filter(|index| {
-            self.operations
-                .get(index)
-                .is_some_and(|operation| matches!(operation.op, Op::Restore { .. }))
-        });
         prefixed!(self.against, id, u64::MAX)
             .into_iter()
             .any(|(index, ())| due(index))
-            || restore.is_some_and(due)
+            || self.open_restore().is_some_and(due)
+    }
+
+    /// The kit's open operation, if it is a restore.
+    fn open_restore(&self) -> Option<u64> {
+        self.kinds.get(&(Kind::Kit, 0)).filter(|index| {
+            self.operations
+                .get(index)
+                .is_some_and(|operation| matches!(operation.op, Op::Restore { .. }))
+        })
+    }
+
+    /// Whether the operation `op` at `index` holds what it matures with:
+    /// its evidence, and its `R2` where it carries one.
+    fn holds_evidence(&self, index: u64, op: &Op) -> bool {
+        self.evidenced.contains(&index) && (!needs_r2(op) || self.deposits.contains(&index))
+    }
+
+    /// Release what the operation at `index` holds: its place among its
+    /// signer's, and the keys it brings.
+    fn release(&mut self, index: u64, operation: &Operation) {
+        self.signed.remove(&(By(operation.by), index));
+        for key in claims(&operation.op) {
+            self.claimed.remove(&key);
+        }
     }
 
     /// Active for the policy's seasoning.
@@ -215,6 +208,25 @@ impl Personal {
         }
     }
 
+    /// An admin call's start: what fell due settled at the call's time,
+    /// the agent assigned, and its signer's; with the call as the log
+    /// carries it, `message` its arguments.
+    pub(crate) fn admin<M: vos_sdk::context::Method>(
+        &mut self,
+        ctx: &Command<Self>,
+        message: &M,
+    ) -> Result<(u64, AdminCall, Signer), PersonalError> {
+        let now = self.settle(ctx.now())?;
+        self.assigned()?;
+        let (origin, by) = self.signer(ctx.caller(), now)?;
+        let call = AdminCall {
+            origin,
+            method: M::ID,
+            arguments: message.encode(),
+        };
+        Ok((now, call, by))
+    }
+
     fn open_at(&self, index: u64) -> Result<Operation, PersonalError> {
         self.operations
             .get(&index)
@@ -236,7 +248,7 @@ impl Personal {
         op: Op,
     ) -> Result<Recorded, PersonalError> {
         if let (Op::Rotate(_), Signer::Device(_)) = (&op, by)
-            && let Some(index) = self.kinds.get(&(Kind::Kit as u8, 0))
+            && let Some(index) = self.kinds.get(&(Kind::Kit, 0))
             && self
                 .operations
                 .get(&index)
@@ -247,7 +259,7 @@ impl Personal {
         }
         self.check_operation(now, by, &op)?;
         let removal = matches!(op, Op::Remove(_));
-        let held = prefixed!(self.signed, signer_key(by), u64::MAX);
+        let held = prefixed!(self.signed, By(by), u64::MAX);
         if !removal && held.iter().filter(|(_, counted)| *counted).count() >= OPEN_OPERATIONS {
             return Err(PersonalError::Operations);
         }
@@ -298,7 +310,7 @@ impl Personal {
         if let Some(key) = kind(&op) {
             self.kinds.insert(&key, &index);
         }
-        self.signed.insert(&(signer_key(by), index), &!removal);
+        self.signed.insert(&(By(by), index), &!removal);
         self.operations.insert(
             &index,
             &Operation {
@@ -317,7 +329,7 @@ impl Personal {
                 self.contest(index, now);
                 self.contest(rival, now);
             }
-            None => self.due.insert(&(matures, index), &()),
+            None => self.due.insert(&(matures, Due::Op(index)), &()),
         }
         if let Some(device) = device {
             self.seen.insert(&device, &now);
@@ -608,7 +620,7 @@ impl Personal {
                 .map(|operation| operation.matures)
                 .filter(|matures| *matures > now);
             match (winner, probation) {
-                (Some(winner), Some(matures)) => self.due.insert(&(matures, winner), &()),
+                (Some(winner), Some(matures)) => self.due.insert(&(matures, Due::Op(winner)), &()),
                 (Some(winner), None) => self.mature(winner, now, now),
                 (None, _) => self.cancel(index, Cancel::Resolved, now),
             }
@@ -616,12 +628,11 @@ impl Personal {
         Ok(Recorded { at: now, index: at })
     }
 
-    /// Whether the operation `op` at `index` holds what it matures with:
-    /// its evidence, and its `R2` where it carries one. A cosign or a
+    /// [`Personal::holds_evidence`], else `Unevidenced`. A cosign or a
     /// resolution that would make one without them mature is refused, so
     /// it is not cancelled for want of them (reopening its rival) at once.
     fn evidenced_op(&self, index: u64, op: &Op) -> Result<(), PersonalError> {
-        if !self.evidenced.contains(&index) || needs_r2(op) && !self.deposits.contains(&index) {
+        if !self.holds_evidence(index, op) {
             return Err(PersonalError::Unevidenced);
         }
         Ok(())
@@ -630,10 +641,7 @@ impl Personal {
     /// A device's `alive` cancels a pending restore, which asserts every
     /// device lost.
     pub(crate) fn cancel_restore(&mut self, now: u64) {
-        if let Some(index) = self.kinds.get(&(Kind::Kit as u8, 0))
-            && let Some(operation) = self.operations.get(&index)
-            && matches!(operation.op, Op::Restore { .. })
-        {
+        if let Some(index) = self.open_restore() {
             self.cancel(index, Cancel::Alive, now);
         }
     }
@@ -644,17 +652,21 @@ impl Personal {
     /// due: whether none is left due.
     pub(crate) fn mature_due(&mut self, now: u64, most: usize) -> bool {
         for _ in 0..most {
-            let Some(((at, index), ())) = self.due.first() else {
+            let Some(((at, due), ())) = self.due.first() else {
                 return true;
             };
             if at > now {
                 return true;
             }
-            if index & CHORE == 0 {
-                self.due.remove(&(at, index));
-                self.mature(index, at, now);
-            } else if !self.chore(index, at, now) {
-                self.due.remove(&(at, index));
+            match due {
+                Due::Op(index) => {
+                    self.due.remove(&(at, due));
+                    self.mature(index, at, now);
+                }
+                Due::Silence(_) | Due::Retire if !self.chore(due, at, now) => {
+                    self.due.remove(&(at, due));
+                }
+                Due::Silence(_) | Due::Retire => {}
             }
         }
         self.due.first().is_none_or(|((at, _), ())| at > now)
@@ -663,27 +675,20 @@ impl Personal {
     /// Queue `device`'s silencing as of `at`: its operations cancelled, a
     /// matured add of its included, and its vetoes lifted, a row a step.
     pub(crate) fn silence(&mut self, device: DeviceId, at: u64) {
-        self.due.insert(&(at, CHORE | u64::from(device)), &());
+        self.due.insert(&(at, Due::Silence(device)), &());
     }
 
-    /// One row of the chore `chore`, as of `at`: whether rows are left.
-    fn chore(&mut self, chore: u64, at: u64, now: u64) -> bool {
-        if chore == RETIRE {
-            let open = (0..KIT_ENTRIES as u64).find_map(|entry| {
-                prefixed!(self.signed, 1 << 32 | entry, u64::MAX)
-                    .first()
-                    .map(|(index, _)| *index)
-            });
-            return match open {
-                Some(index) => {
-                    self.cancel(index, Cancel::Retired, now);
-                    true
-                }
-                None => false,
-            };
-        }
-        let device = (chore & u64::from(DeviceId::MAX)) as DeviceId;
-        if let Some((index, _)) = prefixed!(self.signed, u64::from(device), u64::MAX).first() {
+    /// One row of the chore `chore`, a silencing or a retirement, as of
+    /// `at`: whether rows are left.
+    fn chore(&mut self, chore: Due, at: u64, now: u64) -> bool {
+        let device = match chore {
+            Due::Silence(device) => device,
+            Due::Retire => return self.retire_one(now),
+            Due::Op(_) => unreachable!("an operation's maturity is no chore"),
+        };
+        if let Some((index, _)) =
+            prefixed!(self.signed, By(Signer::Device(device)), u64::MAX).first()
+        {
             if self.open.contains(index) {
                 self.cancel(*index, Cancel::Signer, now);
             } else {
@@ -700,15 +705,29 @@ impl Personal {
         false
     }
 
+    /// One open operation of a replaced kit's cancelled: whether there
+    /// was one.
+    fn retire_one(&mut self, now: u64) -> bool {
+        let open = (0..KIT_ENTRIES as u8).find_map(|entry| {
+            prefixed!(self.signed, By(Signer::Kit(entry)), u64::MAX)
+                .first()
+                .map(|(index, _)| *index)
+        });
+        match open {
+            Some(index) => {
+                self.cancel(index, Cancel::Retired, now);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Cancel the matured add at `index` its commit never carried: its
     /// signer has no voice.
     fn drop_ready(&mut self, index: u64, now: u64) {
         self.ready.remove(&index);
         if let Some(mut operation) = self.operations.get(&index) {
-            self.signed.remove(&(signer_key(operation.by), index));
-            for key in claims(&operation.op) {
-                self.claimed.remove(&key);
-            }
+            self.release(index, &operation);
             operation.state = OpState::Cancelled {
                 at: now,
                 why: Cancel::Signer,
@@ -723,7 +742,7 @@ impl Personal {
         let Some(mut operation) = self.operations.get(&index) else {
             return;
         };
-        self.due.remove(&(operation.matures, index));
+        self.due.remove(&(operation.matures, Due::Op(index)));
         operation.state = OpState::Contested;
         self.operations.insert(&index, &operation);
         self.settled(now, index, OpState::Contested);
@@ -744,7 +763,7 @@ impl Personal {
         operation.state = OpState::Pending;
         operation.matures = operation.matures.max(at);
         self.operations.insert(&index, &operation);
-        self.due.insert(&(operation.matures, index), &());
+        self.due.insert(&(operation.matures, Due::Op(index)), &());
         self.settled(now, index, OpState::Pending);
     }
 
@@ -756,11 +775,8 @@ impl Personal {
     /// rivalry dropped, its targets' probations let run. Answers its rival.
     fn close(&mut self, index: u64, operation: &Operation, now: u64) -> Option<u64> {
         self.open.remove(&index);
-        self.due.remove(&(operation.matures, index));
-        self.signed.remove(&(signer_key(operation.by), index));
-        for key in claims(&operation.op) {
-            self.claimed.remove(&key);
-        }
+        self.due.remove(&(operation.matures, Due::Op(index)));
+        self.release(index, operation);
         if let Some(key) = kind(&operation.op) {
             self.kinds.remove(&key);
         }
@@ -840,8 +856,7 @@ impl Personal {
             Op::Add(_) => {
                 // Held, its keys claimed, until a commit carries it.
                 self.ready.insert(&index, &());
-                self.signed
-                    .insert(&(signer_key(operation.by), index), &true);
+                self.signed.insert(&(By(operation.by), index), &true);
                 for key in claims(&operation.op) {
                     self.claimed.insert(&key, &index);
                 }
@@ -929,7 +944,7 @@ impl Personal {
     /// entries' keys admitted no more, and their open operations queued
     /// for cancelling.
     fn replace_kit(&mut self, entries: &[KitEntry], r2: [u8; 32], at: u64) {
-        self.due.insert(&(at, RETIRE), &());
+        self.due.insert(&(at, Due::Retire), &());
         let previous: Vec<(u8, KitEntry)> = self.kit.iter(None).collect();
         for (i, entry) in previous {
             if self.admitted.get(&entry.signing) == Some(Holder::Kit(i)) {
@@ -971,7 +986,7 @@ impl Personal {
             self.kit.insert(&(i as u8), entry);
         }
         self.secrets.set(&r2);
-        let mut recovery = self.recovery.get().unwrap_or_default();
+        let mut recovery = self.recovery.get_or_default();
         recovery.from = self.scopes.get(&RECOVERY).unwrap_or(0);
         self.recovery.set(&recovery);
     }
@@ -1012,7 +1027,14 @@ impl Personal {
             },
         );
         self.frozen.remove(&target);
-        self.append(now, Body::Matured { device: target });
+        let logged = self.append(now, Body::Matured { device: target });
+        self.gone.insert(
+            &device.keys.sync,
+            &Gone {
+                device: target,
+                logged,
+            },
+        );
         self.silence(target, at);
         if let Some(candidate) = self.group().candidate
             && candidate.set.contains(&target)
@@ -1038,10 +1060,7 @@ impl Personal {
     pub(crate) fn carried(&mut self, index: u64, epoch: u64) {
         self.ready.remove(&index);
         if let Some(mut operation) = self.operations.get(&index) {
-            self.signed.remove(&(signer_key(operation.by), index));
-            for key in claims(&operation.op) {
-                self.claimed.remove(&key);
-            }
+            self.release(index, &operation);
             operation.state = OpState::Carried { epoch };
             self.operations.insert(&index, &operation);
         }

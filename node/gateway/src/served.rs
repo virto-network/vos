@@ -89,17 +89,12 @@ fn ssh_server(
     app: &dyn App,
     listener: OnionListener,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
-    let port = crate::ssh::Port::new(
-        Mark::Onion,
-        Arc::clone(limits),
-        Arc::clone(caps),
-        crate::caps::bodies(),
-    )
-    .with_connections(
-        config
-            .onion
-            .as_ref()
-            .and_then(|onion| onion.ssh_connections),
-    );
+    let port = crate::ssh::Port::new(Mark::Onion, Arc::clone(limits), Arc::clone(caps))
+        .with_connections(
+            config
+                .onion
+                .as_ref()
+                .and_then(|onion| onion.ssh_connections),
+        );
     crate::ssh::serve(config, Arc::clone(gateway), port, app, listener)
 }

@@ -2,8 +2,8 @@
 //! ([`batch`]), the apply of its result ([`apply`]), a work package
 //! ([`package`]), a node's ingress ([`ingress`]) and its peers' messages
 //! ([`peer`]); and the messages of the credential actor ([`credentials`]),
-//! the personal agent ([`personal`]), the homes ([`homes`]) and the books
-//! ([`books`]). The actor ABI they are built on is `vos-abi`'s.
+//! the personal agent ([`personal`]), the homes ([`homes`]), the books
+//! ([`books`]) and the ledger ([`payments`]). The actor ABI they are built on is `vos-abi`'s.
 //!
 //! Everything here is SCALE-coded with the workspace codec, the encoding JAM
 //! uses.
@@ -36,6 +36,7 @@ pub mod credentials;
 pub mod homes;
 pub mod ingress;
 pub mod package;
+pub mod payments;
 pub mod peer;
 pub mod personal;
 

@@ -655,8 +655,7 @@ fn a_phone_is_retired_once_its_successor_is_paired() {
 /// envelopes it pushes open under that `R` with either kit's `R1`.
 #[test]
 fn a_claim_with_a_phrase_and_a_security_key_starts_the_group() {
-    let homes = SigningKey::from_bytes(&[0x50; 32]);
-    let mut home = Home::new(&homes, policy());
+    let mut home = Home::new(policy());
     let phone = Phone::new(1);
     let phrase = vos_light::kit::KitSecret::phrase().unwrap();
     let keys = vec![phrase.key(), kit_key(0)];
@@ -715,9 +714,7 @@ fn a_claim_with_a_phrase_and_a_security_key_starts_the_group() {
     ));
     // The home assigns the agent, as `Homes`' claim does through
     // `Personal`.
-    home.call(&homes, "assign", (phone.keys.clone(), kit.clone()).encode())
-        .answer::<Recorded>()
-        .unwrap();
+    home.claim(&phone.keys, kit.clone());
     let entries = home.log(phone.sync_key(), 0).unwrap();
     let mut phone = phone;
     let group = claim

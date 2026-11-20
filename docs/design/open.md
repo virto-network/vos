@@ -488,11 +488,12 @@ are under "Identity and privacy" above.
 - **The control log's head in an admin call** [not built]: an admin
   call's arguments do not name the control log's head it was made
   against, so a device cannot check that an operation was signed against
-  the log it was shown.
-- **A removed device's course** [open, the owner's]: a device turned away
-  (`Course::TurnedAway`) rests on the agent's unsigned word; a removed
-  device could reach `Out` on the signed log were the agent to serve it
-  the log up to its removal's entry.
+  the log it was shown: a route forking the log a device reads can log
+  again a removal of it once signed and vetoed, and mature it unvetoed,
+  which takes the device out of its group for good (`light-node.md`
+  §3.6, "never on a refusal"). Binding an operation's batch time to its
+  call's session (`t0` to `t0` plus the session's life) would narrow the
+  replay to the calls of the last session's life.
 - **Messaging between members** on `vos-mls` [E12], in a space or across
   spaces, the personal agent's inbox its door (`light-node.md` §3.7,
   §3.10). MLS virtual clients share a virtual leaf's signature and HPKE

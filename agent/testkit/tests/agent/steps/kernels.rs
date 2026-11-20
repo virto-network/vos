@@ -198,7 +198,7 @@ fn derived_kernels_run_in_the_agent() {
 /// installed first.
 #[test]
 fn a_device_kernels_method_is_never_attested() {
-    use vos_testkit::programs::{derived, program_elf};
+    use vos_testkit::programs::derived;
     let derived = derived("device");
     let instance = InstanceId(9);
     let kernels: Vec<(MethodId, &[u8])> = derived
@@ -213,8 +213,7 @@ fn a_device_kernels_method_is_never_attested() {
     for (_, kernel) in &kernels {
         node.add(kernel);
     }
-    let elf = std::fs::read(program_elf("vos-credentials")).unwrap();
-    let credentials = vos_pvm_compiler::derive(&elf).expect("derives");
+    let credentials = vos_testkit::programs::program_derived("vos-credentials");
     node.add(&credentials.actor);
     let install = |instance, derivation, roles: &[&str]| {
         Input::Admin(Admin::Install {

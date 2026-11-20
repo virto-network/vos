@@ -187,9 +187,8 @@ pub(super) fn guard(options: &mut Options, kind: Kind) -> syn::Result<()> {
 }
 
 /// The guard `proven = kernel` names, given `devices`, this actor's device
-/// kernels by name: this actor's kernel of that name, else the stock
-/// `owner`. The stock `auth` takes its scope's name, so it is
-/// `credential = Auth("name")`.
+/// kernels by name: this actor's kernel of that name. A stock kernel's
+/// guard is `credential = Auth("name")` or `credential = Owner`.
 pub(super) fn resolve(kernel: &str, span: Span, devices: &[&str]) -> syn::Result<CredentialGuard> {
     if devices.contains(&kernel) {
         return Ok(CredentialGuard::Kernel {
@@ -197,7 +196,10 @@ pub(super) fn resolve(kernel: &str, span: Span, devices: &[&str]) -> syn::Result
         });
     }
     match kernel {
-        vos_abi::schema::stock::OWNER => Ok(CredentialGuard::Owner),
+        vos_abi::schema::stock::OWNER => Err(Error::new(
+            span,
+            "the stock `owner` kernel's guard is `credential = Owner`",
+        )),
         vos_abi::schema::stock::AUTH => Err(Error::new(
             span,
             "the stock `auth` kernel proves a pseudonym in a scope: name it, \

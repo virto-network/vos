@@ -117,9 +117,6 @@ impl Node {
             .unwrap_or(1);
         let settings = Settings::of(&config);
         let calls = crate::calls::Calls::admitting(devices);
-        for &(format, at_ms) in &config.retired_formats {
-            calls.devices.retire_format(format, at_ms);
-        }
         let inner = Arc::new(Inner {
             storage: StorageThread::spawn_with(
                 store.clone(),

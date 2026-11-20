@@ -44,7 +44,8 @@ fn read(home: &Home, caller: Principal, name: &str, arguments: &[u8]) -> Result<
 }
 
 /// A stranger, another member, the home and a device whose removal
-/// matured read nothing, before the assignment and after; the devices
+/// matured read nothing, before the assignment and after, but the log its
+/// removal rests on, which the removed device's sync key reads; the devices
 /// read everything, by either key; the kit reads all but the inbox and
 /// the scopes other than recovery's; the version answers anyone.
 #[test]
@@ -57,8 +58,7 @@ fn queries_answer_only_admitted_keys() {
             "{name} before the assignment"
         );
     }
-    home.call::<Recorded>(HOMES, "assign", (device(0), kit()))
-        .unwrap();
+    home.claim(device(0), kit(), Policy::DEFAULT).unwrap();
     home.pair(0, 1);
     home.push(1, envelope(scope(1), 1, 1, 100)).unwrap();
     for (name, arguments) in reads() {
@@ -90,12 +90,19 @@ fn queries_answer_only_admitted_keys() {
             "{name}"
         );
     }
+    // Settled, it reads the log alone, through its removal.
     home.call::<Recorded>(sync(0), "alive", ()).unwrap();
     for (name, arguments) in reads() {
+        let expected = if name == "log" {
+            Ok(())
+        } else {
+            Err(PersonalError::NotAdmitted)
+        };
+        assert_eq!(read(&home, sync(1), name, &arguments), expected, "{name}");
         assert_eq!(
-            read(&home, sync(1), name, &arguments),
+            read(&home, admin(1), name, &arguments),
             Err(PersonalError::NotAdmitted),
-            "{name}"
+            "{name} by its admin key"
         );
     }
     // Its frontier: the last position it pushed to, a scope.

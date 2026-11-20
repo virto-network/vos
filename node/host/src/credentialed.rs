@@ -27,8 +27,8 @@
 //! replaced (`Installed::window`), and the binding names which; ingress
 //! admits the device formats this node verifies, the current and the
 //! previous, each until its retirement ([`DEVICE_FORMATS`] or the node's
-//! configured ones, with an earlier date if the configuration or the
-//! agent's log sets one), and verifies a proof against each release's
+//! configured ones, with an earlier date if the agent's log sets one), and
+//! verifies a proof against each release's
 //! program in the proof's format. A proof of a retired release names a
 //! program no guard admits (`Binding`); one of a retired format is refused
 //! at once (`Format`). The call carries its format to apply, which refuses
@@ -37,7 +37,7 @@
 //! runs.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -78,12 +78,11 @@ const _: () = assert!(DEVICE_FORMATS[0].0 == device::FORMAT.number);
 type Place = Arc<smol::lock::OnceCell<Option<Arc<Verifier>>>>;
 
 /// The device programs this node holds, their verifiers alone, by release
-/// and format; the device formats it admits, each with its release's
-/// retirement; and the retirements its configuration set.
+/// and format; and the device formats it admits, each with its release's
+/// retirement.
 pub(crate) struct DevicePrograms {
     programs: Mutex<HashMap<(DeviceRelease, u32), Place>>,
     formats: Vec<(u32, Option<u64>)>,
-    retired: Mutex<HashMap<u32, u64>>,
 }
 
 impl Default for DevicePrograms {
@@ -106,7 +105,6 @@ impl DevicePrograms {
         (known && distinct && (1..=2).contains(&formats.len())).then(|| Self {
             programs: Mutex::default(),
             formats: formats.to_vec(),
-            retired: Mutex::default(),
         })
     }
 
@@ -126,27 +124,6 @@ impl DevicePrograms {
         Arc::clone(lock(&self.programs).entry((release, format)).or_default())
     }
 
-    /// Retires device format `format` at `at_ms`, if that is earlier than
-    /// its retirement: its date kept, if this node admits the format.
-    pub(crate) fn retire_format(&self, format: u32, at_ms: u64) -> Option<u64> {
-        let (_, released) = self
-            .formats
-            .iter()
-            .copied()
-            .find(|(number, _)| *number == format)?;
-        let mut retired = lock(&self.retired);
-        let date = retired
-            .get(&format)
-            .copied()
-            .into_iter()
-            .chain(released)
-            .chain([at_ms])
-            .min()
-            .expect("a date");
-        retired.insert(format, date);
-        Some(date)
-    }
-
     /// The device formats admitted at `now` in an agent whose log retires
     /// each at `logged`'s date, if any, newest first, each with its
     /// retirement, if one is set.
@@ -155,19 +132,12 @@ impl DevicePrograms {
         now: u64,
         logged: impl Fn(u32) -> Option<u64>,
     ) -> Vec<FormatWindow> {
-        let retired = lock(&self.retired);
         self.formats
             .iter()
             .copied()
             .map(|(format, released)| FormatWindow {
                 format,
-                retires_ms: retired
-                    .get(&format)
-                    .copied()
-                    .into_iter()
-                    .chain(released)
-                    .chain(logged(format))
-                    .min(),
+                retires_ms: released.into_iter().chain(logged(format)).min(),
             })
             .filter(|window| window.retires_ms.is_none_or(|date| date > now))
             .collect()
@@ -191,25 +161,7 @@ struct Front {
 /// verification ends, however it ends: it goes with the executor's job, so
 /// a request cancelled while its proof is verified holds its place until
 /// the job is done.
-pub(crate) struct Verifying(Arc<AtomicUsize>);
-
-impl Verifying {
-    /// A place, if fewer than `most` verifications are in flight.
-    fn take(in_flight: &Arc<AtomicUsize>, most: usize) -> Option<Self> {
-        in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-                (held < most).then_some(held + 1)
-            })
-            .ok()
-            .map(|_| Verifying(Arc::clone(in_flight)))
-    }
-}
-
-impl Drop for Verifying {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
+pub(crate) type Verifying = crate::Held<Arc<AtomicUsize>>;
 
 /// A proven call that passed every check but the proof's: the program and
 /// io-hash it is verified against, and the input the log carries once it
@@ -311,8 +263,10 @@ impl Inner {
             Ok(checked) => checked,
             Err(refused) => return refused.into(),
         };
-        let Some(place) = Verifying::take(&self.calls.verifying, self.settings.verifications)
-        else {
+        let Some(place) = Verifying::take(
+            Arc::clone(&self.calls.verifying),
+            self.settings.verifications,
+        ) else {
             return Response::Busy;
         };
         let stats = Arc::clone(&self.stats);
@@ -692,6 +646,7 @@ fn ring(snapshot: &Snapshot, agent: AgentId) -> Result<Option<Ring>, Fault> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     /// The device formats a node admits are one or two, distinct, each one
     /// this binary verifies; the release's are.
@@ -721,15 +676,18 @@ mod tests {
     #[test]
     fn the_verification_budget_is_held_and_given_back() {
         let in_flight = Arc::new(AtomicUsize::new(0));
-        let first = Verifying::take(&in_flight, 2).expect("a place");
-        let second = Verifying::take(&in_flight, 2).expect("a place");
-        assert!(Verifying::take(&in_flight, 2).is_none(), "the budget spent");
+        let first = Verifying::take(Arc::clone(&in_flight), 2).expect("a place");
+        let second = Verifying::take(Arc::clone(&in_flight), 2).expect("a place");
+        assert!(
+            Verifying::take(Arc::clone(&in_flight), 2).is_none(),
+            "the budget spent"
+        );
         drop(first);
-        assert!(Verifying::take(&in_flight, 2).is_some());
+        assert!(Verifying::take(Arc::clone(&in_flight), 2).is_some());
         drop(second);
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
         assert!(
-            Verifying::take(&in_flight, 0).is_none(),
+            Verifying::take(Arc::clone(&in_flight), 0).is_none(),
             "no budget, no place"
         );
     }

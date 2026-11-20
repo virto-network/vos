@@ -5,7 +5,8 @@
 //! and a client's pin across it, the limits per address, refusals for size
 //! and from the head that never reach a node, the budget of install-size
 //! bodies, a dead node delaying no other's requests, and the transport
-//! mark an onion-only agent reads.
+//! mark an onion-only agent reads; with the SSH port, its `vos-api`
+//! subsystem.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -44,6 +45,8 @@ mod dead_node;
 mod limits;
 mod redirects;
 mod routes;
+#[cfg(feature = "ssh")]
+mod ssh;
 mod tls;
 
 fn fresh_nonce() -> [u8; 16] {

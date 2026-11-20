@@ -14,11 +14,11 @@
 //!   `R1` to: a kit's seal binds the agent's identity, which the device
 //!   learns of the agent [`Homes::pooled`] answers. `Homes` takes it,
 //!   indexes it under the nullifier and under each kit entry's
-//!   [`kit_index`], and sends it the claim with the home's policy. A send is one-way, so `Personal` answers
-//!   `assigned` or `refused`; a refused claim's indexes are dropped and its
-//!   agent pooled again. A claim still waiting for its answer is sent again
-//!   when its nullifier claims again, and the operator may `release` one
-//!   that never will be answered.
+//!   [`kit_index`], and sends it the claim with the home's policy. A send
+//!   is one-way, so `Personal` answers `assigned` or `refused`; a refused
+//!   claim's indexes are dropped and its agent pooled again. A claim still
+//!   waiting for its answer is sent again when its nullifier claims again,
+//!   and the operator may `release` one that never will be answered.
 //! - **The lease:** `Personal` keeps it; any device whose nullifier is
 //!   recorded here (the claiming one's at the claim, the others' as their
 //!   adds are confirmed, `record`, until their removals mature, `forget`)
@@ -80,9 +80,9 @@ impl Homes {
     /// Pool `agents`, each made by the keeper with `Personal` installed and
     /// this agent granted its role `homes`: the pooled count after. An
     /// agent stocked already is left as it is, so a keeper that lost the
-    /// answer stocks the page again. 200 agents take 34.1M gas [measured,
-    /// the testkit's agent suite, Core Ultra 7 155H, 2026-11-07; gas is
-    /// deterministic], so a page fits the 50M declared.
+    /// answer stocks the page again. 200 agents take 34.1M gas (the
+    /// testkit's agent suite; gas is deterministic), so a page fits the 50M
+    /// declared.
     #[msg(role = "operator", gas = 50_000_000)]
     pub async fn stock(&mut self, agents: Vec<u32>) -> Result<u32, HomesError> {
         if agents.len() > PAGE {
@@ -101,7 +101,7 @@ impl Homes {
             self.agents.insert(agent, &held);
             self.pool.insert(agent, &());
         }
-        let mut counts = self.tallied();
+        let mut counts = self.counts.get_or_default();
         counts.pooled += fresh.len() as u32;
         self.counts.set(&counts);
         Ok(counts.pooled)
@@ -198,7 +198,7 @@ impl Homes {
                 kit: indexes,
             },
         );
-        let mut counts = self.tallied();
+        let mut counts = self.counts.get_or_default();
         counts.pooled -= 1;
         counts.claimed += 1;
         self.counts.set(&counts);
@@ -235,7 +235,7 @@ impl Homes {
         let (agent, mut held) = self.claimed_by(ctx.caller())?;
         held.standing = Standing::Assigned;
         self.agents.insert(&agent, &held);
-        let mut counts = self.tallied();
+        let mut counts = self.counts.get_or_default();
         counts.claimed -= 1;
         counts.assigned += 1;
         self.counts.set(&counts);
@@ -352,7 +352,7 @@ impl Homes {
     /// The pool's agents pooled, sent and assigned.
     #[msg]
     pub async fn tally(&self) -> Counts {
-        self.counts.get().unwrap_or_default()
+        self.counts.get_or_default()
     }
 
     /// The stocked agents by id, from after `after`, [`PAGE`] at most: the
@@ -377,10 +377,6 @@ impl Homes {
 }
 
 impl Homes {
-    fn tallied(&self) -> Counts {
-        self.counts.get().unwrap_or_default()
-    }
-
     /// `agent`'s claim dropped: its nullifier and kit indexes, the agent
     /// left `standing`, pooled again when that is `Pooled`.
     fn drop_claim(&mut self, agent: u32, held: &Held, standing: Standing) {
@@ -390,7 +386,7 @@ impl Homes {
         for index in &held.kit {
             self.kits.remove(index);
         }
-        let mut counts = self.tallied();
+        let mut counts = self.counts.get_or_default();
         counts.claimed -= 1;
         if standing == Standing::Pooled {
             self.pool.insert(&agent, &());

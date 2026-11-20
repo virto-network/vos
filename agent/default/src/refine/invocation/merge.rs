@@ -29,8 +29,8 @@ impl From<merge::Malformed> for Corrupt {
 impl Invocation<'_> {
     /// A row operation of a merge step, or on a merge field's rows: a merge
     /// handler writes its merge fields alone; a query reads merge fields,
-    /// filtered; nothing else reaches them. Apart, so
-    /// the operations every other step makes keep their frames.
+    /// filtered; nothing else reaches them. Apart, so the operations every
+    /// other step makes keep their frames.
     #[cold]
     #[inline(never)]
     pub(super) fn merge_operation(

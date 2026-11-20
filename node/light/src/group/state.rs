@@ -276,14 +276,9 @@ pub enum Course {
     /// It cannot follow `epoch`, committed by `committer`.
     #[codec(index = 1)]
     Stuck { epoch: u64, committer: DeviceId },
-    /// It is out of the group.
+    /// It is out of the group: its removal, as the log it verified says.
     #[codec(index = 2)]
     Out,
-    /// The agent turns its key away, though its add was confirmed: its
-    /// removal settled while it was off, or the home fails it. Nothing is
-    /// dropped: a pass the agent serves again finds it following.
-    #[codec(index = 3)]
-    TurnedAway,
 }
 
 /// What a device keeps of the device set's operations.
