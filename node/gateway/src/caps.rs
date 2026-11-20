@@ -17,7 +17,8 @@
 //! the others by sending headers; a request whose body is already read is
 //! answered `Busy` past any cap, by the gateway, with no node asked. The clearnet's ports
 //! cap nothing ([`Caps::none`]): their clients' addresses are the bound
-//! ([`crate::limits`]).
+//! ([`crate::limits`]); a large proven body waits for a place among the
+//! port's [`PROVEN_BODIES`] alone.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -36,11 +37,6 @@ use crate::limits::{Rate, counted};
 /// Proven calls' bodies past a call's limit one uncapped SSH port holds at
 /// once, from every channel: as many as the gateway's HTTP holds.
 pub const PROVEN_BODIES: usize = vos_http::CREDENTIALED_LARGE;
-
-/// An uncapped port's own proven bodies' places.
-pub fn bodies() -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(PROVEN_BODIES))
-}
 
 /// What one port's calls may take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +80,17 @@ pub struct Refused {
     pub waiting: u64,
 }
 
+/// The caps, each counting what it refused ([`Refused`]).
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum Cap {
+    Proven,
+    Connection,
+    Circuit,
+    Agent,
+    Waiting,
+}
+
 /// Counts by key, each at most a limit.
 struct Counted<K>(Mutex<HashMap<K, usize>>);
 
@@ -120,7 +127,7 @@ pub struct Caps {
     circuits: Counted<IpAddr>,
     waiting: Counted<IpAddr>,
     agents: Rate<(IpAddr, u32)>,
-    refused: [AtomicU64; 5],
+    refused: [AtomicU64; Cap::Waiting as usize + 1],
 }
 
 /// A proven call's places among its port's, its connection's and its
@@ -178,9 +185,10 @@ impl Caps {
 
     fn with(per: Option<PerPort>) -> Arc<Self> {
         let rates = per.unwrap_or_default();
+        let proven = per.map_or(PROVEN_BODIES, |per| per.proven);
         Arc::new(Self {
             per,
-            proven: Arc::new(Semaphore::new(rates.proven)),
+            proven: Arc::new(Semaphore::new(proven)),
             connections: Counted(Mutex::new(HashMap::new())),
             circuits: Counted(Mutex::new(HashMap::new())),
             waiting: Counted(Mutex::new(HashMap::new())),
@@ -194,8 +202,8 @@ impl Caps {
         self.per.is_some()
     }
 
-    fn refuse(&self, cap: usize) {
-        self.refused[cap].fetch_add(1, Ordering::Relaxed);
+    fn refuse(&self, cap: Cap) {
+        self.refused[cap as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// The connection's and circuit's places for a proven call from
@@ -203,7 +211,7 @@ impl Caps {
     fn own(self: &Arc<Self>, per: PerPort, peer: Option<SocketAddr>) -> Option<Own> {
         if let Some(peer) = peer {
             if !self.connections.take(peer, per.proven_per_connection) {
-                self.refuse(1);
+                self.refuse(Cap::Connection);
                 return None;
             }
             if !self
@@ -211,7 +219,7 @@ impl Caps {
                 .take(counted(peer.ip()), per.proven_per_circuit)
             {
                 self.connections.give(peer);
-                self.refuse(2);
+                self.refuse(Cap::Circuit);
                 return None;
             }
         }
@@ -229,7 +237,7 @@ impl Caps {
         };
         let own = self.own(per, peer).ok_or(Capped)?;
         let Ok(place) = Arc::clone(&self.proven).try_acquire_owned() else {
-            self.refuse(0);
+            self.refuse(Cap::Proven);
             return Err(Capped);
         };
         Ok(Some(Held {
@@ -241,13 +249,21 @@ impl Caps {
     /// A proven call's places from `peer`, once the port has one: `Err` at
     /// once past its connection's or circuit's, or when its circuit has
     /// as many waiting already. Its connection's and circuit's are taken
-    /// first, so what it waits for is the port's alone.
-    pub async fn proven_wait(
-        self: &Arc<Self>,
-        peer: Option<SocketAddr>,
-    ) -> Result<Option<Held>, Capped> {
+    /// first, so what it waits for is the port's alone. On a port that caps
+    /// nothing, a place among its [`PROVEN_BODIES`].
+    pub async fn proven_wait(self: &Arc<Self>, peer: Option<SocketAddr>) -> Result<Held, Capped> {
         let Some(per) = self.per else {
-            return Ok(None);
+            let place = Arc::clone(&self.proven)
+                .acquire_owned()
+                .await
+                .expect("the port's places are never closed");
+            return Ok(Held {
+                _own: Own {
+                    caps: Arc::clone(self),
+                    peer: None,
+                },
+                _place: place,
+            });
         };
         let own = self.own(per, peer).ok_or(Capped)?;
         let place = match Arc::clone(&self.proven).try_acquire_owned() {
@@ -257,7 +273,7 @@ impl Caps {
                     Some(peer) => {
                         let circuit = counted(peer.ip());
                         if !self.waiting.take(circuit, per.waiting_per_circuit) {
-                            self.refuse(4);
+                            self.refuse(Cap::Waiting);
                             return Err(Capped);
                         }
                         Some(Waiting {
@@ -273,10 +289,10 @@ impl Caps {
                     .expect("the port's places are never closed")
             }
         };
-        Ok(Some(Held {
+        Ok(Held {
             _own: own,
             _place: place,
-        }))
+        })
     }
 
     /// Whether a call or proven call holding `body` from `peer` passes its
@@ -291,7 +307,7 @@ impl Caps {
         let agent = u32::from_le_bytes(agent.try_into().expect("four bytes"));
         let passes = self.agents.take((counted(peer.ip()), agent));
         if !passes {
-            self.refuse(3);
+            self.refuse(Cap::Agent);
         }
         passes
     }
@@ -315,15 +331,33 @@ impl Caps {
         Ok(held)
     }
 
+    /// [`Caps::admit`] for a request that may hold `held`, the places its
+    /// header took: then its agent's rate alone is left.
+    pub fn admit_held(
+        self: &Arc<Self>,
+        kind: Kind,
+        body: &[u8],
+        peer: Option<SocketAddr>,
+        held: Option<Held>,
+    ) -> Result<Option<Held>, Capped> {
+        match held {
+            Some(held) => self
+                .agent(kind, body, peer)
+                .then_some(Some(held))
+                .ok_or(Capped),
+            None => self.admit(kind, body, peer),
+        }
+    }
+
     /// The requests refused so far, by the cap.
     pub fn refused(&self) -> Refused {
-        let count = |cap: usize| self.refused[cap].load(Ordering::Relaxed);
+        let count = |cap: Cap| self.refused[cap as usize].load(Ordering::Relaxed);
         Refused {
-            proven: count(0),
-            connection: count(1),
-            circuit: count(2),
-            agent: count(3),
-            waiting: count(4),
+            proven: count(Cap::Proven),
+            connection: count(Cap::Connection),
+            circuit: count(Cap::Circuit),
+            agent: count(Cap::Agent),
+            waiting: count(Cap::Waiting),
         }
     }
 

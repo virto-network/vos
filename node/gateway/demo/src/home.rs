@@ -9,14 +9,14 @@
 //! Two homes on the one node are two homes to a device, each its own agent,
 //! credential actor and handle, as moving home needs.
 
-use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, derive_id};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, derive_id};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode};
 use vos_keeper::{Home as Pool, Keeper};
 use vos_node::client::{Client, Operator, Target};
 use vos_wire::credentials::{CredentialError, Onion};
 use vos_wire::homes::{Counts, HomesError, Terms};
-use vos_wire::ingress::{Install, Response};
+use vos_wire::ingress::Response;
 use vos_wire::personal::Policy;
 
 use crate::LocalSpace;
@@ -26,10 +26,6 @@ use crate::LocalSpace;
 pub const HOME_CREDENTIALS: InstanceId = InstanceId(9);
 pub const HOMES: InstanceId = InstanceId(3);
 pub use vos_wire::personal::PERSONAL;
-/// The registrar's and the operator's role byte at a home's agent: the
-/// operator's key holds both, as the keeper's.
-const ROLE: u8 = 1;
-
 const MINUTE: u64 = 60_000;
 
 /// A phone session's home policy: a device's own operations (a removal, a
@@ -66,13 +62,6 @@ pub struct Home {
     pub identity: [u8; 32],
 }
 
-fn ran(what: &str, answer: Result<Response, vos_node::client::ClientError>) -> Result<(), String> {
-    match answer {
-        Ok(Response::Ran { .. }) => Ok(()),
-        other => Err(format!("{what}: {other:?}")),
-    }
-}
-
 impl LocalSpace {
     /// A home founded on this node: its agent with the credential actor
     /// (handle `handle`) and `Homes` configured with `policy`, open claims
@@ -81,39 +70,22 @@ impl LocalSpace {
     pub fn found_home(&self, handle: [u8; 32], policy: Policy, pool: u32) -> Result<Home, String> {
         let target = Target::socket(self.socket.clone());
         let signed = Operator::signing(&target, self.key.clone(), self.node.id());
-        let agent = match signed.create_agent(vec![1]) {
-            Ok(Response::Created(agent)) => agent,
-            other => return Err(format!("the home's agent: {other:?}")),
-        };
-        let elf = |path: std::path::PathBuf| {
-            std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
-        };
-        for (instance, elf, role) in [
-            (
-                HOME_CREDENTIALS,
-                elf(vos_testkit::programs::program_elf("vos-credentials"))?,
-                "registrar",
-            ),
-            (
-                HOMES,
-                elf(vos_testkit::programs::program_elf("vos-homes"))?,
-                "operator",
-            ),
-        ] {
-            let install = Install {
-                instance,
-                elf,
-                roles: vec![(role.as_bytes().to_vec(), ROLE)],
-            };
-            ran(
-                &format!("installing {role}"),
-                signed.install(agent, &install),
-            )?;
-        }
-        let principal = Principal::Client(self.key.verifying_key().to_bytes());
-        ran(
-            "the operator's role",
-            signed.grant(agent, principal, Some(ROLE)),
+        let agent = crate::agent_with(
+            &signed,
+            &self.key,
+            "the home's agent",
+            &[
+                (
+                    HOME_CREDENTIALS,
+                    vos_testkit::programs::program_elf("vos-credentials"),
+                    "registrar",
+                ),
+                (
+                    HOMES,
+                    vos_testkit::programs::program_elf("vos-homes"),
+                    "operator",
+                ),
+            ],
         )?;
         let identity = self
             .client()
