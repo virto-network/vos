@@ -7,131 +7,40 @@
 //! apply in either order; and a full disk refusing every new write with
 //! nothing written, until room is freed.
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::SigningKey;
-use merkle_crdt::{Author, Node};
+use merkle_crdt::Author;
 use vos_abi::abi::Failure;
-use vos_abi::ids::{InstanceId, MethodId, Principal};
+use vos_abi::ids::{InstanceId, MethodId};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode};
-use vos_light::group::{Archive, archive};
-use vos_light::release::{self, Package};
-use vos_light::sync::{self, Blake2b256, Call, Cid, Hold, Op, Ops, Quarantine};
+use vos_light::release::Package;
+use vos_light::sync::{Call, Hold, Op, Quarantine};
 use vos_light::{Config, Disk, Error, Light, MAX_ARGUMENTS};
 use vos_testkit::programs;
 
+use common::device::{DEVICE, Device, cid, node, open};
+
 const BOOK: InstanceId = InstanceId(2);
-const DEVICE: Principal = Principal::Client([0xd1; 32]);
-
-/// The naming secret the tests' devices share, as pairing gives it.
-const NAMING: [u8; 32] = [0x11; 32];
-
-fn read(path: std::path::PathBuf) -> Vec<u8> {
-    std::fs::read(path).unwrap()
-}
-
-fn agent() -> Vec<u8> {
-    release::agent(&read(programs::program_elf("vos-agent"))).unwrap()
-}
 
 /// The device book's first release, and its next.
 fn device_books() -> (Package, Package) {
     (
-        release::package(&read(programs::program_elf("vos-device-book")), 1).unwrap(),
-        release::package(&read(programs::actor_elf("device-book-next")), 2).unwrap(),
+        common::package(programs::program_elf("vos-device-book"), 1),
+        common::package(programs::actor_elf("device-book-next"), 2),
     )
 }
 
-/// A light node at `dir`, its store's archive the devices' shared one.
-fn open(dir: &std::path::Path, agent: &[u8], config: Config) -> Light {
-    let light = Light::open(dir, agent, config).unwrap();
-    let shared = Archive {
-        naming: NAMING,
-        previous: Vec::new(),
-        scopes: Vec::new(),
-        keys: Vec::new(),
-        recovery: None,
-        drawn: Vec::new(),
-    };
-    light.store().adopt(&shared).unwrap();
-    light
-}
-
-/// A device: its light node at a directory of its own, `package`
-/// installed at [`BOOK`].
-struct Device {
-    light: Light,
-    package: Package,
-    _dir: tempfile::TempDir,
-}
-
-impl Device {
-    fn new(agent: &[u8], package: &Package) -> Self {
-        Self::with(agent, package, Config::default())
-    }
-
-    fn with(agent: &[u8], package: &Package, config: Config) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let light = open(dir.path(), agent, config);
-        let installed = light.install(BOOK, package, Vec::new()).unwrap();
-        assert!(matches!(installed, Outcome::Done(_)), "{installed:?}");
-        Self {
-            light,
-            package: package.clone(),
-            _dir: dir,
-        }
-    }
-
-    fn method(&self, name: &str) -> MethodId {
-        programs::method(&self.package.programs[0], name)
-    }
-
-    fn call(&self, name: &str, arguments: Vec<u8>) -> Result<Outcome, Error> {
-        self.light.call(BOOK, self.method(name), arguments)
-    }
-
-    fn done(&self, name: &str, arguments: Vec<u8>) {
-        match self.call(name, arguments).unwrap() {
-            Outcome::Done(_) => {}
-            other => panic!("{name}: {other:?}"),
-        }
-    }
-
-    fn query<T: Decode>(&self, name: &str, arguments: Vec<u8>) -> T {
-        match self
-            .light
-            .query(DEVICE, BOOK, self.method(name), arguments)
-            .unwrap()
-        {
-            Outcome::Done(reply) => T::decode_exact(&reply).unwrap(),
-            other => panic!("{name}: {other:?}"),
-        }
-    }
-
-    /// The local nodes not yet pushed, marked pushed.
-    fn push(&self) -> Vec<Vec<u8>> {
-        let outbox = self.light.outbox(BOOK).unwrap();
-        let pushed: Vec<(Author, u64)> =
-            outbox.iter().map(|node| (node.author, node.seq)).collect();
-        self.light.pushed(BOOK, &pushed).unwrap();
-        outbox.into_iter().map(|node| node.bytes).collect()
-    }
-
-    fn labels(&self) -> Vec<(u32, String)> {
-        let mut labels: Vec<(u32, String)> = self.query("labels", Vec::new());
-        labels.sort();
-        labels
-    }
-}
-
-/// A node of `ops` at `seq` in `key`'s chain of the book's scope, after
-/// `parents`.
-fn node(key: &SigningKey, seq: u64, ops: Ops, parents: BTreeSet<Cid>) -> Vec<u8> {
-    let scope = merkle_crdt::Scope(archive::scope_id(&NAMING, &sync::scope_name(BOOK)));
-    Node::<Blake2b256, Ops>::sign(key, &scope, seq, ops, parents).to_bytes()
+/// `device`'s labels, in order.
+fn labels(device: &Device) -> Vec<(u32, String)> {
+    let mut labels: Vec<(u32, String)> = device.query("labels", Vec::new());
+    labels.sort();
+    labels
 }
 
 fn call(method: MethodId, release: u32, arguments: Vec<u8>) -> Op {
@@ -144,10 +53,6 @@ fn call(method: MethodId, release: u32, arguments: Vec<u8>) -> Op {
     })
 }
 
-fn cid(bytes: &[u8]) -> Cid {
-    merkle_crdt::Cid(<Blake2b256 as merkle_crdt::Hasher>::hash(bytes))
-}
-
 /// The credential book and the device book, installed from their release
 /// artifacts, read back what their merge handlers wrote, on the device
 /// and opened again; a second device that ingests the first's nodes reads
@@ -156,9 +61,8 @@ fn cid(bytes: &[u8]) -> Cid {
 fn the_credential_book_and_the_device_book_read_back() {
     use vos_wire::books::{Agent, DeviceHandle, Enrolled, Guard, Location, Pinned};
 
-    let agent = agent();
-    let credentials =
-        release::package(&read(programs::program_elf("vos-credential-book")), 1).unwrap();
+    let agent = common::agent();
+    let credentials = common::package(programs::program_elf("vos-credential-book"), 1);
     let (devices, _) = device_books();
     let dir = tempfile::tempdir().unwrap();
     let space = [0x5a; 32];
@@ -214,8 +118,8 @@ fn the_credential_book_and_the_device_book_read_back() {
         other => panic!("{name}: {other:?}"),
     };
     let pushed = {
-        let phone = Device::with(&agent, &devices, Config::default());
-        let light = open(dir.path(), &agent, Config::default());
+        let phone = Device::with(agent, BOOK, &devices, Config::default());
+        let light = open(dir.path(), agent, Config::default());
         light
             .install(CREDENTIALS, &credentials, Vec::new())
             .unwrap();
@@ -275,7 +179,7 @@ fn the_credential_book_and_the_device_book_read_back() {
             }
         ));
         assert_eq!(
-            phone.labels(),
+            labels(&phone),
             [(1, "phone".to_string()), (2, "laptop".to_string())]
         );
         assert_eq!(
@@ -287,9 +191,9 @@ fn the_credential_book_and_the_device_book_read_back() {
             Some("laptop".into())
         );
 
-        let laptop = Device::new(&agent, &devices);
+        let laptop = Device::new(agent, BOOK, &devices);
         laptop.light.ingest(BOOK, phone.push(), None).unwrap();
-        assert_eq!(laptop.labels(), phone.labels());
+        assert_eq!(labels(&laptop), labels(&phone));
         assert_eq!(
             laptop.query::<Vec<(String, Vec<u8>)>>("settings", 2u32.encode()),
             [("theme".to_string(), b"light".to_vec())]
@@ -297,7 +201,7 @@ fn the_credential_book_and_the_device_book_read_back() {
         light.outbox(CREDENTIALS).unwrap()
     };
 
-    let light = Light::open(dir.path(), &agent, Config::default()).unwrap();
+    let light = Light::open(dir.path(), agent, Config::default()).unwrap();
     let spaces = Vec::<([u8; 32], Enrolled)>::decode_exact(&ask(&light, "spaces", Vec::new()));
     assert_eq!(spaces.unwrap(), [(space, enrolled.clone())]);
     let enrolled_again =
@@ -310,7 +214,7 @@ fn the_credential_book_and_the_device_book_read_back() {
 
     // Another device reads the same from the nodes.
     let other = tempfile::tempdir().unwrap();
-    let tablet = open(other.path(), &agent, Config::default());
+    let tablet = open(other.path(), agent, Config::default());
     tablet
         .install(CREDENTIALS, &credentials, Vec::new())
         .unwrap();
@@ -339,10 +243,10 @@ fn the_credential_book_and_the_device_book_read_back() {
 /// kind is held still. A release before the one installed is refused.
 #[test]
 fn an_operation_of_a_later_release_is_held_then_replayed() {
-    let agent = agent();
+    let agent = common::agent();
     let (first, next) = device_books();
-    let newer = Device::new(&agent, &next);
-    let older = Device::new(&agent, &first);
+    let newer = Device::new(agent, BOOK, &next);
+    let older = Device::new(agent, BOOK, &first);
     newer.done("label", (1u32, "phone".to_string()).encode());
     newer.done("retire", 9u32.encode());
     let pushed = newer.push();
@@ -360,12 +264,13 @@ fn an_operation_of_a_later_release_is_held_then_replayed() {
         assert_eq!(held.why, Hold::Release);
         assert_eq!(held.origin.author, newer.light.author().0);
     }
-    assert_eq!(older.labels(), [(2, "laptop".to_string())]);
+    assert_eq!(labels(&older), [(2, "laptop".to_string())]);
     newer.light.ingest(BOOK, older.push(), None).unwrap();
 
     // An operation of a kind no build here knows, from a third author.
     let stranger = SigningKey::from_bytes(&[3; 32]);
     let unknown = node(
+        BOOK,
         &stranger,
         0,
         vec![Op::Unknown {
@@ -395,7 +300,7 @@ fn an_operation_of_a_later_release_is_held_then_replayed() {
     assert_eq!(held.len(), 1, "the unknown kind waits for the app's update");
     assert_eq!(held[0].why, Hold::Kind);
     assert_eq!(older.query::<Vec<u32>>("retired", Vec::new()), [9]);
-    assert_eq!(older.labels(), newer.labels());
+    assert_eq!(labels(&older), labels(&newer));
     assert_eq!(
         older.query::<Vec<u32>>("retired", Vec::new()),
         newer.query::<Vec<u32>>("retired", Vec::new())
@@ -427,9 +332,9 @@ fn an_operation_of_a_later_release_is_held_then_replayed() {
 /// a replay; the node's valid operation beside them applies.
 #[test]
 fn invalid_operations_are_quarantined_never_applied_and_reported() {
-    let agent = agent();
+    let agent = common::agent();
     let (first, _) = device_books();
-    let device = Device::new(&agent, &first);
+    let device = Device::new(agent, BOOK, &first);
     let label = device.method("label");
     let garbler = SigningKey::from_bytes(&[4; 32]);
     let long = "x".repeat(vos_wire::books::LABEL_BYTES + 1);
@@ -441,7 +346,7 @@ fn invalid_operations_are_quarantined_never_applied_and_reported() {
         call(label, 1, (2u32, "fine".to_string()).encode()),
     ];
     let before = device.light.store().rows().unwrap();
-    let garbage = node(&garbler, 0, ops, BTreeSet::new());
+    let garbage = node(BOOK, &garbler, 0, ops, BTreeSet::new());
     let ingested = device.light.ingest(BOOK, [garbage.clone()], None).unwrap();
     assert_eq!(ingested.nodes.applied, [cid(&garbage)]);
     assert!(ingested.held.is_empty());
@@ -459,7 +364,7 @@ fn invalid_operations_are_quarantined_never_applied_and_reported() {
         assert_eq!(kept.origin.author, Author::from(&garbler).0);
         assert_eq!(kept.cid, cid(&garbage));
     }
-    assert_eq!(device.labels(), [(2, "fine".to_string())]);
+    assert_eq!(labels(&device), [(2, "fine".to_string())]);
     // Stored and listed, for the chrome to name its author.
     assert_eq!(
         device.light.quarantined(BOOK).unwrap(),
@@ -475,7 +380,7 @@ fn invalid_operations_are_quarantined_never_applied_and_reported() {
     assert_eq!(quarantined_rows, 4);
     let replayed = device.light.replay(BOOK).unwrap();
     assert!(replayed.applied.is_empty() && replayed.held == 0);
-    assert_eq!(device.labels(), [(2, "fine".to_string())]);
+    assert_eq!(labels(&device), [(2, "fine".to_string())]);
     assert_eq!(device.light.quarantined(BOOK).unwrap().len(), 4);
 }
 
@@ -485,10 +390,10 @@ fn invalid_operations_are_quarantined_never_applied_and_reported() {
 /// wrote before the cutoff is hidden by what it wrote after.
 #[test]
 fn operations_of_a_cut_off_author_are_held_out() {
-    let agent = agent();
+    let agent = common::agent();
     let (first, _) = device_books();
-    let phone = Device::new(&agent, &first);
-    let thief = Device::new(&agent, &first);
+    let phone = Device::new(agent, BOOK, &first);
+    let thief = Device::new(agent, BOOK, &first);
     thief.done("label", (1u32, "mine".to_string()).encode());
     let before = thief.push();
     thief.done("label", (1u32, "stolen".to_string()).encode());
@@ -513,10 +418,10 @@ fn operations_of_a_cut_off_author_are_held_out() {
             .all(|kept| kept.why == Quarantine::CutOff && kept.origin.seq >= 1)
     );
     // Its write before the cutoff stands: the later one never replaced it.
-    assert_eq!(phone.labels(), [(1, "mine".to_string())]);
+    assert_eq!(labels(&phone), [(1, "mine".to_string())]);
     // A replay applies none of them.
     phone.light.replay(BOOK).unwrap();
-    assert_eq!(phone.labels(), [(1, "mine".to_string())]);
+    assert_eq!(labels(&phone), [(1, "mine".to_string())]);
 }
 
 /// A full disk: below the reserve a call, an ingest and an install are
@@ -525,15 +430,15 @@ fn operations_of_a_cut_off_author_are_held_out() {
 /// each succeeds, and the refused ingest's nodes apply.
 #[test]
 fn a_full_disk_refuses_new_writes_until_room_is_freed() {
-    let agent = agent();
+    let agent = common::agent();
     let (first, next) = device_books();
     let free = Arc::new(AtomicU64::new(u64::MAX));
     let probe = Arc::clone(&free);
     let config = Config {
         disk: Disk::Probe(Arc::new(move || probe.load(Ordering::SeqCst))),
     };
-    let phone = Device::with(&agent, &first, config.clone());
-    let laptop = Device::new(&agent, &first);
+    let phone = Device::with(agent, BOOK, &first, config.clone());
+    let laptop = Device::new(agent, BOOK, &first);
     phone.done("label", (1u32, "phone".to_string()).encode());
     laptop.done("label", (2u32, "laptop".to_string()).encode());
     let from_laptop = laptop.push();
@@ -558,11 +463,9 @@ fn a_full_disk_refuses_new_writes_until_room_is_freed() {
     assert_eq!(phone.light.outbox(BOOK).unwrap().len(), outbox);
     assert_eq!(phone.light.have(BOOK).unwrap(), have);
     assert_eq!(phone.light.cursor(BOOK).unwrap(), None);
-    assert_eq!(phone.labels(), [(1, "phone".to_string())]);
+    assert_eq!(labels(&phone), [(1, "phone".to_string())]);
     // A reopened store holds the same: nothing was half-written.
-    drop(phone.light);
-    let light = Light::open(phone._dir.path(), &agent, config).unwrap();
-    let phone = Device { light, ..phone };
+    let phone = phone.reopen(agent, config);
     assert_eq!(phone.light.store().rows().unwrap(), rows);
 
     free.store(vos_light::RESERVE_BYTES, Ordering::SeqCst);
@@ -571,7 +474,7 @@ fn a_full_disk_refuses_new_writes_until_room_is_freed() {
     assert_eq!(ingested.nodes.applied.len(), 1);
     assert_eq!(phone.light.cursor(BOOK).unwrap(), Some(1));
     assert_eq!(
-        phone.labels(),
+        labels(&phone),
         [
             (1, "phone".to_string()),
             (2, "laptop".to_string()),
@@ -585,13 +488,14 @@ fn a_full_disk_refuses_new_writes_until_room_is_freed() {
 /// number, so both read the same, and neither quarantines.
 #[test]
 fn forks_met_in_either_order_read_the_same() {
-    let agent = agent();
+    let agent = common::agent();
     let (first, _) = device_books();
-    let phone = Device::new(&agent, &first);
-    let laptop = Device::new(&agent, &first);
+    let phone = Device::new(agent, BOOK, &first);
+    let laptop = Device::new(agent, BOOK, &first);
     let label = phone.method("label");
     let forker = SigningKey::from_bytes(&[5; 32]);
     let base = node(
+        BOOK,
         &forker,
         0,
         vec![
@@ -602,12 +506,14 @@ fn forks_met_in_either_order_read_the_same() {
     );
     let after = BTreeSet::from([cid(&base)]);
     let left = node(
+        BOOK,
         &forker,
         1,
         vec![call(label, 1, (1u32, "left".to_string()).encode())],
         after.clone(),
     );
     let right = node(
+        BOOK,
         &forker,
         1,
         vec![call(label, 1, (2u32, "right".to_string()).encode())],
@@ -620,7 +526,7 @@ fn forks_met_in_either_order_read_the_same() {
             assert!(ingested.quarantined.is_empty());
         }
     }
-    assert_eq!(phone.labels(), laptop.labels());
+    assert_eq!(labels(&phone), labels(&laptop));
 }
 
 /// The install's replay meets a full disk: the install stands, and the
@@ -628,7 +534,7 @@ fn forks_met_in_either_order_read_the_same() {
 /// Release 0 is no release.
 #[test]
 fn an_install_stands_when_its_replay_finds_no_room() {
-    let agent = agent();
+    let agent = common::agent();
     let (first, next) = device_books();
     // The checks of room the disk answers yes to, then no.
     let roomy = Arc::new(AtomicU64::new(u64::MAX));
@@ -643,8 +549,8 @@ fn an_install_stands_when_its_replay_finds_no_room() {
             }
         })),
     };
-    let older = Device::with(&agent, &first, config);
-    let newer = Device::new(&agent, &next);
+    let older = Device::with(agent, BOOK, &first, config);
+    let newer = Device::new(agent, BOOK, &next);
     newer.done("retire", 9u32.encode());
     older.light.ingest(BOOK, newer.push(), None).unwrap();
     assert_eq!(older.light.held(BOOK).unwrap().len(), 1);

@@ -4,114 +4,34 @@
 //! refuses; and two devices exchanging their nodes and converging, an
 //! equivocating author and a removed one filtered at read.
 
+mod common;
+
 use std::collections::BTreeSet;
 
 use ed25519_dalek::SigningKey;
-use merkle_crdt::{Author, Node};
 use vos_abi::abi::Failure;
-use vos_abi::ids::{InstanceId, MethodId, Principal};
+use vos_abi::ids::{InstanceId, MethodId};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode};
-use vos_light::group::{Archive, archive};
 use vos_light::release::{self, Package};
-use vos_light::sync::{self, Blake2b256, Call, Cid, Hold, Op, Ops};
+use vos_light::sync::{Call, Hold, Op};
 use vos_light::{Config, Error, Light};
 use vos_testkit::programs;
 
+use common::device::{Device, cid, node, open};
+
 const NOTES: InstanceId = InstanceId(1);
-const DEVICE: Principal = Principal::Client([0xd1; 32]);
-
-/// The naming secret the tests' devices share, as pairing gives it.
-const NAMING: [u8; 32] = [0x11; 32];
-
-/// A light node at `dir`, its store's archive the devices' shared one.
-fn open(dir: &std::path::Path, agent: &[u8]) -> Light {
-    let light = Light::open(dir, agent, Config::default()).unwrap();
-    let shared = Archive {
-        naming: NAMING,
-        previous: Vec::new(),
-        scopes: Vec::new(),
-        keys: Vec::new(),
-        recovery: None,
-        drawn: Vec::new(),
-    };
-    light.store().adopt(&shared).unwrap();
-    light
-}
-
-/// The release artifacts, as the release build computes them: the agent
-/// program, and the notes actor's package.
-fn artifacts() -> (Vec<u8>, Package) {
-    let read = |path: std::path::PathBuf| std::fs::read(path).unwrap();
-    let agent = release::agent(&read(programs::program_elf("vos-agent"))).unwrap();
-    let notes = release::package(&read(programs::actor_elf("notes")), 1).unwrap();
-    (agent, notes)
-}
 
 fn method(package: &Package, name: &str) -> MethodId {
     programs::method(&package.programs[0], name)
 }
 
-/// A device: its light node with the notes actor installed.
-struct Device {
-    light: Light,
-    notes: Package,
-    _dir: tempfile::TempDir,
-}
-
-impl Device {
-    fn new(agent: &[u8], notes: &Package) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let light = open(dir.path(), agent);
-        let installed = light.install(NOTES, notes, Vec::new()).unwrap();
-        assert!(matches!(installed, Outcome::Done(_)), "{installed:?}");
-        Self {
-            light,
-            notes: notes.clone(),
-            _dir: dir,
-        }
-    }
-
-    fn call(&self, name: &str, arguments: Vec<u8>) -> Outcome {
-        self.light
-            .call(NOTES, method(&self.notes, name), arguments)
-            .unwrap()
-    }
-
-    fn done(&self, name: &str, arguments: Vec<u8>) -> Vec<u8> {
-        match self.call(name, arguments) {
-            Outcome::Done(reply) => reply,
-            other => panic!("{name}: {other:?}"),
-        }
-    }
-
-    fn query<T: Decode>(&self, name: &str, arguments: Vec<u8>) -> T {
-        let outcome = self
-            .light
-            .query(DEVICE, NOTES, method(&self.notes, name), arguments)
-            .unwrap();
-        match outcome {
-            Outcome::Done(reply) => T::decode_exact(&reply).unwrap(),
-            other => panic!("{name}: {other:?}"),
-        }
-    }
-
-    /// What every read sees.
-    fn state(&self) -> State {
-        State {
-            tags: self.query("tags", Vec::new()),
-            items: self.query("items", Vec::new()),
-            titles: self.query("titles", Vec::new()),
-        }
-    }
-
-    /// The local nodes not yet pushed, marked pushed.
-    fn push(&self) -> Vec<Vec<u8>> {
-        let outbox = self.light.outbox(NOTES).unwrap();
-        let pushed: Vec<(Author, u64)> =
-            outbox.iter().map(|node| (node.author, node.seq)).collect();
-        self.light.pushed(NOTES, &pushed).unwrap();
-        outbox.into_iter().map(|node| node.bytes).collect()
+/// What every read of `device` sees.
+fn state(device: &Device) -> State {
+    State {
+        tags: device.query("tags", Vec::new()),
+        items: device.query("items", Vec::new()),
+        titles: device.query("titles", Vec::new()),
     }
 }
 
@@ -150,21 +70,17 @@ fn the_agent_program_is_held_to_the_service_code_bound() {
 /// store, its author the same.
 #[test]
 fn a_local_actor_installed_from_release_artifacts_is_called() {
-    let (agent, notes) = artifacts();
+    let (agent, notes) = (common::agent(), common::notes());
     // As `vos-phone`'s build script encodes a package: its derivation, its
     // programs, then its release.
     let bytes = (notes.derivation.clone(), notes.programs.clone(), 1u32).encode();
     assert_eq!(bytes, notes.encode());
     let embedded = Package::decode_exact(&bytes).unwrap();
-    assert_eq!(embedded, notes);
+    assert_eq!(embedded, *notes);
     let dir = tempfile::tempdir().unwrap();
     let author = {
-        let light = open(dir.path(), &agent);
-        let device = Device {
-            light,
-            notes: embedded.clone(),
-            _dir: tempfile::tempdir().unwrap(),
-        };
+        let light = open(dir.path(), agent, Config::default());
+        let device = Device::over(light, NOTES, embedded.clone());
         let installed = device.light.install(NOTES, &embedded, Vec::new()).unwrap();
         assert!(matches!(installed, Outcome::Done(_)), "{installed:?}");
         device.done("tag", "home".to_string().encode());
@@ -192,13 +108,9 @@ fn a_local_actor_installed_from_release_artifacts_is_called() {
         assert_eq!(device.light.outbox(NOTES).unwrap().len(), 12);
         device.light.author()
     };
-    let light = open(dir.path(), &agent);
+    let light = open(dir.path(), agent, Config::default());
     assert_eq!(light.author(), author);
-    let device = Device {
-        light,
-        notes,
-        _dir: tempfile::tempdir().unwrap(),
-    };
+    let device = Device::over(light, NOTES, notes.clone());
     let mut items: Vec<u64> = device.query("items", Vec::new());
     items.sort();
     assert_eq!(items, [2, 3, 9]);
@@ -222,9 +134,9 @@ fn a_local_actor_installed_from_release_artifacts_is_called() {
 /// an instance not installed are refused.
 #[test]
 fn the_merge_entry_runs_merge_handlers_writing_merge_fields() {
-    let (agent, notes) = artifacts();
+    let (agent, notes) = (common::agent(), common::notes());
     let dir = tempfile::tempdir().unwrap();
-    let light = open(dir.path(), &agent);
+    let light = open(dir.path(), agent, Config::default());
     let mut forged = notes.clone();
     forged.programs[0].push(0);
     assert!(matches!(
@@ -241,22 +153,30 @@ fn the_merge_entry_runs_merge_handlers_writing_merge_fields() {
         light.ingest(NOTES, Vec::new(), None),
         Err(Error::NotInstalled)
     ));
-    light.install(NOTES, &notes, Vec::new()).unwrap();
-    let device = Device {
-        light,
-        notes,
-        _dir: tempfile::tempdir().unwrap(),
-    };
+    light.install(NOTES, notes, Vec::new()).unwrap();
+    let device = Device::over(light, NOTES, notes.clone());
     device.done("add", 5u64.encode());
     let rows = device.light.store().rows().unwrap();
     let failed = |outcome: Outcome, expected: Failure| match outcome {
         Outcome::Failed { code, .. } => assert_eq!(code, expected),
         other => panic!("{other:?}"),
     };
-    failed(device.call("bump", 1u64.encode()), Failure::Unknown);
-    failed(device.call("peek", 6u64.encode()), Failure::Trapped);
-    failed(device.call("scribble", 1u64.encode()), Failure::Trapped);
-    failed(device.call("refuse", 6u64.encode()), Failure::Handler);
+    failed(
+        device.call("bump", 1u64.encode()).unwrap(),
+        Failure::Unknown,
+    );
+    failed(
+        device.call("peek", 6u64.encode()).unwrap(),
+        Failure::Trapped,
+    );
+    failed(
+        device.call("scribble", 1u64.encode()).unwrap(),
+        Failure::Trapped,
+    );
+    failed(
+        device.call("refuse", 6u64.encode()).unwrap(),
+        Failure::Handler,
+    );
     assert_eq!(
         device.light.store().rows().unwrap(),
         rows,
@@ -272,9 +192,9 @@ fn the_merge_entry_runs_merge_handlers_writing_merge_fields() {
 /// duplicate.
 #[test]
 fn two_devices_exchange_nodes_and_converge() {
-    let (agent, notes) = artifacts();
-    let phone = Device::new(&agent, &notes);
-    let laptop = Device::new(&agent, &notes);
+    let (agent, notes) = (common::agent(), common::notes());
+    let phone = Device::new(agent, NOTES, notes);
+    let laptop = Device::new(agent, NOTES, notes);
     assert_ne!(phone.light.author(), laptop.light.author());
     let stamp = String::decode_exact(&phone.done("stamp", 1u64.encode())).unwrap();
     phone.done("tag", "phone".to_string().encode());
@@ -291,7 +211,7 @@ fn two_devices_exchange_nodes_and_converge() {
     let ingested = laptop.light.ingest(NOTES, to_laptop.clone(), None).unwrap();
     assert_eq!(ingested.nodes.applied.len(), to_laptop.len());
     phone.light.ingest(NOTES, to_phone, None).unwrap();
-    assert_eq!(phone.state(), laptop.state());
+    assert_eq!(state(&phone), state(&laptop));
     assert_eq!(
         laptop.query::<Option<String>>("title_of", 1u64.encode()),
         Some(stamp)
@@ -305,8 +225,8 @@ fn two_devices_exchange_nodes_and_converge() {
     laptop.done("title", (2u64, "settled".to_string()).encode());
     laptop.light.ingest(NOTES, phone.push(), None).unwrap();
     phone.light.ingest(NOTES, laptop.push(), None).unwrap();
-    assert_eq!(phone.state(), laptop.state());
-    let state = phone.state();
+    assert_eq!(state(&phone), state(&laptop));
+    let state = state(&phone);
     assert!(!state.items.contains(&4));
     assert!(state.titles.contains(&(2, "settled".into())));
 }
@@ -316,8 +236,11 @@ fn two_devices_exchange_nodes_and_converge() {
 /// same.
 #[test]
 fn delivery_order_does_not_change_what_devices_read() {
-    let (agent, notes) = artifacts();
-    let writers = [Device::new(&agent, &notes), Device::new(&agent, &notes)];
+    let (agent, notes) = (common::agent(), common::notes());
+    let writers = [
+        Device::new(agent, NOTES, notes),
+        Device::new(agent, NOTES, notes),
+    ];
     let mut nodes = Vec::new();
     for round in 0..4u64 {
         for (index, writer) in writers.iter().enumerate() {
@@ -341,25 +264,18 @@ fn delivery_order_does_not_change_what_devices_read() {
             .unwrap();
         nodes.extend(pushed.into_iter().flatten());
     }
-    let expected = writers[0].state();
-    assert_eq!(writers[1].state(), expected);
+    let expected = state(&writers[0]);
+    assert_eq!(state(&writers[1]), expected);
     for order in 0..3u64 {
-        let reader = Device::new(&agent, &notes);
+        let reader = Device::new(agent, NOTES, notes);
         let mut shuffled = nodes.clone();
         shuffle(&mut shuffled, order);
         for chunk in shuffled.chunks(3 + order as usize) {
             reader.light.ingest(NOTES, chunk.to_vec(), None).unwrap();
         }
         assert_eq!(reader.light.wanted(NOTES).unwrap().0, 0);
-        assert_eq!(reader.state(), expected, "order {order}");
+        assert_eq!(state(&reader), expected, "order {order}");
     }
-}
-
-/// A node of `ops` at `seq` in `key`'s chain of the notes' scope, after
-/// `parents`.
-fn node(key: &SigningKey, seq: u64, ops: Ops, parents: BTreeSet<Cid>) -> Vec<u8> {
-    let scope = merkle_crdt::Scope(archive::scope_id(&NAMING, &sync::scope_name(NOTES)));
-    Node::<Blake2b256, Ops>::sign(key, &scope, seq, ops, parents).to_bytes()
 }
 
 fn call(notes: &Package, name: &str, arguments: Vec<u8>, time: u64) -> Op {
@@ -372,10 +288,6 @@ fn call(notes: &Package, name: &str, arguments: Vec<u8>, time: u64) -> Op {
     })
 }
 
-fn cid(bytes: &[u8]) -> Cid {
-    merkle_crdt::Cid(<Blake2b256 as merkle_crdt::Hasher>::hash(bytes))
-}
-
 /// An author that signs two nodes at one sequence number is cut off from
 /// it on every device that applies both, its earlier writes kept, both
 /// forks applied whichever came first; an author the device set removed is
@@ -383,9 +295,9 @@ fn cid(bytes: &[u8]) -> Cid {
 /// an operation of a kind this build does not know is held.
 #[test]
 fn equivocating_and_removed_authors_are_filtered_at_read() {
-    let (agent, notes) = artifacts();
-    let phone = Device::new(&agent, &notes);
-    let laptop = Device::new(&agent, &notes);
+    let (agent, notes) = (common::agent(), common::notes());
+    let phone = Device::new(agent, NOTES, notes);
+    let laptop = Device::new(agent, NOTES, notes);
     phone.done("title", (1u64, "phone".to_string()).encode());
     let base = phone.push();
     laptop.light.ingest(NOTES, base.clone(), None).unwrap();
@@ -394,10 +306,11 @@ fn equivocating_and_removed_authors_are_filtered_at_read() {
     // A third author: a first node, then two at its second number.
     let thief = SigningKey::from_bytes(&[9; 32]);
     let first = node(
+        NOTES,
         &thief,
         0,
         vec![call(
-            &notes,
+            notes,
             "title",
             (2u64, "thief".to_string()).encode(),
             10,
@@ -406,21 +319,18 @@ fn equivocating_and_removed_authors_are_filtered_at_read() {
     );
     let second = BTreeSet::from([cid(&first)]);
     let one = node(
+        NOTES,
         &thief,
         1,
-        vec![call(
-            &notes,
-            "title",
-            (1u64, "one".to_string()).encode(),
-            11,
-        )],
+        vec![call(notes, "title", (1u64, "one".to_string()).encode(), 11)],
         second.clone(),
     );
     let other = node(
+        NOTES,
         &thief,
         1,
         vec![
-            call(&notes, "title", (1u64, "other".to_string()).encode(), 12),
+            call(notes, "title", (1u64, "other".to_string()).encode(), 12),
             Op::Unknown {
                 kind: 9,
                 body: vec![1, 2, 3],
@@ -446,7 +356,7 @@ fn equivocating_and_removed_authors_are_filtered_at_read() {
         assert_eq!(title(device, 1).as_deref(), Some("phone"));
         assert_eq!(title(device, 2).as_deref(), Some("thief"));
     }
-    assert_eq!(phone.state(), laptop.state());
+    assert_eq!(state(&phone), state(&laptop));
     // Both forks apply, filtered at read, whichever came first: the
     // unknown kind is held, and nothing quarantined.
     let held = phone.light.held(NOTES).unwrap();
