@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -199,10 +199,18 @@ impl Circuits {
     }
 }
 
-/// A stream holding its place on its circuit until it ends.
+/// A stream holding its place on its circuit until it ends, each write
+/// flushed before it counts as written: an onion stream holds what is
+/// written until it is flushed, and russh writes the server's version line
+/// without flushing it, which a client that waits for the server's line
+/// first (as RFC 4253 lets it) would never read. A write whose flush is
+/// pending holds its count across polls: it is polled again with the same
+/// bytes, never dropped for another write.
 struct Placed<S> {
     stream: S,
     _place: StreamPlace,
+    /// The bytes of a write taken but not yet flushed.
+    unflushed: Option<usize>,
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Placed<S> {
@@ -221,7 +229,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Placed<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.stream).poll_write(cx, buf)
+        let written = match self.unflushed {
+            Some(written) => written,
+            None => {
+                let written = ready!(Pin::new(&mut self.stream).poll_write(cx, buf))?;
+                self.unflushed = Some(written);
+                written
+            }
+        };
+        let flushed = ready!(Pin::new(&mut self.stream).poll_flush(cx));
+        self.unflushed = None;
+        flushed?;
+        Poll::Ready(Ok(written))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -285,6 +304,7 @@ impl Onion {
         let stream = Placed {
             stream,
             _place: place,
+            unflushed: None,
         };
         let _ = self.ssh.send((Box::new(stream), peer)).await;
     }
