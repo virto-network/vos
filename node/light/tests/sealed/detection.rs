@@ -688,13 +688,13 @@ fn a_later_configuration_lowers_no_delay() {
     let (a, b) = phones.split_at_mut(1);
     let (a, b) = (&mut a[0], &mut b[0]);
     let at = home.now();
-    let arguments = 1u32.encode();
+    // Placed at the log's head, where the operators' entries follow.
+    let stolen = home.sign(&a.admin, "remove", 1u32.encode());
     let call = AdminCall {
         origin: a.admin.verifying_key().to_bytes(),
         method: home.method("remove").0,
-        arguments: arguments.clone(),
+        arguments: stolen.call.arguments.clone(),
     };
-    let stolen = home.sign(&a.admin, "remove", arguments);
     let zero = vos_wire::personal::Policy {
         operation_delay_ms: 0,
         kit_delay_ms: 0,
@@ -863,13 +863,13 @@ fn a_forged_operation_moves_nothing() {
     let (a, b) = phones.split_at_mut(1);
     let (a, b) = (&mut a[0], &mut b[0]);
     let at = home.now();
-    let arguments = 1u32.encode();
+    // Placed at the log's head, where the operators' entries follow.
+    let forged = home.sign(&a.sync, "remove", 1u32.encode());
     let call = AdminCall {
         origin: a.admin.verifying_key().to_bytes(),
         method: home.method("remove").0,
-        arguments: arguments.clone(),
+        arguments: forged.call.arguments.clone(),
     };
-    let forged = home.sign(&a.sync, "remove", arguments);
     let mut index = 0;
     let log = shown_log(&home, b, |entries| {
         let (_, last) = entries.last().cloned().unwrap();

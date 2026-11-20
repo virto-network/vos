@@ -7,15 +7,15 @@ use ed25519_dalek::Signer as _;
 use vos_abi::Encode;
 use vos_wire::homes;
 use vos_wire::personal::{
-    Attached, Body, DeviceView, Entry, KitKind, NewDevice, OpState, Overview, RECOVERY, Recorded,
-    RecoveryView, method,
+    Attached, Body, DeviceView, Entry, KitKind, NewDevice, OpState, Overview, Place, RECOVERY,
+    Recorded, RecoveryView, method,
 };
 
 use super::link::{Key, Signer, answer};
-use super::set::evidence;
+use super::set::{evidence, placed};
 use super::{
     Claim, Claimed, Error, Held, Host, PERSONAL, Personal, Posted, Prompts, Restoring, answered,
-    entered_kit, failed, link, logged, new_kit, secret, unreached,
+    entered_kit, failed, link, logged, new_kit, secret,
 };
 use crate::group::{Agent as GroupAgent, DeviceGroup, Restored};
 use crate::personal::{Link as _, recover};
@@ -142,7 +142,8 @@ impl<H: Host> Personal<H> {
         }
         let taken = entries.iter().find_map(|(index, entry)| match &entry.body {
             Body::Operation { call, matures, .. }
-                if call.method == method::RESTORE.0 && call.arguments == restoring.arguments =>
+                if call.method == method::RESTORE.0
+                    && unplaced(&call.arguments) == Some(&restoring.arguments[..]) =>
             {
                 Some((
                     Posted {
@@ -170,14 +171,15 @@ impl<H: Host> Personal<H> {
                     self.keep(&held.light, &held.state)
                         .map_err(|error| error.to_string())
                 };
-                let called = link
-                    .settled(
-                        &mut Key::Lent(&mut kit_signer, &sign),
-                        method::RESTORE,
-                        restoring.arguments.clone(),
-                        &mut hold,
-                    )
-                    .map_err(unreached)?;
+                // Placed at the log's head as the agent answers it.
+                let called = placed(
+                    &mut link,
+                    &mut Key::Lent(&mut kit_signer, &sign),
+                    method::RESTORE,
+                    &restoring.arguments,
+                    &mut |link| super::kit::overview_head(link),
+                    &mut hold,
+                )?;
                 let recorded = answer::<Recorded>(&called.outcome)
                     .map_err(failed)?
                     .map_err(Error::AgentRefused)?;
@@ -363,7 +365,7 @@ fn device_of(held: &Held, devices: &[DeviceView]) -> Result<NewDevice, Error> {
 fn restore_cancelled(entries: &[(u64, Entry)], arguments: &[u8]) -> bool {
     let Some(at) = entries.iter().find_map(|(index, entry)| match &entry.body {
         Body::Operation { call, .. }
-            if call.method == method::RESTORE.0 && call.arguments == arguments =>
+            if call.method == method::RESTORE.0 && unplaced(&call.arguments) == Some(arguments) =>
         {
             Some(*index)
         }
@@ -377,4 +379,9 @@ fn restore_cancelled(entries: &[(u64, Entry)], arguments: &[u8]) -> bool {
             Body::Settled { op, state: OpState::Cancelled { .. } } if *op == at
         )
     })
+}
+
+/// An admin call's arguments after the place it names.
+fn unplaced(arguments: &[u8]) -> Option<&[u8]> {
+    Place::split(arguments).map(|(_, rest)| rest)
 }

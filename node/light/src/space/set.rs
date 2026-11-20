@@ -7,16 +7,21 @@ use vos_abi::Encode;
 use vos_abi::ids::MethodId;
 use vos_wire::personal::{
     AdminClass, Attached, Attestation, Candidacy, DeviceView, NewAdmin, Overview, PersonalError,
-    Recorded, Standing, Status, method,
+    Place, Recorded, Standing, Status, method,
 };
 
-use super::link::{AgentLink, Key, Signer, answer};
+use super::link::{AgentLink, Called, Hold, Key, Signer, answer};
 use super::{
     AdminKey, Approval, Error, Held, Host, Personal, Posted, Prompts, admin_sign, answered,
-    entered_kit, failed, new_kit, unreached,
+    entered_kit, failed, logged, new_kit, unreached,
 };
 use crate::group::{Event, Prepared};
 use crate::route::Purpose;
+
+/// The most signatures one admin call takes, each signed at the log's head
+/// read anew after the one before was refused for a head the log moved
+/// past or for `Settling`: for the admin key, a prompt each.
+pub(super) const PLACINGS: usize = 3;
 
 /// A device's new admin key, offered to another device of the set to sign
 /// its replacement: `device` (u32 big-endian) ‖ `key` ‖ a flags byte (1
@@ -472,11 +477,16 @@ impl<H: Host> Personal<H> {
         Ok(())
     }
 
-    /// The admin call of `method` with `arguments`, signed by the admin key
-    /// at its prompt and held in the group before it leaves, its evidence
-    /// posted under the sync key with `r2` beside it: an evidence post that
-    /// fails on the way is posted again by the next pass, from the held
-    /// call ([`crate::group::DeviceGroup::sending`]).
+    /// The admin call of `method` with `arguments`, placed at the log's
+    /// head this device read just before (the call names it first, and the
+    /// agent takes it there alone), signed by the admin key at its prompt
+    /// and held in the group before it leaves, its evidence posted under
+    /// the sync key with `r2` beside it: an evidence post that fails on the
+    /// way is posted again by the next pass, from the held call
+    /// ([`crate::group::DeviceGroup::sending`]). Refused because the log
+    /// moved past the head (another device's entry meanwhile) or `Settling`
+    /// (a wake first), the log is read again and the call signed there, a
+    /// prompt each time, at most [`PLACINGS`] signatures in all.
     fn operate(
         &self,
         held: &mut Held,
@@ -490,11 +500,20 @@ impl<H: Host> Personal<H> {
         let mut signer = held.admin;
         let sign = admin_sign(prompts, admin);
         let recorded = self.with_link(held, Purpose::Personal, |link, held| {
-            let group = held.group.as_mut().ok_or(Error::NoSpace)?;
-            // A call signed again after `Settling` replaces the one before,
-            // which the agent did not take.
+            let group = std::cell::RefCell::new(held.group.as_mut().ok_or(Error::NoSpace)?);
+            // The log read to its head before each signature.
+            let mut head = |link: &mut AgentLink<'_, H>| {
+                let mut group = group.borrow_mut();
+                let entries = logged(link, group.cursor())?;
+                group.follow(entries).map_err(failed)?;
+                let (next, chain) = group.view();
+                Ok(Place { next, chain })
+            };
+            // A call signed again replaces the one before, which the agent
+            // did not take.
             let mut previous: Option<Vec<u8>> = None;
             let mut hold = |message: &[u8], signature: &[u8; 64]| {
+                let mut group = group.borrow_mut();
                 if let Some(previous) = previous.replace(message.to_vec()) {
                     group.unsent(&previous).map_err(|error| error.to_string())?;
                 }
@@ -502,14 +521,15 @@ impl<H: Host> Personal<H> {
                     .sending(message.to_vec(), *signature, r2)
                     .map_err(|error| error.to_string())
             };
-            let called = link
-                .settled(
-                    &mut Key::Lent(&mut signer, &sign),
-                    method,
-                    arguments,
-                    &mut hold,
-                )
-                .map_err(unreached)?;
+            let called = placed(
+                link,
+                &mut Key::Lent(&mut signer, &sign),
+                method,
+                &arguments,
+                &mut head,
+                &mut hold,
+            )?;
+            let group = group.into_inner();
             let recorded = match answer::<Recorded>(&called.outcome).map_err(failed)? {
                 Ok(recorded) => recorded,
                 Err(error) => {
@@ -609,6 +629,42 @@ impl<H: Host> Personal<H> {
         });
         held.admin = signer;
         result
+    }
+}
+
+/// The admin call of `method` with `arguments`, signed by `key` at the
+/// place `head` reads, the log's head, before each signature, each message
+/// given to `hold` before its call leaves ([`AgentLink::signed`]): signed
+/// again at the head read anew while the agent refuses it for a head the
+/// log moved past (an entry logged between the reading and the call) or,
+/// after a wake, `Settling`, at most [`PLACINGS`] signatures in all. The
+/// last call's answer.
+pub(super) fn placed<H: Host>(
+    link: &mut AgentLink<'_, H>,
+    key: &mut Key<'_>,
+    method: MethodId,
+    arguments: &[u8],
+    head: &mut dyn FnMut(&mut AgentLink<'_, H>) -> Result<Place, Error>,
+    hold: Hold<'_>,
+) -> Result<Called, Error> {
+    let mut signed = 1;
+    loop {
+        let place = head(link)?;
+        let called = link
+            .signed(key, method, place.arguments(arguments), &mut *hold)
+            .map_err(unreached)?;
+        let again = match answer::<()>(&called.outcome) {
+            Ok(Err(PersonalError::Settling)) => {
+                answered(link.settle())?;
+                true
+            }
+            Ok(Err(PersonalError::StaleHead)) => true,
+            _ => false,
+        };
+        if !again || signed == PLACINGS {
+            return Ok(called);
+        }
+        signed += 1;
     }
 }
 

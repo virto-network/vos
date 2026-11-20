@@ -312,6 +312,12 @@ pub struct State {
     /// Each phone's requests of a step the route answers with a refusal of
     /// the agent's it made up, and how many more ([`World::refuse`]).
     made_up: HashMap<u8, (Step, vos_wire::personal::PersonalError, usize)>,
+    /// Each phone whose reads of the control log a route forks, by the
+    /// operation it logs again ([`World::relog`]).
+    relogs: HashMap<u8, u64>,
+    /// The next call each phone asks of a step, its agent's lease renewed
+    /// before the world takes it ([`World::renew_before`]).
+    renewing: HashMap<u8, Step>,
     /// The next request each phone asks of a step, the world's time moved
     /// on before it is taken ([`World::pass_at`]).
     passing: HashMap<u8, (Step, u64)>,
@@ -719,6 +725,22 @@ impl World {
             .insert(tag, (step, refusal, times));
     }
 
+    /// The phone tagged `tag`'s reads of the control log and of the
+    /// overview answered from a fork of the agent's log: the device-set
+    /// operation at `op` and its evidence logged again at the log's end,
+    /// then matured after its delay, unvetoed. A route forking the log a
+    /// device reads, to mature a removal once signed and vetoed.
+    pub fn relog(&self, tag: u8, op: u64) {
+        self.state.lock().unwrap().relogs.insert(tag, op);
+    }
+
+    /// The home renews the lease of the agent the phone tagged `tag` calls
+    /// as it asks its next call of `step`, before the world takes it: an
+    /// entry logged between the phone's reading of the log and its call.
+    pub fn renew_before(&self, tag: u8, step: Step) {
+        self.state.lock().unwrap().renewing.insert(tag, step);
+    }
+
     /// The world's time moves on by `ms` as the phone tagged `tag` asks its
     /// next request of `step`, before the world takes it: what fell due
     /// meanwhile settles at that request.
@@ -890,6 +912,140 @@ impl World {
 }
 
 impl World {
+    /// Whether the call `body` is the one [`World::renew_before`] renews
+    /// its agent's lease before: renewed, if it is.
+    fn renewing(&self, tag: u8, kind: u16, body: &[u8]) -> bool {
+        let now = self.now();
+        let mut state = self.state.lock().unwrap();
+        if state.renewing.get(&tag) != Some(&Step::of(kind, body)) {
+            return false;
+        }
+        state.renewing.remove(&tag);
+        let (agent, _) = <(AgentId, ingress::Call)>::decode_exact(body).expect("a call");
+        if let Some(host) = state.personal.get_mut(&agent.0) {
+            host.renew(now);
+        }
+        true
+    }
+
+    /// The answer to a read of the control log or the overview by the
+    /// phone tagged `tag`, from the fork [`World::relog`] makes, if it
+    /// makes one for that phone.
+    fn forked(&self, tag: u8, kind: u16, body: &[u8]) -> Option<Vec<u8>> {
+        use vos_wire::personal::{Body, Entry, Op, OpState, Overview, chain};
+        let state = self.state.lock().unwrap();
+        let op = *state.relogs.get(&tag)?;
+        if Kind::from_u16(kind) != Some(Kind::Query) {
+            return None;
+        }
+        let (agent, query) = <(AgentId, QueryCall)>::decode_exact(body)?;
+        let host = state.personal.get(&agent.0)?;
+        if query.method != personal::LOG && query.method != personal::OVERVIEW {
+            return None;
+        }
+        // Read as the phone reads it, its signature checked.
+        let Outcome::Done(answered) = host.query(&query) else {
+            return None;
+        };
+        let mut log: Vec<(u64, Entry)> = Vec::new();
+        loop {
+            let from = log.last().map_or(0, |(index, _)| index + 1);
+            let Outcome::Done(page) = host.read(query.key, personal::LOG, from.encode()) else {
+                panic!("the log");
+            };
+            let page = Vec::<(u64, Entry)>::decode_exact(&page).expect("a page");
+            if page.is_empty() {
+                break;
+            }
+            log.extend(page);
+        }
+        let operation = log.iter().find(|(index, _)| *index == op)?.1.clone();
+        let Body::Operation {
+            call,
+            by,
+            op: relogged,
+            matures,
+        } = operation.body
+        else {
+            panic!("an operation at {op}");
+        };
+        let evidence = log.iter().find_map(|(_, entry)| match &entry.body {
+            Body::Evidence { index, .. } if *index == op => Some(entry.body.clone()),
+            _ => None,
+        })?;
+        let delay = matures - operation.at;
+        let (last, head) = log.last().cloned().expect("a log");
+        let start = head.at + 1;
+        let again = last + 1;
+        let Body::Evidence {
+            message,
+            signature,
+            welcome,
+            ..
+        } = evidence
+        else {
+            unreachable!("evidence");
+        };
+        let mut bodies = vec![
+            (
+                start,
+                Body::Operation {
+                    call,
+                    by,
+                    op: relogged.clone(),
+                    matures: start + delay,
+                },
+            ),
+            (
+                start,
+                Body::Evidence {
+                    index: again,
+                    message,
+                    signature,
+                    welcome,
+                },
+            ),
+            (
+                start + delay,
+                Body::Settled {
+                    op: again,
+                    state: OpState::Matured { at: start + delay },
+                },
+            ),
+        ];
+        if let Op::Remove(device) = relogged {
+            bodies.push((start + delay, Body::Matured { device }));
+        }
+        let mut linked = head.chain;
+        for (i, (at, body)) in bodies.into_iter().enumerate() {
+            let index = again + i as u64;
+            linked = chain(&linked, index, at, &body);
+            log.push((
+                index,
+                Entry {
+                    at,
+                    body,
+                    chain: linked,
+                },
+            ));
+        }
+        let (next_at, head) = log.last().cloned().expect("a log");
+        let outcome = if query.method == personal::LOG {
+            let from = u64::decode_exact(&query.arguments).expect("a log read");
+            let page: Vec<(u64, Entry)> = log
+                .into_iter()
+                .filter(|(index, _)| *index >= from)
+                .collect();
+            done(page)
+        } else {
+            let mut overview = Overview::decode_exact(&answered).expect("an overview");
+            overview.next = next_at + 1;
+            overview.chain = head.chain;
+            done(overview)
+        };
+        Some(Response::Ran { outcome, at: 1 }.encode())
+    }
+
     /// A call answered as the agent's next log entry, at the world's time,
     /// and never applied.
     fn forged(&self, body: &[u8]) -> Vec<u8> {
@@ -1223,7 +1379,13 @@ impl ssh::Connection for Connection {
                 at: 1,
             }
             .encode(),
-            _ => self.world.answer(kind, body, self.index),
+            _ => match self.world.forked(self.tag, kind, body) {
+                None if self.world.renewing(self.tag, kind, body) => {
+                    self.world.answer(kind, body, self.index)
+                }
+                Some(forked) => forked,
+                None => self.world.answer(kind, body, self.index),
+            },
         };
         if matches!(fate, Fate::TakeAndDrop) {
             return Answer::Cut;

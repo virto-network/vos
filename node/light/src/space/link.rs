@@ -149,7 +149,7 @@ impl<'a, H: Host> AgentLink<'a, H> {
     /// the call is sent (a call `hold` refuses is not): its outcome, and
     /// what was signed. A call whose answer was lost keeps its sequence, so
     /// it is sent again as it was.
-    fn signed(
+    pub(super) fn signed(
         &mut self,
         key: &mut Key<'_>,
         method: MethodId,

@@ -197,6 +197,18 @@ impl Agent {
         self.call(now, call)
     }
 
+    /// The home's re-proof of the agent's lease at `now`, as `Homes`
+    /// sends it: an entry in the log.
+    pub fn renew(&mut self, now: u64) {
+        self.world.now = self.world.now.max(now);
+        self.last = self.world.now;
+        let run =
+            self.world
+                .agent(self.agent)
+                .call(Principal::Agent(self.homes), PERSONAL, "renew", ());
+        assert!(matches!(run.outcome, Outcome::Done(_)), "{:?}", run.outcome);
+    }
+
     /// The home's claim of the agent for `device` with `kit` under
     /// `policy`, at `now`, as `Homes` sends it (the home's `Homes` at
     /// instance `HOMES_AT`): `assigned`, or the error `refused` carries.

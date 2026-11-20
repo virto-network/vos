@@ -258,13 +258,14 @@ impl Prepared {
 
 /// What a device that pairs another hands it over the pairing channel:
 /// the agent, the device group's devices and the device set's operations
-/// as the pairing device verified them, its place in the log, and the key
-/// archive.
+/// as the pairing device verified them, its place in the log and the
+/// index after the last admin call it read there, and the key archive.
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct Pairing {
     agent: Agent,
     next: u64,
     chain: [u8; 32],
+    floor: u64,
     time: u64,
     confirmed: u64,
     offset: u64,
@@ -487,6 +488,7 @@ impl DeviceGroup {
             id: Some(0),
             next: 0,
             chain: [0; 32],
+            floor: 0,
             time: 0,
             calls: vec![now],
             confirmed: 0,
@@ -562,6 +564,7 @@ impl DeviceGroup {
             agent,
             next,
             chain,
+            floor,
             time,
             confirmed,
             offset,
@@ -578,6 +581,7 @@ impl DeviceGroup {
             id: None,
             next,
             chain,
+            floor,
             time,
             calls: Vec::new(),
             confirmed,
@@ -664,6 +668,7 @@ impl DeviceGroup {
             id: Some(id),
             next: read.next,
             chain: read.chain,
+            floor: read.next,
             time: read.time,
             calls: vec![read.time],
             confirmed: read.confirmed,
@@ -1392,6 +1397,7 @@ impl DeviceGroup {
             agent: self.state.agent,
             next: self.state.next,
             chain: self.state.chain,
+            floor: self.state.floor,
             time: self.state.time,
             confirmed: self.state.confirmed,
             offset: self.state.offset,
