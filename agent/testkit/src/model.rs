@@ -693,7 +693,7 @@ pub fn device_auth_arguments(seed: u32, slot: u32, filled: &[usize]) -> (Vec<u8>
     (input, public)
 }
 
-/// The `sdk-device` test actor's `auth` arguments for the same statement as
+/// The stock `auth` kernel's arguments for the same statement as
 /// [`device_auth_arguments`]'s (the secret `seed` gives at `slot`, the
 /// siblings at the levels `filled` nonzero): its witness input (the
 /// siblings, the slot as eight little-endian bytes, the secret, then the
@@ -713,8 +713,8 @@ pub fn device_sdk_auth_arguments(seed: u32, slot: u32, filled: &[usize]) -> (Vec
 /// An owner kernel's arguments for the secret `seed` gives (word `i` is
 /// `seed + 7,919·i`): its witness input (the secret, then the claim:
 /// `owner = C(T(owner), s)` and a binding) and its public arguments, the
-/// claim's 64 bytes. The `sdk-device` test actor's `owner` and
-/// `owner_lean` both read it.
+/// claim's 64 bytes. The stock `owner` kernel and the `sdk-device` test
+/// actor's `owner_lean` both read it.
 pub fn device_owner_arguments(seed: u32) -> (Vec<u8>, Vec<u8>) {
     use vos_abi::credentials::{Tag, compress, digest};
     let secret: [u32; 8] = core::array::from_fn(|i| seed + 7_919 * i as u32);

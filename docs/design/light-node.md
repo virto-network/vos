@@ -2304,8 +2304,8 @@ each a short Rust function in the actor whose state it concerns:
 - any actor's own, under the same rules.
 
 ```rust
-// vos-credentials, beside the tree it proves membership of [built]: the
-// `sdk-device` test actor's (below), each sized on its reference run.
+// vos-credentials, beside the tree it proves membership of [built], each
+// sized on its reference run.
 #[attestable(device, reference = reference::auth)]
 pub fn auth(path: &Path, secret: &Secret, #[public] claim: &AuthClaim) {
     let member = Tag::Member.hash(secret);
@@ -2329,7 +2329,7 @@ walked in one lane (`agent/test-actors/device/src/lib.rs`); the same
 statement written plainly took 18,733 steps [measured, `proving.md` §8],
 about ×11, which the cell model puts at about 3 s on the phone [model].
 The tricks are in the SDK [built], so the code above is what a developer
-writes (the `sdk-device` test actor's `auth` and `owner`):
+writes (the stock `auth` and `owner` above):
 - **in-place arguments by the macro:** a device kernel's arguments by
   reference, `&T` with `T: vos_sdk::p2::InPlace` (`Digest`, `[T; N]`,
   `Path`, integers, and `#[derive(InPlace)]` `#[repr(C)]` structs of them
@@ -2391,7 +2391,7 @@ writes (the `sdk-device` test actor's `auth` and `owner`):
   form's auth at the hand-lean one's sizes but one chip a size smaller
   (2^12 rows where it had 2^13), owner two chips a size smaller; proofs
   about 0.88 MB and 0.85 MB as before. The stock kernels in the credential
-  actor are these, one program each with the `sdk-device` actor's.
+  actor are these.
 - **The transpiler and `unaligned-scalar-mem`** [measured, 2026-11-02, on
   a side branch]: LLVM emits plain misaligned `ld`/`sd`/`lw`/`sw`
   where it emitted byte loops, and the transpiler takes them: the test actors,
