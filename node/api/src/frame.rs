@@ -64,6 +64,21 @@ impl Header {
         }
     }
 
+    /// The header `bytes` start with, once they hold one.
+    fn read(framing: Framing, bytes: &[u8]) -> Option<Self> {
+        let header = bytes.get(..framing.header())?;
+        let id = match framing {
+            Framing::Quic => 0,
+            Framing::Stream => u64::from_le_bytes(header[7..15].try_into().expect("eight")),
+        };
+        Some(Self {
+            length: u32::from_le_bytes(header[..4].try_into().expect("four bytes")),
+            kind: u16::from_le_bytes(header[4..6].try_into().expect("two bytes")),
+            mark: header[6],
+            id,
+        })
+    }
+
     /// The same header, marked `mark`.
     pub fn marked(self, mark: Mark) -> Self {
         Self {
@@ -179,17 +194,7 @@ impl Reader {
     /// [`Reader::event`] gave `None`, one it checked.
     pub fn header(&self) -> Option<Header> {
         let bytes = self.buffer.get(self.at..).filter(|_| !self.done)?;
-        let header = bytes.get(..self.framing.header())?;
-        let id = match self.framing {
-            Framing::Quic => 0,
-            Framing::Stream => u64::from_le_bytes(header[7..15].try_into().expect("eight")),
-        };
-        Some(Header {
-            length: u32::from_le_bytes(header[..4].try_into().expect("four bytes")),
-            kind: u16::from_le_bytes(header[4..6].try_into().expect("two bytes")),
-            mark: header[6],
-            id,
-        })
+        Header::read(self.framing, bytes)
     }
 
     /// The next frame, or the frame error that ends the reader; `None`
@@ -204,23 +209,11 @@ impl Reader {
             return None;
         }
         let length = u32::from_le_bytes(bytes[..4].try_into().expect("four bytes"));
-        let kind = u16::from_le_bytes(bytes[4..6].try_into().expect("two bytes"));
         if length < framing.rest() {
             return self.fail(FrameError::Truncated, 0);
         }
-        if bytes.len() < framing.header() {
-            return None;
-        }
-        let id = match framing {
-            Framing::Quic => 0,
-            Framing::Stream => u64::from_le_bytes(bytes[7..15].try_into().expect("eight")),
-        };
-        let header = Header {
-            length,
-            kind,
-            mark: bytes[6],
-            id,
-        };
+        let header = Header::read(framing, bytes)?;
+        let (kind, id) = (header.kind, header.id);
         let body = header.body(framing).expect("checked above");
         let limit = match self.mode {
             Mode::Answers => MAX_ANSWER,
@@ -262,13 +255,7 @@ impl Reader {
         if !self.pending() {
             return None;
         }
-        let bytes = &self.buffer[self.at..];
-        let id = match self.framing {
-            Framing::Stream if bytes.len() >= Framing::Stream.header() => {
-                u64::from_le_bytes(bytes[7..15].try_into().expect("eight"))
-            }
-            _ => 0,
-        };
+        let id = Header::read(self.framing, &self.buffer[self.at..]).map_or(0, |header| header.id);
         self.fail(FrameError::Truncated, id)
     }
 
