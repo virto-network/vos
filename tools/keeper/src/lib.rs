@@ -193,11 +193,7 @@ impl Keeper {
     /// `Personal` installed in `agent`, and its role `homes` granted to the
     /// home's agent.
     fn finish_one(&self, agent: AgentId, elf: &[u8]) -> Result<(), KeeperError> {
-        let install = Install {
-            instance: self.home.personal,
-            elf: elf.to_vec(),
-            roles: vec![(b"homes".to_vec(), HOMES_ROLE)],
-        };
+        let install = self.install(elf);
         self.at_leader(agent, "install", |operator| {
             operator.install(agent, &install)
         })?;
@@ -205,6 +201,15 @@ impl Keeper {
         self.at_leader(agent, "grant", |operator| {
             operator.grant(agent, home, Some(HOMES_ROLE))
         })
+    }
+
+    /// `Personal` from `elf` at the home's instance, its role `homes`.
+    fn install(&self, elf: &[u8]) -> Install {
+        Install {
+            instance: self.home.personal,
+            elf: elf.to_vec(),
+            roles: vec![(b"homes".to_vec(), HOMES_ROLE)],
+        }
     }
 
     /// `command` sent to `agent`'s replicas in turn until its leader runs
@@ -273,11 +278,7 @@ impl Keeper {
     /// before the next: the agents upgraded. A refusal stops it after its
     /// batch.
     pub fn upgrade(&self, elf: &[u8], batch: usize) -> Result<usize, KeeperError> {
-        let install = Install {
-            instance: self.home.personal,
-            elf: elf.to_vec(),
-            roles: vec![(b"homes".to_vec(), HOMES_ROLE)],
-        };
+        let install = self.install(elf);
         let agents = self.agents()?;
         let mut upgraded = 0;
         for chunk in agents.chunks(batch.max(1)) {
