@@ -5,57 +5,36 @@
 # program's ELF by its name here (`vos_testkit::programs`), and the gates'
 # tripwire (`just check-tiers`) holds the guest workspace's members to it.
 #
-# `pins` names the pin stores a program's bytes feed, which `just repin`
-# writes anew when they move:
-# - `blobs.lock`: its stripped hash.
-# - `facility`: the release artifacts the `vos.credential` facility embeds
-#   (`node/light/android/release`).
-# - `devices`: the stock kernels' device programs (`node/light/tests/device.pins`).
+# A program's ELF is `agent/programs/target/riscv64em-vos/release/<name>.elf`.
 
 [[program]]
 name = "vos-agent"
 crate = "agent/default"
-elf = "agent/programs/target/riscv64em-vos/release/vos-agent.elf"
-pins = ["blobs.lock", "facility"]
 
 [[program]]
 name = "vos-representative"
 crate = "agent/representative"
-elf = "agent/programs/target/riscv64em-vos/release/vos-representative.elf"
-pins = ["blobs.lock"]
 
 [[program]]
 name = "vos-credentials"
 crate = "agent/credentials"
-elf = "agent/programs/target/riscv64em-vos/release/vos-credentials.elf"
-pins = ["blobs.lock", "facility", "devices"]
 
 [[program]]
 name = "vos-personal"
 crate = "agent/personal"
-elf = "agent/programs/target/riscv64em-vos/release/vos-personal.elf"
-pins = ["blobs.lock"]
 
 [[program]]
 name = "vos-payments"
 crate = "agent/payments"
-elf = "agent/programs/target/riscv64em-vos/release/vos-payments.elf"
-pins = ["blobs.lock"]
 
 [[program]]
 name = "vos-homes"
 crate = "agent/homes"
-elf = "agent/programs/target/riscv64em-vos/release/vos-homes.elf"
-pins = ["blobs.lock"]
 
 [[program]]
 name = "vos-credential-book"
 crate = "agent/credential-book"
-elf = "agent/programs/target/riscv64em-vos/release/vos-credential-book.elf"
-pins = ["blobs.lock", "facility"]
 
 [[program]]
 name = "vos-device-book"
 crate = "agent/device-book"
-elf = "agent/programs/target/riscv64em-vos/release/vos-device-book.elf"
-pins = ["blobs.lock", "facility"]

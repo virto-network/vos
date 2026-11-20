@@ -340,6 +340,9 @@ build-test-actors:
     cd agent/test-actors; cargo fetch --locked
     touch agent/test-actors/target/riscv64em-vos/release/.built
 
+# Where a guest program of `programs.toml` is built, its ELF named after it.
+program_elf := "agent/programs/target/riscv64em-vos/release/"
+
 # The agent's guest programs (`programs.toml`), each built alone in the
 # agent's guest workspace (`agent/programs`) with the guest toolchain in
 # `pvm/guest`.
@@ -354,10 +357,9 @@ build-program package:
     if "{{package}}" not-in (open programs.toml | get program.name) { error make { msg: "{{package}} is no program of programs.toml" } }
     just _at-fixed-path agent/programs --release -p {{package}} --target ../../pvm/guest/riscv64em-vos.json
 
-# The guest programs, each with its crate, its ELF and the pin stores it
-# feeds (`programs.toml`).
+# The guest programs, each with its crate and its ELF (`programs.toml`).
 programs:
-    @open programs.toml | get program | each {|program| $"($program.name)  ($program.crate)  ($program.elf)  pins: ($program.pins | str join ', ')" } | str join "\n"
+    @open programs.toml | get program | each {|program| $"($program.name)  ($program.crate)  {{program_elf}}($program.name).elf" } | str join "\n"
 
 # The JAM statements service's program, `statement-service.elf`.
 build-statement-service: (_venue-guest "vos-statement-service" "statement-service" "pvm-guest")
@@ -382,7 +384,7 @@ _blob-hashes:
         msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; \
         let fixed = ["target/riscv64em-vos/release/final-verify.elf" \
         "target/riscv64em-vos/release/statement-service.elf"] ++ (open programs.toml \
-        | get program.elf) ++ ["pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; \
+        | get program.name | each {|name| $"{{program_elf}}($name).elf" }) ++ ["pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; \
         let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 \
         | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort \
         | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); \
@@ -408,7 +410,7 @@ check-blob-roles:
         if not (do $judges $harness) { error make { msg: $"cargo tree ($harness) links no model judge: a harness's blob no longer, its role changed" } } }; \
     let harnesses = [target/riscv64em-vos/release/final-verify.elf pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm]; \
     let deployed = [target/riscv64em-vos/release/statement-service.elf]; \
-    let programs = (if ('programs.toml' | path exists) { open programs.toml | get program.elf } else { [] }); \
+    let programs = (if ('programs.toml' | path exists) { open programs.toml | get program.name | each {|name| $"{{program_elf}}($name).elf" } } else { [] }); \
     let pinned = (open --raw blobs.lock | lines | where {|line| not ($line | str starts-with '#') and $line != '' } | each {|line| $line | split row '  ' | last }); \
     let unknown = ($pinned | where {|path| $path not-in ($harnesses ++ $deployed ++ $programs) and not ($path | str starts-with 'agent/test-actors/') }); \
     if ($unknown | is-not-empty) { error make { msg: $"blobs.lock pins blobs of no role: ($unknown | str join ', ')" } }; \
