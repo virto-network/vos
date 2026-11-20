@@ -200,11 +200,11 @@ fn answer<'l, T: Default, R: Written>(
     T::default()
 }
 
-/// # Safety
-/// `node` is one `nativeOpen` made.
-unsafe fn node<'a>(node: jlong) -> Result<&'a Node, Refusal> {
-    // SAFETY: as the caller promised; a node lives as long as its process.
-    unsafe { (node as *const Node).as_ref() }.ok_or_else(|| failed("no facility"))
+/// The process's facility, which `nativeOpen` opens once and never frees.
+static NODE: OnceLock<Node> = OnceLock::new();
+
+fn node() -> Result<&'static Node, Refusal> {
+    NODE.get().ok_or_else(|| failed("no facility"))
 }
 
 fn prompts(env: &mut Env<'_>, prompts: &JObject<'_>) -> Result<Arc<dyn Prompts>, Refusal> {
@@ -263,11 +263,11 @@ fn kit(byte: jbyte) -> Result<KitKind, Refusal> {
 }
 
 /// The native methods of `VosNode`, each `fn` named as its Java method
-/// (its JNI symbol `VosNode`'s), its arguments after the facility's handle,
-/// its answer and its body, given the environment and the facility. An
-/// `op` takes the operation's `out Refusal` last, which a refusal is
-/// written into, and a `personal` one its `out Refused`; a `quiet` one
-/// takes none; a `bare` one takes no handle either. Statements after
+/// (its JNI symbol `VosNode`'s), its arguments, its answer and its body,
+/// given the environment and the facility. An `op` takes the operation's
+/// `out Refusal` last, which a refusal is written into, and a `personal`
+/// one its `out Refused`; a `quiet` one takes none; a `bare` one is not
+/// given the facility either. Statements after
 /// `take` run first, before the environment is reached. `NATIVES` lists
 /// every symbol and its Java arity.
 macro_rules! natives {
@@ -289,20 +289,20 @@ macro_rules! natives {
         ];
     };
     (@symbol $name:ident) => { concat!("Java_team_virto_s4_vos_VosNode_", stringify!($name)) };
-    (@arity op $($argument:ident)*) => { 2 $(+ natives!(@one $argument))* };
-    (@arity personal $($argument:ident)*) => { 2 $(+ natives!(@one $argument))* };
-    (@arity quiet $($argument:ident)*) => { 1 $(+ natives!(@one $argument))* };
+    (@arity op $($argument:ident)*) => { 1 $(+ natives!(@one $argument))* };
+    (@arity personal $($argument:ident)*) => { 1 $(+ natives!(@one $argument))* };
+    (@arity quiet $($argument:ident)*) => { 0 $(+ natives!(@one $argument))* };
     (@arity bare $($argument:ident)*) => { 0 $(+ natives!(@one $argument))* };
     (@one $argument:ident) => { 1 };
-    (@op $($rest:tt)*) => { natives!(@fn [handle] [refused Refusal] $($rest)*); };
-    (@personal $($rest:tt)*) => { natives!(@fn [handle] [refused Refused] $($rest)*); };
-    (@quiet $($rest:tt)*) => { natives!(@fn [handle] [] $($rest)*); };
-    (@bare $($rest:tt)*) => { natives!(@fn [] [] $($rest)*); };
+    (@op $($rest:tt)*) => { natives!(@fn [refused Refusal] $($rest)*); };
+    (@personal $($rest:tt)*) => { natives!(@fn [refused Refused] $($rest)*); };
+    (@quiet $($rest:tt)*) => { natives!(@fn [] $($rest)*); };
+    (@bare $($rest:tt)*) => { natives!(@fn [] $($rest)*); };
     (@refused) => { &JObject::null() };
     (@refused $refused:ident) => { &$refused };
     (@error) => { Refusal };
     (@error $error:ty) => { $error };
-    (@fn [$($handle:ident)?] [$($refused:ident $error:ty)?]
+    (@fn [$($refused:ident $error:ty)?]
      $(#[$doc:meta])* $name:ident($($argument:ident: $ty:ty),*) -> $answer:ty
      [$($take:tt)*] |$env:ident $(, $node:ident)?| $body:block) => {
         $(#[$doc])*
@@ -311,7 +311,6 @@ macro_rules! natives {
         pub extern "system" fn $name<'l>(
             mut unowned: EnvUnowned<'l>,
             _class: JClass<'l>,
-            $($handle: jlong,)?
             $($argument: $ty,)*
             $($refused: JObject<'l>,)?
         ) -> $answer {
@@ -319,10 +318,7 @@ macro_rules! natives {
             unowned
                 .with_env(|env| -> jni::errors::Result<$answer> {
                     Ok(answer(env, natives!(@refused $($refused)?), |$env| -> Result<_, natives!(@error $($error)?)> {
-                        $(
-                            // SAFETY: the handle `nativeOpen` answered.
-                            let $node = unsafe { node($handle) }?;
-                        )?
+                        $(let $node = node()?;)?
                         $body
                     }))
                 })
@@ -334,14 +330,14 @@ macro_rules! natives {
 natives! {
     /// The facility whose enrollments are kept under `directory`, arti's
     /// state under `tor`, the app's parcelables loaded through `loader`,
-    /// the device read from `device` (the `VosNode`): its handle, never
-    /// freed; 0 when it does not open.
+    /// the device read from `device` (the `VosNode`): opened once for the
+    /// process, never freed; false when it does not open.
     bare fn nativeOpen(
         directory: JString<'l>,
         tor: JString<'l>,
         loader: JObject<'l>,
         device: JObject<'l>,
-    ) -> jlong,
+    ) -> jboolean,
     |env| {
         let directory = PathBuf::from(directory.try_to_string(env).map_err(failed)?);
         let tor = PathBuf::from(tor.try_to_string(env).map_err(failed)?);
@@ -351,8 +347,12 @@ natives! {
         let device = Arc::new(JavaDevice {
             node: env.new_global_ref(&device).map_err(failed)?,
         });
+        if NODE.get().is_some() {
+            return Err(failed("the facility is open already"));
+        }
         let node = Node::open(directory, tor, device).map_err(failed)?;
-        Ok(Box::into_raw(Box::new(node)) as jlong)
+        NODE.set(node).map_err(|_| failed("the facility is open already"))?;
+        Ok(true)
     }
 
     quiet fn nativeSupported() -> jboolean, |_env, node| {
