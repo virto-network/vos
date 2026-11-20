@@ -49,15 +49,12 @@ use vos_wire::personal::{
 
 use crate::group::{self, Alarm, DeviceGroup, Event, Open};
 use crate::light::Light;
-use crate::personal::{Answer, Link, SealedSync, SyncError, Waiting};
+use crate::personal::{Answer, Link, SealedSync, SyncError, WAKES, Waiting};
 use crate::route::Route;
 
 /// The rounds of posting a pass makes while the log keeps asking for
 /// more: a vote, then the next candidate's, and so on.
 const ROUNDS: usize = 8;
-
-/// The `wake`s a post makes before it gives up on `Settling`.
-const WAKES: usize = 8;
 
 /// The readings of one scope a pass makes while a page waits for an epoch
 /// or a key.

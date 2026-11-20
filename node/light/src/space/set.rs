@@ -12,11 +12,10 @@ use vos_wire::personal::{
 
 use super::link::{AgentLink, Signer, answer};
 use super::{
-    AdminKey, Approval, Error, Held, Host, Personal, Posted, Prompts, WAKES, admin_sign, answered,
+    AdminKey, Approval, Error, Held, Host, Personal, Posted, Prompts, admin_sign, answered,
     entered_kit, failed, new_kit, unreached,
 };
 use crate::group::{Event, Prepared};
-use crate::personal::Link as _;
 use crate::route::Purpose;
 
 /// A device's new admin key, offered to another device of the set to sign
@@ -174,12 +173,7 @@ impl<H: Host> Personal<H> {
     /// What fell due settled at the agent, under the sync key.
     fn wake(&self, held: &mut Held) -> Result<(), Error> {
         self.with_link(held, Purpose::Personal, |link, _| {
-            for _ in 0..WAKES {
-                let woken = answered(link.wake())?;
-                if woken.settled {
-                    break;
-                }
-            }
+            answered(link.settle())?;
             Ok(())
         })
     }

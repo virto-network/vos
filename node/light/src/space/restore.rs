@@ -14,8 +14,8 @@ use vos_wire::personal::{
 use super::link::{Signer, answer};
 use super::set::evidence;
 use super::{
-    Claim, Claimed, Error, Held, Host, PERSONAL, Personal, Posted, Prompts, Restoring, WAKES,
-    answered, entered_kit, failed, link, new_kit, secret, unreached,
+    Claim, Claimed, Error, Held, Host, PERSONAL, Personal, Posted, Prompts, Restoring, answered,
+    entered_kit, failed, link, new_kit, secret, unreached,
 };
 use crate::group::{Agent as GroupAgent, DeviceGroup, Restored};
 use crate::personal::{Link as _, recover};
@@ -257,12 +257,7 @@ impl<H: Host> Personal<H> {
         let mut sync = held.sync;
         let (view, envelopes, overview, devices, policy) = {
             let mut link = link(&self.host, &kept, Purpose::Personal, agent, &key, &mut sync);
-            for _ in 0..WAKES {
-                let woken = answered(link.wake())?;
-                if woken.settled {
-                    break;
-                }
-            }
+            answered(link.settle())?;
             let view: RecoveryView = answered(link.query(method::RECOVERY, ()))?;
             let mut envelopes = Vec::new();
             loop {

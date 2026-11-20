@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use super::Host;
 use crate::job::{Control, Post};
-use crate::personal::{Answer, Frontier, Link};
+use crate::personal::{Answer, Frontier, Link, WAKES};
 use crate::route::{Purpose, Route};
 use crate::wire;
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -30,8 +30,6 @@ use vos_wire::personal::{
 
 /// How long a query is good for, by the node's clock.
 const QUERY_MS: u64 = 60_000;
-/// The wakes a call refused with `Settling` waits through.
-const WAKES: usize = 8;
 
 /// A signature over a call's message by a key the link does not hold: the
 /// admin key's, made in the UI process.
@@ -256,6 +254,17 @@ impl<'a, H: Host> AgentLink<'a, H> {
             self.wake().map_err(|error| error.to_string())?.ok();
         }
         Err("the agent is still settling".into())
+    }
+
+    /// What fell due settled at the agent, through up to [`WAKES`] wakes.
+    pub fn settle(&mut self) -> Answer<(), String> {
+        for _ in 0..WAKES {
+            match self.wake()? {
+                Ok(woken) if !woken.settled => {}
+                other => return Ok(other.map(drop)),
+            }
+        }
+        Ok(Ok(()))
     }
 
     /// The sync key's query of `name` with `arguments`.

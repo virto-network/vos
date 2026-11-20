@@ -62,8 +62,9 @@ use merkle_crdt::Hasher as _;
 /// The envelopes a push sends in one round trip, in flight at once.
 pub const PIPELINE: usize = 16;
 
-/// The `wake`s a call makes before it gives up on `Settling`.
-const WAKES: usize = 8;
+/// The `wake`s a call makes before it gives up on `Settling`, and a flow
+/// sends until what fell due is settled.
+pub(crate) const WAKES: usize = 8;
 
 /// The name the archive's scope derives from, apart from every instance's
 /// (four bytes).

@@ -503,8 +503,6 @@ impl Waiting {
 /// reads of a slot or a log.
 pub const WAIT_MS: u64 = 120_000;
 const POLL: Duration = Duration::from_millis(500);
-/// The wakes a flow sends until what fell due is settled.
-const WAKES: usize = 8;
 /// A proven call's expiry past the node's time.
 const EXPIRY_MS: u64 = 60_000;
 
