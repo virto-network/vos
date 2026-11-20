@@ -902,6 +902,14 @@ pub(crate) fn grouped(store: &Store) -> Result<bool, StoreError> {
     Ok(store.group_row(STATE)?.is_some())
 }
 
+/// A store with no device group: refused `Grouped` otherwise.
+fn ungrouped(store: &Store) -> Result<(), GroupError> {
+    match grouped(store)? {
+        true => Err(GroupError::Grouped),
+        false => Ok(()),
+    }
+}
+
 /// A device's leaf credential at its add: its sync key and its admin key.
 pub fn credential(device: &NewDevice) -> Vec<u8> {
     [&device.sync[..], &device.admin[..]].concat()
@@ -918,9 +926,7 @@ pub fn restoring(
     agent: &Agent,
     rows: impl FnOnce(&Split) -> Vec<Change>,
 ) -> Result<Split, GroupError> {
-    if store.group_row(STATE)?.is_some() {
-        return Err(GroupError::Grouped);
-    }
+    ungrouped(store)?;
     let split = Split::draw(keys, &agent.identity).ok_or(GroupError::Kit)?;
     let mut archive = store.archive()?;
     archive.draw(*split.r());
@@ -1017,9 +1023,7 @@ impl DeviceGroup {
         kit: Vec<KitKey>,
         now: u64,
     ) -> Result<Self, GroupError> {
-        if store.group_row(STATE)?.is_some() {
-            return Err(GroupError::Grouped);
-        }
+        ungrouped(store)?;
         let archive = store.archive()?;
         let state = State {
             agent,
@@ -1068,9 +1072,7 @@ impl DeviceGroup {
     /// package made, for the pairing device's add, at `now`. Refused for a
     /// store that has a group.
     pub fn key_package(store: &Store, me: &NewDevice, now: u64) -> Result<Vec<u8>, GroupError> {
-        if store.group_row(STATE)?.is_some() {
-            return Err(GroupError::Grouped);
-        }
+        ungrouped(store)?;
         let mut mls = Mls::open(mls_namespace(store), &credential(me), BTreeMap::new())?;
         Ok(mls.key_package(now / 1000, BTreeMap::new())?)
     }
@@ -1087,9 +1089,7 @@ impl DeviceGroup {
         pairing: Pairing,
         rows: Vec<Change>,
     ) -> Result<Self, GroupError> {
-        if store.group_row(STATE)?.is_some() {
-            return Err(GroupError::Grouped);
-        }
+        ungrouped(store)?;
         if store.scoped()? {
             return Err(GroupError::Scoped);
         }
@@ -1169,9 +1169,7 @@ impl DeviceGroup {
         me: NewDevice,
         read: Restored,
     ) -> Result<Self, GroupError> {
-        if store.group_row(STATE)?.is_some() {
-            return Err(GroupError::Grouped);
-        }
+        ungrouped(store)?;
         let id = read
             .devices
             .iter()
