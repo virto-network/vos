@@ -494,10 +494,11 @@ impl StateReader for Snapshot {
     }
 }
 
-/// A snapshot under the writes an apply makes, which its later reads see.
+/// A snapshot under the writes an apply or a replay makes, which its later
+/// reads see.
 pub(crate) struct Applying<'a> {
     pub(crate) snapshot: &'a Snapshot,
-    pub(crate) written: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    pub(crate) written: &'a mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
 impl State for Applying<'_> {

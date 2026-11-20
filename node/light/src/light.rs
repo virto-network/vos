@@ -616,7 +616,7 @@ impl Light {
         let snapshot = Arc::clone(&merging.snapshot);
         let mut changes = Written::new();
         for kept in held {
-            let mut rows = Staged {
+            let mut rows = Applying {
                 snapshot: &snapshot,
                 written: &mut changes,
             };
@@ -862,9 +862,10 @@ impl Light {
             [Step::Refused { .. }] => return Err(Error::Refused),
             _ => return Err(unexpected()),
         };
+        let mut written = Written::new();
         let mut applying = Applying {
             snapshot,
-            written: Default::default(),
+            written: &mut written,
         };
         let applied = catch_unwind(AssertUnwindSafe(|| {
             apply(&mut applying, &result, Host::Vos { pages: &pages })
@@ -873,7 +874,7 @@ impl Light {
         if !applied {
             return Err(Error::NotApplied);
         }
-        Ok((outcome, applying.written))
+        Ok((outcome, written))
     }
 
     /// An operation of `instance`'s scope, `call` as `origin`, run on the
@@ -952,23 +953,14 @@ pub struct Replayed {
     pub held: usize,
 }
 
-/// The store as of a snapshot under a batch's writes, which its reads
-/// see: a replay's rows.
-struct Staged<'a> {
-    snapshot: &'a Snapshot,
-    written: &'a mut Written,
-}
-
-impl Rows for Staged<'_> {
+/// A replay's rows: the store as of a snapshot under the batch's writes.
+impl Rows for Applying<'_> {
     fn read(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        match self.written.get(key) {
-            Some(value) => value.clone(),
-            None => self.snapshot.get(key).expect("a store read"),
-        }
+        vos_wire::apply::State::read(self, key)
     }
 
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) {
-        self.written.insert(key.to_vec(), value.map(<[u8]>::to_vec));
+        vos_wire::apply::State::write(self, key, value);
     }
 }
 
