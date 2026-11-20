@@ -733,6 +733,9 @@ impl Client {
                     break;
                 }
                 tokio::time::sleep(config.again).await;
+                if self.is_dormant() {
+                    return Err(Error::Dormant);
+                }
             }
             let (target, host_key) = Self::target(routes, route, turn + attempt)?;
             let circuit = Circuit::new();

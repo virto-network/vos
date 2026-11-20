@@ -11,16 +11,16 @@
 //! relay nothing the device hands back. What the screen shows of that
 //! answer is the client's word: it grants nothing here, as the proven call
 //! itself is the action, at the node. The app builds no credential bytes;
-//! its key ([`AppClient`]) sends only the claims an operator's invitations
-//! allow.
+//! its key ([`AppClient`]) only reads. The screens hold each enrollment's
+//! digests, which the operator's invitation claims at once.
 
 use std::sync::Arc;
 
 use s4_server::rui::{App, Cx, Effect, EffectOutput, EffectRequest, View, ViewContext, view};
 use s4_server::{HostServiceError, HostServiceRequest, Identifier, Server, Value};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 use vos_abi::abi::Failure;
-use vos_abi::ids::{AgentId, InstanceId, MethodId, Session, derive_id};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, derive_id};
 use vos_abi::result::Outcome;
 use vos_abi::{Decode, Encode, SpaceId};
 use vos_api::{FRAME_ERROR, Kind, Mark};
@@ -53,9 +53,9 @@ pub struct Demo {
     pub onions: Vec<[u8; 32]>,
 }
 
-/// The demo's screens as an SSH port serves them: on each port, its claims
+/// The demo's screens as an SSH port serves them: on each port, its reads
 /// going as the app key's seed `key`, marked with the port's transport;
-/// the enrollments `held` for a claim from a later session, every port's.
+/// the enrollments `held` for the operator's invitations, every port's.
 pub struct DemoApp {
     pub demo: Demo,
     pub key: [u8; 32],

@@ -328,7 +328,7 @@ parcel! {
     /// taken at `at` (the agent's time, 0 when this pass did not read it)
     /// and maturing at `matures` unless vetoed, signed by device `by` or by
     /// the kit (`by_kit`), `contested` by another (a contest this device
-    /// cannot resolve when `targeted`, the kit alone when `kit_only`); a
+    /// cannot resolve when `cannot_resolve`, the kit alone when `kit_only`); a
     /// restore stopped, at its log `index`; or an alarm of its kind,
     /// `index` its place (its log index, epoch, position or skew) and its
     /// `remedy`. `fresh` when no pass raised it before, so its
@@ -345,7 +345,7 @@ parcel! {
         pub contested: bool => boolean,
         pub alarm: Alarm => enum Alarm,
         pub remedy: Remedy => enum Remedy,
-        pub targeted: bool => boolean,
+        pub cannot_resolve: bool => boolean,
         pub kit_only: bool => boolean,
     }
 

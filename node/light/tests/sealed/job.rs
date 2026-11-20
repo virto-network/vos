@@ -225,7 +225,7 @@ fn a_pass_with_nothing_new_reads_little() {
     for phone in phones.iter_mut() {
         pass(&mut home, phone);
     }
-    home.pass(5 * MIN);
+    home.pass(15 * MIN);
     let quiet = pass(&mut home, &mut phones[1]);
     assert_eq!(quiet.pass.posts, 0);
     assert_eq!(quiet.pass.pushed, 0);

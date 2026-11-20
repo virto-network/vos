@@ -421,6 +421,28 @@ fn the_kit_removes_a_lost_phone_and_the_restore_completes() {
     assert!(removal.index > 0);
 }
 
+/// A quiet home reads at its last batch's time: a joiner just paired, its
+/// probation past by the home's clock with no call since, reads as in
+/// probation there. The Devices read wakes the home first, so it reads
+/// active.
+#[test]
+fn the_devices_read_wakes_a_quiet_home() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let first = device(&world, 0x86);
+    first.claim(&world, home);
+    let second = device(&world, 0x87);
+    let id = first.pair(&second);
+    let quiet = vos_light::job::STALE_MS + suite().probation_ms;
+    world.pass(quiet);
+    first
+        .space
+        .host()
+        .ahead
+        .store(quiet, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(first.standing(id), Some(Standing::Active));
+}
+
 /// The home's onion not yet published at the first contact: every attempt
 /// of the first burst finds it so, and the light node tries once more
 /// after a pause, so the claim goes through.

@@ -11,7 +11,7 @@ import team.virto.vos.personal.Remedy;
  * One thing the chrome raises: an operation's at its log index, taken at {@code at} (the agent's
  * time, 0 when this pass did not read it) and maturing at {@code matures} unless vetoed, signed by
  * device {@code by} or by the kit ({@code byKit}), {@code contested} by another (a contest this
- * device cannot resolve when {@code targeted}, the kit alone when {@code kitOnly}); a restore
+ * device cannot resolve when {@code cannotResolve}, the kit alone when {@code kitOnly}); a restore
  * stopped, at its log index; or an alarm of its kind, {@code index} its place and its
  * {@code remedy}. {@code fresh} when no pass raised it before, so its notification alerts.
  */
@@ -26,6 +26,6 @@ parcelable Notice {
     boolean contested;
     Alarm alarm;
     Remedy remedy;
-    boolean targeted;
+    boolean cannotResolve;
     boolean kitOnly;
 }

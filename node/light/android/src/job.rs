@@ -540,7 +540,7 @@ pub(crate) fn notice(raised: vos_light::job::Notice) -> Notice {
             matures,
             contested,
             at,
-            targeted,
+            cannot_resolve,
             kit_only,
         } => Notice {
             pending: match kind {
@@ -560,7 +560,7 @@ pub(crate) fn notice(raised: vos_light::job::Notice) -> Notice {
             },
             by_kit: matches!(by, vos_wire::personal::Signer::Kit(_)),
             contested,
-            targeted,
+            cannot_resolve,
             kit_only,
             ..Notice::default()
         },

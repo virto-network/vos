@@ -268,10 +268,13 @@ public final class Words {
         return "this phone's admin key is not kept in hardware: open the pairing on a phone"
             + " whose key is";
       case Why.SOURCE:
-        // The source's own words name the key: the phone's, or a security key.
-        return refused.detail == null || refused.detail.isEmpty()
-            ? "the key failed"
-            : refused.detail;
+        // The source's own words name the key, the phone's or a security key, when they can.
+        if (refused.detail == null || refused.detail.isEmpty()) {
+          return "the key failed";
+        }
+        return refused.detail.contains("key") || refused.detail.startsWith("no answer from you")
+            ? refused.detail
+            : "the key failed: " + refused.detail;
       case Why.NO_OPEN_CLAIM:
         return "that home serves no claim";
       case Why.OPEN_CLAIM_REFUSED:

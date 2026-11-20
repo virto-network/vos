@@ -68,7 +68,7 @@ pub const AUDIT_SAMPLE: usize = 1;
 
 /// How old, by the device's clock, the agent's batch time may be before a
 /// pass that posts nothing wakes the agent ([`due`]).
-pub const STALE_MS: u64 = 10 * 60 * 1000;
+pub const STALE_MS: u64 = 30 * 60 * 1000;
 
 /// What a device posts to its agent under its sync key while following
 /// the log, each a named call of `Personal`.
@@ -161,8 +161,7 @@ pub enum Notice {
     /// A device-set operation open at `index`, maturing at `matures`
     /// unless vetoed: `at` is when the log took it, if this pass read it.
     /// Contested, it waits for a resolution: none of this device's when it
-    /// is `targeted`, the kit's alone when it is `kit_only`
-    /// ([`group::Open`]).
+    /// `cannot_resolve`, the kit's alone when `kit_only` ([`group::Open`]).
     Operation {
         index: u64,
         by: Signer,
@@ -170,7 +169,7 @@ pub enum Notice {
         matures: u64,
         contested: bool,
         at: Option<u64>,
-        targeted: bool,
+        cannot_resolve: bool,
         kit_only: bool,
     },
     /// The kit opened a restore, at `index`, which asserts every device
@@ -236,7 +235,8 @@ pub struct Pass {
     pub posts: usize,
     /// Whether it posted `alive`: a restore is pending.
     pub alive: bool,
-    /// The restore it answered with `alive`, by its log index.
+    /// The restore it answered with `alive`, by its log index, if it
+    /// verified it.
     pub restore: Option<u64>,
     /// The epochs confirmed or voided, and this device's removal, as read.
     pub events: Vec<Event>,
@@ -281,7 +281,7 @@ impl Pass {
                 kind: Kind::of(&open.op),
                 matures: open.matures,
                 contested: open.contested,
-                targeted: open.targeted,
+                cannot_resolve: open.cannot_resolve,
                 kit_only: open.kit_only,
                 at: self
                     .taken
@@ -290,11 +290,13 @@ impl Pass {
                     .map(|(_, at)| *at),
             })
             .collect();
-        if let Some(index) = self.restore {
-            notices.push(Notice::Restore { index });
+        if self.alive {
+            notices.push(Notice::Restore {
+                index: self.restore.unwrap_or(0),
+            });
         }
         match self.course {
-            group::Course::Out => notices.push(Notice::Removed),
+            group::Course::Out | group::Course::TurnedAway => notices.push(Notice::Removed),
             group::Course::Stuck { .. } => notices.push(Notice::Stuck),
             group::Course::Following => {}
         }
@@ -308,17 +310,6 @@ impl Pass {
     fn raise(&mut self, alarm: Alarm) {
         if !self.alarms.contains(&alarm) {
             self.alarms.push(alarm);
-        }
-    }
-
-    /// `events` the device group gave outside the log's reading.
-    fn saw(&mut self, events: Vec<Event>) {
-        for event in events {
-            match event {
-                Event::Alarm(alarm) => self.raise(alarm),
-                other if !self.events.contains(&other) => self.events.push(other),
-                _ => {}
-            }
         }
     }
 }
@@ -342,13 +333,18 @@ pub fn run<L: Control>(
     now: u64,
 ) -> Result<Pass, Stopped<L::Error>> {
     let mut pass = Pass::default();
-    let mut done = passing(light, group, link, instances, now, &mut pass);
-    if let Err(SyncError::Refused(PersonalError::NotAdmitted | PersonalError::Removed)) = &done {
-        // Turned away though once added: out, its removal settled unread.
-        done = group
-            .turned_away()
-            .map(|events| pass.saw(events))
-            .map_err(SyncError::Group);
+    // A device turned away follows on, unless the agent turns it away
+    // again.
+    let mut done = group
+        .turned_away(false)
+        .map_err(SyncError::Group)
+        .and_then(|_| passing(light, group, link, instances, now, &mut pass));
+    let refused = matches!(done, Err(SyncError::Refused(PersonalError::NotAdmitted)));
+    match group.turned_away(refused) {
+        // Turned away though once added: its removal settled unread.
+        Ok(true) if refused => done = Ok(()),
+        Ok(_) => {}
+        Err(error) => done = done.and(Err(SyncError::Group(error))),
     }
     pass.course = group.course();
     pass.operations = group.operations();
@@ -458,7 +454,7 @@ fn due(group: &DeviceGroup, overview: &Overview, now: u64) -> bool {
         || group
             .operations()
             .iter()
-            .any(|open| !open.contested && open.matures <= now.max(overview.at))
+            .any(|open| open.verified && !open.contested && open.matures <= now.max(overview.at))
 }
 
 /// Wake the agent until nothing due is left. A wake does not count the

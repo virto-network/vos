@@ -119,14 +119,16 @@ final class DevicesScreen extends Screen {
       if (notice.contested && notice.kitOnly) {
         into.addView(
             text(
-                "Too few of your devices are left outside this contest to resolve it: only your"
-                    + " recovery kit can, from "Resolve it with the kit"."));
+                "Too few of your devices can resolve this contest: only your recovery kit can."
+                    + " Open the kit's screen, read the devices with the kit, then uphold or drop"
+                    + " it there."));
         into.addView(
             button("Resolve it with the kit", v -> app.open(new RestoreScreen(app))));
-      } else if (notice.contested && notice.targeted) {
+      } else if (notice.contested && notice.cannotResolve) {
         into.addView(
-            text("This phone is one of its targets, so it cannot resolve it: your other devices"
-                + " do, or your recovery kit."));
+            text(
+                "This phone cannot resolve it (it is one of its targets, or not yet a seasoned"
+                    + " strong device): your other devices do, or your recovery kit."));
       } else if (notice.contested) {
         into.addView(
             buttons(

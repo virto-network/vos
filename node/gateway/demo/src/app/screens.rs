@@ -14,15 +14,12 @@ pub enum Screen {
 #[derive(Clone)]
 pub enum Message {
     Show(Screen),
-    Account(String),
     Payee(String),
     Amount(String),
     Enroll,
     Enrollment(EffectOutput),
     Enrolled(EffectOutput),
     Held(EffectOutput),
-    Claim,
-    Claimed(EffectOutput),
     SignIn,
     Proved(Screen, EffectOutput),
     Pay,
@@ -34,8 +31,6 @@ pub enum Message {
 pub struct Screens {
     demo: Demo,
     screen: Screen,
-    /// The name of the account the member claims.
-    account: String,
     payee: String,
     amount: String,
     /// The device's member and owner digests, once it enrolled.
@@ -50,7 +45,6 @@ impl Screens {
         Self {
             demo,
             screen: Screen::Enroll,
-            account: String::new(),
             payee: String::new(),
             amount: String::new(),
             digests: None,
@@ -123,16 +117,6 @@ fn short(bytes: &[u8]) -> String {
 }
 
 impl Screens {
-    /// The enrollment of `member` and `owner` for the account typed, as the
-    /// service takes it.
-    fn enrollment(&self, member: [u8; 32], owner: [u8; 32]) -> Value {
-        object([
-            ("member", Value::Bytes(member.to_vec())),
-            ("owner", Value::Bytes(owner.to_vec())),
-            ("account", Value::from(self.account.clone())),
-        ])
-    }
-
     fn failed(&mut self, output: EffectOutput) {
         self.status = match output {
             EffectOutput::HostService(Err(error)) => error.message,
@@ -232,27 +216,14 @@ impl App for Screens {
             Screen::Enroll => {
                 let page = page
                     .text("Enroll this device")
-                    .child(
-                        view::field(self.account.clone(), Message::Account)
-                            .placeholder("Your account's name"),
-                    )
                     .button("Enroll this device", Message::Enroll);
                 match self.digests {
-                    Some(_) => page
-                        .text(
-                            "Your device showed its two digests in its own window: read \
-                             them from there to the space's operator, then claim them.",
-                        )
-                        .button("Claim", Message::Claim),
-                    // The session s4 carries over Tor after an enrollment
-                    // claims what that session held, its digests never
-                    // shown here, so this one signs in.
-                    None => page
-                        .text(
-                            "Enrolled already? Once the operator invited your digests, claim \
-                             them here, then sign in from this session.",
-                        )
-                        .button("Claim my invitation", Message::Claim),
+                    Some(_) => page.text(
+                        "Your device showed its two digests in its own window: read them \
+                         from there to the space's operator. The operator's invitation claims \
+                         them; then sign in from the next session.",
+                    ),
+                    None => page,
                 }
             }
             // A session the device's digests were shown in signs in
@@ -287,7 +258,6 @@ impl App for Screens {
                 self.screen = screen;
                 self.status.clear();
             }
-            Message::Account(account) => self.account = account,
             Message::Payee(payee) => self.payee = payee,
             Message::Amount(amount) => self.amount = amount,
             Message::Enroll => {
@@ -311,11 +281,14 @@ impl App for Screens {
                     (Some(member), Some(owner)) => {
                         self.digests = Some((member, owner));
                         self.status = "Enrolled on this device…".into();
-                        // Held for the claim from the session s4 carries
-                        // over Tor next.
+                        // Held for the operator's invitation, which claims
+                        // it: no session asks for the claim.
                         cx.effect(service(
                             "hold",
-                            self.enrollment(member, owner),
+                            object([
+                                ("member", Value::Bytes(member.to_vec())),
+                                ("owner", Value::Bytes(owner.to_vec())),
+                            ]),
                             Message::Held,
                         ));
                     }
@@ -324,35 +297,9 @@ impl App for Screens {
             }
             Message::Held(output) => match output {
                 EffectOutput::HostService(Ok(_)) => {
-                    self.status = "Enrolled on this device: once the operator invited you, claim \
-                                   here or from the next session"
+                    self.status = "Enrolled on this device: once the operator invited you, sign \
+                                   in from the next session"
                         .into()
-                }
-                other => self.failed(other),
-            },
-            Message::Claim => {
-                self.status = "Claiming…".into();
-                let args = match self.digests {
-                    Some((member, owner)) => self.enrollment(member, owner),
-                    None => Value::Null,
-                };
-                cx.effect(service("claim", args, Message::Claimed));
-            }
-            Message::Claimed(output) => match output {
-                EffectOutput::HostService(Ok(Value::Array(slots))) => {
-                    let slots: Vec<String> = slots.iter().map(display).collect();
-                    self.status = match self.digests {
-                        Some(_) => format!(
-                            "Claimed: member at slot {}, account {}. Pay from here; sign in \
-                             from a new session.",
-                            slots.join(", "),
-                            self.account
-                        ),
-                        None => format!(
-                            "Claimed: member at slot {}. Sign in or pay from here.",
-                            slots.join(", ")
-                        ),
-                    };
                 }
                 other => self.failed(other),
             },
@@ -403,13 +350,5 @@ impl App for Screens {
             },
             Message::Refreshed(_) => {}
         }
-    }
-}
-
-fn display(value: &Value) -> String {
-    match value {
-        Value::Integer(s4_server::rui::protocol::Integer::Unsigned(value)) => value.to_string(),
-        Value::Null => "no such account".into(),
-        other => format!("{other:?}"),
     }
 }

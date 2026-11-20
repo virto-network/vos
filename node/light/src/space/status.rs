@@ -69,7 +69,7 @@ fn phase(held: &Held) -> Result<Phase, super::Error> {
     }
     if let Some(group) = &held.group {
         return Ok(match group.course() {
-            Course::Out => Phase::Removed,
+            Course::Out | Course::TurnedAway => Phase::Removed,
             Course::Stuck { .. } => Phase::Stuck,
             Course::Following if group.id().is_none() || held.state.acked.is_some() => {
                 Phase::Joining

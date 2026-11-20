@@ -72,7 +72,7 @@ impl<H: Host> Personal<H> {
                         matures: operation.matures,
                         contested: operation.state == OpState::Contested,
                         at: Some(operation.at),
-                        targeted: false,
+                        cannot_resolve: false,
                         kit_only: false,
                     })
                     .collect(),

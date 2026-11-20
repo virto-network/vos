@@ -429,7 +429,6 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
 
     // Enroll: the chrome shows what is pinned; the device answers its two
     // digests, which the operator invites before the claim.
-    phone.type_into("Your account's name", "alice").await;
     user.will(confirm(&[]));
     user.will(confirm(&[]));
     let at = phone.click("Enroll this device").await;
@@ -446,16 +445,15 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
             .iter()
             .any(|(_, value)| value.contains("vote (once in scope “vote”)"))
     );
+    phone.settle(0, &["sign in from the next session"]).await;
     tokio::task::block_in_place(|| {
-        space.invite(member, "alice", owner).unwrap();
+        assert!(
+            space.invite(member, "alice", owner).unwrap(),
+            "the invitation claims the device the screens enrolled"
+        );
         space.open_account("shop", some_owner(), 50).unwrap();
         space.open_account("mallory", some_owner(), 0).unwrap();
     });
-    let at = phone.click("Claim").await;
-    let claimed = phone
-        .settle(at, &["Claimed", "refused", "failed", "Not"])
-        .await;
-    assert!(claimed.starts_with("Claimed: member at slot"), "{claimed}");
     tokio::task::block_in_place(|| space.mint("alice", 50).unwrap());
 
     // Pay: the document's fields say 999 to mallory; the user confirms 20
@@ -540,18 +538,17 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
 }
 
 /// After an enrollment s4 connects again (over Tor on a phone, carried):
-/// the new session, the device's digests never shown in it, claims the
-/// invitation the enrolling session held, and signs in from there. Before
-/// the claim a sign-in says to claim first.
+/// the new session, the device's digests never shown in it nor named by
+/// it, signs in once the operator's invitation claimed the device the
+/// screens enrolled; before that, a sign-in says to claim first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_session_after_the_enrollment_claims_and_signs_in() {
+async fn the_session_after_the_enrollment_signs_in_once_invited() {
     let user = Arc::new(User::default());
     let (space, mut phone, _dirs) = demo(Arc::clone(&user)).await;
-    phone.type_into("Your account's name", "bob").await;
     user.will(confirm(&[]));
     user.will(confirm(&[]));
     let at = phone.click("Enroll this device").await;
-    phone.settle(at, &["here or from the next session"]).await;
+    phone.settle(at, &["sign in from the next session"]).await;
     let digests = user.shown.lock().unwrap()[1].clone();
     let member = digest(&digests.rows[0].1);
     let owner = digest(&digests.rows[1].1);
@@ -589,25 +586,15 @@ async fn the_session_after_the_enrollment_claims_and_signs_in() {
     );
     user.answers.lock().unwrap().clear();
 
-    tokio::task::block_in_place(|| space.invite(member, "bob", owner).unwrap());
-    let at = phone.click("Enroll").await;
-    phone.settle(at, &["Enroll this device"]).await;
-    let at = phone.click("Claim my invitation").await;
-    let claimed = phone
-        .settle(
-            at,
-            &["Claimed", "refused", "failed", "Not", "no enrollment"],
-        )
-        .await;
-    assert!(claimed.starts_with("Claimed: member at slot"), "{claimed}");
+    assert!(tokio::task::block_in_place(|| space
+        .invite(member, "bob", owner)
+        .unwrap()));
     assert_eq!(
         tokio::task::block_in_place(|| space.balance("bob").unwrap()),
         Some(0),
-        "the account the enrolling session named, opened"
+        "the account the invitation named, opened"
     );
 
-    let at = phone.click("Sign in").await;
-    phone.settle(at, &["Sign in with your device"]).await;
     let signed = loop {
         user.will(confirm(&[]));
         let at = phone.click("Sign in with my device").await;

@@ -22,7 +22,8 @@
 //!
 //! - `invite MEMBER ACCOUNT OWNER`: invite the member digest into the
 //!   credential actor's tree and the account `ACCOUNT` for the owner
-//!   digest, both as the phone's Enroll screen shows them;
+//!   digest, both as the phone's Enroll screen shows them, claiming both
+//!   at once for a device that enrolled through the screens;
 //! - `mint ACCOUNT AMOUNT`; `balance ACCOUNT`;
 //! - `members N`: N members of random digests enrolled, so a device's
 //!   first read of the tree's feed is a catch-up of about 77 bytes each;
@@ -70,8 +71,11 @@ fn command(space: &LocalSpace, line: &str) -> Result<String, String> {
     let words: Vec<&str> = line.split_whitespace().collect();
     match words.as_slice() {
         ["invite", member, account, owner] => {
-            space.invite(digest(member)?, account, digest(owner)?)?;
-            Ok(format!("invited the member and the account {account}"))
+            let claimed = space.invite(digest(member)?, account, digest(owner)?)?;
+            Ok(match claimed {
+                true => format!("invited and claimed the member and the account {account}"),
+                false => format!("invited the member and the account {account}"),
+            })
         }
         ["mint", account, amount] => {
             let amount = amount.parse().map_err(|_| "the amount is a number")?;

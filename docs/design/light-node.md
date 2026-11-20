@@ -807,9 +807,12 @@ operation's state, the inbox and the slots) is at the time of the agent's
 last call, and nothing that fell due since is settled (a matured removal
 is logged, and its commit owed, by a call alone). A device's pass that
 posts nothing therefore wakes the agent (`wake`, a call that settles and
-counts no one seen) when the overview's batch time is older than ten
-minutes by the device's clock (`job::STALE_MS`), or an uncontested
-operation it holds open has matured by either clock, then reads the log
+counts no one seen) when the overview's batch time is older than thirty
+minutes by the device's clock (`job::STALE_MS`, two of the background
+job's periods: a quiet home is woken every other pass), or an
+uncontested operation it verified open has matured by either clock (so
+the commit a matured removal owes is raised on the pass after it
+matures), then reads the log
 and the overview again: the device set's standing, the clock alarm (the
 device's clock against the batch time read after the wake) and the commit
 owed are at most a pass old. The Devices screen's read wakes the agent
@@ -1861,12 +1864,17 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   kept; one of each scope's own pushes audited (`audit`); the device set
   read. A device stuck or
   out reads the log, the overview and the device set and leaves its
-  scopes alone. A device added once whose key the agent turns away
-  (`NotAdmitted`, `Removed`) is out (`DeviceGroup::turned_away`): its
+  scopes alone. A device added once whose key the agent admits no more
+  (`NotAdmitted`) is turned away (`Course::TurnedAway`,
+  `DeviceGroup::turned_away`), which the chrome shows as removed: its
   removal matured and was settled while it was off (the kit's, another
   device's, a restore), and a removed device reads no log. That rests on
-  the agent's word, unsigned (B6): the operators could say it of a live
-  device, as they could deny it service, and its user pairs it again. A post the agent refuses as held already (`Voted`,
+  the agent's word, unsigned (B6), so nothing is dropped: the operators
+  could say it of a live device, and a later pass the agent serves again
+  follows on. `Removed` (a removal due, not yet settled, which what falls
+  due before it may still cancel) turns no device away. [Open, owner: a
+  removed device could reach `Out` on the signed log were the agent to
+  serve it the log up to its removal's entry.] A post the agent refuses as held already (`Voted`,
   `Evidenced`) or as decided meanwhile (`NoCandidate`, `NotConfirming`) is
   done, the log read on; a page withheld is read again once. A pass that
   stops on an error hands back what it found (`Stopped`), its alarms with

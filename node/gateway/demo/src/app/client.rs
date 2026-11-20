@@ -1,18 +1,16 @@
 //! The demo app's client key: an ordinary VOS client key, apart from the
-//! gateway's own, with which the app sends the claims of members who have
-//! no key of their own. Its authority is the registrar's
-//! invitations, which name the digests; it holds no credential bytes. Its
-//! calls run in one session per agent, so the app sends one claim at a
-//! time to an agent, in order.
+//! gateway's own, with which the app reads the space for its screens. It
+//! holds no credential bytes and makes no call: a member's claim is the
+//! operator's invitation's (`LocalSpace::invite`).
 
 use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
 use vos_abi::Encode;
-use vos_abi::ids::{AgentId, InstanceId, MethodId, Session};
+use vos_abi::ids::{AgentId, InstanceId, MethodId};
 use vos_api::client::Answer;
 use vos_api::{Kind, Mark};
-use vos_wire::ingress::{Call, Consistency, QueryCall};
+use vos_wire::ingress::{Consistency, QueryCall};
 
 use vos_gateway::Gateway;
 
@@ -33,36 +31,9 @@ impl AppClient {
         }
     }
 
-    /// The app's public key, the principal its calls carry.
+    /// The app's public key, the principal its queries carry.
     pub fn key(&self) -> [u8; 32] {
         self.key.verifying_key().to_bytes()
-    }
-
-    /// The call at `sequence` of the app's `session` with the agent whose
-    /// id is `agent` and identity `identity`: its answer frame.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn call(
-        &self,
-        agent: AgentId,
-        identity: &[u8; 32],
-        session: Session,
-        sequence: u64,
-        instance: InstanceId,
-        method: MethodId,
-        arguments: Vec<u8>,
-    ) -> Answer {
-        let mut call = Call {
-            session,
-            sequence,
-            instance,
-            method,
-            arguments,
-            signature: [0; 64],
-        };
-        call.signature = self.key.sign(&call.message(identity)).to_bytes();
-        self.gateway
-            .relay(Kind::Call, self.mark, &(agent, call).encode())
-            .await
     }
 
     /// A query by the app's key, good until `not_after` by the node's

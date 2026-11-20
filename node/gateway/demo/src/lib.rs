@@ -48,7 +48,7 @@ pub struct LocalSpace {
     agent: AgentId,
     operator: Mutex<Client>,
     programs: [(InstanceId, Vec<u8>); 3],
-    /// The enrollments the screens hold for a claim from a later session,
+    /// The enrollments the screens hold for the operator's invitations,
     /// every port's ([`app::Held`]).
     held: app::Held,
 }
@@ -240,8 +240,12 @@ impl LocalSpace {
     /// Invite a member's two digests: `member` into the credential actor's
     /// tree, recorded with `owner` as its person's first device, so the
     /// member's devices enroll one another (a member registered already is
-    /// refused there, `Held`); and the account `account` for `owner`.
-    pub fn invite(&self, member: [u8; 32], account: &str, owner: [u8; 32]) -> Result<(), String> {
+    /// refused there, `Held`); and the account `account` for `owner`. A
+    /// device that enrolled through the screens is claimed at once (the
+    /// member placed in the tree, the account opened, each on its
+    /// invitation's authority): whether it was. No session asks for the
+    /// claim, so none joins it to the device's sign-in.
+    pub fn invite(&self, member: [u8; 32], account: &str, owner: [u8; 32]) -> Result<bool, String> {
         let expires = self.now()? + INVITATION_MS;
         self.write(CREDENTIALS, "invite", (member, expires))?;
         self.write(
@@ -254,7 +258,12 @@ impl LocalSpace {
             "invite",
             (account.as_bytes().to_vec(), owner, expires),
         )?;
-        Ok(())
+        if !self.held.take(&member, &owner) {
+            return Ok(false);
+        }
+        self.write(CREDENTIALS, "claim", member)?;
+        self.write(PAYMENTS, "open", (account.as_bytes().to_vec(), owner))?;
+        Ok(true)
     }
 
     /// An account opened by the operator's invitation for `owner`, as a

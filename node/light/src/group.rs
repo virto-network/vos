@@ -646,6 +646,11 @@ pub enum Course {
     /// It is out of the group.
     #[codec(index = 2)]
     Out,
+    /// The agent turns its key away, though its add was confirmed: its
+    /// removal settled while it was off, or the home fails it. Nothing is
+    /// dropped: a pass the agent serves again finds it following.
+    #[codec(index = 3)]
+    TurnedAway,
 }
 
 /// What a device keeps of the device set's operations.
@@ -933,10 +938,10 @@ pub fn restoring_with(
 /// An open operation of the device set as this device verified it, for
 /// the chrome: its index, signer and operation, when it matures, whether
 /// it is contested, the devices whose vetoes verified, and whether its
-/// own evidence did; and for a contest, whether this device is one of its
-/// targets (the devices its operation and its rival's name), which
-/// resolve nothing, and whether fewer than the two devices a resolution
-/// needs are left outside them, so the kit alone resolves it.
+/// own evidence did; and for a contest, whether this device cannot resolve
+/// it (one of its targets, or not a seasoned strong device, as the agent
+/// rules), and whether fewer than the two devices a resolution needs can,
+/// so the kit alone resolves it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Open {
     pub index: u64,
@@ -946,7 +951,7 @@ pub struct Open {
     pub contested: bool,
     pub vetoes: Vec<DeviceId>,
     pub verified: bool,
-    pub targeted: bool,
+    pub cannot_resolve: bool,
     pub kit_only: bool,
 }
 
@@ -954,7 +959,15 @@ pub struct Open {
 /// whose admin key it replaces.
 fn targets(op: &Op) -> Vec<DeviceId> {
     match op {
-        Op::Remove(target) | Op::Replace { device: target, .. } => vec![*target],
+        Op::Replace { device, .. } => vec![*device],
+        _ => removes(op),
+    }
+}
+
+/// The devices an operation removes.
+fn removes(op: &Op) -> Vec<DeviceId> {
+    match op {
+        Op::Remove(target) => vec![*target],
         Op::Regroup(named) => named.clone(),
         _ => Vec::new(),
     }
@@ -1430,19 +1443,23 @@ impl DeviceGroup {
                     })
                     .collect::<Vec<_>>();
                 let contested = call.rival.is_some() || !vetoes.is_empty();
+                // As the agent rules: a resolution is two seasoned strong
+                // devices', none of them a target of the operation (those
+                // it names) or of its rival (those it removes).
                 let mut named = targets(op);
                 if let Some(Act::Op { op: rival, .. }) = call
                     .rival
                     .and_then(|rival| state.call_at(rival))
                     .map(|rival| &rival.act)
                 {
-                    named.extend(targets(rival));
+                    named.extend(removes(rival));
                 }
-                let resolvers = state
-                    .devices
-                    .iter()
-                    .filter(|(id, _)| state.voiced(*id) && !named.contains(id))
-                    .count();
+                let resolver = |id: DeviceId| {
+                    !named.contains(&id)
+                        && state.seasoned(id, state.time)
+                        && state.known(id).is_some_and(|known| known.strong)
+                };
+                let resolvers = state.devices.iter().filter(|(id, _)| resolver(*id)).count();
                 Some(Open {
                     index: call.index,
                     by: call.by,
@@ -1451,7 +1468,7 @@ impl DeviceGroup {
                     contested,
                     vetoes,
                     verified: call.evidence == Check::Valid && call.awaits.is_none(),
-                    targeted: contested && state.id.is_some_and(|me| named.contains(&me)),
+                    cannot_resolve: contested && !state.id.is_some_and(resolver),
                     kit_only: contested && resolvers < 2,
                 })
             })
@@ -1593,20 +1610,23 @@ impl DeviceGroup {
         self.state.reseal && self.state.rekeyed.is_some()
     }
 
-    /// The agent turns this device's sync key away (`NotAdmitted`, or
-    /// `Removed`) though its add was confirmed: its removal matured and was
-    /// settled before the device read it (a removal by the kit or by
-    /// another device while it was off, or a restore), and the log is no
-    /// longer served to it. It is out, on the agent's word, which the
-    /// operators could give of any device as they could deny it service:
-    /// it pairs again. Nothing to do for a device out already, or not yet
-    /// added.
-    pub fn turned_away(&mut self) -> Result<Vec<Event>, GroupError> {
-        let mut events = Vec::new();
-        if self.state.id.is_some() && self.state.course != Course::Out {
-            self.out(&mut events)?;
-        }
-        Ok(events)
+    /// Whether the agent turns this device's sync key away, as `admitted`
+    /// says: once it was added and while it follows, a key the agent
+    /// admits no more is one whose removal matured and was settled before
+    /// the device read it (a removal by the kit or by another device while
+    /// it was off, or a restore), the log no longer served to it; the
+    /// operators could say as much of any device, as they could deny it
+    /// service. Nothing is dropped, and a key admitted again follows on:
+    /// whether the course changed.
+    pub fn turned_away(&mut self, away: bool) -> Result<bool, GroupError> {
+        let course = match (self.state.course, away) {
+            (Course::Following, true) if self.state.id.is_some() => Course::TurnedAway,
+            (Course::TurnedAway, false) => Course::Following,
+            _ => return Ok(false),
+        };
+        self.state.course = course;
+        self.mls.write(rows(&self.state, None))?;
+        Ok(true)
     }
 
     /// The matured removals the next commit must carry.
@@ -1761,7 +1781,7 @@ impl DeviceGroup {
         match self.state.course {
             Course::Following => {}
             Course::Stuck { .. } => return Err(GroupError::Stuck),
-            Course::Out => return Err(GroupError::Out),
+            Course::Out | Course::TurnedAway => return Err(GroupError::Out),
         }
         self.idle()
     }

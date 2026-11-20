@@ -55,7 +55,7 @@ fn every_type_crosses_its_parcelable_unchanged() {
                         contested: true,
                         alarm: Alarm::Rollback,
                         remedy: Remedy::RePair,
-                        targeted: true,
+                        cannot_resolve: true,
                         kit_only: true,
                     })
                     .collect(),
