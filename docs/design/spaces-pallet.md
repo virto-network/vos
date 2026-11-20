@@ -23,7 +23,7 @@ things:
   `docs/design/identity-and-authority.md` §5, §11 and §12, and
   `docs/design/proving.md` §11.
 
-## 0.1 Build order for the teammate
+## 0. Build order for the teammate
 
 The pallet needs VOS's crates only for §3's calls: the venue rules
 (`vos_anchor::venue`), `judge`, `space_id`, the digests, the genesis

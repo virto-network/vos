@@ -302,6 +302,7 @@ doc-check:
     with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { \
         cargo doc -p vos-venue -p vos-kreivo --features vos-venue/model,vos-kreivo/kreivo-mock --no-deps --quiet }
 
+# Every feature set's lints, with `gate`'s (`ci` runs both).
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-bench --features prove --all-targets --quiet -- -D warnings

@@ -310,12 +310,21 @@ The scale results are in `core-model.md` §14, "The scale test".
   removing it moves the actor's ELF. The feed is kept whole on the actor
   and on every device, about 77 bytes a write: a compaction (a snapshot of the leaves, then the changes since)
   is later work, should a space's history outgrow it.
-- **Full privacy** (`identity-and-authority.md` §8): a shielded pool
+- **Full privacy** (`identity-and-authority.md` §8 points here): a shielded pool
   shared by many spaces, whose integrity does not trust any one space's
   operators (it verifies each spend's proof in its guest), postponed;
   where it first runs (a JAM agent or a proving space run by the root
   space) is decided when it is taken up. A space's own pool is P2's
-  (below).
+  (below). Its design so far: on JAM a final proof costs about 80M gas of
+  refine (the JAM statements service's, measured), so about 60 fit a work
+  package's 5e9, and scanning notes held on JAM needs the JAM light client
+  on the device; an anonymous input travels the client path without a
+  session (self-authenticating, deduplicated by its nullifier, no
+  acknowledgement, a fee note inside its proof, a few padded sizes,
+  accepted from any relay); notes are discovered by scanning with a
+  one-byte view tag, the sender's direct delivery through the messenger
+  the fast path, detection keys deferred, and with every key derived from
+  one master secret a rescan of the pool doubles as recovery.
 - **Authenticators and attestations:** authenticators beyond ed25519 at
   ingress (SSH keys, P-256, hardware tokens) and device-signed sessions;
   grants, delegation and narrowed authority sets with revocation epochs;
@@ -467,13 +476,12 @@ What `light-node.md` leaves for later; the dated risks and deferred flows
 are under "Identity and privacy" above.
 
 - **The phone gates not yet recorded as passed** (`light-node.md` §2.4):
-  PG1′ and PG2′
-  at format 47 on the Fairphone 6, twice a day apart; PG3′'s flows and
-  PG6 as onion runs on two phones with the security key; PG5's battery
-  and rendezvous counts; the recorded background-job cases (the "rare"
+  PG1′ and PG2′ at format 47 on the Fairphone 6, twice a day apart; PG3′'s
+  flows and PG6 as onion runs on two phones with the security key; PG5's
+  battery and rendezvous counts; the recorded background-job cases (the "rare"
   bucket, three days offline, a force-stop, an operation's latency to its
   notification), which the device-change windows are pinned against.
-- **The personal agents' scale gate** (`light-node.md` §3.3, "Replicas"):
+- **The personal agents' scale gate** (`light-node.md` §3.3, "The scale gate"):
   of its three limits, the early run met the snapshot's and missed the
   other two as measured; the rerun splits a replica's memory from the
   store's and reads the p99 at finer buckets.
@@ -521,6 +529,15 @@ are under "Identity and privacy" above.
   proven call into the actor.
 - **A device too small for a full replica,** and a wallet's mirror of a
   large pool (`light-node.md` §8, C10).
+- **MLS on the device is new code:** confirmed epochs, admin-signed
+  commits and copy-and-swap over mls-rs (`light-node.md` §3.4), the risk
+  the external audit's scope names.
+- **Node-signed answers,** so a device's alarm becomes proof a third
+  party can check (`light-node.md` §8, B4; "Node-signed feed heads",
+  above, for the tree's feed).
+- **Not in this design:** a personal space shared by more than one
+  person; iOS (nothing below the secret store is Android-only, but nothing
+  builds it); an anonymity network of VOS's own, or mixnets: Tor only.
 - **Proof bytes over Tor:** the upload dominates a proven call's latency
   over an onion circuit (`light-node.md` §6.3); smaller device proofs and
   an upload split over several circuits are the levers.
@@ -545,8 +562,8 @@ Two actors and one library:
   devices through the personal space.
   It plans spends; the light node builds and proves them with the
   device's key, which never enters the actor's state. A local actor whose
-  rows no device writes again needs the move's carry first (below,
-  "Restore elsewhere and the move's carry").
+  rows no device writes again needs the move's carry first (above, under
+  "Identity and privacy": "Restore elsewhere and the move's carry").
 - **cipher-clerk**, redesigned (below): the ledger kernel, and a shielded
   module whose spend rule is one `no_std` Rust function, the same function
   the device kernel runs and the reference implementation checks.
@@ -562,8 +579,8 @@ Its spending key reaches only kernels the light node ships
 
 ### cipher-clerk, redesigned
 
-cipher-clerk (`~/src/virto/cipher-clerk`; VOS pins tag `v0.3.0`, the
-merge commit `b841640`, `Cargo.toml:239`, and uses its codec, `Account`, `Layer`,
+cipher-clerk (codeberg's `Virto/CipherClerk`; VOS pins tag `v0.3.0`, the
+merge commit `b841640`, in its root `Cargo.toml`, and uses its codec, `Account`, `Layer`,
 `Value` and `settlement::window` in the `accounts` and `window` test
 actors) has a sound transparent kernel (its tests are most of the 315 the
 workspace runs with every feature; about 114 are the privacy modules') and a notes
@@ -757,7 +774,7 @@ Over Tor (`light-node.md` §6), not the address it came from.
   paid for (inflation), refuse a spend, or roll back. Users see the
   pool's transparent total (the pseudo-account's balance) and their own
   notes, not a proof of supply. A pool that needs integrity without
-  trusting its host is `identity-and-authority.md` §8's, postponed.
+  trusting its host is "Full privacy"'s (above), postponed.
 - **The anonymity set** is the pool's notes under the anchors in use: in a
   small space, small. A member who spends right after receiving links
   the two by timing; the wallet waits a random interval before spending a

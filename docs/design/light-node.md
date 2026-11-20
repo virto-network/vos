@@ -10,7 +10,7 @@ attestable Rust, and clients reaching a space over Tor.
 - **Numbers** carry their tag: [measured] (a run, cited), [model] (the
   cell model, `proving.md` §8), [est] (arithmetic on those, unmeasured).
 
-## 1. Goals and non-goals
+## 1. Goals
 
 **The owner's direction** (2026-11-02), in their words:
 
@@ -52,7 +52,7 @@ devices decrypt each other's messages".
 | E10 | Anonymous calls (sign-in, spends) go from the device to their target over Tor, never through the personal agent, which would link them. The personal agent holds only ciphertext and what its operators may see. |
 | E11 | The edge scenarios that could bite later worked through before code (§8); the remaining design questions taken at their recommendations. |
 | E12 | Keep MLS, built as one shared `vos-mls` layer: the personal space its first user, member messaging and virtual clients later; one stack, fewer pieces. |
-| E13 | P2 (the shielded pool, the wallet, PG4) is built on the finished personal space and Tor; P1 ships first. |
+| E13 | P2 (the shielded pool, the wallet, PG4) comes after the personal space and Tor, built on them; P1 first (P2's design: `open.md`). |
 | E14 | A home-only space by default: a space the user holds no other membership in, hosting personal agents. A user may home in a space they belong to, the app stating that its operators can link the agent to them. |
 | E15 | A yearly membership re-proof (`Auth("home")`, one prompt a year) keeps the agent; an expelled member's agent lapses into a grace period, its data recoverable by the kit. `Homes`' `renew`, the lease and the grace are built; the device's re-proof flow is not (`open.md`); a move makes no call to the old home, so the grace serves the kit's restore. |
 | E16 | Recovery: the phrase or printed kit, and a FIDO2 security key as a kit (the `hmac-secret` path). An encrypted export file is later. |
@@ -346,7 +346,8 @@ P2's (`open.md`).
 | **PG5 footprint** | the light node with arti, `vos-mls` and mls-rs | `.so` growth from `vos-mls` and mls-rs ≤ 2 MB; from arti ≤ 10 MB, provisional; idle ≤ 96 MiB; warm bootstrap ≤ 3 s p50; a day of background jobs ≤ 2% of the battery; ≤ 30 rendezvous an hour in the foreground |
 | **PG6 sync** | the background job; a 1 MiB catch-up; a commit | on a locked phone after first unlock: the job ≤ 30 s and ≤ 1 MB down with nothing new, p50; the 1 MiB catch-up over Tor ≤ 20 s p50; a candidate processed on its copy ≤ 200 ms. **Recorded, as inputs to the device-change windows:** the job in the "rare" bucket, after 3 days offline, after a force-stop, and the latency from a pending operation to its local notification |
 
-PG1′ and PG2′ passed at format 46 [measured, Fairphone 6, 2026-11-08]:
+PG1′ and PG2′ passed at format 46 (against 46's sign-in limit of ≤ 1.0 s)
+[measured, Fairphone 6, 2026-11-08]:
 `owner` 351.8 ms and ≤ 337 MiB, `auth` 615.6 ms, ≤ 505 MiB and
 ≤ 0.88 MB, each phone-made sign-in run at the node's ingress
 (`proving.md` §8). PG5's arti and `vos-mls` figures and PG6's candidate
@@ -821,7 +822,7 @@ device's last call (below, "Seen means a call"). Delays and maturities
 themselves run on batch time alone, as below. The home's
 calls (`configure`, `assign`, `claim`, `renew`) take the role `homes`;
 `assign` answers its caller, and `claim` answers `Homes` by message
-(below, "`Homes` as built"). Bounds the rules above leave open: `alive` is logged at
+(above, "`Homes` as built"). Bounds the rules above leave open: `alive` is logged at
 most once an hour a device (the entry logged last answers between), a
 vote's signed message names its candidate's log index as well as its
 epoch (an epoch's number is free again after a void), an opener holds one
@@ -2294,7 +2295,7 @@ writes (the `sdk-device` test actor's `auth` and `owner`):
   [measured, step counts of the traced run on the host, Intel Core Ultra 7
   155H, 2026-11-02]:
 
-| kernel | today's target | with `unaligned-scalar-mem` | and the SDK's words as plain accesses |
+| kernel | the target before the feature | with `unaligned-scalar-mem` | and the SDK's words as plain accesses |
 |---|---|---|---|
 | auth by hand (`device`) | 1,722 | 1,635 | 1,624 |
 | auth in SDK form | 1,839 (×1.068) | 1,770 (×1.083) | 1,710 (×1.053) |
@@ -2308,7 +2309,7 @@ writes (the `sdk-device` test actor's `auth` and `owner`):
   in-place checks and the digests copied once more into each call's block
   where the hand-lean kernel computes into the lane. With the target
   feature and the SDK's plain accesses, the SDK-form auth (1,710) runs
-  under today's hand-lean kernel on today's target (1,722). So **the
+  under the hand-lean kernel on the target before the feature (1,722). So **the
   SDK-form kernels are the stock ones**, and the hand-lean kernels
   stay as the test actors' references; the fallback (the hand-lean
   kernels shipped as stock, the assembly kept inside `vos_sdk::p2`) is not
@@ -2317,7 +2318,7 @@ writes (the `sdk-device` test actor's `auth` and `owner`):
   the host, Intel Core Ultra 7 155H, 2026-11-03]: a crate with several
   device kernels, or a kernel and its reference entry, called
   one outlined `DeviceReturn` end and its part writers. With them
-  `#[inline(always)]`, on today's target, the SDK-form auth takes 1,546
+  `#[inline(always)]`, on the target before the feature, the SDK-form auth takes 1,546
   steps (from 1,839) and owner 385 (from 708, `owner_lean` 383); the
   hand-lean auth stays at 1,722. The programs shrink with them: the SDK
   form's auth at the hand-lean one's sizes but one chip a size smaller
@@ -2351,7 +2352,7 @@ picked the circuit; a proven call carries the kernel's claim:
   device kernel of this actor, or `#[msg(proven = owner)]`, the
   credential actor's. `#[msg(credential = Auth("login"))]` and
   `#[msg(credential = Owner)]` stay as the SDK's sugar for the stock
-  kernels, so purses-style code reads as today. The stock auth kernel is
+  kernels, so purses-style code reads as it did. The stock auth kernel is
   named through `credential = Auth("name")` alone, since its scope needs
   the guard's name: `proven = auth` is refused, naming that form, unless
   the actor has its own kernel `auth`, whose name comes first [built].
@@ -2378,9 +2379,8 @@ picked the circuit; a proven call carries the kernel's claim:
     verification, bounded like any other by the PoW and the budget;
   - `once` is defined for auth's guard alone.
 - **The origin** a proven call logs: `Anonymous { scope, nullifier }` for
-  auth, `Owner(digest)` for owner (both as today), and a new
-  `Kernel { program }` for any other kernel (codec index 7: `Principal`
-  ends at 4 today, `Identity` 5 and `Jam` 6 reserved; not "Proven", which
+  auth, `Owner(digest)` for owner, and `Kernel { program }` for any other
+  kernel (codec index 7; `Identity` 5 and `Jam` 6 reserved; not "Proven", which
   `Input::Proven`, index 9, already names). **The log carries the claim:**
   `Input::Credentialed` (index 10) takes the claim's bytes, capped (1 KiB,
   a spend's about 240), in place of auth's `root`, since apply's freshness
@@ -2564,9 +2564,13 @@ stock kernels, each measured as a candidate first (`proving.md` §8): the
 per-program CPU −9.5% (auth) and −7.8% (owner), word-level memory −19.3%
 and −7.3%, the two together −28.8% and −15.1%, against the model's −8.8%,
 −17% and −26% for auth; peak −45% and −35% together [measured, x86 dev
-machine, 2026-11-09]. The phone's figures at 47 are `proving.md` §8's;
-PG2′'s gate is 0.65 s with 0.55 s the target (§2.4), against format 46's
-581–645 ms for a sign-in [measured, `proving.md` §8].
+machine, 2026-11-09]. The Fairphone 6's figures at 47 are not yet
+measured (`open.md`, "The phone gates not yet recorded as passed"); the
+Pixel 1's are `proving.md` §8's. PG2′'s gate is 0.65 s with 0.55 s the
+target (§2.4), against format 46's 581–645 ms for a sign-in [measured,
+`proving.md` §8]: the model's 450 ms with both levers scales a 607 ms run,
+and from the 645 ms gate run it is about 478 ms, so 0.5 s would leave a
+4% margin.
 - **The price of one path:** a sign-in costs about 3.5× the retired
   credential proof in time and 4.5× in bytes, payment authorization about
   2× in time; within the owner's requirement (`proving.md` §1: under a
@@ -2721,7 +2725,7 @@ current at the claim; a space whose onions have all changed since is
 found only by its handle through the registry of spaces, which is not
 built (`open.md`, "The registry and the root space"; §8, D4). A gateway
 could serve a forged set, as it could forge any answer it relays
-(`open.md`, "Node-signed roots").
+(`open.md`, "Node-signed feed heads").
 
 **Built** [built, `node-api.md` §6, `docs/operations.md`]: the
 gateway's `tor` feature hosts the onion in process on arti-client 0.47.0
@@ -3530,7 +3534,7 @@ version is pinned a release, with an upgrade step budgeted regularly.
 | `vos-wire`, `vos-api` | `Credentialed.claim`, the kernel's public arguments; `CredentialedInput` carries the claim; `Principal::Kernel { program }` (index 7); the frame's transport mark (`node-api.md` §2; a missing mark is clearnet, §3.3) |
 | `merkle-crdt` (`support/merkle-crdt`) | the incremental apply (`core-model.md` §9.4); the author, its sequence and signature in the payload; a `Store` over fjall (`FjallStore`, the `fjall` feature; the core stays `no_std`); fetching by batch, sans I/O so an asynchronous client drives the round trips (`Replica::want` and `serve` for a DAG walk, `Replica::cursor` and `ingest` for `since`) |
 | `vos-credentials` | the stock `auth` and `owner` kernels, with their references; each stock guard's compatibility window of program ids (§4.4), the kernels' ingress checks staying in the node (§4.3); the registrar's open claim priced by work (§3.3), its person records, `enroll_device` and `revoke_device` (§3.8) |
-| `vos-gateway` | the onion service behind a `tor` feature, serving the same SSH as the clearnet and nothing else (§6.1); the SSH `vos-api` subsystem's relay set with `Call` and `Credentialed`, capped per connection, circuit, agent and onion; the transport mark on every relayed request; every node of its space listed as an upstream (§3.3) |
+| `vos-gateway` | the onion service behind a `tor` feature, serving the same SSH as the clearnet and nothing else (§6.1); the SSH `vos-api` subsystem's relay set with `Call` and `Credentialed`, capped per connection, circuit, agent and onion; the transport mark on every relayed request; every node of its space an upstream when given its space file (§3.3) |
 | system actors | `Homes` (`agent/homes`: the pool, claims, the indexes by nullifier and by kit key, the yearly re-proof and the lease) and `Personal` (`agent/personal`: the device set and its contests, liveness, the commit log and confirmations, sealed scopes, checkpoint acknowledgements, the inbox, quotas, gated queries, an append-only layout), each one package; `Payments` (`agent/payments`) |
 | `vos-keeper` (`tools/keeper`) | the operator's keeper: topping up the pool, granting `Homes` its role, upgrading `Personal` in batches (§3.3) |
 
@@ -3879,7 +3883,7 @@ alarm.
 *Mitigation:* two commits for one epoch give two signed `h` and a void;
 views in envelopes catch a split control log. *Known limit:* nodes sign
 nothing a device can show a third party, so an alarm is not proof
-(`open.md`, "Node-signed roots").
+(`open.md`, "Node-signed feed heads").
 
 **B5. The operators inject or replay.** A forged envelope fails its AEAD; a
 replayed one is a duplicate; a replayed commit breaks the epoch rule.
