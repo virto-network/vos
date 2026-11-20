@@ -2,9 +2,10 @@ set shell := ["nu", "-c"]
 
 # The pinning tests write their pins under `VOS_PINS=write` and hold them
 # otherwise. No recipe inherits it: the recipes that write pins (`repin`,
-# `repin-proof`, `fixtures`, `conformance`, each in no tier) set it on their own lines, so
-# a `VOS_PINS=write` left in the caller's environment cannot turn a gate's
-# check into a rewrite (`just check-tiers` holds the tiers to that).
+# `repin-proof`, `fixtures`, `conformance`, each in no tier) set it on
+# their own lines, so a `VOS_PINS=write` left in the caller's environment
+# cannot turn a gate's check into a rewrite (`just check-tiers` holds the
+# tiers to that).
 unexport VOS_PINS
 
 default:
@@ -14,30 +15,8 @@ default:
 #
 #   check ⊆ gate ⊆ ci ⊆ ci-full ⊆ slice-gate
 #
-# Each named for when it runs, by what it adds and the pins it holds.
+# What each adds, the pins it holds and when it runs: `README.md`'s table.
 # There is no hosted CI: "ci" names the pre-push hook's recipe.
-# - `check`, after every edit (minutes, warm): formatting, the gates' own
-#   tripwire, the workspace's lints and the fast tests. Holds the final
-#   verifier's layout constants (format 39's), the conformance vectors.
-# - `gate`, before each commit: `check`, the heavy test
-#   targets (`tools/gates/heavy.toml`), the docs' tripwire, deny, the
-#   builds without std, every guest and its blob, the leak checks, the
-#   verifier kit, the fuzz corpora replayed and their reach, and the
-#   suites outside the workspace. Holds `blobs.lock`, the wrap's
-#   preprocessed root, the compiler's leaf tables, the kit's lock and the
-#   facility's release artifacts.
-# - `ci`, before a push (the pre-push hook, `just install-hooks`): `gate`
-#   and every feature set's lints, the JAR check, the PVM vectors, the
-#   bench's cross-host checks, the slow fault runs and the prover's library
-#   tests. Holds the formats' bit counts (`COUNTS`).
-# - `ci-full`, by hand before a release candidate (under a 12 GiB memory
-#   cap): `ci` and the prover suites (`test-proof`: the forgery and
-#   soundness gates, the leakage tests at a medium N), the bench's proving
-#   tests and the fuzz targets a minute each. Holds `H_FOLD`, the known
-#   programs' ids and the golden fixtures.
-# - `slice-gate`, the full gate, by hand before a release: `ci-full` with
-#   the leakage tests at their full N and the fuzz targets five minutes
-#   each.
 # A suite belongs to the lowest tier that can afford it; `just check-tiers`
 # holds the recipes to that. `just test-changed` runs the tests a change
 # touches. Outside every tier, on purpose: what needs a PolkaJam testnet
@@ -1123,13 +1102,7 @@ fuzz secs="60":
         cargo fuzz run --fuzz-dir . -a $target $"corpus/($target)" $"target/replay/($target)" -- \
         -max_total_time={{secs}} -len_control=0 ...$limits } }
 
-# The light check, after every edit, and the innermost tier: formatting,
-# the gates' own tripwire, the replay archives' reader's refusals
-# (`pvm/proof/fuzz/test_corpus.py`), the workspace's lints, and every test
-# target of the fast suites' crates but the heavy ones (`tools/gates/heavy.toml`,
-# each a binary past about 20 s): minutes, warm. It builds the guests its
-# tests run, the agent's programs, the test actors and the venues' refine
-# programs, and nothing else outside the workspace.
+# The first tier, after every edit (`README.md`'s table).
 check: fmt-check check-tiers check-layers check-device-verifier build-test-actors build-programs build-final-verify build-statement-service
     python3 -I pvm/proof/fuzz/test_corpus.py
     cargo clippy --workspace --all-targets --quiet -- -D warnings
@@ -1137,18 +1110,7 @@ check: fmt-check check-tiers check-layers check-device-verifier build-test-actor
     cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py fast -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4
     cargo test {{agent_crates}} ...(python3 -I tools/gates/tiers.py fast {{agent_crates}} | split row ' ')
 
-# The commit gate, before each commit: `check`,
-# then the docs' links, the dependencies' licences and advisories (`deny`),
-# the side workspaces' lock files held to the root's (`check-locks`), the
-# venue rules' tripwire, the builds without std
-# with every guest built and its blob checked, the production builds'
-# leaks, the verifier kit, the fuzz corpus replayed, the lints of the
-# feature sets a change touches, the heavy test targets and the doc tests of
-# the fast suites' crates, and the edge's suites: the gateway's onion and
-# SSH ports with the demo, the light node's Tor client and the
-# `vos.credential` facility; last the reads at a cut.
-# Left to `just ci`: the slow fault runs, the PVM vectors, the bench and
-# prover library tests, and the lints of other feature sets.
+# The second tier, before each commit: `check` and more (`README.md`'s table).
 gate: check doc-check deny check-locks check-venue-rules check-no-std check-no-leaks check-no-faults check-kit fuzz-replay fuzz-reach
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     cargo clippy -p vos-http --all-targets --quiet -- -D warnings
@@ -1254,28 +1216,23 @@ test-reads: build-test-actors build-programs
         if $listed != $named { error make { msg: $"test-reads names ($named) tests, of which ($listed) exist" } }
     cargo test -p vos-kernel-tests --test kernel -- --test-threads=1 --exact {{reads_tests}}
 
-# Before a merge, and at the end of each planned stage of work: `gate`,
-# and everything else but the prover suites: the lints of every feature
-# set, the JAR check, the PVM vectors, the bench's cross-host checks, the
-# slow fault runs, the statement's heap peak and the prover's library
-# tests.
+# The third tier, the pre-push hook's: `gate` and more (`README.md`'s table).
 ci: gate clippy jar-check vectors test-bench test-faults
     cargo test -p vos-statement --features heap-peak --test heap
     cargo test -p vos-pvm-proof --lib
 
-# The gate at a milestone: `ci` plus the release binary's scan, the prover
-# suites, the soundness gates (the leakage tests at their medium N), the
-# bench tests that prove and the fuzz targets a minute each. Run it under a 12 GiB limit, e.g.
+# The fourth tier, by hand: `ci` and the prover suites (`README.md`'s
+# table), under a 12 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 just ci-full`.
 # Run alone on the machine, its builds may take `CARGO_BUILD_JOBS` 8 to 12:
 # the proving tests keep their own thread limits (`test-proof`'s
 # `--test-threads`), so the peak stays under the cap.
 ci-full: ci check-release-names test-bench-proof test-proof (fuzz "60")
 
-# The release gate, before a release: `ci-full`'s recipes, with the leakage tests at
-# their full N (2,000 proofs a witness on the small circuit, 32 on the real
-# wrap, 256 a witness on the device segment) and the fuzz targets five
-# minutes each. Under the same limit.
+# The fifth tier, before a release: `ci-full`'s recipes with the leakage
+# tests at their full N (2,000 proofs a witness on the small circuit, 32 on
+# the real wrap, 256 a witness on the device segment) and the fuzz targets
+# five minutes each. Under the same limit.
 slice-gate: ci check-release-names test-bench-proof
     with-env { LEAKAGE_N: "2000", LEAKAGE_WRAP_N: "32", LEAKAGE_SEGMENT_N: "256" } { just test-proof }
     just fuzz 300
