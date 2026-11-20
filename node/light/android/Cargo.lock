@@ -7859,6 +7859,7 @@ dependencies = [
 name = "vos-facility"
 version = "0.1.0"
 dependencies = [
+ "bip39",
  "blake2 0.10.6",
  "ciborium",
  "ed25519-dalek 2.2.0",

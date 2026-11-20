@@ -11,7 +11,8 @@
 pub mod contract;
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use vos_abi::ids::InstanceId;
 use vos_light::group::Alarm;
@@ -22,6 +23,7 @@ use vos_wire::credentials::Onion;
 use zeroize::Zeroizing;
 
 use crate::job::{Passed, Personal};
+use crate::kept::Kept;
 use crate::net::Pinned;
 use crate::node::Prompts;
 use crate::session::{Inner, Kernel};
@@ -31,7 +33,7 @@ use s4_credential_contract::KeyAnswer;
 
 pub use contract::{
     Claim, Claimed, Device, Home, KitKind, KitView, MAX_LABEL, Membership, Notice, Owed, PairCode,
-    Paired, Pending, PersonalStatus, Phase, Posted, Refused, Seen, Synced, Tor, Why, label,
+    Paired, Pending, PersonalStatus, Phase, Posted, Refused, Seen, Stage, Synced, Tor, Why, label,
 };
 pub use vos_light::space::{AdminOffer, Artifacts, CREDENTIAL_BOOK, DEVICE_BOOK, LIGHT, PERSONAL};
 
@@ -154,9 +156,159 @@ impl Host for Reach {
     }
 }
 
+/// The form a kit's words are entered in, and the one asking two of a new
+/// phrase's words back: the screens give their fields the kit's word list
+/// by these titles (`KitWords.java`).
+pub const ENTER_PHRASE: &str = "Enter your recovery phrase";
+pub const CHECK_PHRASE: &str = "Check your recovery phrase";
+
+/// How long a restore's sitting holds the kit entered, at most, from its
+/// entry (`light-node.md` §3.5).
+pub const KIT_LIFE_MS: u64 = 10 * 60_000;
+
+/// The facility's database row naming the kind of kit a restore under way
+/// was opened with, which its finish enters again: not a secret.
+const RESTORE_KIT: &[u8] = b"personal/restore-kit";
+
+/// A kit entered: a phrase's words, or a security key's `hmac-secret` of
+/// the kit's salt. Zeroized on drop; no `Clone`, no `Debug`.
+enum Entered {
+    Words(Zeroizing<String>),
+    Touched {
+        salt: [u8; 32],
+        secret: Zeroizing<[u8; 32]>,
+    },
+}
+
+/// The restore screen's sitting (`IVosPersonal.kitHold`): the kit entered
+/// in one of its flows held in this process for the next, until the
+/// sitting closes, the app goes to the background, or [`KIT_LIFE_MS`] (or
+/// the life a test sets) after its entry, whichever is first, then
+/// zeroized. Never written, logged or handed back to the UI.
+#[derive(Default)]
+pub struct Sitting(Mutex<Holding>);
+
+#[derive(Default)]
+struct Holding {
+    open: bool,
+    /// Counted at each change, so a wipe timed for one kit wipes no later.
+    generation: u64,
+    kit: Option<Entered>,
+    /// A test's life for the kit, in ms; none: [`KIT_LIFE_MS`].
+    life_ms: Option<u64>,
+}
+
+impl Sitting {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Holding> {
+        crate::lock(&self.0)
+    }
+
+    fn open(&self) {
+        let mut holding = self.lock();
+        holding.generation += 1;
+        holding.open = true;
+        holding.kit = None;
+    }
+
+    /// The sitting closed, its kit zeroized.
+    fn close(&self) {
+        let mut holding = self.lock();
+        holding.generation += 1;
+        holding.open = false;
+        holding.kit = None;
+    }
+
+    /// The kit zeroized, the sitting left open: a kit that is not the
+    /// space's is entered anew.
+    fn wipe(&self) {
+        let mut holding = self.lock();
+        holding.generation += 1;
+        holding.kit = None;
+    }
+
+    /// `kit` held while the sitting is open: the generation and life to
+    /// time its wipe at.
+    fn keep(&self, kit: Entered) -> Option<(u64, u64)> {
+        let mut holding = self.lock();
+        if !holding.open {
+            return None;
+        }
+        holding.generation += 1;
+        holding.kit = Some(kit);
+        Some((holding.generation, holding.life_ms.unwrap_or(KIT_LIFE_MS)))
+    }
+
+    fn expire(&self, generation: u64) {
+        let mut holding = self.lock();
+        if holding.generation == generation {
+            holding.kit = None;
+        }
+    }
+
+    fn words(&self) -> Option<Zeroizing<String>> {
+        match &self.lock().kit {
+            Some(Entered::Words(words)) => Some(words.clone()),
+            _ => None,
+        }
+    }
+
+    fn touched(&self, salt: &[u8; 32]) -> Option<Zeroizing<[u8; 32]>> {
+        match &self.lock().kit {
+            Some(Entered::Touched { salt: held, secret }) if held == salt => Some(secret.clone()),
+            _ => None,
+        }
+    }
+}
+
 /// The chrome's prompts, lent to one flow, as the personal space asks
-/// them: each kit shown and entered in a form, each key's use the UI's.
-pub struct Asked<'a>(pub &'a dyn Prompts);
+/// them: each kit shown and entered in a form, each key's use the UI's;
+/// within a restore's sitting, the kit it holds given for the kit entered.
+pub struct Asked<'a> {
+    prompts: &'a dyn Prompts,
+    sitting: Option<&'a Sitting>,
+    /// The kit this flow entered, for the sitting to hold once it is done.
+    entered: Mutex<Option<Entered>>,
+}
+
+impl<'a> Asked<'a> {
+    fn new(prompts: &'a dyn Prompts) -> Self {
+        Self {
+            prompts,
+            sitting: None,
+            entered: Mutex::new(None),
+        }
+    }
+
+    fn within(prompts: &'a dyn Prompts, sitting: &'a Sitting) -> Self {
+        Self {
+            sitting: Some(sitting),
+            ..Self::new(prompts)
+        }
+    }
+}
+
+/// A phrase as entered, as the kit's words are: lower case, one space
+/// between words.
+fn normalized(words: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(words.len()));
+    for word in words.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.extend(word.chars().flat_map(char::to_lowercase));
+    }
+    out
+}
+
+/// Two distinct positions among `count` words, drawn, in order.
+fn two_of(count: usize) -> (usize, usize) {
+    let mut bytes = [0; 4];
+    getrandom::getrandom(&mut bytes).expect("the system's randomness");
+    let count = count.max(2);
+    let first = u16::from_le_bytes([bytes[0], bytes[1]]) as usize % count;
+    let second = (first + 1 + u16::from_le_bytes([bytes[2], bytes[3]]) as usize % (count - 1)) % count;
+    (first.min(second), first.max(second))
+}
 
 /// The kit's card's rows: the home's handle and each onion with its SSH
 /// host key.
@@ -197,29 +349,103 @@ fn thirty_two(answer: KeyAnswer, what: &str) -> Result<Zeroizing<[u8; 32]>, Erro
 
 impl Asked<'_> {
     fn shown(&self, form: Form) -> bool {
-        matches!(self.0.confirm(form), Answer::Confirmed { .. })
+        matches!(self.prompts.confirm(form), Answer::Confirmed { .. })
+    }
+
+    /// Two of the phrase's words asked back, from what the user wrote:
+    /// whether both are right; `None` when the user declined.
+    fn checked(&self, words: &[&str]) -> Option<bool> {
+        let (first, second) = two_of(words.len());
+        let answer = self.prompts.confirm(Form {
+            title: CHECK_PHRASE.into(),
+            detail: format!(
+                "From what you wrote down, words {} and {}: so a word written wrong is found \
+                 now, while the phrase can still be read.",
+                first + 1,
+                second + 1
+            ),
+            rows: Vec::new(),
+            fields: [first, second]
+                .iter()
+                .map(|at| Field {
+                    label: format!("Word {}", at + 1),
+                    value: String::new(),
+                })
+                .collect(),
+            notice: None,
+            choices: vec!["Check".into()],
+        });
+        let Answer::Confirmed { values, .. } = answer else {
+            return None;
+        };
+        let given: Vec<Zeroizing<String>> = values.iter().map(|value| normalized(value)).collect();
+        Some(
+            given.len() == 2
+                && given[0].as_str() == words[first]
+                && given[1].as_str() == words[second],
+        )
+    }
+}
+
+impl From<space::Stage> for Stage {
+    fn from(stage: space::Stage) -> Self {
+        match stage {
+            space::Stage::Reaching => Self::Reaching,
+            space::Stage::Proving => Self::Proving,
+            space::Stage::WritingKit => Self::WritingKit,
+            space::Stage::Joining => Self::Joining,
+            space::Stage::Scanned => Self::Scanned,
+            space::Stage::Checked => Self::Checked,
+            space::Stage::HandingOver => Self::HandingOver,
+            space::Stage::Approving => Self::Approving,
+        }
     }
 }
 
 impl space::Prompts for Asked<'_> {
+    fn stage(&self, stage: space::Stage) {
+        self.prompts.stage(stage.into());
+    }
+
+    /// The phrase shown, then two of its words asked back before the flow
+    /// goes on; a wrong word shows the phrase again, saying so, and so does
+    /// a check declined.
     fn show_phrase(&self, words: &str, card: &Card) -> bool {
-        let rows = words
-            .split(' ')
-            .enumerate()
-            .map(|(at, word)| (format!("{}", at + 1), word.to_owned()))
-            .chain(card_rows(card))
-            .collect();
-        self.shown(Form {
-            title: "Your recovery phrase".into(),
-            detail: "Write these 24 words down, in order, with the card below them, and keep \
-                     them apart from this phone. They restore your personal space at this home \
-                     if every device is lost; this is the only time they are shown."
-                .into(),
-            rows,
-            fields: Vec::new(),
-            notice: None,
-            choices: vec!["I wrote them down".into()],
-        })
+        let each: Vec<&str> = words.split(' ').collect();
+        let mut notice = None;
+        loop {
+            let rows = each
+                .iter()
+                .enumerate()
+                .map(|(at, word)| (format!("{}", at + 1), (*word).to_owned()))
+                .chain(card_rows(card))
+                .collect();
+            let shown = self.shown(Form {
+                title: "Your recovery phrase".into(),
+                detail: "Write these 24 words down, in order, with the card below them, and keep \
+                         them apart from this phone. They restore your personal space at this \
+                         home if every device is lost; this is the only time they are shown."
+                    .into(),
+                rows,
+                fields: Vec::new(),
+                notice: notice.take(),
+                choices: vec!["I wrote them down".into()],
+            });
+            if !shown {
+                return false;
+            }
+            match self.checked(&each) {
+                Some(true) => return true,
+                Some(false) => {
+                    notice = Some(
+                        "Those were not the words asked: compare what you wrote with the phrase \
+                         above, word by word, and correct it."
+                            .into(),
+                    );
+                }
+                None => {}
+            }
+        }
     }
 
     fn show_card(&self, card: &Card) -> bool {
@@ -236,8 +462,11 @@ impl space::Prompts for Asked<'_> {
     }
 
     fn enter_phrase(&self) -> Option<Zeroizing<String>> {
-        let answer = self.0.confirm(Form {
-            title: "Enter your recovery phrase".into(),
+        if let Some(words) = self.sitting.and_then(Sitting::words) {
+            return Some(words);
+        }
+        let answer = self.prompts.confirm(Form {
+            title: ENTER_PHRASE.into(),
             detail: "The 24 words you wrote down, in order, separated by spaces.".into(),
             rows: Vec::new(),
             fields: vec![Field {
@@ -245,12 +474,16 @@ impl space::Prompts for Asked<'_> {
                 value: String::new(),
             }],
             notice: None,
-            choices: vec!["Restore".into()],
+            choices: vec!["Go on".into()],
         });
-        match answer {
-            Answer::Confirmed { values, .. } => Some(Zeroizing::new(values.join(" "))),
-            Answer::Declined => None,
+        let Answer::Confirmed { values, .. } = answer else {
+            return None;
+        };
+        let words = normalized(&Zeroizing::new(values.join(" ")));
+        if self.sitting.is_some() {
+            *crate::lock(&self.entered) = Some(Entered::Words(words.clone()));
         }
+        Some(words)
     }
 
     fn approve_admin(&self, approval: &Approval) -> bool {
@@ -307,7 +540,7 @@ impl space::Prompts for Asked<'_> {
     }
 
     fn create_source(&self) -> Result<Vec<u8>, Error> {
-        let key = key_answer(self.0.create_key(Kind::Keystore))?;
+        let key = key_answer(self.prompts.create_key(Kind::Keystore))?;
         Reference::from_bytes(&[&[Kind::Keystore as u8], &key[..]].concat())
             .map(|reference| reference.to_bytes())
             .ok_or_else(|| Error::Source("the source's key handle".into()))
@@ -322,24 +555,37 @@ impl space::Prompts for Asked<'_> {
             .ok_or_else(|| Error::Source("the source's key handle".into()))?;
         let bytes = reference.to_bytes();
         thirty_two(
-            self.0.evaluate_key(reference.kind(), &bytes[1..], input),
+            self.prompts.evaluate_key(reference.kind(), &bytes[1..], input),
             "the source's output",
         )
     }
 
     fn create_kit_key(&self) -> Result<Vec<u8>, Error> {
-        key_answer(self.0.create_key(Kind::Kit)).map(|id| id.to_vec())
+        key_answer(self.prompts.create_key(Kind::Kit)).map(|id| id.to_vec())
     }
 
+    /// The kit's security key's output; for its discoverable credential
+    /// (the kit entered, `id` empty), the one the sitting holds if any.
     fn kit_secret(&self, id: &[u8], salt: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, Error> {
-        thirty_two(
-            self.0.evaluate_key(Kind::Kit, id, salt),
+        let entered = id.is_empty() && self.sitting.is_some();
+        if entered && let Some(secret) = self.sitting.and_then(|sitting| sitting.touched(salt)) {
+            return Ok(secret);
+        }
+        let secret = thirty_two(
+            self.prompts.evaluate_key(Kind::Kit, id, salt),
             "the security key's output",
-        )
+        )?;
+        if entered {
+            *crate::lock(&self.entered) = Some(Entered::Touched {
+                salt: *salt,
+                secret: secret.clone(),
+            });
+        }
+        Ok(secret)
     }
 
     fn create_admin(&self) -> Result<AdminKey, Error> {
-        let bytes = key_answer(self.0.create_key(Kind::Admin))?;
+        let bytes = key_answer(self.prompts.create_key(Kind::Admin))?;
         let (key, flags) = bytes
             .split_first_chunk::<32>()
             .ok_or_else(|| Error::Source("the admin key's answer is short".into()))?;
@@ -352,7 +598,7 @@ impl space::Prompts for Asked<'_> {
     }
 
     fn sign_admin(&self, key: &[u8; 32], message: &[u8]) -> Result<[u8; 64], Error> {
-        let bytes = key_answer(self.0.sign_key(Kind::Admin, key, message))?;
+        let bytes = key_answer(self.prompts.sign_key(Kind::Admin, key, message))?;
         <[u8; 64]>::try_from(bytes.as_slice())
             .map_err(|_| Error::Source("a signature is 64 bytes".into()))
     }
@@ -437,6 +683,15 @@ impl From<KitKind> for vos_wire::personal::KitKind {
         match kind {
             KitKind::Phrase => Self::Phrase,
             KitKind::SecurityKey => Self::SecurityKey,
+        }
+    }
+}
+
+impl From<vos_wire::personal::KitKind> for KitKind {
+    fn from(kind: vos_wire::personal::KitKind) -> Self {
+        match kind {
+            vos_wire::personal::KitKind::Phrase => Self::Phrase,
+            vos_wire::personal::KitKind::SecurityKey => Self::SecurityKey,
         }
     }
 }
@@ -562,8 +817,14 @@ impl From<Membership> for space::Membership {
     }
 }
 
-/// The device's personal space, as the facility serves it.
-pub struct Space(space::Personal<Reach>);
+/// The device's personal space, as the facility serves it: its flows, the
+/// restore screen's sitting, and the facility's database for the kind of
+/// kit a restore under way was opened with.
+pub struct Space {
+    personal: space::Personal<Reach>,
+    sitting: Arc<Sitting>,
+    kept: Option<Kept>,
+}
 
 /// The prompts a flow is lent.
 pub type Lent<'a> = &'a dyn Prompts;
@@ -579,19 +840,71 @@ impl Space {
         facility: Facility,
         runtime: tokio::runtime::Handle,
     ) -> Result<Self, Refused> {
-        space::Personal::open(directory, artifacts, Reach { facility, runtime })
-            .map(Space)
-            .map_err(Refused::from)
+        let personal = space::Personal::open(directory, artifacts, Reach { facility, runtime })?;
+        Ok(Space {
+            personal,
+            sitting: Arc::default(),
+            kept: Kept::open(directory).ok(),
+        })
+    }
+
+    /// The restore screen's sitting opened: the kit entered in its flows
+    /// held until [`Space::forget_kit`], the app in the background, or its
+    /// life's end.
+    pub fn hold_kit(&self) {
+        self.sitting.open();
+    }
+
+    /// The sitting closed, the kit it held zeroized.
+    pub fn forget_kit(&self) {
+        self.sitting.close();
+    }
+
+    /// Whether the sitting holds a kit now.
+    #[doc(hidden)]
+    pub fn kit_held(&self) -> bool {
+        self.sitting.lock().kit.is_some()
+    }
+
+    /// The life of a kit the sitting holds from now on, in ms.
+    #[doc(hidden)]
+    pub fn set_kit_life(&self, ms: u64) {
+        self.sitting.lock().life_ms = Some(ms);
+    }
+
+    /// `flow` within the sitting: the kit it entered held after, unless it
+    /// is not a kit or not this space's, which is wiped; its wipe timed.
+    fn with_kit<T>(
+        &self,
+        prompts: Lent<'_>,
+        flow: impl FnOnce(&Asked<'_>) -> Result<T, Error>,
+    ) -> Result<T, Refused> {
+        let asked = Asked::within(prompts, &self.sitting);
+        let done = flow(&asked);
+        let entered = crate::lock(&asked.entered).take();
+        match &done {
+            Err(Error::NotAKit | Error::WrongKit | Error::NoAgentForKit) => self.sitting.wipe(),
+            _ => {
+                if let Some((generation, life)) = entered.and_then(|kit| self.sitting.keep(kit)) {
+                    let sitting = Arc::clone(&self.sitting);
+                    self.personal.host().runtime.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(life)).await;
+                        sitting.expire(generation);
+                    });
+                }
+            }
+        }
+        Ok(done?)
     }
 
     pub fn grouped(&self) -> bool {
-        self.0.grouped()
+        self.personal.grouped()
     }
 
     /// The personal space's state as the device holds it, the facility's
     /// parts (Tor, the notices standing) left for the node to fill.
     pub fn status(&self) -> Result<PersonalStatus, Refused> {
-        let status = self.0.status()?;
+        let status = self.personal.status()?;
         let (phase, matures) = match status.phase {
             space::Phase::None => (Phase::None, 0),
             space::Phase::Claiming => (Phase::Claiming, 0),
@@ -602,6 +915,9 @@ impl Space {
             space::Phase::Stuck => (Phase::Stuck, 0),
         };
         let home = status.home.map_or_else(Home::default, Home::from);
+        let restoring = matches!(phase, Phase::Restoring).then(|| self.restore_kit());
+        let known = restoring.unwrap_or_else(|| status.kit.map(KitKind::from));
+        let (kit, kit_known) = (known.unwrap_or_default(), known.is_some());
         Ok(PersonalStatus {
             phase,
             matures,
@@ -609,13 +925,15 @@ impl Space {
             agent: status.agent.map_or(0, |(agent, _)| agent),
             device: status.device.unwrap_or(0),
             owed: status.owed,
+            kit,
+            kit_known,
             ..PersonalStatus::default()
         })
     }
 
     #[doc(hidden)]
     pub fn set_wait(&self, ms: u64) {
-        self.0.set_wait(ms);
+        self.personal.set_wait(ms);
     }
 
     /// The route a request of `purpose` to the device's home takes now.
@@ -624,9 +942,9 @@ impl Space {
         &self,
         purpose: vos_light::route::Purpose,
     ) -> Option<vos_light::route::Route> {
-        let kept = self.0.home()?;
+        let kept = self.personal.home()?;
         let routes = self
-            .0
+            .personal
             .host()
             .facility
             .net()
@@ -636,25 +954,25 @@ impl Space {
     }
 
     pub fn scope_key(&self, name: &[u8]) -> Result<[u8; 32], Refused> {
-        Ok(self.0.scope_key(name)?)
+        Ok(self.personal.scope_key(name)?)
     }
 
     #[doc(hidden)]
     pub fn recorded(&self, device: u32) -> usize {
-        self.0.recorded(device)
+        self.personal.recorded(device)
     }
 
     pub fn sync_key(&self) -> [u8; 32] {
-        self.0.sync_key()
+        self.personal.sync_key()
     }
 
     pub fn claim(&self, prompts: Lent<'_>, request: Claim) -> Result<Claimed, Refused> {
         let request = claim(request)?;
-        Ok(self.0.claim(&Asked(prompts), request)?.into())
+        Ok(self.personal.claim(&Asked::new(prompts), request)?.into())
     }
 
     pub fn pair_offer(&self, _prompts: Lent<'_>) -> Result<PairCode, Refused> {
-        let code = self.0.pair_offer()?;
+        let code = self.personal.pair_offer()?;
         Ok(PairCode {
             code: code.code,
             expires_ms: code.expires_ms,
@@ -662,11 +980,11 @@ impl Space {
     }
 
     pub fn pair_await(&self, prompts: Lent<'_>) -> Result<Paired, Refused> {
-        Ok(self.0.pair_await(&Asked(prompts))?.into())
+        Ok(self.personal.pair_await(&Asked::new(prompts))?.into())
     }
 
     pub fn pair_cancel(&self) {
-        self.0.pair_cancel();
+        self.personal.pair_cancel();
     }
 
     pub fn pair_join(
@@ -676,33 +994,33 @@ impl Space {
         label: &str,
     ) -> Result<Paired, Refused> {
         contract::label(label)?;
-        Ok(self.0.pair_join(&Asked(prompts), code, label)?.into())
+        Ok(self.personal.pair_join(&Asked::new(prompts), code, label)?.into())
     }
 
     pub fn memberships(&self) -> Result<Vec<Membership>, Refused> {
-        let all = self.0.memberships()?;
+        let all = self.personal.memberships()?;
         Ok(all.into_iter().map(Into::into).collect())
     }
 
     pub fn enroll_device(&self, prompts: Lent<'_>, owed: Membership) -> Result<(), Refused> {
-        Ok(self.0.enroll_device(&Asked(prompts), owed.into())?)
+        Ok(self.personal.enroll_device(&Asked::new(prompts), owed.into())?)
     }
 
     pub fn confirm_device(&self, prompts: Lent<'_>, owed: Membership) -> Result<(), Refused> {
-        Ok(self.0.confirm_device(&Asked(prompts), owed.into())?)
+        Ok(self.personal.confirm_device(&Asked::new(prompts), owed.into())?)
     }
 
     pub fn drop_enrollment(&self, owed: Membership) -> Result<(), Refused> {
-        Ok(self.0.drop_enrollment(owed.into())?)
+        Ok(self.personal.drop_enrollment(owed.into())?)
     }
 
     /// Each space's leaf of the removed `device` revoked.
     pub fn revoke(&self, prompts: Lent<'_>, device: u32) -> Result<u32, Refused> {
-        Ok(self.0.revoke(&Asked(prompts), device)?)
+        Ok(self.personal.revoke(&Asked::new(prompts), device)?)
     }
 
     pub fn devices(&self) -> Result<Vec<Device>, Refused> {
-        let all = self.0.devices()?;
+        let all = self.personal.devices()?;
         Ok(all.into_iter().map(Into::into).collect())
     }
 
@@ -712,9 +1030,10 @@ impl Space {
         home: Home,
         kind: KitKind,
     ) -> Result<KitView, Refused> {
-        let view = self
-            .0
-            .kit_view(&Asked(prompts), home.check()?.into(), kind.into())?;
+        let home = home.check()?;
+        let view = self.with_kit(prompts, |asked| {
+            self.personal.kit_view(asked, home.into(), kind.into())
+        })?;
         Ok(KitView {
             devices: view.devices.into_iter().map(Into::into).collect(),
             operations: view
@@ -732,10 +1051,12 @@ impl Space {
         kind: KitKind,
         device: u32,
     ) -> Result<Posted, Refused> {
-        Ok(self
-            .0
-            .remove_by_kit(&Asked(prompts), home.check()?.into(), kind.into(), device)?
-            .into())
+        let home = home.check()?;
+        self.with_kit(prompts, |asked| {
+            self.personal
+                .remove_by_kit(asked, home.into(), kind.into(), device)
+        })
+        .map(Into::into)
     }
 
     pub fn resolve_by_kit(
@@ -746,61 +1067,71 @@ impl Space {
         index: u64,
         upheld: bool,
     ) -> Result<Posted, Refused> {
-        Ok(self
-            .0
-            .resolve_by_kit(
-                &Asked(prompts),
-                home.check()?.into(),
-                kind.into(),
-                index,
-                upheld,
-            )?
-            .into())
+        let home = home.check()?;
+        self.with_kit(prompts, |asked| {
+            self.personal
+                .resolve_by_kit(asked, home.into(), kind.into(), index, upheld)
+        })
+        .map(Into::into)
     }
 
     pub fn operations(&self) -> Result<Vec<Notice>, Refused> {
-        let open = self.0.operations()?;
+        let open = self.personal.operations()?;
         Ok(open.into_iter().map(crate::job::notice).collect())
     }
 
     pub fn remove(&self, prompts: Lent<'_>, device: u32) -> Result<Posted, Refused> {
-        Ok(self.0.remove(&Asked(prompts), device)?.into())
+        Ok(self.personal.remove(&Asked::new(prompts), device)?.into())
     }
 
     pub fn veto(&self, prompts: Lent<'_>, index: u64) -> Result<Posted, Refused> {
-        Ok(self.0.veto(&Asked(prompts), index)?.into())
+        Ok(self.personal.veto(&Asked::new(prompts), index)?.into())
     }
 
     pub fn cosign(&self, prompts: Lent<'_>, index: u64) -> Result<Posted, Refused> {
-        Ok(self.0.cosign(&Asked(prompts), index)?.into())
+        Ok(self.personal.cosign(&Asked::new(prompts), index)?.into())
     }
 
     pub fn resolve(&self, prompts: Lent<'_>, index: u64, upheld: bool) -> Result<Posted, Refused> {
-        Ok(self.0.resolve(&Asked(prompts), index, upheld)?.into())
+        Ok(self.personal.resolve(&Asked::new(prompts), index, upheld)?.into())
     }
 
     pub fn rotate_kit(&self, prompts: Lent<'_>, kind: KitKind) -> Result<Posted, Refused> {
-        Ok(self.0.rotate_kit(&Asked(prompts), kind.into())?.into())
+        Ok(self.personal.rotate_kit(&Asked::new(prompts), kind.into())?.into())
     }
 
     pub fn replace_admin(&self, prompts: Lent<'_>, kind: KitKind) -> Result<Posted, Refused> {
-        Ok(self.0.replace_admin(&Asked(prompts), kind.into())?.into())
+        Ok(self.personal.replace_admin(&Asked::new(prompts), kind.into())?.into())
     }
 
     pub fn admin_offer(&self, prompts: Lent<'_>) -> Result<Vec<u8>, Refused> {
-        Ok(self.0.admin_offer(&Asked(prompts))?)
+        Ok(self.personal.admin_offer(&Asked::new(prompts))?)
     }
 
     pub fn replace_admin_of(&self, prompts: Lent<'_>, code: &[u8]) -> Result<Posted, Refused> {
-        Ok(self.0.replace_admin_of(&Asked(prompts), code)?.into())
+        Ok(self.personal.replace_admin_of(&Asked::new(prompts), code)?.into())
     }
 
     pub fn regroup(&self, prompts: Lent<'_>) -> Result<Posted, Refused> {
-        Ok(self.0.regroup(&Asked(prompts))?.into())
+        Ok(self.personal.regroup(&Asked::new(prompts))?.into())
     }
 
     pub fn update(&self, prompts: Lent<'_>) -> Result<(), Refused> {
-        Ok(self.0.update(&Asked(prompts))?)
+        self.personal.update(&Asked::new(prompts))?;
+        Ok(())
+    }
+
+    /// The commit a matured removal's notice asks for, then each device it
+    /// carried out revoked in every space its handles name: how many
+    /// revokes. A revoke refused leaves the commit made, and the device
+    /// listed removed, its revoke the Devices screen's.
+    pub fn commit_removals(&self, prompts: Lent<'_>) -> Result<u32, Refused> {
+        let carried = self.personal.update(&Asked::new(prompts))?;
+        let mut revoked = 0;
+        for device in carried {
+            revoked += self.personal.revoke(&Asked::new(prompts), device)?;
+        }
+        Ok(revoked)
     }
 
     pub fn restore(
@@ -810,22 +1141,41 @@ impl Space {
         old: KitKind,
     ) -> Result<Posted, Refused> {
         let request = claim(request)?;
-        Ok(self.0.restore(&Asked(prompts), request, old.into())?.into())
+        let posted = self.with_kit(prompts, |asked| {
+            self.personal.restore(asked, request, old.into())
+        })?;
+        // The finish enters the same kit: its kind is named to the screen,
+        // which the device holds nowhere else while it restores.
+        if let Some(kept) = &self.kept {
+            kept.put(RESTORE_KIT, &(old as u8))
+                .map_err(|error| Refused::from(Error::Store(error)))?;
+        }
+        Ok(posted.into())
     }
 
     pub fn restored(&self, prompts: Lent<'_>, kind: KitKind) -> Result<Claimed, Refused> {
-        Ok(self.0.restored(&Asked(prompts), kind.into())?.into())
+        let claimed = self.with_kit(prompts, |asked| self.personal.restored(asked, kind.into()))?;
+        if let Some(kept) = &self.kept {
+            let _ = kept.remove(RESTORE_KIT);
+        }
+        Ok(claimed.into())
+    }
+
+    /// The kind of kit the restore under way was opened with.
+    fn restore_kit(&self) -> Option<KitKind> {
+        let byte: u8 = self.kept.as_ref()?.get(RESTORE_KIT).ok()??;
+        KitKind::from_byte(byte)
     }
 
     pub fn move_home(&self, prompts: Lent<'_>, request: Claim) -> Result<Claimed, Refused> {
         let request = claim(request)?;
-        Ok(self.0.move_home(&Asked(prompts), request)?.into())
+        Ok(self.personal.move_home(&Asked::new(prompts), request)?.into())
     }
 }
 
 impl Personal for Space {
     fn pass(&self, now: u64) -> Result<Passed, String> {
-        let passed = self.0.pass(now).map_err(|error| error.to_string())?;
+        let passed = self.personal.pass(now).map_err(|error| error.to_string())?;
         Ok(Passed {
             notices: passed.notices.into_iter().map(crate::job::notice).collect(),
             alarms: passed.alarms,
@@ -839,7 +1189,7 @@ impl Personal for Space {
     }
 
     fn acknowledge(&self, alarms: &[Alarm]) -> Result<(), String> {
-        self.0
+        self.personal
             .acknowledge_alarms(alarms)
             .map_err(|error| error.to_string())
     }
@@ -848,7 +1198,7 @@ impl Personal for Space {
 impl crate::session::PersonalLink for Space {
     fn owed_source(&self, handle: &[u8; 32]) -> Result<Option<Reference>, String> {
         match self
-            .0
+            .personal
             .owed_source(handle)
             .map_err(|error| error.to_string())?
         {
@@ -860,12 +1210,112 @@ impl crate::session::PersonalLink for Space {
     }
 
     fn enrolled(&self) {
-        self.0.enrolled();
+        self.personal.enrolled();
     }
 
     fn home(&self) -> Option<([u8; 32], [u8; 32], Vec<vos_wire::credentials::Onion>)> {
-        self.0
+        self.personal
             .home()
             .map(|kept| (kept.home.handle, kept.home.space, kept.onions))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+    use space::Prompts as _;
+
+    /// A user who answers the phrase's check from a script: each check's
+    /// answer wrong or right, every form seen.
+    struct Scripted {
+        right: Mutex<VecDeque<bool>>,
+        seen: Mutex<Vec<Form>>,
+    }
+
+    impl Prompts for Scripted {
+        fn confirm(&self, form: Form) -> Answer {
+            self.seen.lock().unwrap().push(form.clone());
+            if form.title != CHECK_PHRASE {
+                return Answer::Confirmed {
+                    choice: 0,
+                    values: Vec::new(),
+                };
+            }
+            let right = self.right.lock().unwrap().pop_front().expect("scripted");
+            let values = form
+                .fields
+                .iter()
+                .map(|field| {
+                    let at: usize = field.label["Word ".len()..].parse().unwrap();
+                    if right {
+                        // As written, the case and spaces aside.
+                        format!("  {} ", WORDS[at - 1].to_uppercase())
+                    } else {
+                        "abandon".into()
+                    }
+                })
+                .collect();
+            Answer::Confirmed { choice: 0, values }
+        }
+
+        fn create_key(&self, _: Kind) -> KeyAnswer {
+            KeyAnswer::Declined
+        }
+
+        fn evaluate_key(&self, _: Kind, _: &[u8], _: &[u8; 32]) -> KeyAnswer {
+            KeyAnswer::Declined
+        }
+
+        fn sign_key(&self, _: Kind, _: &[u8], _: &[u8]) -> KeyAnswer {
+            KeyAnswer::Declined
+        }
+    }
+
+    const WORDS: [&str; 24] = [
+        "zoo", "wrist", "vote", "unit", "toast", "swamp", "sun", "spy", "salon", "rich", "pupil",
+        "price", "oyster", "nurse", "mule", "milk", "lunar", "loud", "liar", "keep", "invite",
+        "hybrid", "habit", "gather",
+    ];
+
+    /// A new phrase is asked back, two of its words, before the flow goes
+    /// on: a wrong answer shows the phrase again, saying so.
+    #[test]
+    fn two_words_of_a_new_phrase_are_asked_back() {
+        let user = Scripted {
+            right: Mutex::new([false, true].into()),
+            seen: Mutex::new(Vec::new()),
+        };
+        let card = Card {
+            handle: [1; 32],
+            onions: Vec::new(),
+        };
+        assert!(Asked::new(&user).show_phrase(&WORDS.join(" "), &card));
+        let seen = user.seen.lock().unwrap();
+        let titles: Vec<&str> = seen.iter().map(|form| form.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Your recovery phrase",
+                CHECK_PHRASE,
+                "Your recovery phrase",
+                CHECK_PHRASE
+            ]
+        );
+        assert!(seen[0].notice.is_none());
+        assert!(seen[2].notice.is_some(), "the wrong word said");
+        let asked: Vec<&str> = seen[1].fields.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(asked.len(), 2);
+        assert_ne!(asked[0], asked[1]);
+    }
+
+    #[test]
+    fn a_phrase_entered_is_read_as_the_kit_reads_it() {
+        assert_eq!(normalized("  Zoo\tWRIST \n vote ").as_str(), "zoo wrist vote");
+        for _ in 0..64 {
+            let (first, second) = two_of(24);
+            assert!(first < second && second < 24);
+        }
     }
 }

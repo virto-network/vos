@@ -99,11 +99,13 @@ struct Raised {
     since: u64,
 }
 
-/// The runs, the latest last, and the notices standing.
+/// The runs, the latest last, the notices standing, and why the last
+/// personal pass failed (empty when it did not).
 #[derive(Debug, Default)]
 struct State {
     runs: Vec<JobRun>,
     raised: Vec<Raised>,
+    failed: String,
 }
 
 /// A run as its row keeps it.
@@ -140,6 +142,7 @@ struct Stood {
 struct Row {
     runs: Vec<Run>,
     raised: Vec<Stood>,
+    failed: String,
 }
 
 impl From<&State> for Row {
@@ -176,6 +179,7 @@ impl From<&State> for Row {
                     since: raised.since,
                 })
                 .collect(),
+            failed: state.failed.clone(),
         }
     }
 }
@@ -227,7 +231,11 @@ impl Row {
                 apart: run.apart,
             })
             .collect();
-        Ok(State { runs, raised })
+        Ok(State {
+            runs,
+            raised,
+            failed: self.failed,
+        })
     }
 }
 
@@ -337,6 +345,12 @@ impl Job {
         self.runs.all().map_err(job_error)
     }
 
+    /// Why the last personal pass failed, as its run's failures say; empty
+    /// when it did not.
+    pub fn failed(&self) -> Result<String, Refusal> {
+        Ok(self.runs.read().map_err(job_error)?.failed)
+    }
+
     /// The notices standing after the last pass.
     pub fn standing(&self) -> Result<Vec<Notice>, Refusal> {
         let state = self.runs.read().map_err(job_error)?;
@@ -418,6 +432,9 @@ impl Job {
             }
         }
         state.raised = standing(std::mem::take(&mut state.raised), found, now);
+        if part == Part::Personal {
+            state.failed = synced.failures.clone();
+        }
         synced.notices = state
             .raised
             .iter()

@@ -398,9 +398,10 @@ fn pair_sync_retire_and_the_removed_phone() {
     );
 }
 
-/// A restore on a fresh phone: the words mistyped first, then the restore
-/// opened, the kit's view read, and the restore finished after the kit's
-/// delay; then a move to another home.
+/// A restore on a fresh phone, its screen's sitting open: the words
+/// mistyped first, then the restore opened, the kit's view read, and the
+/// restore finished after the kit's delay, the kit entered again only
+/// after the mistyped words; then a move to another home.
 #[test]
 fn restore_from_the_kit_and_move() {
     let world = world();
@@ -416,6 +417,7 @@ fn restore_from_the_kit_and_move() {
     drop(lost);
     world.delay(Delays::ONION);
     let (fresh, stamped) = held(&world, 0x42);
+    fresh.node.space().unwrap().hold_kit();
 
     // One word replaced by another of the list: the checksum fails, or in
     // one try of 256 holds and names another kit.
@@ -473,6 +475,11 @@ fn restore_from_the_kit_and_move() {
         .restored(&*stamped, KitKind::Phrase)
         .unwrap();
     meter.print(&world, "restore: finished after the kit's delay");
+    println!(
+        "flow: restore: the kit entered {} times in the sitting (once mistyped)",
+        fresh.hand.entered.lock().unwrap()
+    );
+    fresh.node.space().unwrap().forget_kit();
 
     let meter = Meter::start(&world, &[&stamped]);
     fresh

@@ -24,6 +24,7 @@ use vos_wire::ingress::DeviceWindow;
 use crate::chrome::{Answer, Chrome, Field, Form, short};
 use crate::enrollment::{Agent, Enrollment, Guard, Method, Origin, Store, write_private};
 use crate::job::now_ms;
+use crate::personal::Stage;
 use crate::net::{Net, Pinned};
 use crate::source::{Kind, Reference, Source, SourceError};
 use crate::warm::{self, Programs, Warming};
@@ -1316,8 +1317,10 @@ impl Session {
         let refused_root = witness.root;
         let secret = self.secret(&enrollment).await?;
         let started = Instant::now();
+        chrome.stage(Stage::Proving);
         let request = self.prove_sign_in(call, scope, &secret, witness).await?;
         let mut proving_ms = started.elapsed().as_millis() as u64;
+        chrome.stage(Stage::Sending);
         let mut answer = self.send(&enrollment, &request).await?;
         let again = match root_refused(&answer) {
             Some(stale) => self.next_witness(&enrollment, refused_root, stale).await,
@@ -1496,6 +1499,7 @@ impl Session {
                 .filter(|last| last.values == values && now + 5_000 < last.expires_ms)
         });
         if let Some(again) = again {
+            chrome.stage(Stage::Sending);
             return Ok(answer(self.send(&enrollment, &again.request).await?, 0));
         }
         let arguments = vos_light::transfer_arguments(&values.0, amount);
@@ -1503,6 +1507,7 @@ impl Session {
         let secret = self.secret(&enrollment).await?;
         let started = Instant::now();
         let expires_ms = call.expires_ms;
+        chrome.stage(Stage::Proving);
         let bytes = Inner::prove(
             &self.inner,
             Kernel::Owner,
@@ -1522,6 +1527,7 @@ impl Session {
                 request: bytes.clone(),
             });
         }
+        chrome.stage(Stage::Sending);
         Ok(answer(self.send(&enrollment, &bytes).await?, proving_ms))
     }
 

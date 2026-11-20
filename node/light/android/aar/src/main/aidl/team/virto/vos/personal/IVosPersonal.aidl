@@ -9,6 +9,7 @@ import team.virto.vos.personal.ClaimRequest;
 import team.virto.vos.personal.Claimed;
 import team.virto.vos.personal.Device;
 import team.virto.vos.personal.Home;
+import team.virto.vos.personal.IVosWatcher;
 import team.virto.vos.personal.KitKind;
 import team.virto.vos.personal.KitView;
 import team.virto.vos.personal.Membership;
@@ -144,6 +145,14 @@ interface IVosPersonal {
     boolean update(IVosPrompts prompts, out Refused refused);
 
     /**
+     * The commit a matured removal's notice asks for, then each device it removed revoked in every
+     * space its handles name (one admin or owner prompt a signature, as each call alone): how many
+     * spaces it was revoked in. Refused as the first call that fails; a revoke refused leaves the
+     * commit made, the device listed removed for its revoke from the Devices screen.
+     */
+    int commitRemovals(IVosPrompts prompts, out Refused refused);
+
+    /**
      * Open a restore from the kit of kind `old` at the request's home, a new kit of the request's
      * kind split for it; it matures after the kit's delay unless a device answers.
      */
@@ -168,6 +177,23 @@ interface IVosPersonal {
     Posted resolveByKit(
             in Home home, KitKind kit, long index, boolean upheld, IVosPrompts prompts,
             out Refused refused);
+
+    /**
+     * The restore screen's sitting opened: the kit entered in its flows (`restore`, `kitView`,
+     * `removeByKit`, `resolveByKit`, `restored`) is held in this process for the next of them, at
+     * most ten minutes from its entry, zeroized at `kitForget`, when `token`'s process dies, when
+     * the app goes to the background and at its time; never written or logged, never handed back.
+     */
+    void kitHold(IBinder token);
+
+    /** The sitting closed: the kit held, if any, zeroized. */
+    void kitForget();
+
+    /**
+     * The screens' watcher, told each flow's stage and each personal pass's end; the one set last
+     * is told (null: none).
+     */
+    void watch(IVosWatcher watcher);
 
     /** The restore matured: the kit entered again, the personal space read back. */
     Claimed restored(KitKind kit, IVosPrompts prompts, out Refused refused);

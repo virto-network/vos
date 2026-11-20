@@ -84,7 +84,12 @@ in `:vos` with no UI (`src/job.rs`): `sync`, every enrollment's tree read from
 its feed if due, and `syncPersonal`, the personal space's pass at its agent;
 Tor's bridges and the per-space opt-out; the personal space's status
 (`status`: its phase, a restore's maturity, Tor's state, the memberships owed,
-the notices standing, what needs repair), which the screens branch on; and the
+the notices standing, what needs repair, the kind of kit a kit's call enters,
+why the last pass did not finish), which the screens branch on; the screens'
+watcher (`watch`: each flow's stage and each pass's end); the restore screen's
+sitting (`kitHold`, `kitForget`: the kit entered once and held in `:vos` for
+its flows, ten minutes at most, wiped when the screen closes or the app goes
+to the background); and the
 personal space's operations (`src/personal/`, called as
 `node.personal()?.claim(..)`), each refusing with a `Refused` of its `Why`
 (`vos_light::space::Error`'s kinds), worded by the screens' `Words`. Every

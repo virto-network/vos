@@ -39,7 +39,7 @@ use crate::chrome::Chrome;
 use crate::enrollment::Store;
 use crate::job::{Job, Part};
 use crate::net::{Arti, Net};
-use crate::personal::{Artifacts, PersonalStatus, Phase, Refused, Space, Why};
+use crate::personal::{Artifacts, PersonalStatus, Phase, Refused, Space, Stage, Why};
 use crate::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
 use crate::{
     Answer, Code, Enroll, Enrolled, EnrolledSpace, Facility, Form, Gateway, JobRun, Paid, Pay,
@@ -61,6 +61,9 @@ pub trait Prompts: Send + Sync + 'static {
     /// The admin key's Ed25519 signature over `message`, which this process
     /// prepared, after a strong biometric at its prompt: 64 bytes.
     fn sign_key(&self, kind: Kind, key: &[u8], message: &[u8]) -> KeyAnswer;
+    /// The operation reached `stage`, which the UI says while it runs:
+    /// nothing answered, nothing of a secret in it.
+    fn stage(&self, _stage: Stage) {}
 }
 
 /// What the device offers, which this process reads itself.
@@ -153,6 +156,10 @@ impl Chrome for Shown {
                 .await
                 .unwrap_or(Answer::Declined)
         })
+    }
+
+    fn stage(&self, stage: Stage) {
+        self.0.stage(stage);
     }
 }
 
@@ -492,6 +499,10 @@ impl Node {
         let _entered = self.runtime.enter();
         let mut waking = crate::lock(&self.waking);
         waking.0 = foreground;
+        // The app in the background: a restore's sitting holds no kit.
+        if !foreground && let Some(Ok(space)) = &self.personal {
+            space.forget_kit();
+        }
         self.facility.net().set_foreground(foreground);
         self.facility.net().keep_rendezvous();
         if foreground {
@@ -634,6 +645,7 @@ impl Node {
             None => return Err(no_personal()),
         };
         (status.tor, status.tor_why, status.standing) = (tor, tor_why, standing);
+        status.failed = self.job.failed().unwrap_or_default();
         if let Some(repair) = repair {
             (status.phase, status.repair) = (Phase::NeedsRepair, repair);
         }

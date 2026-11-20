@@ -90,6 +90,8 @@ blake2 = "0.10"
 russh = { version = "0.65", default-features = false, features = ["ring", "flate2"] }
 # An answer's bytes as the server is answered.
 ciborium = "0.2"
+# The kit's word list, which the screens' copy is held to.
+bip39 = { version = "2.2", default-features = false }
 
 # As VOS's workspace: fjall's lsm-tree fork, and fjall's, which the light
 # node's store runs on.

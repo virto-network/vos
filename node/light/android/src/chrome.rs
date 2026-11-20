@@ -14,6 +14,9 @@ use crate::source::BoxFuture;
 /// The trusted chrome the client lends the facility.
 pub trait Chrome: Send + Sync {
     fn confirm(&self, form: Form) -> BoxFuture<'_, Answer>;
+    /// The operation reached `stage` (a proof made, its request sent):
+    /// what the chrome says it is doing. Nothing is answered.
+    fn stage(&self, _stage: crate::personal::Stage) {}
 }
 
 /// The first bytes of a digest in hex, as the chrome names it.

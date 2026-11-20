@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use common::phone::*;
 use common::*;
 use vos_facility::Enroll;
-use vos_facility::personal::{Claim, KitKind, Owed, Why};
+use vos_facility::personal::{Claim, KitKind, Owed, Stage, Why};
 use vos_light::tor::Target;
 
 /// The path the brief names: a claim with a security-key kit, a pairing
@@ -67,8 +67,28 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
     );
     assert!(again.is_err());
 
-    // The second phone is paired from the first, offered the club.
+    // The claim said its stages: the home reached, the proof, the kit
+    // written, the log followed.
+    let stages = first.hand.stages.lock().unwrap().clone();
+    for stage in [Stage::Reaching, Stage::Proving, Stage::WritingKit, Stage::Joining] {
+        assert!(stages.contains(&(stage as u8)), "{stage:?} in {stages:?}");
+    }
+
+    // The second phone is paired from the first, offered the club, each
+    // saying the pairing's steps.
+    first.hand.stages.lock().unwrap().clear();
     let (opened, joined) = first.pair(&second, "second phone");
+    for phone in [&first, &second] {
+        let stages = phone.hand.stages.lock().unwrap().clone();
+        for stage in [
+            Stage::Scanned,
+            Stage::Checked,
+            Stage::HandingOver,
+            Stage::Approving,
+        ] {
+            assert!(stages.contains(&(stage as u8)), "{stage:?} in {stages:?}");
+        }
+    }
     assert_eq!((opened.device, joined.device), (1, 1));
     assert_eq!((opened.memberships, joined.memberships), (1, 1));
     assert_eq!(second.node.personal().unwrap().devices().unwrap().len(), 2);
@@ -147,8 +167,9 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
     assert!(runs.last().unwrap().apart);
 
     // The first retired: once the second is past its probation it removes
-    // it; the removal matures after the policy's delay, and the second's
-    // commit carries it. Its leaf in the club is revoked by the second.
+    // it; the removal matures after the policy's delay, its pass raises the
+    // commit's notice, and the second's commit from it carries the removal
+    // and revokes the first's leaf in the club, in one flow.
     after(policy().probation_ms);
     second.node.sync_personal().unwrap();
     let removal = second
@@ -160,18 +181,13 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
     let notices = first.node.space().unwrap().operations();
     assert!(notices.is_ok());
     after(policy().operation_delay_ms);
-    second
-        .node
-        .personal()
-        .unwrap()
-        .update(&*second.hand)
-        .unwrap();
-    let devices = second.node.personal().unwrap().devices().unwrap();
+    second.node.sync_personal().unwrap();
+    let standing = second.node.status().unwrap().standing;
     assert!(
-        devices
+        standing
             .iter()
-            .any(|device| device.id == 0 && device.removed),
-        "{devices:?}"
+            .any(|notice| notice.pending == vos_facility::personal::Pending::Commit),
+        "{standing:?}"
     );
     assert!(removal.index > 0);
     assert!(in_club(&world, &member));
@@ -180,9 +196,16 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
             .node
             .personal()
             .unwrap()
-            .revoke(&*second.hand, 0)
+            .commit_removals(&*second.hand)
             .unwrap(),
         1
+    );
+    let devices = second.node.personal().unwrap().devices().unwrap();
+    assert!(
+        devices
+            .iter()
+            .any(|device| device.id == 0 && device.removed),
+        "{devices:?}"
     );
     assert!(!in_club(&world, &member), "the first's leaf revoked");
     assert!(in_club(&world, &theirs));
@@ -528,6 +551,110 @@ fn a_personal_space_is_restored_from_its_phrase() {
             .restore(&*fresh.hand, restore, KitKind::Phrase)
             .is_err()
     );
+}
+
+/// Every file under `directory`, its bytes.
+fn files(directory: &std::path::Path, into: &mut Vec<Vec<u8>>) {
+    for entry in std::fs::read_dir(directory).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files(&path, into);
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            into.push(bytes);
+        }
+    }
+}
+
+/// The restore screen's sitting: its flows take the kit once, the sitting
+/// holding it in `:vos` between them, never on disk; it is wiped when the
+/// screen closes, when the app goes to the background, at its life's end
+/// (a test's second), and when the kit entered is not the space's.
+#[test]
+fn a_restores_sitting_takes_the_kit_once_and_wipes_it_three_ways() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let lost = phone(&world, 0x51);
+    lost.claim(&world, home, KitKind::Phrase, "lost phone");
+    let words = lost.hand.phrase();
+    // A pass wakes the home: its batch admits the kit's key.
+    lost.node.sync_personal().unwrap();
+    drop(lost);
+
+    let fresh = phone(&world, 0x52);
+    fresh.hand.will_enter(words.clone());
+    let space = || fresh.node.personal().unwrap();
+    let entered = || *fresh.hand.entered.lock().unwrap();
+    let view = || {
+        space()
+            .kit_view(&*fresh.hand, home_of(&world, home), KitKind::Phrase)
+            .unwrap()
+    };
+    fresh.node.space().unwrap().hold_kit();
+    assert_eq!(view().devices.len(), 1);
+    space()
+        .remove_by_kit(&*fresh.hand, home_of(&world, home), KitKind::Phrase, 0)
+        .unwrap();
+    assert_eq!(view().devices.len(), 1);
+    assert_eq!(entered(), 1, "the kit entered once for the sitting");
+    assert!(fresh.node.space().unwrap().kit_held());
+    let mut kept = Vec::new();
+    files(fresh._directory.path(), &mut kept);
+    assert!(
+        kept.iter().all(|bytes| !bytes
+            .windows(words.len())
+            .any(|window| window == words.as_bytes())),
+        "the kit's words written to disk"
+    );
+
+    // The screen closed.
+    fresh.node.space().unwrap().forget_kit();
+    assert!(!fresh.node.space().unwrap().kit_held());
+    view();
+    assert_eq!(entered(), 2, "entered again, no sitting open");
+
+    // The app in the background.
+    fresh.node.space().unwrap().hold_kit();
+    view();
+    view();
+    assert_eq!(entered(), 3);
+    fresh.node.foreground(false);
+    assert!(!fresh.node.space().unwrap().kit_held());
+    fresh.node.foreground(true);
+
+    // The kit's life over, it is wiped with no call.
+    fresh.node.space().unwrap().hold_kit();
+    fresh.node.space().unwrap().set_kit_life(1_000);
+    view();
+    assert!(fresh.node.space().unwrap().kit_held());
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    assert!(!fresh.node.space().unwrap().kit_held(), "wiped at its life's end");
+    view();
+    assert_eq!(entered(), 5);
+
+    // A kit no space at the home holds is wiped too: the next is entered.
+    let other = vos_light::kit::KitSecret::phrase().unwrap();
+    fresh.hand.will_enter(other.words().unwrap().to_string());
+    fresh.node.space().unwrap().forget_kit();
+    fresh.node.space().unwrap().hold_kit();
+    let refused = space()
+        .kit_view(&*fresh.hand, home_of(&world, home), KitKind::Phrase)
+        .unwrap_err();
+    assert_eq!(refused.why, Why::NoAgentForKit, "{refused:?}");
+    assert!(!fresh.node.space().unwrap().kit_held());
+
+    // A restore opened names its kit's kind to the screen, for its finish.
+    fresh.hand.will_enter(words);
+    let restore = Claim {
+        home: home_of(&world, home),
+        kit: KitKind::Phrase,
+        label: "new phone".into(),
+    };
+    space()
+        .restore(&*fresh.hand, restore, KitKind::Phrase)
+        .unwrap();
+    let status = fresh.node.status().unwrap();
+    assert_eq!(status.phase, vos_facility::personal::Phase::Restoring);
+    assert!(status.kit_known && status.kit == KitKind::Phrase);
 }
 
 /// Three phones claimed and paired, past their probation and seasoning.

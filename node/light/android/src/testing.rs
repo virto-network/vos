@@ -84,7 +84,25 @@ impl Prompts for Phone {
                 let shown = self.show_card(&card(&form));
                 answered(shown, &form)
             }
-            "Enter your recovery phrase" => match self.enter_phrase() {
+            crate::personal::CHECK_PHRASE => {
+                // The user reads the asked words off what they wrote.
+                let phrase = self.phrase();
+                let words: Vec<&str> = phrase.split(' ').collect();
+                let values = form
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        let at: usize = field
+                            .label
+                            .strip_prefix("Word ")
+                            .and_then(|at| at.parse().ok())
+                            .expect("a word's position");
+                        words[at - 1].to_owned()
+                    })
+                    .collect();
+                Answer::Confirmed { choice: 0, values }
+            }
+            crate::personal::ENTER_PHRASE => match self.enter_phrase() {
                 Some(words) => Answer::Confirmed {
                     choice: 0,
                     values: vec![words.to_string()],
@@ -144,6 +162,10 @@ impl Prompts for Phone {
             Kind::Keystore => key_answer(self.evaluate_source(key, input).map(|out| out.to_vec())),
             Kind::Admin => KeyAnswer::Failed("an admin key evaluates nothing".into()),
         }
+    }
+
+    fn stage(&self, stage: crate::personal::Stage) {
+        self.stages.lock().unwrap().push(stage as u8);
     }
 
     fn sign_key(&self, kind: Kind, key: &[u8], message: &[u8]) -> KeyAnswer {
