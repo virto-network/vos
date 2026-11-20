@@ -1,27 +1,16 @@
 # The light node, the personal agent, one proving path and Tor
 
-Design. **Accepted for implementation, 2026-11-02 (owner sign-off).** The
-architecture of slice 8
-(`slice-8-plan.md`): a light node of VOS on the user's devices, a personal
+Design, as built: a light node of VOS on the user's devices, a personal
 agent in a space that keeps the user's devices in step, one proving path
-for every device statement, payments rebuilt on cipher-clerk as the
-showcase of attestable Rust, and clients reaching a space over Tor.
-- **Status:** everything here is [proposed], to be built as stated,
-  unless tagged [decided] (an owner decision, listed in §1.1 by its
-  number, E1–E30, or cited from another document) or [built] (what
-  `vos-core` holds at `543c05e07`).
+for every device statement, payments on cipher-clerk as the showcase of
+attestable Rust, and clients reaching a space over Tor.
+- **Status:** this describes what is built; [decided] marks an owner
+  decision (listed in §1.1 by its number, E1–E30, or cited from another
+  document), and what is not built is named so and listed in `open.md`.
 - **Numbers** carry their tag: [measured] (a run, cited), [model] (the
   cell model, `proving.md` §8), [est] (arithmetic on those, unmeasured).
-- **It amends:** `proving.md` §8 (the credential AIR retired),
-  `identity-and-authority.md` §5–§8 (credentialed calls generalized; the
-  personal space unpostponed in the form of §3), `core-model.md` §9.4
-  (sealed scopes beside plaintext ones, §3.6), and `node-api.md` §2 (the
-  frame's transport mark), §3 (admission at ingress) and §6 (the
-  gateway's onion service). Those
-  documents keep their text until the steps that change the code change
-  them.
 
-## 1. Goals and non-goals
+## 1. Goals
 
 **The owner's direction** (2026-11-02), in their words:
 
@@ -51,67 +40,65 @@ devices decrypt each other's messages".
 
 | # | decision |
 |---|---|
-| E1 | Retire the credential AIR (format 44) in M1: one proving path; sign-in about 0.6 s until the levers bring it to about 0.45 s. |
+| E1 | Retire the credential AIR (format 44): one proving path; sign-in about 0.6 s until the levers bring it to about 0.45 s. |
 | E2 | Per-device secrets, as today: a member leaf, an owner digest and a wallet per device; the personal space syncs everything but secrets; paying from another device's funds is a transfer between one's own devices. |
-| E3 | Payments P1 (cipher-clerk's ledger with owner proofs, replacing `purses`) then P2 (the shielded pool and a local wallet). The slices: E13. |
+| E3 | Payments P1 (cipher-clerk's ledger with owner proofs, replacing `purses`) then P2 (the shielded pool and a local wallet). The order: E13. |
 | E4 | No relay held by a gateway: a space has several gateways, and two devices on different ones would never meet. Each user gets a **personal agent** in a space they belong to (the home space): a small log for rare operations (the device set, MLS ordering, quotas), the space's nodes as durable ciphertext replicas of the user's DAG, and an inbox with expiring entries. |
 | E5 | The personal agent is owned by a pseudonym, not by the member key. |
 | E6 | The space's nodes keep full ciphertext replicas of the user's DAG (durable, a backup), not only expiring mailboxes. |
 | E7 | MLS among the user's devices; data sealed under per-epoch keys from the MLS exporter, history readable by new devices through a key archive; removal is an MLS remove and a revocation of that device's leaf, with no global rotation. |
-| E8 | Several home spaces allowed (CRDT replicas are free to multiply); slice 8 builds one. |
-| E9 | Actors the user installs in the personal agent: later than slice 8; slice 8 builds sync and the inbox. |
+| E8 | Several home spaces allowed (CRDT replicas are free to multiply); one is built. |
+| E9 | Actors the user installs in the personal agent: later; sync and the inbox first. |
 | E10 | Anonymous calls (sign-in, spends) go from the device to their target over Tor, never through the personal agent, which would link them. The personal agent holds only ciphertext and what its operators may see. |
-| E11 | Plan thoroughly; a Fable review of the design; the edge scenarios that could bite later worked through before code. The remaining design questions taken at their recommendations (§9.1). |
+| E11 | The edge scenarios that could bite later worked through before code (§8); the remaining design questions taken at their recommendations. |
 | E12 | Keep MLS, built as one shared `vos-mls` layer: the personal space its first user, member messaging and virtual clients later; one stack, fewer pieces. |
-| E13 | P2 (the shielded pool, the wallet, PG4) moves to slice 9, built on the finished personal space and Tor. Slice 8 ships P1. |
+| E13 | P2 (the shielded pool, the wallet, PG4) comes after the personal space and Tor, built on them; P1 first (P2's design: `open.md`). |
 | E14 | A home-only space by default: a space the user holds no other membership in, hosting personal agents. A user may home in a space they belong to, the app stating that its operators can link the agent to them. |
-| E15 | A yearly membership re-proof (`Auth("home")`, one prompt a year) keeps the agent; an expelled member's agent lapses into a grace period, its data recoverable by the kit or a move. [Amended 2026-11-17, decision 16: the device's re-proof flow moves to slice 9; `Homes`' `renew`, the lease and the grace stay built; a move makes no call to the old home, so the grace serves the kit's restore.] |
-| E16 | Recovery in slice 8: the phrase or printed kit, and a FIDO2 security key as a kit (the `hmac-secret` path). An encrypted export file is later. |
-| E17 | Tor-only is a rule for the personal agent: it refuses anything that did not come through the onion service. Bridges and pluggable transports weighed for slice 8 against later (§6.5). |
-| E18 | cipher-clerk v0.4 (the shielded redesign, R1–R11) moves to slice 9 with P2; P1 runs on v0.3.0 unchanged. |
-| E19 | No bridges in slice 8. Reversed for plain bridges by E22. |
+| E15 | A yearly membership re-proof (`Auth("home")`, one prompt a year) keeps the agent; an expelled member's agent lapses into a grace period, its data recoverable by the kit. `Homes`' `renew`, the lease and the grace are built; the device's re-proof flow is not (`open.md`); a move makes no call to the old home, so the grace serves the kit's restore. |
+| E16 | Recovery: the phrase or printed kit, and a FIDO2 security key as a kit (the `hmac-secret` path). An encrypted export file is later. |
+| E17 | Tor-only is a rule for the personal agent: it refuses anything that did not come through the onion service. Bridges and pluggable transports: §6.5. |
+| E18 | cipher-clerk v0.4 (the shielded redesign, R1–R11, `open.md`) comes with P2; P1 runs on v0.3.0 unchanged. |
+| E19 | No bridges. Reversed for plain bridges by E22. |
 | E20 | Virto runs a public home-only space, listed in the app as the default; others may run their own, and users may pick them. |
-| E21 | The light node runs in its own `:vos` Android process behind Binder in slice 8, for crash isolation and background sync without the UI process. |
-| E22 | Tor is the light node's default transport for every space, with a per-space opt-out and a plain warning; anonymous (credentialed or proven) calls never leave the client over the clearnet in any space, enforced by the client and optionally by a space's ingress through the gateway's transport mark; a space may declare itself onion-only (the home is, E17); key-signed calls may use the clearnet where the space allows. Plain bridges in slice 8; obfs4 and Snowflake later. |
+| E21 | The light node runs in its own `:vos` Android process behind Binder, for crash isolation and background sync without the UI process. |
+| E22 | Tor is the light node's default transport for every space, with a per-space opt-out and a plain warning; anonymous (credentialed or proven) calls never leave the client over the clearnet in any space, enforced by the client and optionally by a space's ingress through the gateway's transport mark; a space may declare itself onion-only (the home is, E17); key-signed calls may use the clearnet where the space allows. Plain bridges; obfs4 and Snowflake later. |
 | E23 | The gateway's onion serves only SSH; no raw node-API port, and no HTTP (owner, 2026-11-13: port 80 had no client, and an unused protocol on the anonymous side is surface with no user; it opens again when one exists). The light node speaks `vos-api` over SSH over the onion, whose relay set gains `Call` and `Credentialed`; the SSH handshake is paid once per kept-open connection. SSH over QUIC or a roaming transport later, when UDP over Tor exists. |
 | E24 | The device set records each admin key's attestation (a TEE key behind a strong biometric) and the verified-boot state; the chrome shows an unattested key or an unverified boot, without changing the device's admin class. |
-| E25 | 8.25's flood measurement over live Tor runs on a private Tor test network (chutney) at M5's acceptance, a lighter run accepted. |
+| E25 | The onion's flood measurement runs on a private Tor test network (chutney) in place of live Tor, a lighter run accepted (§6.6). |
 | E26 | A scheduling decision (phone sessions), not recorded here. |
-| E27 | M3's and M4's acceptances run together: one `ci-full`, one carrier audit, one Fable review; M5's phone runs may fold into S8-P7. |
-| E28 | A joining device's open claim at a home-only space is made by the background job after a random drawn delay from its add, never at the pairing, so the home's operators cannot link the new member to the agent by its time. [Moved to slice 9, 2026-11-17, decision 16: no joiner makes an open claim; only the claiming device is a member of the home.] |
+| E27 | A scheduling decision (reviews and acceptance runs), not recorded here. |
+| E28 | A joining device's open claim at a home-only space is made by the background job after a random drawn delay from its add, never at the pairing, so the home's operators cannot link the new member to the agent by its time. Not built: no joiner makes an open claim, and only the claiming device is a member of the home (`open.md`). |
 | E29 | A device's admin key is replaced (`admin(d, new key)`) on the kit's signature or another seasoned active device's; the new key's 72 h probation stands either way. |
 | E30 | No C tor in the product, its tooling or its demo: the gateway hosts its onion with arti in process, the one path; the C tor sidecar, run once to measure it, is removed. A private test network's relays (chutney) may use C tor outside the tree. |
 
-**The scope cuts** [the owner, 2026-11-17, decision 16]: four flows that
-had no caller in the product, or carried most of the device side's
-complexity, are cut before the device side's flows move into `vos-light`:
+**The flows left out** [the owner, 2026-11-17]: four flows that had no
+caller in the product, or carried most of the device side's complexity,
+are not built (each in `open.md`):
 - **Moving home carries nothing** (§3.9): the mover leaves its personal
   space with no call to the old home (its store made anew), claims at the
   new home as a first claim does, and the other devices leave and pair
   again. Valid only while the personal space holds the credential book and
   the device book alone, which every device writes again from what it
   holds; a local actor holding what no device writes again needs the carry
-  back first (slice 9, with the wallet).
-- **A restore is at its own home** (§3.5): restore elsewhere moves to slice
-  9 (restore there, then move). **Scope checkpoints** (8.21's) move to
-  slice 9 (§3.6): a paired or restored device reads each scope from its
-  start, and a home's operators can serve it a shortened scope without an
-  alarm at that moment (§8, C4; `open.md`).
+  back first.
+- **A restore is at its own home** (§3.5): restoring elsewhere is
+  restoring there, then moving. **Scope checkpoints** are not built
+  (§3.6): a paired or restored device reads each scope from its start,
+  and a home's operators can serve it a shortened scope without an alarm
+  at that moment (§8, C4).
 - **A regroup keeps its regrouper alone** (§3.5): every other device is
-  removed and pairs again; the key-package handover is gone.
-- **The joiners' open claim (E28) and the yearly re-proof flow** move to
-  slice 9 (§3.3, §3.8): only the claiming device joins the home; `Homes`'
-  `renew`, `Personal`'s lease and its grace stay built. Every agent lapses
-  13 months after its claim unless slice 9 ships both or the home sets a
-  longer lease (`open.md`).
+  removed and pairs again.
+- **The joiners' open claim (E28) and the yearly re-proof flow** (§3.3,
+  §3.8): only the claiming device joins the home; `Homes`' `renew`,
+  `Personal`'s lease and its grace are built. Every agent lapses 13 months
+  after its claim unless both are built or the home sets a longer lease.
 
 ### 1.2 Goals
 
-1. **A light node, not a proving library.** `vos-device` becomes a light
-   node of VOS: the PVM runtime running local actors, a local store, the
+1. **A light node, not a proving library.** `vos-light` is a light node
+   of VOS: the PVM runtime running local actors, a local store, the
    device prover, a node-API client, merkle-crdt sync and MLS
-   (`vos-mls`). It runs on
-   the phone, inside s4's Android client.
+   (`vos-mls`). It runs on the phone, inside s4's Android client.
 2. **The user's private space across devices.** Local actors hold the
    user's private data (notes, credentials, contacts, the wallet later);
    the user's devices keep them in agreement with merkle-crdt, through a
@@ -119,43 +106,22 @@ complexity, are cut before the device side's flows move into `vos-light`:
 3. **One proving path.** Every statement a device proves is an
    `#[attestable(device)]` kernel written in Rust and proved by the general
    zkVM under the device profile. No hand-written circuit outside the
-   recursion: the credential AIR (format 44) and its code are deleted.
+   recursion (§4.1).
 4. **Payments as the showcase.** A short, readable pair of actors on
    cipher-clerk, whose spend is one Rust function proved on the phone
-   (§5). P1, pseudonymous, in slice 8; P2, private, designed here and
-   built in slice 9 (E13).
-5. **Fewer pieces.** One crate in (`vos-light`), one out (`vos-device`),
-   one proving path in place of two. The slice adds arti's and mls-rs's
-   dependency trees, `vos-mls`, two system actors (`Homes`, `Personal`)
-   and the CRDT fields; the claim is about what VOS maintains as proving and transport
-   code, not a smaller dependency graph.
+   (§5). P1, pseudonymous, is built; P2, private, is designed in
+   `open.md` (E13).
+5. **Fewer pieces.** One light node crate (`vos-light`) and one proving
+   path. arti's and mls-rs's dependency trees, `vos-mls`, two system
+   actors (`Homes`, `Personal`) and the CRDT fields come with it; the
+   claim is about what VOS maintains as proving and transport code, not a
+   smaller dependency graph.
 6. **Network privacy.** Clients reach a space's gateway as a Tor onion
    service by default, and anonymous calls only so, so no node or gateway
    learns a member's network address [E22].
 7. **The rule stays:** `vos` and the node know no JAM and no Kreivo
    [decided, `core-model.md` §13]; the same holds for Tor and for MLS:
    the node stores and orders opaque bytes for them (§3, §6, §7).
-
-### 1.3 Non-goals for slice 8
-
-- P2 (the shielded pool, the wallet, PG4) and cipher-clerk v0.4, which
-  only P2 needs: designed in §5, built in slice 9 (E13).
-- A pool shared across spaces, or one whose integrity does not trust its
-  space's operators (`identity-and-authority.md` §8).
-- Messaging between members, in a space or across spaces. The personal
-  agent's design keeps its door open (§3.10).
-- Plaintext Merge scopes on nodes (`core-model.md` §9.4 as designed),
-  and the Merge lane on JAM.
-- Actors a user installs in their personal agent (E9).
-- A second home mirroring the first, a live handover between homes, and
-  a successor group after a lost home (§3.9): later. Slice 8 moves home by
-  re-pairing.
-- A personal space shared by more than one person.
-- Signature chips, recursion of device proofs, device proofs at a venue.
-- iOS: nothing below the secret store is Android-only, but no step builds
-  it.
-- Our own anonymity network, or mixnets. Tor only.
-- The extension host [decided, deferred past the slices].
 
 ## 2. The light node
 
@@ -166,12 +132,12 @@ complexity, are cut before the device side's flows move into `vos-light`:
 | **PVM runtime** | the interpreter, its machine pool and inner machines; no JIT (the recompiler is x86-64 Linux only, `pvm/runtime/src/lib.rs`) | `vos-pvm` [built] |
 | **the agent program** | the default agent, `vos-agent`: local actors are installed into it as into a node's agent; its merge entry runs `#[msg(merge)]` handlers writing merge fields, and its queries read them filtered (`core-model.md` §9.4) | `agent/default` [built, extended] |
 | **merge and query dispatch** | local actors are Merge-only (`#[msg(merge)]` handlers and `&self` queries; `core-model.md` §9.2: a merge handler runs on "any replica or device, no log"), so the light node runs the agent program's merge and query entries over its store, one fjall batch per operation; no refine, no accumulate, no work results, sessions or sweeps; no Raft, no leader, no peers | the executor's host-call layer, reused from `vos-node` without its pipeline (§7.1) |
-| **release artifacts** | the transpiled programs of the local actors and the stock kernels' device programs, computed at release and embedded with their ELF bytes; the phone runs no transpiler and no reference run (§4.4) | the release build [new] |
+| **release artifacts** | the transpiled programs of the local actors and the stock kernels' device programs, computed at release and embedded with their ELF bytes; the phone runs no transpiler and no reference run (§4.4) | the release build [built] |
 | **local store** | fjall, as the node's, with small caches (8–16 MiB block cache [est]) | `vos-node`'s `store` [built] |
 | **device prover** | the device profile (format 47, the per-program CPU and the word ledger, §4.4), masked, `Threads::Auto` | `vos-pvm-proof` and `vos-pvm-device`'s masked device segment, its recursion prover featured out (§7.1) |
 | **node-API client** | the multiplexed `vos-api` client over SSH's `vos-api` subsystem, over an arti onion stream (§6) [E23] | `vos-api` [built] |
 | **sync** | merkle-crdt DAGs of the local actors' Merge fields, one a local instance, its `Store` over fjall, sealed before they leave the device (§3.6) | `support/merkle-crdt` [built: incremental apply, author chains, `FjallStore`, batched fetching], `vos-light`'s `sync` and `personal` [built: nodes recorded and applied through the merge entry, sealed at push and read by the cursor over `Personal`, §3.6] |
-| **MLS** | the user's device group, through `vos-mls` over mls-rs, on the host side, native, never in a guest | `vos-mls` [new]; the storage providers and copy-and-swap adapted from the `messaging` branch (§3.4) |
+| **MLS** | the user's device group, through `vos-mls` over mls-rs, on the host side, native, never in a guest | `vos-mls` [built]; the storage providers and copy-and-swap adapted from the `messaging` branch (§3.4) |
 | **secrets** | per device, as today: the member secret from the keystore's HMAC; the admin key in the hardware keystore; the sync key and MLS state wrapped after first unlock; a security-key kit through the `hmac-secret` path (§3.5) | `vos-light`'s `secret` [built, extended] |
 | **Tor** | arti's client, one `TorClient` per process | arti (§6) |
 
@@ -328,11 +294,11 @@ actors, and calls a space through its gateway.
 | state | budget | basis |
 |---|---|---|
 | idle, foreground (store open, arti bootstrapped, no proof) | ≤ 96 MiB resident, of which arti ≤ 48 MiB | [est]: interpreter and pool a few MiB, fjall's caches 8–16 MiB, arti's directory and circuits (§6.4), MLS state under 1 MiB for a few devices |
-| the facility's `.so` | growth from arti ≤ 10 MB [provisional]; from `vos-mls` and mls-rs ≤ 2 MB, a limit 8.3 can miss | arti: +13.85 MB stripped on arm64, missing the limit by 39% (within twice it); +8.84 MB under fat LTO [measured, §6.4, 2026-11-02]; mls-rs +0.86 MB stripped [measured, arm64-v8a, 2026-11-02, §3.4] |
+| the facility's `.so` | growth from arti ≤ 10 MB [provisional]; from `vos-mls` and mls-rs ≤ 2 MB | arti: +13.85 MB stripped on arm64, missing the limit by 39% (within twice it); +8.84 MB under fat LTO [measured, §6.4, 2026-11-02]; mls-rs +0.86 MB stripped [measured, arm64-v8a, 2026-11-02, §3.4] |
 | local actor call | ≤ 1 ms on the interpreter | 85 µs an invocation on the node's interpreter [measured, `core-model.md` §14], with the fsync of a local commit dominating |
 | proving a sign-in | ≤ 1 GiB peak (target 768 MiB) | 513 MiB [measured, `proving.md` §8] |
 | background sync job | ≤ 30 s wall, ≤ 1 MB down a run with nothing new | [est]: arti from a warm directory, one onion connection, one cursor query a scope and one for the device-set log |
-| battery | no work while backgrounded beyond the periodic job; no persistent circuit | the design's rule, measured by the plan's PG5 |
+| battery | no work while backgrounded beyond the periodic job; no persistent circuit | the design's rule, PG5's to measure (§2.4) |
 
 **The light node's local calls, first numbers** [measured, x86-64 dev
 host shared with other builds (load 20–55), 2026-11-02, `vos-phone light`,
@@ -346,7 +312,7 @@ yet split out. If the phone misses it too, a call's durability (synced, or buffe
 and synced in a group) is the lever, against §2.2's rule that every write
 is crash-safe.
 
-**On the phones** [measured, S8-P1, 2026-11-06, `light.sh`, the notes
+**On the phones** [measured, 2026-11-06, `light.sh`, the notes
 actor, a release build]: the Fairphone 6 opens a new store in 263 ms and
 reopens it in 125 ms; a call through the merge entry, synced, takes
 0.46–0.53 ms p50 and 0.52–1.07 ms p95; a query 22–33 ms. Within the 1 ms
@@ -362,6 +328,30 @@ Proving is the only heavy phase: about 0.65 s of wall time on the four
 big cores at full load a sign-in [measured, `proving.md` §8: 645 ms]. A
 phone that signs in twenty times a day spends about 13 s of wall time on
 them [est], far below a screen-on minute.
+
+### 2.4 The phone gates
+
+Every gate is on the Fairphone 6 [decided, `proving.md` §8], automatic
+threads, three rounds of five, the gate the median of the rounds' medians,
+the 95th percentile beside it, each proof verified on the phone and
+accepted at a space's ingress. Every gate has a limit it can miss. PG1,
+the credential AIR's 250 ms, retired with format 44; PG4, the spend, is
+P2's (`open.md`).
+
+| gate | what | limit |
+|---|---|---|
+| **PG1′ owner** | the stock `owner` kernel | ≤ 0.5 s, ≤ 512 MiB |
+| **PG2′ sign-in** | the stock `auth` kernel | at format 47 **the gate 0.65 s, the target 0.55 s** (a miss makes the 4-way CPU split, `open.md`, the next lever); ≤ 1 GiB; the proof ≤ 1.5 MiB |
+| **PG3′ flows** | enroll, sign-in and pay (P1); claim at a home-only test space with a phrase kit and with a security-key kit; pair a second device (enrolled in every other space at once); sync both ways; retire a phone; a removal let through, one contested and resolved by the kit, and the kit alone removing a phone that holds only a sync key; a restore cancelled by liveness, then one completed on a fresh install; a regroup keeping its regrouper alone, another device pairing again; move home (two homes: leave, claim, pair again); every secret behind its prompt; on test homes with delays in minutes, a lease that outlasts the session and a low claim difficulty; recorded, as onion runs (the client refuses the clearnet for these by construction; the host suites cover the clearnet paths) | each completes; over Tor at the median: a sign-in ≤ 4 s, a P1 payment ≤ 5 s, pairing ≤ 60 s from the scan to the second device's first read, arti and its SSH connections warm |
+| **PG5 footprint** | the light node with arti, `vos-mls` and mls-rs | `.so` growth from `vos-mls` and mls-rs ≤ 2 MB; from arti ≤ 10 MB, provisional; idle ≤ 96 MiB; warm bootstrap ≤ 3 s p50; a day of background jobs ≤ 2% of the battery; ≤ 30 rendezvous an hour in the foreground |
+| **PG6 sync** | the background job; a 1 MiB catch-up; a commit | on a locked phone after first unlock: the job ≤ 30 s and ≤ 1 MB down with nothing new, p50; the 1 MiB catch-up over Tor ≤ 20 s p50; a candidate processed on its copy ≤ 200 ms. **Recorded, as inputs to the device-change windows:** the job in the "rare" bucket, after 3 days offline, after a force-stop, and the latency from a pending operation to its local notification |
+
+PG1′ and PG2′ passed at format 46 (against 46's sign-in limit of ≤ 1.0 s)
+[measured, Fairphone 6, 2026-11-08]:
+`owner` 351.8 ms and ≤ 337 MiB, `auth` 615.6 ms, ≤ 505 MiB and
+≤ 0.88 MB, each phone-made sign-in run at the node's ingress
+(`proving.md` §8). PG5's arti and `vos-mls` figures and PG6's candidate
+are §3.4's and §6.4's. The rest are `open.md`'s.
 
 ## 3. The personal space and the personal agent
 
@@ -383,8 +373,8 @@ user holds no other membership in, run to host personal agents. A user
 may choose a space they belong to instead; the app then says plainly that
 its operators can link the agent to them (§3.10).
 
-Devices sync with the personal agent, never with each other directly in
-slice 8; the agent is where two devices that are never online together
+Devices sync with the personal agent, never with each other directly;
+the agent is where two devices that are never online together
 meet. Every gateway of the home lists every node of it as an upstream, so
 any gateway reaches the agent (§3.3).
 
@@ -404,11 +394,11 @@ no kit loses everything with the phone (§8, D2).
   set's authority is the personal agent's log, §3.5; this is its
   user-facing mirror).
 
-**Before a third local actor is added** [2026-11-17, decision 16]: a move
+**Before a third local actor is added** [the owner, 2026-11-17]: a move
 home carries nothing (§3.9), which is valid only while the personal space
 holds just these two books, whose rows every device writes again at the
 new home from what it holds. An actor whose rows no device writes again
-(the wallet's, slice 9) needs the move's carry back first.
+(a wallet's) needs the move's carry back first (`open.md`).
 
 Each actor instance is one sync scope: one merkle-crdt DAG
 (`core-model.md` §9.4's "one DAG per sync scope"). A merge handler's
@@ -475,7 +465,7 @@ operation and travel inside it.
 
 ### 3.3 The home and the personal agent
 
-**Membership in a home-only space** [proposed, E14]: a home-only space
+**Membership in a home-only space** [decided, E14]: a home-only space
 admits anyone, priced by work, so that joining it says nothing about the
 user's other spaces.
 - Its registrar's invitations (`identity-and-authority.md` §6: `invite`
@@ -484,15 +474,10 @@ user's other spaces.
   of work over `(space, member, the registrar's current salt)` at the
   difficulty the space sets (about a minute of a phone's cores), within a
   daily cap of open enrollments. Over the onion, the registrar learns
-  only that someone joined. A new device's open claim runs in the
-  background after pairing; it reads and writes through the archive
-  meanwhile (§3.8). [Slice 9, 2026-11-17, decision 16: no joiner makes
-  one; only the claiming device joins the home.]
-- **Each device joins on its own:** under E2 each device has its own
-  member secret, so each device of the user makes its own open claim in
-  the home, unlinked to the others at the registrar. The device set in
-  `Personal` is what ties them together, and that holds no member
-  digests.
+  only that someone joined. Only the claiming device makes one: a device
+  paired later holds no leaf at a home-only home (E28, `open.md`). The
+  device set in `Personal` ties the user's devices together, and holds no
+  member digests.
 - **What bounds abuse is the cap, not the work:** a minute of a phone's
   cores is seconds on a desktop, so the work only stops a trivial loop.
   The daily cap is sized to the home's disk (each claim can grow to 192
@@ -504,7 +489,7 @@ user's other spaces.
   have passed since the claim, where the device's yearly prompt first
   falls (the lease's last sixth): an earlier one renews the lease and lifts
   nothing, so a Sybil cannot re-prove at once for the larger quota
-  [built, `Personal::renew`; no device calls it in slice 8, decision 16]. Nothing an open member does reaches another user's
+  [built, `Personal::renew`; no device calls it yet, `open.md`]. Nothing an open member does reaches another user's
   agent (known keys, gated queries, one agent a claim). The default home
   is run by Virto, listed in the app, its cap published [decided, E20];
   anyone may run another, and users may pick it.
@@ -539,23 +524,21 @@ operator makes ahead of time**:
   claim on a device that already holds a personal space's archive, so a
   user's second device never claims a second agent by mistake.
 - **"home" is reserved:** the light node proves in that scope only for
-  its own claim (and, in slice 9, its re-proofs), and the facility refuses
+  its own claim, and the facility refuses
   any request naming `Homes`' agent and instance.
 
-**The lease: one re-proof a year** [decided, E15; the device's flow,
-the yearly prompt and the joiner's own leaf at the home it needs, slice 9
-(2026-11-17, decision 16); `Homes`' `renew`, the lease and the grace
-built]:
+**The lease: one re-proof a year** [decided, E15; `Homes`' `renew`, the
+lease and the grace built; the device's flow, the yearly prompt and a
+joiner's own leaf at the home it needs not built, `open.md`]:
 - Every device's own "home" nullifier is recorded at its add (the device
   computes it without a proof; `Personal` passes it to `Homes`, which
   refuses one already mapped to another agent). The person records (§3.8)
   give it no proof: they hold `member` and `owner` digests, from which no
   nullifier follows (it is unlinkable to both by design), and the
-  enrollment is the adding device's proof, not the added one's. The
-  proof path is the added device's own `Auth("home")` once it has a leaf
-  in the home (its open claim at a home-only space, its enrollment at a
-  home that is the user's own space), with which 8.23a's pairing records
-  it.
+  enrollment is the adding device's proof, not the added one's. A
+  re-proof is the device's own `Auth("home")`, so it needs a leaf in the
+  home (its open claim at a home-only space, its enrollment at a home that
+  is the user's own space).
 - Once a year, any device proves `Auth("home")` to `homes.renew(agent)`
   under a recorded nullifier: one prompt a year, at an ordinary sign-in
   when the home is the user's own space, or at a yearly "keep my backup"
@@ -572,10 +555,9 @@ built]:
   the data stays recoverable and a stolen phone can still be removed. A
   re-proof ends the grace.
 - **On a test home** the delays of §3.5 and the lease are set per space
-  (minutes, not days), so the plan's gates can run every flow.
+  (minutes, not days), so the phone gates can run every flow (§2.4).
 - **Reaping** an agent after its grace, wiping it and returning it to the
-  pool, is later work (§9.3): nothing can lapse within slice 8's first
-  year.
+  pool, is later work (`open.md`).
 
 **`Homes` as built** [built, `agent/homes`, its wire types
 `vos_wire::homes`; tested in the testkit's agent suite,
@@ -604,7 +586,7 @@ this is the one taken]:
   and the kit's `Malformed` (what `Personal` would refuse, so a refusal
   cannot be repeated against a pooled agent), an empty pool `PoolEmpty`,
   an `agent` not pooled `Taken`, each writing nothing. A kit may be empty
-  (no recovery). **The device names the agent** [built, 8.23a]: a kit's
+  (no recovery). **The device names the agent** [built]: a kit's
   `R1` is sealed with the agent's identity bound (§3.5), which the device
   must know before its claim, so it reads `pooled` (the lowest pooled
   agent), learns that agent's identity from its record (`AgentInfo`),
@@ -692,9 +674,30 @@ this is the one taken]:
 makes the agent. One replica is allowed for small spaces and shown in the
 chrome (§8, B10). **Cost:** about 46 KiB and 1.6 µs/s a replica when idle
 [measured, `core-model.md` §14]; with a 64 MiB quota (§3.6), 10^4 full
-agents on three replicas is about 1.9 TB a space. Unmeasured, and the
-plan's scale gate: 10^4 agents waking a few times an hour, a full agent's
-snapshot, a `replace` (plan 8.15).
+agents on three replicas is about 1.9 TB a space.
+
+**The scale gate** (`tools/scale`, `--personal`): 10^4 personal agents on a
+three-node space, each pushing and fetching every 15 minutes for an hour,
+sessions opening and sweeping, pushes of full steps among them; one agent
+filled to 64 MiB, its snapshot installed, and one `replace`. Its limits:
+the other agents' commit p99 within 20% of the same run without personal
+agents; ≤ 64 KiB resident a personal-agent replica above idle; a full
+agent's snapshot installed ≤ 30 s. **The early run** [measured, compumax
+nodes c1–c3 and spare c4, sigma the driver, 2026-11-06; the scale test's
+load of 64 shards at 5,000 calls a second beside 10,000 personal agents
+waking every 15 minutes; the largest push 60 KiB, `Personal`'s envelope
+cap; the fill a run of its own]: every call of the three runs succeeded.
+The snapshot's limit is met: a 64 MiB agent's replacement installed its
+snapshot in 1.04 s. The other two missed as measured:
+- **Commit p99:** the transfers' p99 rose from 1.84 s to 2.62 s (+43%),
+  one bucket of the harness's histogram, with the nodes' CPU unchanged at
+  about 70%. The fill's run, with the same 10,000 agents, was back at
+  1.84 s.
+- **Memory:** +50–54 KiB a replica right after creation, but +106–111 KiB
+  a replica at the load's end, which counts the 255 MiB the agents pushed
+  and the store's caches.
+
+The rerun is `open.md`'s.
 
 **Reaching the agent: every gateway lists every node.** A node that does
 not replicate an agent answers `Elsewhere { replicas }`
@@ -702,7 +705,7 @@ not replicate an agent answers `Elsewhere { replicas }`
 it lists (`node-api.md` §6), so a gateway that lists every node of its
 space reaches every agent. That is the configuration a home requires, for
 spaces of three to a few dozen nodes. Forwarding between nodes, for a
-gateway that lists only some, is later work (§9.3).
+gateway that lists only some, is later work (`open.md`).
 
 **Admission** [built, `node-api.md` §2–§3]: a personal agent sets two
 flags that ingress reads from the agent's own state, as it reads the
@@ -737,9 +740,7 @@ Nothing in the node knows a personal agent: any agent's actor may ask.
   workflow read, a credentialed call; a schema read answers none. The
   gateway marks each request it relays with the transport it came in on
   (the frame's `mark`, `node-api.md` §2: 1 clearnet from its HTTP and SSH
-  ports, 2 onion from its onion service's, which comes with the onion
-  service itself, plan 8.25: until then no gateway port marks onion, and
-  an onion-only agent is reached only by a test's port), never passing a
+  ports, 2 onion from its onion service's, §6.1), never passing a
   client's own on; a node treats a missing mark (0) as clearnet (the unix socket's
   tools and test clients send none). The node trusts the mark as it trusts
   any API client, the gateway being inside the operator's network. The
@@ -766,7 +767,7 @@ expires after an hour idle (`SESSION_EXPIRY_MS`), so a background job opens
 one per run: at 10^4 users syncing four times an hour, about 11 session
 commits a second across a space [est].
 
-**`Personal`'s upgrades over agents that hold data** [proposed]:
+**`Personal`'s upgrades over agents that hold data:**
 `Admin::Install` replaces the program and touches no table
 (`agent/default/src/refine/admin.rs`), and state migration is unbuilt, so
 `Personal`'s storage layout is **append-only across versions:** new
@@ -775,13 +776,13 @@ would not decode what the previous version wrote (the codec has no
 optional tail), and an actor's struct stores nothing (`core-model.md`
 §9.1: state is rows, a single value a `Cell`, and a changed value type a
 new table), so `Personal`'s state is its tables and cells, and its
-version answers `version` [built,
-`agent/personal`]. Each release installs over a populated agent of the
-previous release in a test that reads every envelope and operation back
-(plan 8.14; the mechanism's test, the next version built from the same
-tables, is `agent/testkit/tests/agent/personal/upgrade.rs`: it reads every
-row back, and adds no table, since `#[actor]` gives a field no `#[cfg]`);
-the keeper upgrades in batches and stops on the first refusal. The layout
+version answers `version` [built, `agent/personal`]. The upgrade test
+installs the next version, built from the same tables, over a populated
+agent and reads every row back
+(`agent/testkit/tests/agent/personal/upgrade.rs`; it adds no table, since
+`#[actor]` gives a field no `#[cfg]`); each release is to install so over
+a populated agent of the one before. The keeper upgrades in batches and
+stops on the first refusal. The layout
 binds from the first release: until then rows change freely. A change that cannot
 be append-only waits for state migration (`open.md`, "Upgrades").
 
@@ -821,7 +822,7 @@ device's last call (below, "Seen means a call"). Delays and maturities
 themselves run on batch time alone, as below. The home's
 calls (`configure`, `assign`, `claim`, `renew`) take the role `homes`;
 `assign` answers its caller, and `claim` answers `Homes` by message
-(below, "`Homes` as built"). Bounds the rules above leave open: `alive` is logged at
+(above, "`Homes` as built"). Bounds the rules above leave open: `alive` is logged at
 most once an hour a device (the entry logged last answers between), a
 vote's signed message names its candidate's log index as well as its
 epoch (an epoch's number is free again after a void), an opener holds one
@@ -883,7 +884,7 @@ strongly consistent delivery service; the rule is the `messaging` branch's
   a void, as the `messaging` branch's `mls.rs` snapshot and restore did.
   Its own commit, likewise, becomes current only on confirmation (§8, A9).
 
-**Key-confirmed epochs** [proposed]: an epoch's keys are used only once the
+**Key-confirmed epochs** [built]: an epoch's keys are used only once the
 devices that are awake have shown they hold the same keys.
 - **The confirming set** is the devices of the new epoch that the agent has
   seen within the last 72 h by its batch time, minus every device whose
@@ -930,19 +931,17 @@ devices that are awake have shown they hold the same keys.
   commit (§8, B8).
 - **Between a removal's maturity and its confirmed epoch** the agent
   already refuses the removed device's keys; only operators serving it
-  anyway could hand it data sealed under the prior epoch, for at most 72 h
-  after the 72 h removal delay (§8, B8). [As built, 2026-11-18: the 72 h
-  after the delay is the time to the user's next commit, which nothing
+  anyway could hand it data sealed under the prior epoch, until the
+  user's next commit after the 72 h removal delay (§8, B8), which nothing
   makes without them: every pass raises a commit owed (`Notice::Commit`,
   the chrome's "Commit now") for as long as a matured removal waits for
-  one, and for as long as a verdict left the kit's `R` unheld (below).]
-- **Updates:** a device updates its leaf when an MLS leaf lifetime nears
-  its end (a year), on the same yearly prompt as the home's re-proof
-  [E15], and after its admin key is replaced; each is an admin-signed
-  commit. [The yearly prompt: slice 9, 2026-11-17, decision 16. Any commit
-  of a device's renews its leaf, and "Commit now" makes one; a device that
-  commits nothing for a year leaves a leaf of its key package's lifetime,
-  which a later joiner's Welcome refuses (`open.md`).]
+  one, and for as long as a verdict left the kit's `R` unheld (below).
+- **Updates:** any commit of a device's renews its leaf, an admin-signed
+  commit ("Commit now" makes one), as does its commit after its admin key
+  is replaced. The yearly prompt shared with the home's re-proof [E15] is
+  not built: a device that commits nothing for a year leaves a leaf of its
+  key package's lifetime, which a later joiner's Welcome refuses
+  (`open.md`).
 
 **Retention:** the agent keeps handshakes and confirmations for 180 days
 and no plaintext group information; a device away longer re-pairs (§8,
@@ -964,12 +963,12 @@ A5).
   it missing; a new device receives it over the pairing channel (§3.8).
   Archives that disagree keep every candidate key, and the AEAD decides.
 - **No forward secrecy for history, by design;** post-compromise security
-  for new data. History horizons are later work (§9.3).
+  for new data. History horizons are later work (`open.md`).
 
-**The suite:** ciphersuite 1 (X25519, AES-128-GCM, SHA-256, Ed25519)
-unless mls-rs maintains a hybrid post-quantum suite by plan 8.3 (§9.1); a
-later change is a successor group, never two suites in one group (§8, F2).
-None is maintained [read 2026-11-02]: mls-rs 0.57.0 (2026-10-28) has
+**The suite:** ciphersuite 1 (X25519, AES-128-GCM, SHA-256, Ed25519), as
+mls-rs maintains no hybrid post-quantum suite; a later change is a
+successor group, never two suites in one group (§8, F2). None is
+maintained [read 2026-11-02]: mls-rs 0.57.0 (2026-10-28) has
 `ML_KEM_768_X25519`, X-Wing over suite 1's AEAD, hash and signature, but
 on a private code point (65100, "no official PQ cipher suites" in its
 source), behind mls-rs-core's `post-quantum` feature, implemented only by
@@ -982,7 +981,7 @@ point is assigned and a provider ships it outside an unstable feature.
 
 **Measured on mls-rs 0.57** [measured, 2026-11-02; spike outside the
 tree; timings on x86 (Core Ultra 7 155H, under load), the `.so` an
-arm64-v8a build; the phones' timings below are S8-P1's]:
+arm64-v8a build; the phones' timings below of 2026-11-06]:
 - **Features:** `default-features = false` with `private_message` only
   (encrypted handshakes); no `std`, `rayon`, `x509`, `psk`,
   `by_ref_proposal`, `out_of_order`, `prior_epoch`, `custom_proposal` or
@@ -991,13 +990,13 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
   takes 5.0.0, so 0.23 now builds beside it, unmeasured).
 - **The facility's `.so`** (`libvos_facility.so`, release, arm64,
   stripped as packaged): +0.86 MB with the device-group scenario linked
-  (+0.38 MB gzip -9), +0.96 MB with `std`: within PG5's 2 MB. The growth
+  (+0.38 MB gzip -9), +0.96 MB with `std`: within PG5's 2 MB (§2.4). The growth
   includes a second RustCrypto generation beside the facility's own.
 - **A candidate processed on a copy** (x86): about 1 ms p50 (0.9–3 ms as
   the host's load varied) in a group of 3 or 8, whether the copy is a
   clone of the in-memory group or loaded from its persisted bytes and
   written back; PG6's limit, on the phone, is 200 ms. **On the phones**
-  [measured, S8-P1, 2026-11-06; 200 runs, 3 rounds each]: the Fairphone
+  [measured, 2026-11-06; 200 runs, 3 rounds each]: the Fairphone
   6 0.63–0.66 ms p50 in a group of 3, 0.73 ms in a group of 8; the
   Pixel 1 1.22–1.24 ms and 1.40–1.43 ms; loaded from persisted bytes and
   written back, 0.66 and 1.30–1.33 ms. The exporter agrees on three
@@ -1095,8 +1094,7 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
   too, and the next commit is the regrouper's new group of it alone
   (`DeviceGroup::regroup`), its epoch the confirmed one plus one, carrying
   every removal, its epochs counting on from the agent's; the others pair
-  again from it [amended 2026-11-17, decision 16: the key packages the
-  kept devices handed over, and their joining by its Welcome, are gone]. A device that cannot
+  again from it. A device that cannot
   follow reads on for the device set's operations and takes no candidate
   but its own regroup's, following the others' epochs and the removals
   they carry by the agent's word. A restore's device starts its new group alone
@@ -1142,7 +1140,7 @@ arm64-v8a build; the phones' timings below are S8-P1's]:
 **The device group measured** [measured, x86-64 Core Ultra 7 155H under
 load (load average 15–20), release, 2026-11-06; `vos-phone group`, the
 agent's log scripted, each step one synced fjall batch; the phone's
-numbers wait for the phone session, `tools/phone/scripts/group.sh`]:
+numbers are the phone session's, `tools/phone/scripts/group.sh`]:
 - a group of 3, 40 update rounds: the committer's commit, built and held,
   2.1 ms p50 (7.0 p95); another device's reading of the candidate and its
   evidence, the commit processed on a copy and its vote, 1.7 ms (2.9);
@@ -1154,7 +1152,7 @@ numbers wait for the phone session, `tools/phone/scripts/group.sh`]:
   key);
 - a confirmation round is, at the agent, the commit call, its evidence,
   one vote a device of the set and each device's read of the log: at
-  8.12's measured 2.6–3 ms a call through a node's socket, about 15 ms for
+  §3.6's measured 2.6–3 ms a call through a node's socket, about 15 ms for
   three devices on a quiet host, before Tor.
 
 ### 3.5 Device secrets and the rules for changing devices
@@ -1168,7 +1166,7 @@ numbers wait for the phone session, `tools/phone/scripts/group.sh`]:
 | the **sync key** (ed25519) | the client key at the personal agent; signing DAG nodes and confirmations | wrapped under a keystore key usable **after the first unlock** since boot, no per-use prompt, no unlocked-screen requirement: background sync runs on a locked phone |
 | the MLS state, the key archive, `R` | sealing and opening envelopes, processing commits | the same after-first-unlock wrap; kept out of Android's backups (§8, A11) |
 
-- **Ed25519 only** [proposed]: ingress client keys are ed25519
+- **Ed25519 only:** ingress client keys are ed25519
   (`agent/wire/src/ingress.rs`), and an admin key is a client key, so
   admin keys are Ed25519 too. A second client-key curve (P-256) at ingress
   would serve only phones whose TEE has no Ed25519, at the cost of new
@@ -1193,7 +1191,7 @@ numbers wait for the phone session, `tools/phone/scripts/group.sh`]:
   included, waits 72 h and can be contested (its commits carry only
   operations already matured), which bounds what malware that captures
   such a key can do.
-- **The class as built** [built, 2026-11-18, decision 6]: the class is
+- **The class as built** [built]: the class is
   the device's own report, as the UI's keystore answered it (`KeyInfo`'s
   security level), not an attestation another device verified: a key that
   is not hardware-backed registers `AdminClass::Delayed`, claimed, paired
@@ -1207,8 +1205,8 @@ numbers wait for the phone session, `tools/phone/scripts/group.sh`]:
   runs code on it reads the personal space. Before the first unlock
   nothing opens (§8, A2).
 
-**Measured on the phones** [measured, plan 8.3, S8-P1, 2026-11-06; a
-spike app, its log host-verified]:
+**Measured on the phones** [measured, 2026-11-06; a spike app, its log
+host-verified]:
 - **Fairphone 6** (KeyMint 3, Android 15, bootloader locked): the admin
   key is an Ed25519 keystore key at security level TEE, its attestation
   chain 5 certificates long to the Key Attestation CA; StrongBox refuses
@@ -1235,8 +1233,8 @@ spike app, its log host-verified]:
 - **One call, one prompt:** every device-set operation (add, remove, veto,
   resolve, kit rotation, restore, regroup, admin-key replacement) and
   every commit is a one-shot client call whose key is the device's admin
-  key (or the kit's, for its own operations), its arguments including the
-  control log's head it was made against. The prompt authorizes the one
+  key (or the kit's, for its own operations); its arguments do not name
+  the control log's head it was made against (`open.md`). The prompt authorizes the one
   signature the call needs; ingress verifies it as it verifies any client
   call, and the agent checks the origin, `Principal::Client(key)`, against
   the device set: whose key it is, and whether that device's state (active,
@@ -1246,8 +1244,8 @@ spike app, its log host-verified]:
   §3.8); a removal is the operation's prompt and, once it matures, the
   commit that carries it, made by the next device whose user authenticates
   (the agent already refuses the removed device's keys at maturity); a
-  veto, a resolve or a kit rotation is one each; the yearly re-proof and the
-  leaf renewal share one (slice 9, decision 16).
+  veto, a resolve or a kit rotation is one each; a yearly prompt for the
+  re-proof and the leaf renewal is not built (`open.md`).
 - **Size:** the keystore signs at most 16 KiB in one Ed25519 operation
   (`IKeyMintDevice.aidl`), so an admin call's arguments stay under 15
   KiB; anything larger (a commit's Welcome) rides in its evidence call,
@@ -1258,25 +1256,24 @@ spike app, its log host-verified]:
   and its signature. The agent stores them as data, compares the message's
   arguments byte for byte with the operation it recorded, and verifies
   nothing. **Every device verifies the signature** against the admin key
-  before acting, and acts on no operation without its evidence; the device
-  that made the call re-posts the evidence until it is stored. [As built,
-  2026-11-18: the device holds the call as signed before it leaves
-  (`DeviceGroup::sending`), and every pass posts its evidence until the log
-  holds it, finding the call in the log after a kill; the kit's flows keep
-  theirs in the store and post it when the kit calls again. **An operation
-  due without its evidence is cancelled** (`Unevidenced`), a cosigned one
-  too, so the agent and the devices close it alike: a call whose device is
-  lost between the call and its evidence wedges nothing, and is made
-  again. A cosign or a resolution that would make an operation without its
+  before acting, and acts on no operation without its evidence. The device
+  holds the call as signed before it leaves (`DeviceGroup::sending`), and
+  every pass posts its evidence until the log holds it, finding the call
+  in the log after a kill; the kit's flows keep theirs in the store and
+  post it when the kit calls again. **An operation due without its
+  evidence is cancelled** (`Unevidenced`), a cosigned one too, so the
+  agent and the devices close it alike: a call whose device is lost
+  between the call and its evidence wedges nothing, and is made again. A
+  cosign or a resolution that would make an operation without its
   evidence mature is refused `Unevidenced`: it is made again once the
-  operation's evidence is in, which its author's next pass posts.] The
+  operation's evidence is in, which its author's next pass posts. The
   operators run ingress and could append anything to the log, so a device
   trusts an operation only by its signature (§8, B6).
 - Delays run on the agent's batch time alone; a device whose clock
   disagrees with the agent's by more than an hour raises an alarm and
-  otherwise acts as the log says. [As built: a restored device starts from
-  the agent's batch time and the log's policy (the claim's configuration,
-  each later one over it), never its own clock or a default.]
+  otherwise acts as the log says. A restored device starts from the
+  agent's batch time and the log's policy (the claim's configuration, each
+  later one over it), never its own clock or a default.
 
 **The device set** (a table in `Personal`): each device's sync key, admin
 key and its attestation, its admin class (strong or delayed), its
@@ -1285,7 +1282,7 @@ its add: it may sync and post confirmations, not sign operations or
 commits), **active**, or **removed** (with its frontier). A device is
 **seasoned** once it has been active for 7 days.
 
-**The rules** [proposed]:
+**The rules:**
 1. **Add** (pairing, §3.8): signed by an active strong admin, immediate;
    the new device is in probation. Signed by a delayed admin, it waits
    72 h first.
@@ -1309,13 +1306,13 @@ commits), **active**, or **removed** (with its frontier). A device is
    **liveness**: any device's signed `alive`, posted under its sync key by
    an ordinary sync (no prompt) while the restore is pending, cancels it,
    since a restore asserts that every device is lost.
-9. **A device whose removal has matured has no voice:** its vetoes,
-   `alive`, confirmations and nacks are ignored, whatever the agent
-   stores.
 8. **Probation devices** cannot sign operations or veto. **A removal
    pending or contested against a probation device freezes its
    probation** until the removal resolves, so an add cannot ripen into a
    second vote inside a removal's own window.
+9. **A device whose removal has matured has no voice:** its vetoes,
+   `alive`, confirmations and nacks are ignored, whatever the agent
+   stores.
 
 *What is conceded, and only this:* a thief who passes the owner's strong
 biometric holds an active device and can always contest. The owner wins
@@ -1328,13 +1325,12 @@ so it matures after 7 days; from then the phone's `alive` is ignored, and
 the kit's restore matures 7 days later, 14 days in all. With the kit alone
 against a thief who also passes the biometric, the owner cannot win: the
 thief vetoes, as an owner must be able to against a leaked kit (§8, A4,
-D3). [As built, 2026-11-18: the kit's `remove` and `resolve` are the
-light node's `Personal::remove_by_kit` and `resolve_by_kit`, from any
-install, a fresh one too: the agent found by the kit's index, the set read
-under the kit (`kit_view`), what fell due settled before the call; the
-facility's restore screen offers them. A lost phone left powered, whose
-background job answers every restore with `alive`, is removed this way
-first.]
+D3). The kit's `remove` and `resolve` are the light node's
+`Personal::remove_by_kit` and `resolve_by_kit`, from any install, a fresh
+one too: the agent found by the kit's index, the set read under the kit
+(`kit_view`), what fell due settled before the call; the facility's
+restore screen offers them. A lost phone left powered, whose background
+job answers every restore with `alive`, is removed this way first.
 
 **The removal frontier:** when a removal matures, the agent records, per
 scope, the position of the removed device's last accepted envelope; its
@@ -1350,15 +1346,13 @@ device.
 device to re-pair from): an active seasoned device runs the restore flow
 below signed by its admin key in place of the kit: it needs no `R2` (it
 holds `R`), waits 72 h and is vetoable and contestable as a removal is,
-and is immediate when two seasoned devices or the kit sign it. It removes
-the devices it names, starts a new group with the rest by Welcome, and
-the control log restarts under it. [Amended 2026-11-17, decision 16: a
-regroup keeps its regrouper alone. It names every other live device, and
-at its maturity every device but the regrouper is removed, one added
-while it was open too; the new group is the regrouper's alone, and the
-others pair again from it.]
+and is immediate when two seasoned devices or the kit sign it. A regroup
+keeps its regrouper alone: it names every other live device, and at its
+maturity every device but the regrouper is removed, one added while it
+was open too; the new group is the regrouper's alone, the control log
+restarts under it, and the others pair again from it.
 
-**The recovery kit** [decided, E16; proposed details]:
+**The recovery kit** [decided, E16]:
 - **Two kinds,** either or both, each a recovery entry in the device set
   (never an MLS leaf, since it is never online):
   - **a phrase:** 32 random bytes shown once as 24 words, with the home's
@@ -1390,10 +1384,9 @@ others pair again from it.]
   envelopes, removes every old device, starts a new group as its only
   member (the control log restarts under it), draws a new naming secret
   for new scopes, and **rotates the kit**, since the kit just used may be
-  the one that leaked. A restore may target another home: the same restore
-  at the old agent releases `R2`, and the new group lives at an agent
-  claimed elsewhere. [Slice 9, 2026-11-17, decision 16: a restore is at
-  its own home; to land elsewhere, restore there, then move (§3.9).]
+  the one that leaked. A restore is at its own home; to land elsewhere,
+  restore there, then move (§3.9); restoring straight at another home is
+  not built (`open.md`).
 - **Kit rotation:** a new kit, a new `R`, `R1` sealed to the new kit, the
   old `R2` deleted, and the recovery envelopes re-sealed under the new `R`
   by the device that rotates. Two seasoned active devices make it at once;
@@ -1488,7 +1481,7 @@ where the rules above leave a choice, this is the one taken]:
   removal's signer removed first); the operations read as the last call
   left them.
 - **Not built:** an admin call's arguments naming the control log's head
-  it was made against (the devices' check, plan 8.19).
+  it was made against (`open.md`).
 
 **The kit and its flows as built** [built, `vos_light::kit`, the device
 group and sealed sync, tested against `Personal` in
@@ -1502,7 +1495,7 @@ where the text above leaves a choice, this is the one taken]:
   "vos/personal/kit/signing" ‖ bytes)`, the sealing key the X25519 secret
   `BLAKE2b-256("vos/personal/kit/sealing" ‖ bytes)`; `Homes` indexes the
   agent by `BLAKE2b-256("vos/personal/kit/index" ‖ signing key)`, which
-  8.14's `Homes` keeps. The phrase's card carries the home's handle and
+  `Homes` keeps. The phrase's card carries the home's handle and
   onions beside the words.
 - **`R1` sealed to an entry:** an ephemeral X25519 key, `R1` under
   XChaCha20-Poly1305 with a zero nonce and the key `BLAKE2b-256(
@@ -1547,7 +1540,7 @@ where the text above leaves a choice, this is the one taken]:
   (`DeviceGroup::restore`, the next kit's `R` the kit's) and takes the
   recovered archive in (`DeviceGroup::inherit`): the old group's naming
   secret kept beside its own, so old scopes keep their ids and new ones
-  are named afresh. A restore elsewhere is not built (slice 9).
+  are named afresh. A restore elsewhere is not built (`open.md`).
 - **Liveness:** every device with a voice that reads an open restore
   posts `alive` (`Event::Alive`) until the log cancels it, and shows a
   kit-signed operation for as long as it is open (`Alarm::Kit`); the
@@ -1562,8 +1555,9 @@ recovery entries. Not the labels, not the data.
 
 ### 3.6 Sealed scopes: storage and sync
 
-**An amendment to `core-model.md` §9.4:** a sync scope is either
-**plaintext** (as `core-model.md` §9.4 designs it; not built in slice 8) or **sealed**: its
+**Beside `core-model.md` §9.4's scopes:** a sync scope is either
+**plaintext** (as `core-model.md` §9.4 designs it; not built on nodes,
+`open.md`) or **sealed**: its
 DAG nodes are ciphertext to every node; devices validate and apply; nodes
 store, order and serve envelopes and enforce what they can see (who may
 push, the epoch, quotas). `core-model.md` §9.4's authorization rule runs
@@ -1572,11 +1566,11 @@ key was in the device set (probation, active, or with a removal pending)
 when its envelope was accepted, and within its frontier if later removed.
 
 **The envelopes live in the personal agent's replicated tables, written
-through its log** [decided, §9.1]: durable, and each push checked
+through its log** [decided]: durable, and each push checked
 atomically against the confirmed epoch and the device set. **The API is
 blob-ready:** an envelope's id is its hash, `push` returns its position,
 `since` returns `(position, id, bytes)`, so moving the bytes into a blob
-store later (media) is a node change with no client change (§9.3).
+store later (media) is a node change with no client change (`open.md`).
 
 **An envelope:**
 ```text
@@ -1631,21 +1625,6 @@ at 18.
   channel.
 - Nodes sign nothing a device can show a third party, so detection is not
   proof.
-
-**Checkpoints at the agent's positions** [slice 9, 2026-11-17, decision
-16: not built; a paired or restored device reads each scope from its
-start, and the operators can serve it a shortened scope without an alarm
-then (§8, C4)]:
-- a checkpoint is a scope's state after every envelope up to a position
-  `P` whose causal past is complete, so every device that has read to `P`
-  computes the same state; its author pushes it sealed with `P` and the
-  state's hash inside;
-- **a new device trusts the checkpoint of the device it pairs from:** that
-  device already hands it the archive and `R`, and sends the checkpoint's
-  hash over the pairing channel (§3.8). A restore, with no pairing device,
-  trusts a checkpoint that two devices other than its author acknowledged
-  (each having recomputed it), or replays.
-- Garbage collection of covered envelopes is later work (§9.3).
 
 **Quotas** (per agent, the space's policy, enforced by `Personal`): bytes
 held (8 MiB for a new agent, 64 MiB after its first yearly re-proof, §3.3),
@@ -1728,10 +1707,11 @@ the one taken]:
 - **Tor only:** a `Link` names its `Route`; `SealedSync` refuses a link
   whose route is not the onion, and checks it again before every
   request, so no request to the personal agent leaves over the clearnet
-  [E17]. The onion transport itself is 8.26's.
+  [E17]. The onion transport is §6.2's.
 - **Not built here:** pipelined reads, re-reading an envelope passed
   over once a later archive brings a key that opens it, and garbage
-  collection of covered envelopes and of earlier epochs' archives (§9.3).
+  collection of covered envelopes and of earlier epochs' archives
+  (`open.md`).
 - **Known limits found here:** a scope's reading stops for good at an
   envelope of an epoch whose key never arrives, or of an epoch past any
   confirmed one, which the operators can plant (as they can withhold, B1);
@@ -1795,23 +1775,23 @@ choice, this is the one taken]:
   at its positions, the bytes' hash checked against the id the push was
   answered with, and one gone or replaced raises `Deleted` and its node
   is sealed and pushed again.
-- **Checkpoints** are not built (slice 9, decision 16): every device reads
-  each scope from its start, the author of each node checked and each
-  writer's `seen` positions kept, so a scope served short of where a
-  writer had read it raises `Partition` once an envelope crosses it, never
-  at a pairing or a restore by itself.
-  `Personal`'s `acknowledge` and `acknowledgements` and their table stay
-  built, with no device calling them, for slice 9's checkpoints.
+- **Checkpoints** are not built (`open.md`): every device reads each
+  scope from its start, the author of each node checked and each writer's
+  `seen` positions kept, so a scope served short of where a writer had
+  read it raises `Partition` once an envelope crosses it, never at a
+  pairing or a restore by itself. `Personal`'s `acknowledge` and
+  `acknowledgements` and their table are built, with no device calling
+  them, for the checkpoints.
 - **Known limits:** the frontier and the device set a restore reads are
   the agent's word (B8); a device that cannot follow takes the devices
   added meanwhile by the agent's word (§3.4), and their nodes as authored;
   a consistent partition is caught only once an envelope crosses it (a
   `seen` position, a view); the rows by position and the chain rows grow
-  until garbage collection (§9.3). The callers of `made`, `head` and
-  `audit` are the background job's (8.22) and pairing's (8.23a); the
-  model test drives them.
+  until garbage collection (`open.md`). The callers of `made`, `head` and
+  `audit` are the background job's and pairing's; the model test drives
+  them.
 
-**PG6's catch-up on the clearnet** [measured, x86-64 Core Ultra 7 155H,
+**PG6's catch-up on the clearnet** (§2.4) [measured, x86-64 Core Ultra 7 155H,
 load average 5–11, release, 2026-11-06; `node/host/tests/ingress/sealed.rs`
 with `VOS_CATCH_UP_ROUNDS=5`: two light nodes in one device group at
 `Personal` on a node, every request through the node's socket with the
@@ -1830,7 +1810,7 @@ numbers wait for the phone session (`tools/phone/scripts/sync.sh`).
 **Over Tor** the reads, not the device, set the time: at §6.3's measured
 0.15 MB/s and 0.55 s a round trip, the 1.48 MB of small envelopes take
 about 10 s to arrive and their 26 sequential pages about 14 s of round
-trips, past the limit. The levers, before S8-P6: `since` pages asked
+trips, past the limit. The levers: `since` pages asked
 ahead (positions are dense, so a device can pipeline the next pages'
 requests), and several operations a node, which cuts the framing and the
 envelope count (a push of 1,049 envelopes 16 a round trip is 66 round
@@ -1842,8 +1822,8 @@ cursor, applies, and raises a local notification when an operation is
 pending. Android runs it late or not at all in the "rare" and "restricted"
 standby buckets, after a force-stop until the app is opened, and under some
 OEMs' battery managers; the chrome shows each device's last sync and
-recommends the battery-optimization exemption, and PG6 measures these
-cases before the device-change windows are pinned (§8, D5).
+recommends the battery-optimization exemption, and PG6 records these
+cases, which the device-change windows are pinned against (§2.4; §8, D5).
 
 **The background job as built** [built, `vos_light::job` and the
 facility's `node/light/android/src/job.rs` with its WorkManager worker in
@@ -1872,13 +1852,12 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   the agent's word, unsigned (B6), so nothing is dropped: the operators
   could say it of a live device, and a later pass the agent serves again
   follows on. `Removed` (a removal due, not yet settled, which what falls
-  due before it may still cancel) turns no device away. [Open, owner: a
-  removed device could reach `Out` on the signed log were the agent to
-  serve it the log up to its removal's entry.] A post the agent refuses as held already (`Voted`,
+  due before it may still cancel) turns no device away (a removed
+  device's course on the signed log: `open.md`). A post the agent refuses as held already (`Voted`,
   `Evidenced`) or as decided meanwhile (`NoCandidate`, `NotConfirming`) is
   done, the log read on; a page withheld is read again once. A pass that
   stops on an error hands back what it found (`Stopped`), its alarms with
-  it. `made` stays the caller of an admin call's (the chrome's, 8.24).
+  it. `made` stays the caller of an admin call's (the chrome's).
 - **What it leaves** (`Pass`, `Pass::notices`): each verified open
   operation of the device set with the batch time the log took it when
   this pass read it (what a notification's latency is measured from); a
@@ -1906,15 +1885,15 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   before and after each of its requests (a push that had something to
   do, a scope to read), restarts the phone from its store and runs the
   next pass: the phones converge and the agent holds each node once.
-- **s4's job**: WorkManager's periodic job (15 minutes, a network up) in
-  `:vos` alone (`setDefaultProcessName`, every WorkManager component
+- **s4's jobs**: WorkManager's periodic jobs (15 minutes, a network up)
+  in `:vos` alone (`setDefaultProcessName`, every WorkManager component
   declared in `:vos`, its start-up initializer dropped from the UI
-  process), scheduled when the facility opens. A run reads each
-  enrollment's tree from its feed if due, then the personal space's
-  pass once the device holds one (`job::Personal`; the claim's and
-  pairing's facility operations attach it, 8.24); every connection is a
-  stream of the facility's one dialer, counted (TCP today, arti's stream
-  with s4's Tor wiring: the same seam). Each run is kept (the latest 64),
+  process), scheduled when the facility opens, two parts each on its own
+  schedule (`job::Part`): each enrollment's tree read from its feed if
+  due, and the personal space's pass once the device holds one
+  (`job::Personal`; the claim's and pairing's facility operations attach
+  it); every connection is a stream of the facility's Tor client,
+  counted (§7.3). Each run is kept (the latest 64),
   written as started before anything is sent and as finished after, each
   write whole or not at all, so a run its process's death cut short shows
   as never finished; the device's last sync is the latest finished run.
@@ -1939,26 +1918,21 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   2026-11-08; again 2026-11-17]: a pass with nothing new on a paired
   phone, 6 requests and 372 bytes of the agent's answers (the log's head,
   the overview, the scope's and the archive's empty pages, the device
-  set; 7 and 376 with the checkpoints' page, gone with decision 16),
-  no call and so no session; s4's run with nothing new, one enrollment at a
+  set), no call and so no session; s4's run with nothing new, one enrollment at a
   stand-in gateway, 2 SSH connections (the time, the root), 5.2 KB down
   and 5.6 KB up, 25 ms. The phones' numbers (PG6's 30 s and 1 MB, the
   recorded cases) wait for the phone session.
-- **Not built:** the personal agent's link over arti (s4's Tor wiring),
-  which `job::Personal` takes as it is (its pass is given the facility's
-  runtime to drive the link on); until then a phone's pass reads only its
-  enrollments, since the agent takes nothing off the clearnet (E17). When
-  it lands, the personal pass moves to its own periodic job and its own
-  isolation group (§3.4: the agent's traffic on its own background
-  schedule), so the agent's circuits and timing do not ride with every
-  space's root polls; today one run does both, over one dialer.
+- **Two jobs over Tor:** the personal pass runs in its own periodic job
+  and its own isolation group (`Purpose::Background`, §3.10: the agent's
+  traffic on its own background schedule), so the agent's circuits and
+  timing do not ride with every space's root polls.
 
 ### 3.7 The inbox
 
 A table in `Personal`, keyed by `(expiry, id)`; **expiry is lazy** (reads
 skip expired items, each write deletes a few; no timer).
-- **Writers** in slice 8: the user's devices and a pairing slot's holder.
-  Others' messages wait for messaging (slice 9).
+- **Writers:** the user's devices and a pairing slot's holder. Others'
+  messages wait for messaging (`open.md`).
 - **Readers:** the user's devices by their sync keys; a slot by its two
   parties.
 - Items are sealed to the device group or a slot's key; bounds: 64 items,
@@ -1990,8 +1964,7 @@ skip expired items, each write deletes a few; no timer).
    has seen whom it pairs.
 4. **Over the Noise channel,** B sends its public keys, the admin key's
    attestation and its KeyPackage; A sends the key archive, the naming
-   secret, `R`, and its newest checkpoint's hash per scope (slice 9,
-   decision 16).
+   secret and `R`.
 5. **A adds B in one admin call, on one prompt:** for a strong admin an
    add is immediate, so the add and its commit are one call,
    `commit(epoch, add(B's keys, B's "home" nullifier), handshake,
@@ -2000,9 +1973,8 @@ skip expired items, each write deletes a few; no timer).
    evidence call. B is in probation, and reads and writes at once through
    the archive. A delayed admin's add is an operation first and its
    commit, after the 72 h, a second call.
-6. **B joins:** fetches each scope's checkpoint (A's, by the hash it was
-   given) and the envelopes after it. [As built, 2026-11-17, decision 16:
-   it reads each scope from its start.]
+6. **B joins:** it reads each scope from its start (checkpoints:
+   `open.md`).
 
 **Memberships elsewhere** (E2: each device has its own secrets):
 - **in every space other than the home, at once,** on the pairing's own
@@ -2015,10 +1987,9 @@ skip expired items, each write deletes a few; no timer).
   member digest, so its owner digest acts for the person (B's prompt a
   space, on its own device). Those
   registrars never see the personal agent, so there is nothing to blur;
-- **in a home-only space,** B makes its own open claim (§3.3), in the
-  background after pairing: no enrollment by A, no link, and no wait on
-  the pairing's path [slice 9, E28, 2026-11-17, decision 16: B makes
-  none, and holds no leaf at a home-only home];
+- **in a home-only space,** B makes no open claim and holds no leaf
+  there (E28's joiner's claim, after a drawn delay from its add, is not
+  built, `open.md`);
 - **in a home that is the user's own space,** the user chooses "now" (the
   default, since §3.10 already concedes the link there) or "at my next
   sign-in".
@@ -2037,10 +2008,10 @@ skip expired items, each write deletes a few; no timer).
   the record does, so the device that enrolls or revokes another names it
   from the book. The gate: `node/host/tests/served/credentialed.rs`'s
   `a_second_device_is_enrolled_and_revoked_by_its_first_devices_proof`.
-- **`once` scopes** admit one nullifier per device in slice 8 [decided,
-  §9.1]: a member with three devices can vote three times where a space
-  uses `once`, which the space's chrome states. A ring of person leaves is
-  later work (§9.3).
+- **`once` scopes** admit one nullifier per device [decided]: a member
+  with three devices can vote three times where a space uses `once`,
+  which the space's chrome states. A ring of person leaves is later work
+  (`open.md`).
 - **A person's enrollments are counted** [decided, built]: a device
   revoked and another enrolled is a fresh leaf, so a fresh nullifier in
   every scope, and the limit alone bounds the devices held, not the
@@ -2145,7 +2116,7 @@ one taken]:
   The registrar registers a person's first device (`register`) as it
   enrols the member, its own call; the light node calls none of the
   registrar's role methods.
-- **The joiner's open claim** is not built (slice 9, E28, decision 16):
+- **The joiner's open claim** is not built (E28, `open.md`):
   only the claiming device makes one (`home::open_claim`, its own work, as
   its claim's membership); a joiner records its "home" nullifier at its
   add, computed with no proof, and holds no leaf at a home-only home, so
@@ -2156,36 +2127,32 @@ one taken]:
   devices as §3.5's rules time it, carried by the next commit; the old
   phone, relayed the log, sees `Event::Removed`, which is where the app
   offers to wipe it; its leaves revoked in each space its handles name.
-- **The yearly prompt** is not built (slice 9, E15, decision 16): no
-  device proves `renew`, so the lease runs 13 months from the claim
-  (`open.md`); "Commit now" renews the device's leaf.
+- **The yearly prompt** is not built (E15, `open.md`): no device proves
+  `renew`, so the lease runs 13 months from the claim; "Commit now"
+  renews the device's leaf.
 
 ### 3.9 Home spaces: several, and moving home
 
 **Several homes** [decided, E8: allowed, one built]. Exactly one home
 orders the group; a second home mirroring the first, and a live handover,
-are later work (§9.3).
+are later work (`open.md`).
 
 **Moving home** (the home vanishes, turns hostile, its lease lapses, or
 the user wants out): devices are full replicas, so nothing is lost but the
 agent. A device claims an agent in another home, creates a new group,
-re-splits the kit (a new `R2` at the new agent) and pushes everything,
-including recovery envelopes; the other devices pair again by QR.
-[Amended 2026-11-17, decision 16: it pushes only what it writes again,
-the books (below).] Until
-the move completes, the kit opens nothing at the new home. The old
+re-splits the kit (a new `R2` at the new agent) and writes the books
+again there (below); the other devices pair again by QR. Until the move completes, the kit opens nothing
+at the new home. The old
 operators keep what they held; deletion there cannot be verified.
 
 **Moving home as built** [built, `node/light/android`'s `move_home`;
-host-tested in its `tests/personal.rs` and `crashes.rs`; amended
-2026-11-17, decision 16: nothing is carried, and `vos_light::moving`,
-`SealedSync::carry`, `NewDevice::carried` and the move's notice are gone;
-where the text above leaves a choice, this is the one taken]:
+host-tested in its `tests/personal.rs` and `crashes.rs`; nothing is
+carried; where the text above leaves a choice, this is the one taken]:
 - **Valid only while the personal space holds the credential book and the
   device book alone** (§3.1), which every device writes again from what it
   holds: a move drops the scopes' history at the old home. A local actor
-  whose rows no device writes again (the wallet's, slice 9) needs the
-  carry back before it is installed in the personal space.
+  whose rows no device writes again (a wallet's) needs the carry back
+  before it is installed in the personal space (`open.md`).
 - **Leave, claim, pair again:** the mover checks that the new home's
   `Homes` has an agent to give (`pooled`), leaves its personal space with
   no call to the old home (`Space::leave`, §7.3: the light node's store
@@ -2204,7 +2171,7 @@ where the text above leaves a choice, this is the one taken]:
   envelopes and the old kit's entries. The moved devices are never
   removed there. Its lease lapses 13 months after its claim, then refuses
   pushes and serves reads and a restore for the 180 days' grace
-  (B14); reaping is later work. An old kit kept across the move still
+  (B14); reaping is later work (`open.md`). An old kit kept across the move still
   restores there, and reads the history to the move.
 - *Known limits:* each scope's id and a reused kit's index at `Homes` are
   the same at both homes, so the two homes' operators together link the
@@ -2247,52 +2214,22 @@ survive.
 - no push-notification token (FCM, APNs) is given to any space; devices
   poll, and raise local notifications.
 
-**Messaging later** (slice 9) builds on `vos-mls` [E12]. MLS virtual
-clients share a virtual leaf's signature and HPKE keys across the user's
-devices, a secret that syncs, against E2's letter: slice 9 asks the owner
-first.
-
 ## 4. One proving path
 
-### 4.1 What is retired
+### 4.1 Why one path
 
-The credential AIR, format 44 [built, `proving.md` §8], proves auth, owner
-and the joint statement in 0.16–0.18 s on the Fairphone 6 [measured, `proving.md` §8]
-with proofs of about 0.2 MB, verified in about 2.0 ms [measured,
-`node/SECURITY.md`]. It is a hand-written circuit over the recursion AIR's
-`p2` and `qm31`: every statement change is a circuit change, a re-pin and
-a new fixture. It is retired, and every device statement becomes a device
-kernel [built: the credential AIR and format 44 deleted, the stock
-kernels proving auth and owner].
-
-**Deleted** (at `543c05e07`, about 3,200 lines and one wire enum's arms):
-- `pvm/proof/recair/src/credential/` (`mod.rs`, `circuit.rs`: 609 lines);
-- `pvm/proof/recair-air/src/credential.rs` and `masked/credential.rs`
-  (256 lines);
-- `pvm/proof/final-verifier/src/credential.rs` (352 lines) and the
-  `credential-bytes` feature;
-- `pvm/proof/recair/tests/credential/` (1,331 lines) and the examples
-  `credential_timing`, `credential_stress`, `credential_ingress` (525
-  lines);
-- the fuzz target `credential_verify_bytes`;
-- in `vos-device`: `prove_auth`, `prove_owner`,
-  `prove_membership_and_payment`, `verify`, `verify_joint`,
-  `CredentialProof`'s format-44 path, `PEAK_BYTES`' credential figure
-  (`prove_auth` and `prove_owner` are the stock kernels' now);
-- in the node: ingress's format-44 branch and its constants;
-  `vos_pvm_proof::format::CREDENTIAL_PROOF` (44 leaves the registry; the
-  numbering itself is reset before the first release, `open.md`,
-  "Repository");
-- the phone bench's credential cases (`tools/phone`), PG1's gate.
-
-**Not deleted:** the recursion AIR's `p2` and `qm31` (the folds and the
+The credential AIR, format 44, proved auth, owner and the joint statement
+in 0.16–0.18 s on the Fairphone 6, with proofs of about 0.2 MB verified in
+about 2.0 ms [measured, as `proving.md` §8 and `node/SECURITY.md`
+recorded it before the format's deletion]. It was a hand-written circuit
+over the recursion AIR's `p2` and `qm31`: every statement change a circuit
+change, a re-pin and a new fixture. It is retired [decided, E1], and every
+device statement is a device kernel [built: the stock kernels prove auth
+and owner]. Kept: the recursion AIR's `p2` and `qm31` (the folds and the
 wrap use them); the Poseidon2-M31 compression, `0x402` and its chip; the
 credential actor and its tree; `H_io`; the device format and its chips.
-
-**No crate disappears by retiring 44 alone.** The crates go with §7.1's
-consolidation: `vos-device` folds into `vos-light`, and the light node
-links the zkVM and its masking without the recursion's leaves, folds and
-wrap (§9.1).
+The light node links the zkVM and its masking without the recursion's
+leaves, folds and wrap (§7.1).
 
 ### 4.2 Every device statement a kernel in an actor
 
@@ -2300,7 +2237,7 @@ Sign-in, ownership and spending are `#[attestable(device)]` methods,
 each a short Rust function in the actor whose state it concerns:
 - **auth** and **owner** in the credential actor (`vos-credentials`), the
   stock kernels every space gets with it;
-- **spend** and **join** in the payments actor (§5; slice 9, E13);
+- **spend** and **join** in the payments actor, with P2 (`open.md`, E13);
 - any actor's own, under the same rules.
 
 ```rust
@@ -2346,23 +2283,19 @@ writes (the `sdk-device` test actor's `auth` and `owner`):
   and `Path::root` over `0x402`, written once, lean (the lane walk with
   selects, no branch on the slot's bits, a digest's equality by every word
   without an early exit), and shared by every kernel and by cipher-clerk
-  through its hash trait (§5.3). Its unaligned word accesses
-  (`load_u64`, `store_u64`, for a public argument appended to the
-  device's return) are inline assembly until the target change below;
-- **word loads from the compiler:** the guest target built with LLVM's
-  `unaligned-scalar-mem` feature, so an unaligned `u64` load is one `ld`
-  (the PVM serves unaligned accesses; today the target's own unaligned
-  reads go byte by byte, which is why the SDK uses assembly), measured on
-  a side branch kept apart from the re-pin (below). A target change rebuilds
-  every guest ELF (`pvm/guest/riscv64em-vos.json`), so every pinned blob
-  and program id moves: it lands with M2's re-pin (plan 8.10), and with it
-  the SDK's assembly becomes plain `read_unaligned`/`write_unaligned`;
+  through its hash trait (`open.md`, "Private payments"). Its unaligned
+  word accesses (`load_u64`, `store_u64`, for a public argument appended
+  to the device's return) are plain `read_unaligned`/`write_unaligned`;
+- **word loads from the compiler:** the guest target is built with LLVM's
+  `unaligned-scalar-mem` feature (`pvm/guest/riscv64em-vos.json`), so an
+  unaligned `u64` load is one `ld` (the PVM serves unaligned accesses;
+  without the feature the target's unaligned reads go byte by byte);
 - **the gate** (`device_kernel::sdk_form_kernels_run_within_the_lean_kernels_steps`):
   the SDK-form kernels within 1.15× the hand-lean kernels' steps. **Met**
   [measured, step counts of the traced run on the host, Intel Core Ultra 7
   155H, 2026-11-02]:
 
-| kernel | today's target | with `unaligned-scalar-mem` | and the SDK's words as plain accesses |
+| kernel | the target before the feature | with `unaligned-scalar-mem` | and the SDK's words as plain accesses |
 |---|---|---|---|
 | auth by hand (`device`) | 1,722 | 1,635 | 1,624 |
 | auth in SDK form | 1,839 (×1.068) | 1,770 (×1.083) | 1,710 (×1.053) |
@@ -2376,8 +2309,8 @@ writes (the `sdk-device` test actor's `auth` and `owner`):
   in-place checks and the digests copied once more into each call's block
   where the hand-lean kernel computes into the lane. With the target
   feature and the SDK's plain accesses, the SDK-form auth (1,710) runs
-  under today's hand-lean kernel on today's target (1,722). So **the
-  SDK-form kernels are the stock ones** (Q7), and the hand-lean kernels
+  under the hand-lean kernel on the target before the feature (1,722). So **the
+  SDK-form kernels are the stock ones**, and the hand-lean kernels
   stay as the test actors' references; the fallback (the hand-lean
   kernels shipped as stock, the assembly kept inside `vos_sdk::p2`) is not
   taken.
@@ -2385,7 +2318,7 @@ writes (the `sdk-device` test actor's `auth` and `owner`):
   the host, Intel Core Ultra 7 155H, 2026-11-03]: a crate with several
   device kernels, or a kernel and its reference entry, called
   one outlined `DeviceReturn` end and its part writers. With them
-  `#[inline(always)]`, on today's target, the SDK-form auth takes 1,546
+  `#[inline(always)]`, on the target before the feature, the SDK-form auth takes 1,546
   steps (from 1,839) and owner 385 (from 708, `owner_lean` 383); the
   hand-lean auth stays at 1,722. The programs shrink with them: the SDK
   form's auth at the hand-lean one's sizes but one chip a size smaller
@@ -2401,10 +2334,8 @@ writes (the `sdk-device` test actor's `auth` and `owner`):
   for the pinned program ids, which move as expected, and one timing test
   that passes alone; the proof crate's kernel tests pass through the
   device kernels, the balance kernel and the fixtures, the pinned
-  constants again failing as expected (the chain-proving tests, run one
-  process for all past the 12 GiB cap, are left to 8.10's gate). The
-  step counts above come from it. Not built with it: the final verifier's
-  and the statements service's guests.
+  constants again failing as expected. The step counts above come from
+  it.
 
 ### 4.3 What the node checks at ingress
 
@@ -2421,7 +2352,7 @@ picked the circuit; a proven call carries the kernel's claim:
   device kernel of this actor, or `#[msg(proven = owner)]`, the
   credential actor's. `#[msg(credential = Auth("login"))]` and
   `#[msg(credential = Owner)]` stay as the SDK's sugar for the stock
-  kernels, so purses-style code reads as today. The stock auth kernel is
+  kernels, so purses-style code reads as it did. The stock auth kernel is
   named through `credential = Auth("name")` alone, since its scope needs
   the guard's name: `proven = auth` is refused, naming that form, unless
   the actor has its own kernel `auth`, whose name comes first [built].
@@ -2440,16 +2371,16 @@ picked the circuit; a proven call carries the kernel's claim:
     auth's claim field); owner's none (the handler compares `ctx.owner()`
     with the live row). Their refusal codes are kept;
   - **an actor's own kernel's run at apply only,** in its handler (the
-    pool's anchor in its ring and its nullifiers unseen, §5.5). There is
+    pool's anchor in its ring and its nullifiers unseen, `open.md`'s
+    P2). There is
     no pre-check at ingress: that would need a host-to-guest entry point
     run on an executor before the verification slot, a new cost an
     attacker chooses. A proof for a spent nullifier therefore costs a
     verification, bounded like any other by the PoW and the budget;
   - `once` is defined for auth's guard alone.
 - **The origin** a proven call logs: `Anonymous { scope, nullifier }` for
-  auth, `Owner(digest)` for owner (both as today), and a new
-  `Kernel { program }` for any other kernel (codec index 7: `Principal`
-  ends at 4 today, `Identity` 5 and `Jam` 6 reserved; not "Proven", which
+  auth, `Owner(digest)` for owner, and `Kernel { program }` for any other
+  kernel (codec index 7; `Identity` 5 and `Jam` 6 reserved; not "Proven", which
   `Input::Proven`, index 9, already names). **The log carries the claim:**
   `Input::Credentialed` (index 10) takes the claim's bytes, capped (1 KiB,
   a spend's about 240), in place of auth's `root`, since apply's freshness
@@ -2459,7 +2390,7 @@ picked the circuit; a proven call carries the kernel's claim:
   about 11.7 ms on one quiet x86 core [measured, `node/SECURITY.md`],
   about six times a format-44 proof's 2.0 ms. **Profiled** [measured,
   Intel Core Ultra 7 155H, one thread, load average 7–21, 2026-11-06;
-  `cargo run --release -p vos-phone --example device_ingress`]: the
+  `cargo run --release -p vos-phone --example verify_cost`]: the
   verifier's setup, the program's masked format and layout computed per
   proof, took 6.6 ms, and the canonical decode 4.2 ms, of which the
   re-encoding 2.5 ms; a wrong interaction PoW was refused after both. So
@@ -2521,8 +2452,8 @@ format, the chips, the sizes and the root.
   sizes [built].
 - **Computed at release, on the phone never** [built: the release build
   and the device's side; the facility embeds them from this tree's
-  guests (`just facility-release`, held by its `tests/release.rs`), plan
-  8.24b]: the release build computes each device kernel's program
+  guests (`just facility-release`, held by its `tests/release.rs`)]: the
+  release build computes each device kernel's program
   from the package's ELF as a node's install does
   (`vos_light::release::devices`), the stock kernels' among them, and the
   app embeds the artifacts (`release::Release`, `vos_pvm_device::Release`: the kernel, its chips and
@@ -2534,17 +2465,17 @@ format, the chips, the sizes and the root.
   space taking the same release artifact, the ELF, by its hash: the
   space's window names the ids the app's artifacts name (the window
   test checks it; the guest blobs are path-independent, `blobs.lock`).
-- **Which kernels see a secret** [proposed, the slice-8 rule]: the light
-  node puts a member secret (and, in slice 9, a spending key) only into
-  kernels it ships, whose programs it embeds: the stock `auth` and
-  `owner` (and in slice 9 the pool's `spend` and `join`, from its own
-  build of cipher-clerk's `shielded::check`, §5.4). It proves one of them
+- **Which kernels see a secret** [built]: the light node puts a member
+  secret (and, with P2, a spending key) only into kernels it ships, whose
+  programs it embeds: the stock `auth` and `owner` (and with P2 the pool's
+  `spend` and `join`, from its own build of cipher-clerk's
+  `shielded::check`, `open.md`). It proves one of them
   only under a program id its compatibility window admits (below). A
   kernel whose bytes a space serves may take only the user's public data:
   otherwise a space could install a kernel whose public claim is the
-  secret itself (§8, G2). So in slice 8 a developer's own device kernel
-  proves over public data and over data the user explicitly hands it,
-  never over keys; a consent model per program id is later work (§9.3).
+  secret itself (§8, G2). So a developer's own device kernel proves over
+  public data and over data the user explicitly hands it, never over
+  keys; a consent model per program id is later work (`open.md`).
 - **Compatibility windows** [built]: so that an app release and a
   space's upgrade need not land on the same day, each guard naming a
   device kernel (the stock kernels' among them) admits a **window** of
@@ -2597,7 +2528,7 @@ format, the chips, the sizes and the root.
     must update. An app ships its release's artifacts, one per kernel
     (the facility's `release/`) [built]; shipping the previous release's
     beside them, so an app outlives a space's move to the next one, is
-    [proposed].
+    not built (`open.md`).
   - **One claim per window:** two versions in one window must compute
     identical claims (auth's nullifier, owner's digest) with identical
     meaning, so a `once` scope admits a member once whichever version
@@ -2626,344 +2557,77 @@ format, the chips, the sizes and the root.
   proofs are not folded, `proving.md` §11, "Device proofs are not
   folded").
 
-**The cost** (the Fairphone 6, automatic threads):
-
-| statement | today, format 44 | today, format 46 | with the per-program CPU | and word-level memory |
-|---|---|---|---|---|
-| sign-in (auth) | 164–170 ms [measured] | 581–645 ms, 0.88–0.98 MB [measured, `proving.md` §8] | about 554 ms [model] | about 450 ms [model] |
-| ownership (owner) | 161–179 ms [measured] | 0.30–0.40 s [est]: every chip at its 2^10 floor, the CPU half auth's | 0.27–0.36 s [est] | 0.25–0.33 s [est] |
-| spend, 1 in 2 out | none | 0.9–1.3 s [est] (§5.7) | 0.8–1.1 s [est] | 0.7–0.95 s [est] |
-
-The levers' cells on the stock kernels, both built as candidates
-(`proving.md` §8): the per-program CPU −9.5% (auth) and −7.8% (owner),
-word-level memory −19.3% and −7.3%, the two together −28.8% and −15.1%,
-against the model's −8.8%, −17% and −26% for auth; peak −45% and −35%
-together [measured, x86 dev machine, 2026-11-09]. The phone's times are
-the next run's.
-
-- **The price of one path:** sign-in costs about 3.5× today's credential
-  proof in time and 4.5× in bytes, payment authorization about 2× in time.
-  Within the owner's requirement (`proving.md` §1: under a second on a
-  2023-or-later phone), not within PG1's 250 ms, which retires with format
-  44. Between format 44's retirement (M1, E1) and the levers (M2),
-  sign-in proves at 0.58–0.65 s.
-- **The levers are the next device format** [decided: the
-  per-program CPU and word-level memory are the next device format's]: both change
-  the AIR, so they land together as one device format (47), with one
-  re-pin of the device programs. The model's 450 ms scales a 607 ms run;
-  from the 645 ms gate run it is about 478 ms, so 0.5 s would leave a 4%
-  margin. The plan's gate is therefore **0.65 s, with 0.55 s the target:**
-  format 47 ships at what it measures under the gate, and if it misses,
-  M2 holds and the 4-way CPU split by opcode family (`open.md`, "Proving")
-  is the next lever.
-- **Not the node's segment format in slice 8:** a new segment format
-  means a new leaf, new folds and a new wrap, and new venue and
-  `MANIFEST` pins, far more than a re-pin. The per-program CPU for node
-  segments is a later step of its own.
-
-### 4.5 What the formats become
-
-| format | today | after slice 8 |
-|---|---|---|
-| 39 (final, masked wrap), 41 (node segments) | admitted | kept as they are |
-| 44 (credential) | admitted at ingress | retired |
-| 46 (device) | admitted for auth's statement | retired and deleted; superseded by 47 |
-| 47 (device, per-program CPU, word-level memory) | none | the device format |
-
+**The cost.** Format 47 holds both levers, the per-program CPU and
+word-level memory [decided]: both change the AIR, so they came as one
+device format, with one re-pin of the device programs. Their cells on the
+stock kernels, each measured as a candidate first (`proving.md` §8): the
+per-program CPU −9.5% (auth) and −7.8% (owner), word-level memory −19.3%
+and −7.3%, the two together −28.8% and −15.1%, against the model's −8.8%,
+−17% and −26% for auth; peak −45% and −35% together [measured, x86 dev
+machine, 2026-11-09]. The Fairphone 6's figures at 47 are not yet
+measured (`open.md`, "The phone gates not yet recorded as passed"); the
+Pixel 1's are `proving.md` §8's. PG2′'s gate is 0.65 s with 0.55 s the
+target (§2.4), against format 46's 581–645 ms for a sign-in [measured,
+`proving.md` §8]: the model's 450 ms with both levers scales a 607 ms run,
+and from the 645 ms gate run it is about 478 ms, so 0.5 s would leave a
+4% margin.
+- **The price of one path:** a sign-in costs about 3.5× the retired
+  credential proof in time and 4.5× in bytes, payment authorization about
+  2× in time; within the owner's requirement (`proving.md` §1: under a
+  second on a 2023-or-later phone).
+- **Not the node's segment format:** a new segment format means a new
+  leaf, new folds and a new wrap, and new venue and `MANIFEST` pins, far
+  more than a re-pin. The per-program CPU for node segments is later work
+  (`open.md`, "Proving").
 
 ## 5. Payments as the showcase
 
-P1 is built in slice 8 on cipher-clerk v0.3.0's L0 kernel, which it
-needs as it is; P2 and cipher-clerk v0.4 (§5.3), which only P2 needs, are
-designed here and built in slice 9 on the finished personal space and Tor
-[decided, E13].
+Payments show how far plain attestable Rust carries a system feature: a
+short actor on cipher-clerk (VOS pins its tag `v0.3.0`), whose
+authorization is the stock `owner` kernel proved on the phone. P1, the
+pseudonymous ledger, is built on cipher-clerk v0.3.0's L0 kernel, which it
+needs as it is; P2, the shielded pool and the wallet, and cipher-clerk
+v0.4, which only P2 needs, are designed in `open.md`, "Private payments
+(P2)" [decided, E13, E18].
 
 ### 5.1 The shape
 
-Two actors and one library:
-- **`Payments`**, a public actor in the space: cipher-clerk's double-entry
-  ledger (transparent accounts held by owner digests) beside a shielded
-  pool (note commitments, nullifiers, encrypted notes). It never sees a
-  note's value or owner.
-- **`Wallet`**, a local actor in the user's personal space (§3): the notes
-  the user's devices hold and the nullifiers they have spent, each note
-  marked with the device whose key spends it (E2), synced across the
-  devices through the personal space.
-  It plans spends; the light node builds and proves them with the
-  device's key, which never enters the actor's state.
-- **cipher-clerk**, redesigned (§5.3): the ledger kernel, and a shielded
-  module whose spend rule is one `no_std` Rust function, the same function
-  the device kernel runs and the reference implementation checks.
+**P1, pseudonymous:** `Payments` is cipher-clerk's
+L0 kernel in an actor, its user accounts held by `Owner` digests,
+`transfer` under `#[msg(credential = Owner)]` proved by the stock
+`owner` kernel. It replaces the `purses` test actor (a hand-rolled
+ledger) with cipher-clerk's, and keeps today's privacy: a public payer,
+amounts and payees in clear to the operators, custodial `rekey`.
+Accounts are per owner digest, so per device (E2): a payment comes from
+one device's account, and moving funds between one's devices is a
+transfer the operators see linking the two (§8, L4).
 
-**The spend is the showcase:** the kernel the phone proves is
-`cipher_clerk::shielded::check` called from a five-line method. There is no
-circuit: the rules (owner binding, nullifier derivation, membership,
-Faerie Gold, value balance with 64-bit range checks as `checked_add`) are
-ordinary Rust, and "the reference check is bit-identical with the
-circuit" (cipher-clerk's Phase 3 entry criterion 11) holds by construction.
+### 5.2 P1 as built
 
-### 5.2 Staged: pseudonymous first, then notes
-
-1. **P1, pseudonymous** [slice 8, M1]: `Payments` is cipher-clerk's
-   L0 kernel in an actor, its user accounts held by `Owner` digests,
-   `transfer` under `#[msg(credential = Owner)]` proved by the stock
-   `owner` kernel. It replaces the `purses` test actor (a hand-rolled
-   ledger) with cipher-clerk's, and keeps today's privacy: a public payer,
-   amounts and payees in clear to the operators, custodial `rekey`.
-   Accounts are per owner digest, so per device (E2): a payment comes from
-   one device's account, and moving funds between one's devices is a
-   transfer the operators see linking the two (§8, L4).
-   [built, `agent/payments`]: one journal and currency; each account
-   named (its handle for a payee, kept in its row's `user_data`) and held
-   by one owner digest, opened by an operator's invitation of the name and
-   the digest; `transfer(to, amount)` pays from the account of the digest
-   the proof states, so a payment names no payer; `mint` credits from the
-   space's issuance (a debit-normal account whose owner, like the
-   journal's registrar, is a non-canonical digest no proof states);
-   `rekey` moves an account to a new digest and lifts a `freeze`; a
-   payment to oneself or of nothing is refused; a device reads its own
-   account by its digest (`held`), and an account's digest and balance are
-   readable by the agent's callers, as the log's readers see them. The
-   facility proves with the stock kernels' release artifacts it
-   embeds, never a kernel a server sends (G2), so the s4 demo signs in by
-   the stock `auth` kernel alone.
-2. **P2, private** [slice 9, E13]: the shielded pool and the
-   wallet. Payer, payee and amount hidden from the operators and every
-   other member inside the pool; deposits into and withdrawals from the
-   pool visible as transparent legs.
-
-### 5.3 cipher-clerk, redesigned
-
-cipher-clerk (`~/src/virto/cipher-clerk`; VOS pins tag `v0.3.0`, the
-merge commit `b841640`, `Cargo.toml:239`, and uses its codec, `Account`, `Layer`,
-`Value` and `settlement::window` in the `accounts` and `window` test
-actors) has a sound transparent kernel (its tests are most of the 315 the
-workspace runs with every feature; about 114 are the privacy modules') and a notes
-prototype that is not for value (`STATUS.md`): Pedersen commitments on
-Ristretto, a BLAKE2b nullifier, a pool that rebuilds its tree on every
-insert (F21), no spend proof, and a `pvm-precompile` feature that routes
-scalar multiplication to a Ristretto chip VOS removed as unsound
-(`core-model.md` §11.2), pinned by a git dependency on VOS at
-`9f5337fb`. Its own Phase 3 entry criteria (`docs/viability-plan.md`)
-name what a private tier must settle; this design answers them.
-
-**What changes, released as v0.4.0 (breaking) in slice 9, with P2, from cipher-clerk's own
-repository:**
-
-| # | change | why | Phase 3 item |
-|---|---|---|---|
-| R1 | **One hash, Poseidon2-M31's compression `C`**, behind a trait `Compress { fn compress(l: &Digest, r: &Digest) -> Digest }`; cipher-clerk ships no permutation; VOS's SDK implements it over `0x402` in a kernel and natively on hosts; cipher-clerk's tests take golden vectors from VOS | the zkVM proves `0x402` in one chip row and BLAKE2b or a curve not at all cheaply; one hash keeps device shapes free of BLAKE2b (`proving.md` §8, `H_io`) | 8 |
-| R2 | **Hash commitments, not Pedersen**: `cm = C(C(T(note), [asset, v₀, v₁, v₂, 0…]), C(rho, C(owner, r)))`, value in three 24-bit words; `r` a 248-bit blinding the caller passes (randomness as a parameter, v0.3.0's rule kept). The order lets a pool compute a deposit's `cm` from a public amount, a protocol `rho` and the depositor's `C(owner, r)` (§5.4) | the spend proof checks the balance in Rust, so no homomorphism is needed; no curve in the kernel | 4 |
-| R3 | **Keys hash-only, per device**: `sk` per device and pool, 32 random bytes drawn by the light node, wrapped under a per-use keystore key; for recovery, HPKE-sealed to each kit's X25519 key (never under `R`, which every device holds) and stored at the personal agent, released only to a matured restore as `R2` is (§3.5), re-sealed at each kit rotation: no device opens another's `sk`, a leaked kit alone gets nothing before 7 days unvetoed and unrefuted, and the operators with a leaked kit can spend (slice 9 asks the owner, §9.1); `owner = C(T(note-owner), sk)`, `nk = C(T(note-nf), sk)`; the device proves knowledge of `sk` | spend authorization without an embedded curve: option 1 of item 1 ("the device proves, with `ak = Poseidon(ask)`"); no delegated proving, which the light node does not need | 1, 2 |
-| R4 | **Nullifier** `nf = C(nk, C(pool, cm))`, scoped to the pool's id; **`rho` of each output** `C(T(rho), C(nf₀, [i, 0…]))` (two calls), bound to the transaction's first nullifier; **a deposit's `rho`** `C(T(rho-deposit), W(b))`, `b` the deposit call's binding digest, unique and recorded | unique per note, unlinkable to `cm` without `nk`; `rho` fixed by the protocol closes Faerie Gold (F3) for spends and deposits alike; `nk`'s tag apart from the credential's `T(nf)`; a note of one pool spends in no other | 3 |
-| R5 | **Fixed-shape transactions**, `Tx<const I, const O>`: `asset` (the transaction's one asset, its fee's too), `anchor`, `nullifiers: [Digest; I]`, `commitments: [Digest; O]`, `memos_hash`, `value_balance: i64` (a withdrawal's amount, or 0), `leg` (the withdrawal's destination account id, or zero), `fee: u64`, `pool: Digest`, `binding`; deposits are not transactions (§5.4) | a proof's shape is its kernel's; two kernels, 1-in-2-out (`spend`) and 2-in-1-out (`join`), cover payments and consolidation; the transparent leg and the fee's asset are in what the proof binds | 4, 5 |
-| R6 | **`shielded::check::<H, I, O>(tx, witness) -> Result<(), SpendError>`**: `no_std`, no allocation, fixed arrays, no `BTreeMap`, no panic; `Witness` the input notes, their positions and paths, `sk`, the output notes; plus `shielded::Plan` and `shielded::build` (host side, taking the device's `sk`) | the device kernel's body; the same function runs on hosts as the reference | 11 |
-| R7 | **An incremental note tree**: append-only, depth 32, its frontier (33 digests) and a ring of the last 64 anchors in point rows behind a `NoteState` trait (as `LedgerState`), O(32) calls an append | F21; the actor stores it in its tables; the anchor ring mirrors the credential actor's | 7 |
-| R8 | **The pool a pseudo-account of the L0 kernel**: a transaction's `value_balance` is one kernel transfer between the payer's or payee's transparent account and the `ShieldedPool` pseudo-account, under the depositor's `Authority` or the proof's | `seal` and `open` kept as the kernel's two legs, not a second ledger | 9 |
-| R9 | **Encrypted notes**: a memo per output, X25519 to the recipient's address key and ChaCha20-Poly1305 (the `viewing-keys` envelope's AEAD), a one-byte view tag; outgoing ciphertext under the sender's `ovk`; host side only, never in a kernel; the transaction binds `memos_hash` | note delivery through the pool's feed (§5.4); the recipient checks a note's `owner` against its own on receipt (F8) | 2, 6 |
-| R10 | **Deleted**: `notes` (replaced by `shielded`), `pvm-precompile` and its VOS git dependency, `fmd-experimental`, `stealth-experimental` (F8: unspendable), the Ristretto `AuthKey` and Schnorr outside the `signatures` helper the CLI uses | fewer pieces; nothing in VOS uses them; the view tag and scanning replace FMD at this scale | — |
-| R11 | **Recovery and refusals** written as tests against `check` and the pool: Faerie Gold, a spend back by the sender, a double spend (at the actor), an anchor out of the ring, a fee or memo-hash mismatch, an overflow, a wrong pool, a mismatched owner on receipt (the wallet's check, R9) | Phase 3's refusal list | 10, 11 |
-
-**Kept as they are:** the L0 kernel (`apply_batch`, `Authority`,
-`LedgerState`, the two layers, two-phase transfers, the encodings, the
-fit check), payments between spaces and `settlement::window` (the window
-test actor's kernel), and `ValueModel` (`Value` the only model; the
-confidential model stays on paper: notes make it unnecessary for privacy).
-cipher-clerk stays independent of VOS: its kernel depends on no VOS crate
-once R10 drops the git dependency, and VOS depends on its tag.
-
-### 5.4 The code a developer writes
-
-The whole of the payments actor's private path, with cipher-clerk doing
-the cryptography (sketch; names follow §5.3):
-
-```rust
-use cipher_clerk::shielded::{self, Spend, Join, NoteTree};
-use vos_sdk::prelude::*;
-
-#[actor]
-pub struct Payments {
-    clerk: Clerk,                       // cipher-clerk's L0 accounts, in tables
-    notes: NoteTree,                    // the frontier and the anchor ring
-    spent: Table<Digest, ()>,           // nullifiers
-    memos: Table<u64, Memo>,            // a position's encrypted note
-}
-
-#[messages]
-impl Payments {
-    /// Proven on the payer's device; never run by a node.
-    #[attestable(device, reference = shielded::reference::<1, 2>)]
-    pub fn spend(witness: &Spend, #[public] tx: &shielded::Tx<1, 2>) {
-        shielded::check::<P2, 1, 2>(tx, witness).expect("a valid spend");
-    }
-
-    #[attestable(device, reference = shielded::reference::<2, 1>)]
-    pub fn join(witness: &Join, #[public] tx: &shielded::Tx<2, 1>) {
-        shielded::check::<P2, 2, 1>(tx, witness).expect("a valid join");
-    }
-
-    /// A proven spend: its nullifiers once, its notes appended.
-    #[msg(proven = spend)]
-    pub async fn pay(&mut self, ctx: &mut Command<Self>, tx: shielded::Tx<1, 2>,
-                     memos: [Memo; 2]) -> Result<(), PayError> {
-        self.notes.accepts(&tx.anchor)?;
-        tx.memos_hash.matches(&memos)?;
-        for nf in tx.nullifiers { self.spent.insert_new(&nf)?; }
-        for (cm, memo) in tx.commitments.into_iter().zip(memos) {
-            let at = self.notes.append(cm)?;
-            self.memos.insert(&at, &memo);
-        }
-        self.clerk.pool_leg(ctx, tx.value_balance, tx.fee)
-    }
-
-    /// A note from a transparent account, under its owner's proof. The pool
-    /// computes the commitment itself from the public amount, a `rho` the
-    /// call's binding fixes, and the depositor's hidden `C(owner, r)`: a
-    /// deposit cannot mint more than it debits, and no two share a `rho`.
-    #[msg(credential = Owner)]
-    pub async fn deposit(&mut self, ctx: &mut Command<Self>, from: AccountId,
-                         hidden: Digest, memo: Memo, amount: u64) -> Result<(), PayError> {
-        let rho = shielded::deposit_rho::<P2>(ctx.binding());
-        let cm = shielded::commit::<P2>(self.asset(), amount, &rho, &hidden);
-        self.clerk.debit_into_pool(ctx, from, amount)?;   // the L0 kernel, the owner's authority
-        let at = self.notes.append(cm)?;
-        self.memos.insert(&at, &memo);
-        Ok(())
-    }
-
-    /// The feeds a wallet scans, every wallet all of them: commitments and
-    /// memos from a position on, and nullifiers from a position on (never
-    /// a query for one nullifier, which would tell the operators which).
-    #[msg]
-    pub async fn notes_feed(&self, from: u64) -> Page<(Digest, Memo)> { /* … */ }
-    #[msg]
-    pub async fn spent_feed(&self, from: u64) -> Page<Digest> { /* … */ }
-}
-```
-
-The wallet, a local actor whose scope the personal space syncs:
-
-```rust
-#[actor]
-pub struct Wallet {
-    notes: crdt::GSet<Owned>,           // notes received: the note, its position, its device
-    spent: crdt::GSet<Digest>,          // nullifiers spent or seen spent
-    tree: crdt::Map<u64, Digest>,       // the pool's leaves seen so far, for paths
-}
-
-#[messages]
-impl Wallet {
-    #[msg(merge)]
-    pub fn received(&mut self, note: Owned) { self.notes.insert(note) }
-
-    #[msg(merge)]
-    pub fn spent(&mut self, nf: Digest) { self.spent.insert(nf) }
-
-    #[msg]
-    pub fn balance(&self) -> u64 {
-        self.unspent().map(|n| n.note.value).sum()
-    }
-
-    /// The plan of a spend paying `amount` to `to` from `device`'s notes,
-    /// its change back to `device`: the light node builds it with that
-    /// device's key, proves it and sends it to the pool.
-    #[msg]
-    pub fn prepare(&self, device: Owner, to: Address, amount: u64)
-                   -> Result<shielded::Plan<1, 2>, PayError> {
-        let input = self.pick(device, amount)?;
-        Ok(shielded::Plan::new(input, self.path(input.position), to, amount))
-    }
-}
-```
-
-**What the light node does around it** (a `pay` operation of the
-facility, §7.3): calls `prepare` on the local wallet, builds the
-transaction and its witness with the device's `sk` and fresh randomness
-(`shielded::build`), proves the `spend` kernel on them (its device
-program computed from the light node's own build of cipher-clerk and
-checked equal to the pool's installed one, §4.4), sends the proven call
-over Tor, and on `Ok` records `spent(nf)`. A local workflow with
-device effects (`ctx.prove`, `ctx.call_remote`) would move that glue into
-the actor; it is a later extension of the local host (§9.1).
-
-### 5.5 What is proved on the device, and what is checked publicly
-
-**Proved on the device** (the `spend` kernel, `shielded::check`):
-- the payer knows `sk` behind the input note's `owner`;
-- the input note's commitment is a leaf of the pool's tree under `anchor`
-  at the witnessed position;
-- each nullifier is `C(nk, C(pool, cm))` of its input (R4);
-- each output's commitment is well formed, its `rho` the protocol's;
-- `Σ inputs = Σ outputs + fee + value_balance`, every value and sum in
-  `u64` with checked arithmetic (the 64-bit range checks);
-- the proof binds the call (`binding`), the pool, the anchor, the memos'
-  hash, the fee and the transparent leg.
-
-**Checked publicly, by the space:**
-- at ingress: the generic checks and the proof against the `spend`
-  program (§4.3); no pool-specific pre-check;
-- at apply (`pay`): the anchor accepted (newest, or superseded within
-  `ROOT_GRACE_MS`, the credential ring's rule, 90 s: a spend proof's
-  larger upload, about 1.2 MB, still fits its 45 s margin at the median
-  circuit, and P2 sets its own window if its measured trip does not); each nullifier inserted
-  once (a second is refused, the whole call with it); the memos' hash;
-  the commitments appended; the transparent leg applied by cipher-clerk's
-  kernel (a withdrawal credits the account `leg` names from the pool's
-  pseudo-account);
-- at a deposit: the depositor's owner proof, the debit by cipher-clerk's
-  kernel, and the commitment computed by the pool (above), so the value a
-  note holds is the value debited.
-
-**What the operators learn:** that a spend happened, when, its fee, its
-transparent leg if any, and two new commitments; never the payer, the
-payee, the amount or which note was spent among those under the anchor.
-Over Tor (§6), not the address it came from.
-
-### 5.6 What the pool trusts
-
-- **Authority is the users':** no operator can spend a note (it needs
-  `sk`), and there is no `rekey`: the private tier is non-custodial in its
-  authority, unlike today's ledger (`identity-and-authority.md` §7).
-- **Integrity is the operators':** a space's nodes trust each other
-  (`core-model.md` §5); an operator can append a commitment no deposit
-  paid for (inflation), refuse a spend, or roll back. Users see the
-  pool's transparent total (the pseudo-account's balance) and their own
-  notes, not a proof of supply. A pool that needs integrity without
-  trusting its host is `identity-and-authority.md` §8's, postponed.
-- **The anonymity set** is the pool's notes under the anchors in use: in a
-  small space, small. A member who spends right after receiving links
-  the two by timing; the wallet waits a random interval before spending a
-  fresh note, and joins run when the phone is idle and charging.
-
-### 5.7 The spend's cost
-
-[est] by counting, against the auth kernel (1,722 steps, 43 calls of
-`0x402` with `H_io`'s):
-- calls: `owner` and `nk` 2, the input's commitment 4, its nullifier 2,
-  its path 32, two outputs' `rho` 4 and commitments 8, `H_io` over a claim
-  of about 260 bytes 12: about 64, under the Poseidon2 chip's 2^10 floor;
-- steps: about 2,800–3,600 in SDK form, so the CPU at 2^12 rows (auth's
-  2^11), the memory ledger one power of two above auth's;
-- the cell model's time at that size: 0.9–1.3 s on the Fairphone 6 today
-  [model, est], 0.7–0.95 s with both levers; peak 0.7–0.9 GiB; a proof of
-  about 1.1–1.3 MB.
-- `join` (2 in, 1 out) adds a path and a nullifier: about 100 calls,
-  4,500–5,500 steps, 2^13 rows, 1.4–1.9 s today [est]; it runs in the
-  background, not on a user's tap.
-- **The gate** (slice 9's PG4, a target until the spend's steps are
-  measured): the spend at most 1.0 s at the median
-  with the levers, at most 1.5 s without them.
-
+[built, `agent/payments`]: one journal and currency; each account
+named (its handle for a payee, kept in its row's `user_data`) and held
+by one owner digest, opened by an operator's invitation of the name and
+the digest; `transfer(to, amount)` pays from the account of the digest
+the proof states, so a payment names no payer; `mint` credits from the
+space's issuance (a debit-normal account whose owner, like the
+journal's registrar, is a non-canonical digest no proof states);
+`rekey` moves an account to a new digest and lifts a `freeze`; a
+payment to oneself or of nothing is refused; a device reads its own
+account by its digest (`held`), and an account's digest and balance are
+readable by the agent's callers, as the log's readers see them. The
+facility proves with the stock kernels' release artifacts it
+embeds, never a kernel a server sends (G2), so the s4 demo signs in by
+the stock `auth` kernel alone.
 
 ## 6. Tor via arti
 
-From the research of 2026-11-02; each claim's source is in §6.8, and
+From the research of 2026-11-02; each claim's source is in §9, and
 "unverified" marks what could not be read first-hand (the Tor Project's
 GitLab refused the fetches).
 
 ### 6.1 Where the onion service lives: the gateway
 
-**At the gateway, in process** [proposed; the owner: "arti could be
+**At the gateway, in process** [decided; the owner: "arti could be
 included in the ingress"]:
 - The gateway is the space's ingress for clients; it is tokio already
   (`node-api.md` §6), arti's default runtime, and it holds no authority,
@@ -2987,8 +2651,8 @@ E23]: on port 22, the same `s4-server` handler its TCP port runs, with its
 `vos-api` subsystem relaying the node API's frames. HTTP stays the
 clearnet's.
 
-**What hosting takes in arti-client 0.47** [measured, plan 8.1's spike
-gateway, 2026-11-02]:
+**What hosting takes in arti-client 0.47** [measured, a spike gateway,
+2026-11-02]:
 - `launch_onion_service_with_hsid` sits behind the `experimental-api`
   feature as well as `onion-service-service`, and it refuses a nickname
   whose key the keystore already holds. A restarted gateway launches with
@@ -3000,14 +2664,12 @@ gateway, 2026-11-02]:
   `tor_proto::stream::IncomingStreamRequest`; a `Begin` to port 22 is
   accepted with `Connected::new_empty()`, anything else refused with
   `End::new_misc()`.
-- **s4-server served only a `TcpListener`** (`serve_on`) in the spike,
-  which handed each accepted onion stream to the gateway's SSH port on a
-  loopback listener. Through loopback every onion client arrives from 127.0.0.1,
-  so it shares one address's limits (64 connections, 200 requests a
-  second), and the gateway cannot mark the request as onion-borne. The
-  product's s4-server serves any `Listener` (russh's `run_stream` takes
-  any `AsyncRead + AsyncWrite`), so the gateway hands it each stream,
-  marked and under §6.6's limits (§6.1, "Built").
+- **No loopback carrier:** through a loopback listener every onion
+  client would arrive from 127.0.0.1, sharing one address's limits, and
+  the gateway could not mark a request as onion-borne; s4-server serves
+  any `Listener` (russh's `run_stream` takes any `AsyncRead +
+  AsyncWrite`), so the gateway hands it each stream, marked and under
+  §6.6's limits ("Built", below).
 - Seen from a client, an arti-hosted onion showed no difference from a
   C tor-hosted one [measured, x86, 2026-11-02, n = 20 each]. Isolated
   connections from one warm client to the spike's onion took a median of
@@ -3037,7 +2699,7 @@ pushes, commits and device-set operations, and member calls) and
   their own signatures, as today. The handshake is paid once a connection,
   and the connection is kept open while the group is in use (§6.3).
 - **Later:** SSH over QUIC, or a roaming transport in the manner of mosh;
-  Tor carries streams only, so both wait for UDP over Tor (§9.3).
+  Tor carries streams only, so both wait for UDP over Tor (`open.md`).
 
 **Tor carries streams, not datagrams:** no QUIC end to end; UDP over Tor
 is a proposal (339), not deployed. iroh's experimental Tor transport
@@ -3063,7 +2725,7 @@ current at the claim; a space whose onions have all changed since is
 found only by its handle through the registry of spaces, which is not
 built (`open.md`, "The registry and the root space"; §8, D4). A gateway
 could serve a forged set, as it could forge any answer it relays
-(`open.md`, "Node-signed roots").
+(`open.md`, "Node-signed feed heads").
 
 **Built** [built, `node-api.md` §6, `docs/operations.md`]: the
 gateway's `tor` feature hosts the onion in process on arti-client 0.47.0
@@ -3081,7 +2743,8 @@ its claims marked onion) beside the `vos-api` subsystem; no loopback port
 carries them. The screens' own calls (the demo's host service) pass no
 per-circuit limit: s4's host-service requests name no peer, so only the
 server's bound per session holds them; and the onion's SSH server has
-s4-server's connection cap (128) and no idle timeout of its own, both
+s4-server's connection cap (`[onion] ssh_connections`) and no idle
+timeout of its own, both
 open (§6.6). arti in process is the onion's one host (E30). The
 `vos-api` relay set holds `Call` and `Credentialed`. A proven call's
 body is read only once it holds its places, the port's, its connection's
@@ -3107,7 +2770,7 @@ nodes may ask the onion's mark of its proven calls, or of every request
   cold bootstrap. Zcash's `zcash_client_backend::tor::Client` is the model:
   one client, `isolated_client()` handles, `set_dormant` when the app is
   in the background, persisted state.
-- **What the embedding needs** [measured, plan 8.1, 2026-11-02]:
+- **What the embedding needs** [measured, 2026-11-02]:
   - With `rustls`, the application installs rustls's process-wide
     `CryptoProvider` before it creates the client; ring's, the one russh
     and the gateway use already, so no second crypto library comes in.
@@ -3118,7 +2781,7 @@ nodes may ask the onion's mark of its proven calls, or of every request
     nightly was found: the one tried (2026-03-20) does not build Stwo at
     the facility's pinned revision (`array_chunks` is gone). So every
     arti upgrade may hit the same wall until the prover's nightly moves,
-    and §6.7's "an upgrade step each slice" includes checking this.
+    and §6.7's upgrade step includes checking this.
   - **A bootstrap through an unreachable bridge never ends:**
     `create_bootstrapped` with one bridge line whose address refused TCP
     ran for 15 minutes, cold and then warm, without an error, until the
@@ -3278,7 +2941,7 @@ nodes may ask the onion's mark of its proven calls, or of every request
     renewed every 4 to 12 minutes while the app is in the foreground,
     each a fetch: open times again, none of them joined to another
     session.
-  - **Rendezvous (PG5):** a foreground hour with a session open costs one
+  - **Rendezvous (PG5, §2.4):** a foreground hour with a session open costs one
     a kept group (the feed, the member's, the personal agent's: 3), the
     proven spare's lives (4 to 12 unused, one a sign-in otherwise) and the
     clock's readings (5 to 15, about 7.5, each taking the fetch spare and
@@ -3383,7 +3046,7 @@ acknowledgement. Phone figures come from the phone session (§6.4).
   round trip. The levers: smaller device proofs (format 47 and §4.4's
   levers cut bytes), and an upload split over several circuits.
   Congestion control on onion circuits would be a third; it is listed as
-  experimental in arti's 2.5.1 notes (§6.8) and was not tested.
+  experimental in arti's 2.5.1 notes (§9) and was not tested.
 - **Spares carry the load.** With an onion connection at a median of
   3.7–4.7 s and a tail of tens of seconds, plus 3.5 s of SSH, a purpose's
   connection costs about 8 s at the median. §6.2's spare, built ahead
@@ -3446,8 +3109,8 @@ the phone (`vos.node`'s stage lines).
 ### 6.4 What it costs on the phone
 
 No published figures exist for arti's library size, idle memory or
-battery on Android [the research found none]; they are the slice's first
-measurement (the plan's step 8.1). The budgets of §2.3 (arti ≤ 48 MiB
+battery on Android [the research found none]; the figures below are the
+first. The budgets of §2.3 (arti ≤ 48 MiB
 resident, ≤ 10 MB of `.so` growth) are targets to measure against, not
 known values. The production precedents: Zashi ships arti on Android and
 iOS (exchange rates since 2024; transaction submission and fetching in beta
@@ -3455,7 +3118,7 @@ since Zashi 2.1, 2025-08-07, with a prompt to turn Tor off when it is
 slow); the Tor Project's own Android VPN (onionmasq) runs arti and is
 still in beta; Orbot still bundles C tor.
 
-**Measured for arm64 and on a desktop** [measured, plan 8.1, 2026-11-02;
+**Measured for arm64 and on a desktop** [measured, 2026-11-02;
 arti-client 0.47.0 with §6.2's features, plus rustls's ring provider and
 tokio's multi-threaded runtime, which the light node brings anyway]:
 
@@ -3468,7 +3131,7 @@ tokio's multi-threaded runtime, which the light node brings anyway]:
 | the state directory | 8.0 MB after a cold bootstrap: the directory cache 7.98 MB, state and keystore 11–14 kB. 11.4 MB after about 1.5 h of runs, once the directory refreshed | — |
 | warm bootstrap, x86 | 1.6 s median (5) | ≤ 3 s p50: met on x86 |
 
-**Measured on the phones** [measured, S8-P1, 2026-11-06; the same probe
+**Measured on the phones** [measured, 2026-11-06; the same probe
 as §6.3's, built for `aarch64-linux-android` and run from the shell over
 the live Tor network against the spike gateway's onion; 3 cold and 5 warm
 bootstraps and a cold and a warm one through the plain bridge on each
@@ -3494,7 +3157,7 @@ phone; the Fairphone 6 (Snapdragon 7s Gen 3, Android 15) and the Pixel 1
 - **The sign-in over Tor** at the Fairphone's median: about 0.6 s of
   proving, 2.2 s for the 0.9 MB proof, 0.4 s for the reply: about 3.2 s,
   under PG3′'s 4 s. Upload rates vary by circuit (§6.3's 0.15 MB/s on
-  2026-11-02); PG3′'s M5 gate decides.
+  2026-11-02); PG3′'s run over Tor decides.
 - **Connections fail often enough to plan for:** 10–20% of fresh onion
   connections failed on the phones, as on the desktop, so the client
   retries on a new circuit and keeps its connections open (§6.2's
@@ -3502,8 +3165,8 @@ phone; the Fairphone 6 (Snapdragon 7s Gen 3, Android 15) and the Pixel 1
 - **arti's state on Android:** under `/data/local/tmp` arti refused its
   state directory's permissions ("problem with filesystem permissions"),
   so the probe ran with `ARTI_FS_DISABLE_PERMISSION_CHECKS=1`. The app's
-  private directory has the modes arti expects; 8.26 checks that it
-  opens there without the override.
+  private directory has the modes arti expects, and the light node keeps
+  arti's check on and ignores the override (§6.2, "Built").
 
 ### 6.5 The Tor policy, bridges, and blocked networks
 
@@ -3528,15 +3191,15 @@ phone; the Fairphone 6 (Snapdragon 7s Gen 3, Android 15) and the Pixel 1
   agent or `Homes`, and the agent refuses a request its gateway did not
   receive on the onion (§3.3). Over the clearnet it would hand the home's
   operators the device's address beside its pseudonym.
-- **Plain bridges in slice 8** [decided, E22]: arti's bridge client with
+- **Plain bridges** [decided, E22]: arti's bridge client with
   bridge lines the user pastes (from the Tor Project's bridge
   distribution), which defeats networks that block Tor by its public relay
   list, as many campus and corporate networks do. Pluggable transports
   (obfs4 through lyrebird, Snowflake, WebTunnel), which defeat deep packet
   inspection but each bring a Go binary run as a managed subprocess on
-  Android, are later work (§9.3).
-- **What a user behind a network that blocks Tor by inspection sees** in
-  slice 8: key-signed calls fall back to the clearnet where the space
+  Android, are later work (`open.md`).
+- **What a user behind a network that blocks Tor by inspection sees:**
+  key-signed calls fall back to the clearnet where the space
   allows it and the user opted out for it; anonymous calls and the
   personal space wait, the app saying "this network blocks Tor" with the
   last sync time. **The stated limit:** the personal space's timed
@@ -3562,8 +3225,8 @@ place:
   `doc/OnionService.md` still says "suitable for testing and
   experimentation only" and lists no DoS protection (last touched
   2025-08, and stale on restricted discovery, so weak evidence either
-  way). Turn PoW on when a release declares it; until then the gateway's
-  other limits hold alone (§9.1).
+  way). PoW is turned on when a release declares it; until then the
+  gateway's other limits hold alone.
 - **Limits per circuit and per service:** streams per rendezvous circuit,
   requests a second per stream, calls per agent per circuit (so one
   circuit cannot fill a personal agent's log), and a global cap of proven
@@ -3575,22 +3238,22 @@ place:
   refused by the pre-check in about 0.02 ms, and junk ground for the 8-bit
   interaction PoW costs the node 11–27 ms under load [measured, format
   46, §4.3]. Tor's own throughput to one onion bounds such proofs to tens
-  a second, below a node's budget; M5 measures it.
+  a second, below a node's budget (measured below).
 - **Restricted discovery** (onion-service client authorization): stable
   since arti 1.7.0 (2025-11). Only clients holding an authorized key can
-  read the service's descriptor, which hides it from scanners. Not offered
-  in slice 8: a key per member makes the descriptor grow with the space
+  read the service's descriptor, which hides it from scanners. Not
+  offered: a key per member makes the descriptor grow with the space
   (its size is bounded), and one key shared by every member is as good
   as public once one member leaks it. A space small enough for per-member
   keys may turn it on later.
 
-**The caps as built** [built, `node-api.md` §6]: each circuit counts as
-an address of its own (4 connections, 16 requests in flight over them,
-20 requests a second, a burst of 40); 8 streams at once a circuit, 1,024
-circuits at once, a circuit with no stream let go after 60 s; the onion's
-SSH server takes 128 connections at once unless `[onion] ssh_connections`
-says otherwise, each given 30 s to authenticate; 16 proven calls in
-flight through the onion, 2 from one connection and 4 from one circuit,
+**The caps as built** [built, `node-api.md` §6; each a key of `[onion]`
+with its default, `docs/operations.md`, "The onion service"]: each
+circuit counts as an address of its own (its connections, requests in
+flight and a second, and streams capped), the circuits at once capped, a
+circuit with no stream let go after 60 s; the onion's SSH server's
+connections capped, each given 30 s to authenticate; proven calls capped
+in flight through the onion, from one connection and from one circuit,
 taken from a proven call's header before its body is read: its
 connection's and circuit's first (past either the channel is closed),
 then the onion's, for which one call a circuit waits (another is closed
@@ -3599,8 +3262,8 @@ takes its circuit's request token, and the body must then keep its pace:
 by 5 s plus its share of 30 s, as much of it as that share, the whole
 within 30 s, so a header whose body never comes, or comes a byte at a
 time, gives its places back after about 5 s; an agent's calls
-and proven calls from one circuit 4 a second, a burst of 16. *Known
-limit:* the members' wait still grows with the circuits an attacker
+and proven calls from one circuit rated. *Known limit:* at the defaults,
+the members' wait still grows with the circuits an attacker
 holds: with one waiter each and 16 places freed every 5 s, a member waits
 about C × 5 / 16 s behind C attacker circuits, inside the 60 s a call
 waits for up to about 190 circuits (the 1,024-circuit cap would mean
@@ -3614,7 +3277,7 @@ the member's own proven call on another connection were answered (the
 gateway's test 22, in process, no network).
 
 **The flood through Tor** [measured, x86 dev machine, chutney, 2026-11-09;
-`8.25f/spike/flood`, E25's private Tor test network]: a chutney network of
+a spike outside the tree, E25's private Tor test network]: a chutney network of
 four authorities and eight relays on loopback, the gateway's arti onion in
 process over it (full vanguards, descriptor published in about 0.3 s), and
 arti clients over the same network. Eight circuits flooded well-formed
@@ -3642,7 +3305,7 @@ against a no-flood baseline:
   loopback bandwidth lets the junk flow faster than the live network
   would, so the private run is a harder test of the node per junk proof
   and a lighter one of Tor's latency and rendezvous. The caps remain the
-  backstop should a live flood outrun the bandwidth bound (§6.7, §9.1).
+  backstop should a live flood outrun the bandwidth bound (§6.7).
 
 ### 6.7 What Tor fixes, and what it does not
 
@@ -3843,83 +3506,37 @@ throwaway spike]. A feed query is 139 bytes; an answer with nothing new
   are about 330 queries a second, two cores' worth. Every member reads the
   same pages, so a gateway's cache of the feed's answers (by place, until
   the length moves) is the lever, not built.
-- **The phone at M5** measures: a 10,000-member catch-up over Tor (time,
-  bytes), the keeper's page and restore time and its memory at 10,000 and
-  100,000, and the feed connection's rendezvous and polls an hour in the
-  foreground (PG5).
+- **On the phone,** for the phone session to measure: a 10,000-member
+  catch-up over Tor (time, bytes), the keeper's page and restore time and its
+  memory at 10,000 and 100,000, and the feed connection's rendezvous and
+  polls an hour in the foreground (PG5, §2.4).
 
-**Verdict on arti** [proposed]: ready for the client side (stable since
+**Verdict on arti** [decided]: ready for the client side (stable since
 1.0, shipped by Zashi and Fedimint); usable, not yet hardened, for
-hosting, whose DoS defence is the gap. Ship the client path in slice 8;
-host the gateway's onion behind a `tor` feature, full vanguards on, PoW
-when a release declares it, arti the onion's one host (E30); pin one arti
-version a release and budget an upgrade step each slice.
-
-### 6.8 Sources (read 2026-11-02 unless marked)
-
-- arti 1.7.0 (restricted discovery stable):
-  https://blog.torproject.org/arti_1_7_0_released/ ; 2.5.1 (unix-socket
-  targets; congestion control and CGO on onion circuits experimental):
-  https://blog.torproject.org/arti_2_5_1_released/ ; the onion-service
-  document: https://gitlab.torproject.org/tpo/core/arti/-/raw/main/doc/OnionService.md
-
-- arti 2.7.0, 2026-10-01: https://blog.torproject.org/arti_2_7_0_released/ ;
-  2.6.0: https://blog.torproject.org/arti_2_6_0_released/ ; 2.5.0:
-  https://blog.torproject.org/arti_2_5_0_released/
-- arti-client's versions: https://crates.io/api/v1/crates/arti-client ;
-  its API (`launch_onion_service`, `StreamPrefs`):
-  https://docs.rs/arti-client/latest/arti_client/struct.TorClient.html
-- features (`onion-service-service` in `full`, not default):
-  https://docs.rs/crate/arti-client/latest/features ;
-  `tor-hsservice` (`handle_rend_requests`, `hs-pow-full` experimental):
-  https://docs.rs/tor-hsservice/latest/tor_hsservice/ ,
-  https://docs.rs/crate/tor-hsservice/latest/features ;
-  `tor-rtcompat` (`smol` experimental):
-  https://docs.rs/crate/tor-rtcompat/latest/features
-- vanguards in arti: https://blog.torproject.org/announcing-vanguards-for-arti/
-- "proxy and onion service support are ready for use":
-  https://arti.torproject.org/core/arti/ ; the older "not recommended for
-  production" page, unrevised since 2023:
-  https://arti.torproject.org/guides/capability-limitations
-- onion connections timing out (unverified, not readable):
-  https://gitlab.torproject.org/tpo/core/arti/-/issues/2482 ; onionperf:
-  https://metrics.torproject.org/onionperf-latencies.html
-- Zcash's arti client: https://docs.rs/zcash_client_backend/latest/zcash_client_backend/tor/struct.Client.html ;
-  Zashi 2.1: https://zodl.com/zashi-2-1-enhanced-privacy-with-tor-beta
-- Fedimint's connector: https://docs.rs/crate/fedimint-connectors/0.11.2/source/src/tor.rs
-- onionmasq's cold bootstrap (unverified):
-  https://gitlab.torproject.org/tpo/core/onionmasq/-/issues/161
-- iroh's Tor transport (QUIC over Tor streams, C tor):
-  https://iroh.computer/blog/tor-custom-transport
-- UDP over Tor, a proposal: https://spec.torproject.org/proposals/339-udp-over-tor.html
-
+hosting, whose DoS defence is the gap. The client path ships; the
+gateway hosts its onion behind a `tor` feature, full vanguards on, PoW
+when a release declares it, arti the onion's one host (E30); one arti
+version is pinned a release, with an upgrade step budgeted regularly.
 
 ## 7. Fitting the existing system
 
 ### 7.1 Crates
 
-| crate | change |
+| crate | what it holds of this design |
 |---|---|
-| `vos-device` (`pvm/device`) | folds into `vos-light`; its secret, wire and path-keeper modules move, its credential prover goes (§4.1) |
-| `vos-light` (new, `node/light`) | the light node: merge and query dispatch over its store (no log), the release artifacts it embeds (local actors' programs, the stock kernels' device programs), the prover's device path, the node-API client, sync of sealed scopes, the device group through `vos-mls`, arti's client behind a feature; replaces `vos-device` one for one |
-| `vos-mls` (new, `support/mls`) | [built] one MLS layer for VOS over mls-rs [decided, E12]: storage providers over fjall, copy-and-swap of group state for candidates, the confirmation hash, a proposal policy per user (the device group's: Add, Remove, Update); the device group its first user (`vos_light::group`), messaging later |
-| `vos-node` (`node/host`) | admission at ingress for an agent that asks: known keys looked up before the signature, and the gateway's transport mark for onion-only agents (§3.3); the device-format window at ingress (§4.4). The light node does not carve it up: it needs only the executor's host-call layer, which moves to a crate both link (plan 8.6); `credentialed.rs`'s use of `vos_pvm_device` stays in the node (the light node takes device programs as release artifacts) |
-| `vos-pvm-recair` | `credential` deleted; the leaves, folds and wrap behind a `recursion` feature, on by default (the masking needs `context`, `circuit` and `trace`, which stay), so a device links less of the recursion prover (§9.1) |
-| `vos-pvm-final-verifier` | `credential` and `credential-bytes` deleted |
+| `vos-light` (`node/light`) | the light node: merge and query dispatch over its store (no log), the release artifacts it embeds (local actors' programs, the stock kernels' device programs), the prover's device path, the node-API client, sync of sealed scopes, the device group through `vos-mls`, the personal space's flows (`space`), arti's client behind a feature; its device library (secrets, wire, the tree keeper) |
+| `vos-facility` (`node/light/android`, outside the workspace) | the `vos.credential` facility's cdylib and the `:vos` service: the Binder interfaces, Tor, the jobs, the personal space's screens (§2.2, §7.3) |
+| `vos-mls` (`support/mls`) | one MLS layer for VOS over mls-rs [decided, E12]: storage providers over fjall, copy-and-swap of group state for candidates, the confirmation hash, a proposal policy per user; the device group its first user (`vos_light::group`) |
+| `vos-exec` (`node/exec`) | the executor's host-call layer, which `vos-node` and `vos-light` link; ingress's device programs stay in the node (the light node takes them as release artifacts) |
+| `vos-node` (`node/host`) | admission at ingress for an agent that asks: known keys looked up before the signature, and the gateway's transport mark for onion-only agents (§3.3); the device-format window at ingress (§4.4) |
+| `vos-pvm-recair` | the leaves, folds and wrap behind a `recursion` feature, on by default (the masking needs `context`, `circuit` and `trace`, which stay), so a device links less of the recursion prover |
 | `vos-sdk`, `vos-sdk-macros` | `#[attestable(device, reference = …, headroom = …)]`; `#[msg(proven = kernel)]`; in-place kernel arguments; `vos_sdk::p2` (digests, tags, paths); `crdt::{GSet, Set, Map}` and `#[msg(merge)]` on the light node |
-| `vos-wire`, `vos-api` | `Credentialed.claim` in place of `CredentialPublic`; `CredentialedInput` carries the claim; `Principal::Kernel { program }` (index 7); `CredentialKind` deleted; the frame's transport mark (`node-api.md` §2; a missing mark is clearnet, §3.3) |
-| `merkle-crdt` | [built] the incremental apply (`core-model.md` §9.4); the author, its sequence and signature in the payload; a `Store` over fjall (`FjallStore`, the `fjall` feature; the core stays `no_std`); fetching by batch, sans I/O so an asynchronous client drives the round trips (`Replica::want` and `serve` for a DAG walk, `Replica::cursor` and `ingest` for `since`); the `redb` store and feature deleted (one storage engine) |
-| `vos-credentials` | the stock `auth` kernel (from the `device` test actor, in SDK form) and a new `owner` kernel, with their references; each stock guard's compatibility window of program ids (§4.4); the stock kernels' ingress checks stay in the node (§4.3); the registrar's open claim priced by work (§3.3), its person records, `enroll_device` and `revoke_device` (§3.8) |
-| `vos-gateway` | the onion service behind a `tor` feature, serving the same SSH as the clearnet and nothing else (§6.1); the SSH `vos-api` subsystem's relay set adding `Call` and `Credentialed`, with caps per connection, circuit, agent and onion; the transport mark on every relayed request; every node of its space listed as an upstream when it serves a home (§3.3) |
-| new system actors | `Homes` (the pool, claims, the indexes by nullifier and by kit key, the yearly re-proof and the lease) and `Personal` (the device set and its contests, liveness, the commit log and confirmations, sealed scopes, checkpoint acknowledgements, the inbox, quotas, gated queries, an append-only layout), each one package; `Payments` (replacing the `purses` test actor) |
-| new tool | the operator's keeper: topping up the pool, granting `Homes` its role, upgrading `Personal` in batches (§3.3) |
-
-**Net:** two crates in (`vos-light`, `vos-mls`), one out (`vos-device`);
-the credential AIR's modules, one feature, one format, its fixtures and its
-fuzz target out; merkle-crdt's redb out. In: arti's dependency tree (in
-the gateway and the light node), mls-rs's (in `vos-mls`), three actors, a
-tool, the SDK's CRDT fields and merge dispatch, and admission at ingress.
-No proving code beyond the levers' format.
+| `vos-wire`, `vos-api` | `Credentialed.claim`, the kernel's public arguments; `CredentialedInput` carries the claim; `Principal::Kernel { program }` (index 7); the frame's transport mark (`node-api.md` §2; a missing mark is clearnet, §3.3) |
+| `merkle-crdt` (`support/merkle-crdt`) | the incremental apply (`core-model.md` §9.4); the author, its sequence and signature in the payload; a `Store` over fjall (`FjallStore`, the `fjall` feature; the core stays `no_std`); fetching by batch, sans I/O so an asynchronous client drives the round trips (`Replica::want` and `serve` for a DAG walk, `Replica::cursor` and `ingest` for `since`) |
+| `vos-credentials` | the stock `auth` and `owner` kernels, with their references; each stock guard's compatibility window of program ids (§4.4), the kernels' ingress checks staying in the node (§4.3); the registrar's open claim priced by work (§3.3), its person records, `enroll_device` and `revoke_device` (§3.8) |
+| `vos-gateway` | the onion service behind a `tor` feature, serving the same SSH as the clearnet and nothing else (§6.1); the SSH `vos-api` subsystem's relay set with `Call` and `Credentialed`, capped per connection, circuit, agent and onion; the transport mark on every relayed request; every node of its space an upstream when given its space file (§3.3) |
+| system actors | `Homes` (`agent/homes`: the pool, claims, the indexes by nullifier and by kit key, the yearly re-proof and the lease) and `Personal` (`agent/personal`: the device set and its contests, liveness, the commit log and confirmations, sealed scopes, checkpoint acknowledgements, the inbox, quotas, gated queries, an append-only layout), each one package; `Payments` (`agent/payments`) |
+| `vos-keeper` (`tools/keeper`) | the operator's keeper: topping up the pool, granting `Homes` its role, upgrading `Personal` in batches (§3.3) |
 
 **What the `recursion` feature saves** [measured, x86-64 host building
 for arm64 Android (NDK 28.2, API 30), stripped, 2026-11-02]: a
@@ -3929,7 +3546,7 @@ is 9,933,368 bytes without the feature and 9,979,576 with it under fat LTO
 (46 KB, 0.5%), and 13,684,120 against 13,894,072 without LTO (210 KB,
 1.5%): the linker already drops most of the recursion prover a device
 never calls. The feature stays (it costs one `cfg` a module and builds the
-device's crates faster); Q9's size argument for it is small.
+device's crates faster); its size argument is small.
 
 ### 7.2 The node and the gateway
 
@@ -3937,14 +3554,14 @@ device's crates faster); Q9's size argument for it is small.
   Kreivo. Its ingress generalizes (§4.3), admits a window of device
   formats (§4.4) and, for an agent that asks, admits only known keys and
   only onion-marked requests (§3.3); its install computes a device program
-  for every device kernel (§4.4); format 44 goes. The personal agent is
+  for every device kernel (§4.4). The personal agent is
   an ordinary agent running ordinary actors: nothing in the node knows
   what a personal agent is.
 - **The gateway** keeps HTTP, TLS and SSH, and adds the onion service
-  (§6): the same SSH behind an onion address, and nothing else [E23]. Its SSH `vos-api` subsystem's relay set is wider than
-  today's (`NodeKey`, `Time`, `AgentInfo`, `Schema`, `Devices`, `Query`;
-  `node/api/src/lib.rs`, `Kind::relayed`): it adds `Credentialed` and
-  `Call`, which the light node sends through it.
+  (§6): the same SSH behind an onion address, and nothing else [E23]. Its
+  SSH `vos-api` subsystem relays `NodeKey`, `Time`, `AgentInfo`, `Schema`,
+  `Devices` and `Query`, and `Credentialed` and `Call`, which the light
+  node sends through it (`node/api/src/lib.rs`, `Kind::relayed`).
 - **Limits that bind the personal agent** [built]: 64 KiB a call's
   arguments, a reply and a row; 256 KiB a step's writes; 16 in flight on
   one `vos-api` channel; one answer a request, no push
@@ -3962,11 +3579,10 @@ device's crates faster); Q9's size argument for it is small.
   leaves in every other space), `devices` (list,
   last sync, remove, veto, resolve, contests, kit rotation, admin-key
   replacement; each behind the admin key's prompt), `restore` (from a
-  kit), `move_home` (§3.9), the yearly re-proof (with the leaf renewal on
-  the same prompt; slice 9, decision 16), and local notifications for
-  pending device operations. These are the facility's own screens (its Android
-  library, `team.virto.vos.personal`), their own plan step (8.24), over
-  the facility's own Binder interface, `IVosPersonal` (§2.2, plan 8.24b).
+  kit), `move_home` (§3.9), and local notifications for pending device
+  operations (the yearly re-proof is not built, `open.md`). These are the
+  facility's own screens (its Android library, `team.virto.vos.personal`),
+  over the facility's own Binder interface, `IVosPersonal` (§2.2).
 - **Tor in s4's client:** its SSH connection to the gateway goes to the
   onion address pinned at enrollment, through the facility's `TorClient`;
   the host key is pinned as today.
@@ -3974,8 +3590,7 @@ device's crates faster); Q9's size argument for it is small.
   of the prover, in VOS (`node/light/android`), s4's crates built with
   `--ignore-rust-version`; s4 builds nothing of VOS.
 
-**The facility's wiring as built** [built, `node/light/android`, plan
-8.24 part 1]: the screens are the step's second part.
+**The facility's wiring as built** [built, `node/light/android`]:
 - **Tor**: one arti runtime in `:vos`, its state in `files/tor`, rebuilt
   through pasted bridges (a `BootstrapError` named by its Display); one
   `Client` whose every space is set from the onions pinned at enrollment
@@ -4009,7 +3624,7 @@ device's crates faster); Q9's size argument for it is small.
   key, which the joiner pins to reach the home. The card is shown in the
   kit's own form: beside the phrase's words, or after a security key's
   credential is made.
-- **The screens** [built, plan 8.24 part 2]: one activity of plain views
+- **The screens** [built]: one activity of plain views
   over `IVosPersonal`, each operation off the main thread with its
   prompts lent and released when it returns or the screen gives it up.
   A home is entered as its code (`VOSHOME1:` and hex: the home as a device
@@ -4023,14 +3638,14 @@ device's crates faster); Q9's size argument for it is small.
   refusal, on the screen and as a notification after a personal pass that
   did not finish.
 - **A regroup** [built, `node/light/android`; host-tested in its
-  `tests/personal.rs`; amended 2026-11-17, decision 16]: `regroup` names
+  `tests/personal.rs`]: `regroup` names
   every other live device of the set, and once it matured the
   regrouper's "Commit now" starts the new group of it alone
   (`DeviceGroup::regroup`); each other device, out and its sync key
   admitted no more, pairs again from it, leaving the space it held at
   the pairing's offer (`vos_light::space::Personal`'s leave) and joining
   with new sync and admin keys.
-- **Leaving** [built, `vos_light::space`, 2026-11-17]:
+- **Leaving** [built, `vos_light::space`]:
   a device gives up its personal space with no call to its agent: a light
   node store made anew under the next generation's directory
   (`light.<n>`), the local actors installed there, then made the
@@ -4101,17 +3716,17 @@ s4's facility model; cipher-clerk's L0 kernel and settlement.
 
 ## 8. Edge scenarios
 
-What could bite this design later, worked through before code. Each
-entry names the situation and its consequence, then its handling: a
-**mitigation** (with the plan step that builds it) or a **known limit**
-(with where it is carried). Sources for prior art are in §8.9.
+What could bite this design, worked through before code [decided, E11].
+Each entry names the situation and its consequence, then its handling: a
+**mitigation** or a **known limit** (with where it is carried). Sources
+for prior art are in §9.
 
 ### 8.1 Devices and keys
 
 **A1. Two devices change the device set at once,** one offline.
 *Mitigation:* the agent's log orders operations and commits; one candidate
 per epoch (`EpochTaken`); the loser rereads and re-proposes only if its
-intent still holds; no device commits offline. (8.13, 8.19)
+intent still holds; no device commits offline.
 
 **A2. A device is lost or stolen, locked.** Before its first unlock since
 boot nothing opens. After a first unlock the sync key and the MLS state
@@ -4120,8 +3735,7 @@ and runs code on it reads the personal space; the admin key stays in the
 hardware keystore behind the owner's strong biometric. *Mitigation:* the
 owner retires the phone from another device (§3.8) or with the kit.
 *Known limit:* after-first-unlock exposure, the price of background sync
-on a locked phone; stated in the light node's `SECURITY.md`. (8.13,
-8.23a, 8.28)
+on a locked phone; stated in the light node's `SECURITY.md`.
 
 **A3. A device is stolen unlocked, or malware runs in the app's process.**
 Either reads what the phone reads and holds its sync key: it can push
@@ -4129,7 +3743,7 @@ garbage (C1), nack commits (A21), post `alive` and use the device's share
 of the quota (C5). It can neither commit nor sign a device-set operation:
 both need the admin key, which never leaves the hardware keystore and
 signs only after the owner's biometric. The kit removes it even with no
-other device (A4). *Known limit* for what the phone shows. (8.13)
+other device (A4). *Known limit* for what the phone shows.
 
 **A4. A thief who passes the owner's strong biometric** (coercion, a weak
 sensor) holds an active device. *Mitigation:* the symmetric rules (§3.5):
@@ -4144,17 +3758,16 @@ Property-tested against an adversary with one device and its biometric
 who may also pair devices, and one with a sync key alone, and a leaked kit
 against devices that veto (`agent/testkit/tests/agent/personal/
 adversaries.rs`): the owner reacting before a paired device's probation
-ends removes every thief device within the delay of its first move. (8.13)
+ends removes every thief device within the delay of its first move.
 
 **A5. A device returns after weeks or months.** *Mitigation:* while away
 it is outside the confirming set, so the awake devices are never blocked;
 it processes the confirmed commits on return (handshakes are kept 180
 days) and re-pairs if one does not process or if it was away longer.
-(8.19, 8.23a)
 
 **A6. A long replay on a phone,** killed midway. *Mitigation:* each commit
 applied in one fjall batch, the stored epoch checked before and after; a
-gap of more than a few hundred commits prefers re-pairing. (8.19)
+gap of more than a few hundred commits prefers re-pairing.
 
 **A7. A removed device backdates DAG writes.** *Mitigation:* seal at push
 takes only the confirmed epoch; the agent refuses its keys; devices accept
@@ -4162,49 +3775,49 @@ its envelopes only up to its frontier, and the CRDT types filter its
 writes at read; the light node cuts it off there, so its later operations
 are quarantined wherever they arrive [built]. Nor does it leave a
 writer behind: an archive names no author, and an archive read takes no
-key of an epoch past the confirmed one [built]. (8.18a, 8.18b, 8.20)
+key of an epoch past the confirmed one [built].
 
 **A8. A write made offline leaks to a device removed meanwhile.**
 *Mitigation:* seal at push under the confirmed epoch read just before;
-`StaleEpoch` otherwise. (8.20)
+`StaleEpoch` otherwise.
 
 **A9. A device takes a candidate as current before it is confirmed,** the
 first cause of forks in deployed MLS. *Mitigation:* candidates are
 processed on a copy of the group state and swapped in only on
 confirmation (mls-rs applies received commits at once, so the copy is the
-mechanism). (8.19)
+mechanism).
 
 **A10. Retries and leader changes.** *Mitigation:* the queue keeps sealed
 bytes and reseals only after `StaleEpoch`; the agent deduplicates by id
-before the epoch check; a commit is a candidate once. (8.12, 8.20)
+before the epoch check; a commit is a candidate once.
 
 **A11. An OS backup or a cloned phone restores MLS state on a second
 device.** *Mitigation:* MLS state, the archive and the queue are excluded
 from Android's backup and wrapped under a key that does not migrate; a
 restored copy starts as a new device (A13). A clone's commit cannot be
-confirmed consistently and is voided. (8.19, 8.22)
+confirmed consistently and is voided.
 
 **A12. The user's biometrics change,** invalidating the admin key.
 *Mitigation:* another seasoned device, or the kit, signs a replacement
 admin key; the device keeps its seasoning, and the new key signs nothing
-for 72 h. (8.23b)
+for 72 h.
 
 **A13. The app is reinstalled on the same phone.** Keystore keys are gone;
 the phone is a new device. *Mitigation:* it pairs from another device or
 restores from the kit, then removes its own ghost, which never confirms
-and so blocks nothing meanwhile. (8.23a)
+and so blocks nothing meanwhile.
 
 **A14. A thief who passed the prompt pairs his own device** to gain a
 second vote. *Mitigation:* the new device is in probation for 72 h, its
 probation frozen while a removal against it is pending or contested, and
 it counts for two-device rules only after 7 days' seasoning; so the
 owner's removal of it, contested by the thief, cannot be outvoted inside
-its own window. (8.13)
+its own window.
 
 **A15. Clocks are wrong.** *Mitigation:* delays, probation, seasoning,
 retention and the lease run on the agent's batch time; a device whose
 clock disagrees by more than an hour raises an alarm and acts as the log
-says; Lamport counters order CRDT operations. (8.13, 8.19)
+says; Lamport counters order CRDT operations.
 
 **A16. A committer forks the group selectively,** good path secrets to
 some devices and garbage to others. Committing needs the admin key, so the
@@ -4212,82 +3825,79 @@ committer is the owner's own device or a thief who passed the biometric
 (A4). *Mitigation:* an awake target nacks and the epoch is void, nothing
 sealed; a sleeping target, outside the logged confirming set, finds on
 return that it cannot process the commit, raises an alarm naming the
-committer, and re-pairs or regroups (§3.5). (8.19, 8.21)
+committer, and re-pairs or regroups (§3.5).
 
 **A17. A commit carries a proposal the design does not use** (ReInit, an
 external commit, a PSK, a group-context change). *Mitigation:* `vos-mls`'s
 policy for the device group nacks anything outside Add, Remove and Update,
-and any Add or Remove not matching a matured signed operation. (8.19)
+and any Add or Remove not matching a matured signed operation.
 
 **A18. A device without a strong biometric.** *Mitigation:* a delayed
 admin: its operations wait 72 h and can be contested; pairing works, 72 h
-later. (8.13, 8.23a)
+later.
 
 **A19. A shoulder-surfed PIN.** The thief signs in and pays from P1 (the
 member secret keeps its decided PIN fallback) but cannot sign a device-set
 operation unless the device is a delayed admin, whose operations wait and
 can be contested. The owner retires the phone, which revokes its leaves in
 every space at once. *Known limit:* P1 money has the lower bar; `rekey` is
-its remedy. (8.7, 8.23a)
+its remedy.
 
 **A20. Two attacker devices nack each other's removal.** *Mitigation:* one
 commit carries both matured removals, and nacks from devices whose
-removal has matured are ignored. (8.12, 8.19)
+removal has matured are ignored.
 
 **A21. A device nacks every commit** (a bug, a thief). Key changes stall,
 not data. *Mitigation:* its removal's commit needs nothing from it; the
-chrome names the device that nacks. (8.19)
+chrome names the device that nacks.
 
 **A22. Phone replacement every two or three years.** *Mitigation:* "retire
 this phone": pair the new one (enrolled in every space at once), then
 remove the old one, revoke its leaves everywhere, and offer to wipe it.
-(8.23a, 8.24)
 
 **A23. A sync-key thief waits for the owner's other device to go quiet,**
 then commits garbage to it. *Mitigation:* a commit is an admin call,
 verified at ingress and by every device through its evidence, so a sync
-key alone commits nothing. (8.12, 8.19)
+key alone commits nothing.
 
 **A24. A device cannot follow the confirmed epoch and has no device to
 re-pair from** (a buggy commit, a lost committer, a lockout). *Mitigation:*
 a regroup signed by its admin key: 72 h and a veto, or at once with two
 seasoned devices or the kit (§3.5); it keeps its regrouper alone, and
-the other devices pair again from it (2026-11-17, decision 16). (8.13,
-8.23b)
+the other devices pair again from it.
 
 ### 8.2 The home space and its operators
 
 **B1. The operators withhold or delay sync.** *Mitigation:* devices work
 offline and are full replicas; after 7 days without the agent the chrome
-offers to move home. (8.20)
+offers to move home.
 
 **B2. The operators delete envelopes.** *Mitigation:* each device fetches
-a sample of positions it pushed and re-pushes what is missing. (8.21)
+a sample of positions it pushed and re-pushes what is missing.
 
 **B3. The operators roll the agent back.** *Mitigation:* a control log
 shorter than, or diverging from, the highest view a device saw raises an
-alarm. (8.21)
+alarm.
 
 **B4. The operators equivocate** on commits or on operations.
 *Mitigation:* two commits for one epoch give two signed `h` and a void;
 views in envelopes catch a split control log. *Known limit:* nodes sign
 nothing a device can show a third party, so an alarm is not proof
-(`open.md`, "Node-signed roots"). (8.19, 8.21)
+(`open.md`, "Node-signed feed heads").
 
 **B5. The operators inject or replay.** A forged envelope fails its AEAD; a
 replayed one is a duplicate; a replayed commit breaks the epoch rule.
-*Mitigation:* as stated. (8.20)
+*Mitigation:* as stated.
 
 **B6. The operators forge device-set operations.** *Mitigation:* every
 device verifies every operation's and confirmation's signature itself,
 from the evidence stored beside it; an operation without evidence moves no
 device.
-(8.13, 8.19)
 
 **B7. The operators advance the agent's clock,** maturing a hostile
 removal or a restore early. *Known limit:* delays trust the operators'
 clock; devices alarm on more than an hour's skew; it helps only a thief
-who already passed the biometric (A4) or holds the kit (D3), or B8. (8.13)
+who already passed the biometric (A4) or holds the kit (D3), or B8.
 
 **B8. The operators collude** with a thief or a removed device: dropping
 vetoes, ordering the thief's operations first, placing a removed device's
@@ -4303,73 +3913,70 @@ over the devices' own count (§3.5), nor silence a view or a dropped call
 by naming a head they do not serve (§3.6) [built].
 *Known limit:* the home is trusted for availability, order and time
 (`core-model.md` §5); the owner's remedies are two seasoned devices'
-immediate removal and moving home. (8.28)
+immediate removal and moving home.
 
 **B9. The agent loses its quorum.** Sync and device changes stop; local
 work continues. *Mitigation:* devices queue and retry; the lease counts
-re-proofs, not uptime. (8.12)
+re-proofs, not uptime.
 
 **B10. A home with one replica.** *Mitigation:* the chrome shows the
 replica count; devices remain full replicas. *Known limit:* losing that
-disk and every device at once. (8.14)
+disk and every device at once.
 
 **B11. The pool runs out,** or the open claims' daily cap is reached.
 *Mitigation:* `Homes` answers `PoolEmpty`, the designed symptom (the cap
 is kept below the keeper's refill rate so the disk never fills first); the
-keeper tops up, the device stays local and retries. (8.14)
+keeper tops up, the device stays local and retries.
 
 **B12. `Homes` assigns one agent twice, or one nullifier twice.**
 *Mitigation:* unique Linear indexes in `Homes`; `assigned`/`refused`
-replies. (8.14)
+replies.
 
 **B13. A user's second device claims a second agent** (its nullifier
 differs under E2, so `Homes` cannot tell). *Mitigation:* the chrome
-refuses a claim on a device that already holds an archive (8.23a). A
+refuses a claim on a device that already holds an archive. A
 person that churns devices instead, revoking one and enrolling another
 for a fresh nullifier at each round, is held to its enrollments of the
 year at a home that is the user's own space: its limit and two
 replacements (§3.8), so at most that many agents a period, each lapsing
 13 months after its last re-proof, which a revoked leaf cannot make. At a
-home-only space each device's open claim is under the period's cap (only
-the claiming device's in slice 8, decision 16).
+home-only space only the claiming device makes an open claim, under the
+period's cap.
 
 **B14. A member is expelled, or stops re-proving.** *Mitigation:* the
 lease lapses 13 months after the last re-proof; the agent then refuses
 pushes for 180 days of grace but serves reads and a restore, so the
 data stays recoverable (E15). Each device's home nullifier is recorded at
-its add, so any device can re-prove even after the claiming one is gone
-(slice 9: a joiner holds no leaf at a home-only home to prove with,
-decision 16).
-*Known limit:* reaping after the grace is later work; no device re-proves
-in slice 8 (decision 16; `open.md`). (8.14)
+its add, so a device with a leaf at the home can re-prove even after the
+claiming one is gone. *Known limit:* reaping after the grace is later
+work; no device re-proves yet, and a joiner holds no leaf at a home-only
+home to prove with (`open.md`).
 
 **B15. The user stops using every device** with the kit in a drawer.
 *Mitigation:* the lease needs only one re-proof a year; past it, the grace
-leaves 180 days for a restore. (8.14, 8.23b) [The re-proof flow: slice 9,
-decision 16; until then every agent lapses 13 months after its claim
-(`open.md`).]
+leaves 180 days for a restore. *Known limit:* the re-proof flow is not
+built, so every agent lapses 13 months after its claim (`open.md`).
 
 **B16. The home vanishes or turns hostile.** *Mitigation:* move home by
 leaving, claiming at the new home and pairing again (§3.9; nothing
-carried, 2026-11-17, decision 16): the books are written again by every
-device. *Known limit:* a scope's history stays at the old home; a reused
+carried): the books are written again by every device. *Known limit:* a scope's history stays at the old home; a reused
 kit links the two agents for the two homes' operators together; a
-successor group and a live handover are later work. (8.23c)
+successor group and a live handover are later work.
 
 **B17. Personal agents fill the space's disks.** *Mitigation:* a 64 MiB
 default quota; the scale gate measures a full agent's snapshot and a
-`replace` against limits. (8.15)
+`replace` against limits.
 
 **B18. `Personal` is upgraded over agents that hold data** (`Install`
 touches no table; migration is unbuilt). *Mitigation:* an append-only
 layout across versions, an upgrade test over a populated agent, and the
 keeper upgrading in batches and stopping at the first refusal. *Known
-limit:* a hostile upgrade is B8. (8.12, 8.14)
+limit:* a hostile upgrade is B8.
 
 **B19. The operators show each device only its own envelopes**
 (partition). *Mitigation:* every envelope carries its writer's `seen`
 positions; a reader served less of a scope than a writer had read raises
-the alarm. (8.20, 8.21)
+the alarm.
 
 **B20. The home space re-founds** (a new `SpaceId`, members re-enroll).
 The agents and `Homes`' indexes survive if the agents do; the "home"
@@ -4377,7 +3984,7 @@ scope includes the space, so nullifiers change. *Mitigation:* each device
 re-records its new nullifier at its next re-proof; the kit carries the
 home's stable handle, not its `SpaceId`. *Known limit:* the re-recording
 is not built; it waits for the re-founding runbook (§3.3, "`Homes` as
-built"). (8.14)
+built").
 
 ### 8.3 Data, storage and quotas
 
@@ -4385,62 +3992,58 @@ built"). (8.14)
 validates each operation; one that fails is quarantined and the chrome
 names its author [built: `Light::quarantined`]. *Known limit:* excising a
 device's range after the fact is later work; the remedy is removing the
-device. (8.18b)
+device.
 
 **C2. The DAG grows without bound, or a user stores media.** *Mitigation:*
-checkpoints (slice 9) let new devices start late; the quota bounds the agent; the
-push API is blob-ready. *Known limit:* garbage collection and a blob
-store are later work; media fills the quota fast. (8.20, 8.21)
+the quota bounds the agent; the push API is blob-ready. *Known limit:*
+checkpoints, which would let new devices start late, garbage collection
+and a blob store are later work (`open.md`); media fills the quota fast.
 
-**C3. Two devices checkpoint at once.** *Mitigation:* checkpoints are cut
-at agent positions, so both hold the same state. (8.21; slice 9, decision
-16)
+**C3. Two devices checkpoint at once.** Checkpoints are not built; their
+design cuts them at agent positions, so both would hold the same state
+(`open.md`).
 
-**C4. A wrong checkpoint.** *Mitigation:* a paired device trusts only its
-pairing device's checkpoint, whose hash it got over the pairing channel; a
-restore trusts one acknowledged by two devices other than its author, or
-replays. (8.21) [Amended 2026-11-17, decision 16: checkpoints move to
-slice 9, so every device replays each scope from its start. *Known
+**C4. A shortened scope served to a new device.** Every device replays
+each scope from its start (checkpoints are not built, `open.md`). *Known
 limit:* a newly paired or restored device can be served a shortened
 scope (its last envelopes withheld) without an alarm: it has read no
 position to hold the operators to, and raises `Partition` only once a
-later envelope's `seen` position crosses the cut (`open.md`).]
+later envelope's `seen` position crosses the cut.
 
 **C5. Quotas fill,** perhaps to block the filler's removal. *Mitigation:*
 operations, the commits carrying them, confirmations and `alive` are
-exempt; each device has an unadvertised share. (8.12)
+exempt; each device has an unadvertised share.
 
-**C6. Large objects.** A 1 MiB checkpoint is 17 envelopes and 17 pushes.
-*Mitigation:* chunking; the scale gate pushes full 256 KiB steps; the API
-is blob-ready. (8.15, 8.20)
+**C6. Large objects.** A 1 MiB object is 17 envelopes and 17 pushes.
+*Mitigation:* chunking; the scale gate pushes envelopes of the largest
+size (§3.3); the API is blob-ready.
 
 **C7. Inbox spam.** *Mitigation:* only the user's devices and a slot's
 holder write; slots are single-use and last 10 minutes; admission by known
-keys. (8.11, 8.12)
+keys.
 
 **C8. Sizes and timing describe the user.** *Mitigation:* Padmé padding,
 opaque scope ids, structure inside the ciphertext. *Known limit:* counts,
 times and the epoch counter remain; foreground sync follows app use; no
-cover traffic. (8.20)
+cover traffic.
 
 **C9. Two key archives disagree.** *Mitigation:* every candidate key is
-kept and the AEAD decides. (8.20)
+kept and the AEAD decides.
 
 **C10. Fetching on demand reveals what the user reads.** *Mitigation:*
 devices are full replicas, fetching on a schedule; member trees stay
 device-local. *Known limit:* a device too small for a full replica, and
-slice 9's wallet mirror of a large pool, are later concerns. (8.20)
+a wallet's mirror of a large pool, are later concerns (`open.md`).
 
 **C11. The phone's storage fills.** *Mitigation:* the local store refuses
 writes before the disk fills; sync pauses; the chrome says so [built:
 `Error::Full` below the reserve, §2.1]. *Known limit:* a disk another app
 fills past the reserve fails fjall's write, which refuses every write
-until the store is opened again. (8.18b)
+until the store is opened again.
 
-**C12. Years of history for a two-device user.** *Mitigation:* the new
-device takes its pairing device's checkpoint, so it never replays from the
-start. (8.21) [Slice 9, 2026-11-17, decision 16: a new device replays
-each scope from its start.]
+**C12. Years of history for a two-device user.** *Known limit:* a new
+device replays each scope from its start; taking its pairing device's
+checkpoint instead is later work (`open.md`).
 
 ### 8.4 Recovery and the device's life
 
@@ -4450,12 +4053,12 @@ envelopes opened (they follow every confirmed epoch), a new group, the kit
 rotated; memberships re-enrolled by each registrar's ordinary process,
 whose cost the chrome states; P1 accounts by `rekey`. *Known limit:* the
 kit holds keys, not data; a home gone or withholding at that moment leaves
-it nothing; the encrypted export file is later work (E16). (8.23b)
+it nothing; the encrypted export file is later work (E16).
 
 **D2. Every device and the kit are lost,** or a single device with no
 backup dies. *Known limit:* the personal space is gone; memberships and
 P1 accounts come back by each space's process. The app offers backup at
-first launch and after (§3.1). (8.23a)
+first launch and after (§3.1).
 
 **D3. The kit leaks** (a photo of the phrase in the stolen phone's gallery
 is the likely way). *Mitigation:* alone it opens `R1`, not `R2`; its
@@ -4468,27 +4071,27 @@ a thief holding the kit, a phone and the owner's biometric wins (A4). A
 removed device is not a leaked kit: `R` rotates at every removal (the
 committer draws a new `R`, seals `R1` to the kit and stores `R2` at the
 agent), so the operators and a removed device read nothing the recovery
-scope holds after its removal. (8.13, 8.23b)
+scope holds after its removal.
 
 **D4. The kit points at old onions.** *Mitigation:* the kit carries the
 handle and the onions at the claim; the agent is found by the kit's key.
 *Known limit:* a home whose onions all changed is found only through the
-registry of spaces, not built. (8.23b)
+registry of spaces, not built.
 
 **D5. The background job does not run** (the "rare" or "restricted"
 bucket, a force-stop, an OEM battery manager, a cold Tor bootstrap that
 eats the job's 30 s). *Mitigation:* the chrome shows each device's last
-sync and recommends the battery exemption; PG6 measures these cases
-before the windows are pinned. *Known limit:* a device whose job never
-runs neither vetoes nor posts `alive` until the user opens the app. (8.22)
+sync and recommends the battery exemption; PG6 records these cases,
+which the windows are pinned against (§2.4). *Known limit:* a device whose job never
+runs neither vetoes nor posts `alive` until the user opens the app.
 
 **D6. Android kills the process mid-write.** *Mitigation:* each local
 operation, MLS state change and queue change is one fjall batch; pushes
-and commits are idempotent. (8.6, 8.19)
+and commits are idempotent.
 
 **D7. A local actor's new version changes its state's shape.** *Known
 limit:* state migration is unbuilt; such an actor starts a new scope and
-the device re-imports. (8.18b)
+the device re-imports.
 
 **D8. An app release and a space's upgrade land days apart.**
 *Mitigation:* compatibility windows: each stock guard admits the current
@@ -4496,105 +4099,102 @@ and the previous release's program ids, and ingress the current and
 previous device formats, for 60 days or until the operator retires the
 previous one, at once if it is found unsound; the two versions compute the
 same claims; the light node proves with the newest program the space
-admits. (8.4, 8.10)
+admits.
 
 **D9. Devices run different app versions.** *Mitigation:* versioned
 operations; unknown kinds and later releases wait for the update
-[built, §3.2]. (8.18b)
+[built, §3.2].
 
 **D10. The security key is lost** (the kit of that kind). *Mitigation:* a
 second kit (the phrase, or a second key) is offered at the claim; rotation
-from any seasoned device replaces it. (8.23b)
+from any seasoned device replaces it.
 
 **D11. The UI is swiped away, or crashes, mid-proof or mid-sync.**
 *Mitigation:* the light node runs in its own `:vos` process [E21]; the
 UI's death does not touch a proof or a sync, and a crash in `:vos` leaves
-the UI to report it. (8.24b)
+the UI to report it.
 
 ### 8.5 Cryptography's future
 
 **F1. Harvest now, decrypt later.** *Mitigation:* a hybrid post-quantum
-suite if mls-rs maintains one by 8.3 (it does not: an X-Wing suite on a
+suite once mls-rs maintains one (it does not: an X-Wing suite on a
 private code point behind an unstable feature of the aws-lc provider,
 §3.4 [read 2026-11-02]), then by a successor group (F2); 180-day
 retention of handshakes.
-*Known limit:* a hostile operator keeps what it wants. (8.3, 8.19)
+*Known limit:* a hostile operator keeps what it wants.
 
 **F2. Changing the suite or the protocol.** *Mitigation:* a successor
 group, archives resealed, old envelopes left under their keys; never two
-suites in one group. (later)
+suites in one group. Later work.
 
 **F3. RFC 9420's exporter is not forward-secure.** *Mitigation:* moot for
-history; the Safe Exporter when mls-rs has it. (8.19)
+history; the Safe Exporter when mls-rs has it.
 
 **F4. An mls-rs defect, or its version churn.** *Mitigation:* `vos-mls`
-holds the one pinned version for VOS, upgraded once a slice; a state the
-new version cannot read means re-pairing that device. (8.19)
+holds the one pinned version for VOS, upgraded at regular steps; a state the
+new version cannot read means re-pairing that device.
 
 ### 8.6 Proving and payments
 
 **G1. Junk proofs.** *Mitigation:* the format's PoW, the in-flight caps
 and the verification budget; Tor bounds the rate; the pre-check is a
-target. (8.5, 8.25)
+target.
 
 **G2. A space installs a kernel that leaks a secret.** *Mitigation:*
 secrets enter only kernels the light node ships, by program ids embedded
-at release (§4.4). (8.4)
+at release (§4.4).
 
 **G3. A space upgrades a stock kernel.** *Mitigation:* the window admits
 the previous program for 60 days unless retired sooner, both computing the
-same claim; past it, the light node says which side must update. (8.4,
-8.10)
+same claim; past it, the light node says which side must update.
 
 **G4. Balances split per device** (E2). *Known limit:* a payment comes
-from one device; consolidating under P1 is a visible transfer (L4). (8.7)
+from one device; consolidating under P1 is a visible transfer (L4).
 
 **G5. A developer's own kernel wants the user's private data.** *Known
-limit:* only data the user hands it, never keys, in slice 8. (8.4)
+limit:* only data the user hands it, never keys (§4.4).
 
-**G6. PG2′ misses its target.** *Mitigation:* the gate is 0.65 s, the
-target 0.55 s; format 47 ships at what it measures under the gate, and the
-4-way CPU split is the next lever. (8.10)
+**G6. A sign-in misses its target.** *Mitigation:* PG2′'s gate is 0.65 s,
+the target 0.55 s (§2.4); format 47 ships at what it measures under the
+gate, and the 4-way CPU split is the next lever (`open.md`).
 
 ### 8.7 The network
 
 **H1. The onion is flooded** before arti's service PoW is declared ready.
 *Mitigation:* introduction-point, SSH-connection, circuit, per-agent and per-onion caps;
 the in-flight cap on large requests; Tor's own throughput bounding junk
-proofs; a flood measured in M5 (Q11).
-(8.25)
+proofs; a flood measured through Tor (§6.6).
 
 **H2. Tor is blocked on the user's network.** *Mitigation:* plain bridges
 pasted in the chrome defeat blocking by the public relay list [E22].
-*Known limit:* against deep packet inspection, slice 8 has no pluggable
+*Known limit:* against deep packet inspection there is no pluggable
 transport, so anonymous calls and the personal space wait, saying so, and
 the personal space's veto and `alive` windows run without the device;
 key-signed calls may use the clearnet where the space allows it and the
-user opted out for it (§6.5). (8.26)
+user opted out for it (§6.5).
 
 **H3. arti's library breaks monthly.** *Mitigation:* one pinned version a
-release, an upgrade step each slice. (8.25, 8.26)
+release, upgraded at regular steps.
 
 **H4. A background job starts cold.** *Mitigation:* arti's state
 persisted; an unfinished job leaves everything consistent and the next
-resumes (D5). (8.22)
+resumes (D5).
 
 **H5. A gateway's onion key is stolen.** *Mitigation:* the pinned set is
-refreshed from the registrar. *Known limit:* answers are unsigned. (8.25)
+refreshed from the registrar. *Known limit:* answers are unsigned.
 
 **H6. A gateway lists only some nodes** of a home. *Mitigation:* a home's
 gateways list every node (§3.3); a gateway that cannot reach an agent
-answers 421, which the client reports. Forwarding is later work. (8.25)
+answers 421, which the client reports. Forwarding is later work.
 
 **H7. Strangers flood a personal agent** (agent ids are sequential).
 *Mitigation:* known keys only, looked up before the signature check; the
-onion-only mark; per-agent circuit caps; gated queries. (8.11, 8.25)
+onion-only mark; per-agent circuit caps; gated queries.
 
 **H8. One rendezvous per poll.** *Mitigation:* the tree feed on one
-long-lived circuit (8.27); PG5 counts rendezvous. (8.26, 8.27)
+long-lived circuit (§6.7); PG5 counts rendezvous (§2.4).
 
 **H9. A wrong clock stops Tor.** *Mitigation:* the chrome names the clock.
-(8.26)
 
 **H10. One SSH connection could join two identities.** The light node
 reaches every gateway through SSH over the onion (E23); one connection for
@@ -4603,65 +4203,105 @@ and the personal agent by their shared SSH session. *Mitigation:* one SSH
 connection per isolation group, each on its own circuit and under an SSH
 key drawn for it alone; a session's spare connections (a proven call's,
 a fetch's) are made ahead, one at a time after drawn delays, each used
-once, kept for that session alone (§6.2). (8.26)
+once, kept for that session alone (§6.2).
 
 **H11. A user opts out of Tor for a space.** *Mitigation:* the opt-out
 covers that space's key-signed calls and its screens only, after a
 plain warning that its operators can then join the device's address to
 the sign-ins and payments asked on its screens; proofs and the personal
-agent stay on Tor whatever the user chooses [E22]. (8.26)
+agent stay on Tor whatever the user chooses [E22].
 
 ### 8.8 Linkability and membership
 
 **L1. The claim follows the user's sign-ins.** *Mitigation:* at a
 home-only space (the default) the user has no other sign-ins there.
-*Known limit* at a home that is the user's own space (§3.10). (8.23a)
+*Known limit* at a home that is the user's own space (§3.10).
 
 **L2. One device acts as a member and as the pseudonym.** *Mitigation:*
 separate Tor isolation groups, keys used nowhere else. *Known limit:*
-foreground sync starts when the user opens the app. (8.26)
+foreground sync starts when the user opens the app.
 
 **L3. Push-notification tokens identify the user.** *Mitigation:* none is
-given to any space; devices poll and raise local notifications. (8.22)
+given to any space; devices poll and raise local notifications.
 
 **L4. P1 transfers between one's own devices** link their owner digests.
-*Known limit:* P1 is pseudonymous; P2 (slice 9) hides it. (8.7)
+*Known limit:* P1 is pseudonymous; P2 would hide it (`open.md`).
 
 **L5. Device changes and counts link the agent to the member.**
-*Mitigation:* at a home-only space each device joins by its own open
-claim and the registrar has no person to count (in slice 8 only the
-claiming device joins, decision 16, which the operators see no less). *Known limit* at a home
-that is the user's own space, stated in the app. (8.14, 8.23a)
+*Mitigation:* at a home-only space only the claiming device joins, by an
+open claim, and the registrar has no person to count. *Known limit* at a home
+that is the user's own space, stated in the app.
 
 **L6. `once` scopes with one leaf per device** admit a member once per
-device [decided, §9.1]. *Known limit,* stated in the space's chrome;
-person leaves are later work. (8.16)
+device [decided]. *Known limit,* stated in the space's chrome;
+person leaves are later work (`open.md`).
 
 **L7. The registrar learns which device leaves are one member's**
 (`enroll_device`). It already knows each member; the tree still hides
-which leaf proves. *Known limit,* stated. (8.16)
+which leaf proves. *Known limit,* stated.
 
 **L8. Path fetches and the logged `map_root`** link a member's proofs.
-*Mitigation:* the credential tree's feed (8.27); a gateway that ends its
+*Mitigation:* the credential tree's feed; a gateway that ends its
 answers early marks the root a logged proof names for the root's grace
 alone, 90 s after the change it held back (§6.7). *Known limit:* within the
 grace, the split an honest keeper one period behind shows; node-signed
-feed heads are later work (`open.md`). (8.27)
+feed heads are later work (`open.md`).
 
 **L9. A space's page asks the device to prove in the "home" scope.**
-*Mitigation:* the scope is reserved by the facility. (8.14, 8.23a)
+*Mitigation:* the scope is reserved by the facility.
 
 **L10. Other members read a personal agent's control log** (any key may
 query). *Mitigation:* `Personal`'s queries answer only admitted keys.
-(8.12)
 
 **L11. Open claims at a home-only space are a Sybil door.** *Mitigation:*
 a bound on griefing, not a price: the daily cap sized to the home's disk,
 the quota ramp (8 MiB until the first re-proof), and work that stops only
 the trivial loop; nothing an open member can do reaches another user's
-agent. (8.14)
+agent.
 
-### 8.9 Sources for the prior art
+## 9. Sources
+
+Read 2026-11-02 unless marked.
+
+**Tor and arti** (§6):
+
+- arti 1.7.0 (restricted discovery stable):
+  https://blog.torproject.org/arti_1_7_0_released/ ; 2.5.1 (unix-socket
+  targets; congestion control and CGO on onion circuits experimental):
+  https://blog.torproject.org/arti_2_5_1_released/ ; the onion-service
+  document: https://gitlab.torproject.org/tpo/core/arti/-/raw/main/doc/OnionService.md
+
+- arti 2.7.0, 2026-10-01: https://blog.torproject.org/arti_2_7_0_released/ ;
+  2.6.0: https://blog.torproject.org/arti_2_6_0_released/ ; 2.5.0:
+  https://blog.torproject.org/arti_2_5_0_released/
+- arti-client's versions: https://crates.io/api/v1/crates/arti-client ;
+  its API (`launch_onion_service`, `StreamPrefs`):
+  https://docs.rs/arti-client/latest/arti_client/struct.TorClient.html
+- features (`onion-service-service` in `full`, not default):
+  https://docs.rs/crate/arti-client/latest/features ;
+  `tor-hsservice` (`handle_rend_requests`, `hs-pow-full` experimental):
+  https://docs.rs/tor-hsservice/latest/tor_hsservice/ ,
+  https://docs.rs/crate/tor-hsservice/latest/features ;
+  `tor-rtcompat` (`smol` experimental):
+  https://docs.rs/crate/tor-rtcompat/latest/features
+- vanguards in arti: https://blog.torproject.org/announcing-vanguards-for-arti/
+- "proxy and onion service support are ready for use":
+  https://arti.torproject.org/core/arti/ ; the older "not recommended for
+  production" page, unrevised since 2023:
+  https://arti.torproject.org/guides/capability-limitations
+- onion connections timing out (unverified, not readable):
+  https://gitlab.torproject.org/tpo/core/arti/-/issues/2482 ; onionperf:
+  https://metrics.torproject.org/onionperf-latencies.html
+- Zcash's arti client: https://docs.rs/zcash_client_backend/latest/zcash_client_backend/tor/struct.Client.html ;
+  Zashi 2.1: https://zodl.com/zashi-2-1-enhanced-privacy-with-tor-beta
+- Fedimint's connector: https://docs.rs/crate/fedimint-connectors/0.11.2/source/src/tor.rs
+- onionmasq's cold bootstrap (unverified):
+  https://gitlab.torproject.org/tpo/core/onionmasq/-/issues/161
+- iroh's Tor transport (QUIC over Tor streams, C tor):
+  https://iroh.computer/blog/tor-custom-transport
+- UDP over Tor, a proposal: https://spec.torproject.org/proposals/339-udp-over-tor.html
+
+**The prior art** (§3, §8):
 
 - Ink & Switch, Keyhive notebooks 01, 02, 05, 06 (2024-09 to 2026-07):
   https://www.inkandswitch.com/keyhive/notebook/
@@ -4697,84 +4337,3 @@ agent. (8.14)
   sources `mls-rs-core/src/crypto/cipher_suite.rs` and
   `mls-rs-crypto-awslc/src/lib.rs`: https://github.com/awslabs/mls-rs
   (read 2026-11-02)
-
-## 9. Decisions, risks, and later work
-
-### 9.1 Every question answered
-
-- **P2's slice:** P2, the wallet, PG4 and cipher-clerk v0.4 in slice 9
-  [E13, E18]; P1 on cipher-clerk v0.3.0 in slice 8.
-- **Where sealed scopes live:** the personal agent's tables through its
-  log, with a blob-ready API (§3.6).
-- **`once` under per-device secrets:** one nullifier per device in slice
-  8, stated; person leaves later.
-- **Spending keys and recovery:** with P2 in slice 9, by the mechanism of
-  §5.3 R3 (each `sk` HPKE-sealed to the kit's key, released only to a
-  matured restore).
-- **The device-change parameters:** as §3.5 states them, the windows
-  pinned after PG6's measurements of the background job, and set per
-  space on test homes.
-- **The suite:** ciphersuite 1 unless 8.3 finds a maintained hybrid
-  post-quantum suite in mls-rs that fits the phone; 8.3 found none
-  (§3.4), so ciphersuite 1.
-- **MLS or a simpler scheme:** MLS, as one `vos-mls` layer [E12].
-- **The home:** a home-only space by default [E14], Virto's listed in the
-  app [E20]; **the lease:** a yearly re-proof [E15]; **recovery:** a
-  phrase or a security key [E16]; **Tor:** the default for every space,
-  anonymous calls only over Tor, onion-only spaces, the home onion-only,
-  plain bridges in slice 8 [E17, E22]; **the ingresses:** HTTP and SSH on
-  the onion, `vos-api` over SSH [E23].
-- **The light node's process:** its own `:vos` process behind Binder
-  [E21] (Q5).
-- **The remaining design choices,** at their recommendations [E11]:
-  generic proven calls, `#[msg(proven = k)]` (Q6); SDK kernels measured
-  first, the hand-lean kernels the stock ones if the 1.15× gate misses
-  (Q7; the gate met, the SDK-form kernels the stock ones, §4.2); glue in
-  the light node's Rust for device effects (Q8); a
-  `recursion` feature on `vos-pvm-recair` (Q9); arti in the gateway behind
-  a `tor` feature, PoW when a release declares it, arti the onion's one
-  host (Q11, E30); the pool's integrity and note delivery with
-  P2 (Q10, Q12).
-
-### 9.2 Risks
-
-- **The slice's size:** about 24–34 weeks with reviews
-  (`slice-8-plan.md`); the light node's stream is the critical path, with
-  s4's screens and the Binder interface at its tail.
-- **The Merge lane is unbuilt:** slice 8 builds the device side and sealed
-  scopes, not plaintext scopes on nodes.
-- **MLS on the device is new code,** with confirmed epochs, admin-signed
-  commits and copy-and-swap on top; `vos-mls` carries the `messaging`
-  branch's storage providers, snapshot-and-restore and one-commit-an-epoch
-  rule, nothing else.
-- **10^4 personal agents waking a few times an hour** are unmeasured (plan
-  8.15).
-- **Android's background limits** decide how soon a device sees a pending
-  removal or restore (§8, D5); PG6 measures them.
-- **Proof bytes over Tor** dominate a call's latency (§6.3).
-
-### 9.3 Later work this design leaves
-
-One list; `open.md` takes it at the slice's end.
-- P2, the wallet, PG4, cipher-clerk v0.4 (slice 9).
-- Messaging between members on `vos-mls` and MLS virtual clients, with the
-  owner's word on the virtual leaf's shared keys against E2 (§3.10).
-- Plaintext Merge scopes on nodes; actors the user installs in the
-  personal agent (E9).
-- A second home mirroring the first; a live handover; a successor group
-  after a lost home; reaping a lapsed agent after its grace, with tenancy
-  numbers (§3.3, §3.9).
-- Forwarding between nodes, for gateways that list only some (§3.3).
-- Person leaves for `once` scopes.
-- History horizons and garbage collection of covered envelopes; a blob
-  store for media (§3.4, §3.6).
-- An encrypted export file under the kit's key [E16].
-- Pluggable transports (obfs4, Snowflake) [E22].
-- SSH over QUIC, or a roaming transport in the manner of mosh, once UDP over
-  Tor exists [E23].
-- Excising a device's operations after the fact (§8, C1).
-- A consent model per program id for developers' kernels over private data
-  (§4.4).
-- Node-signed answers, so an alarm becomes proof (§8, B4).
-- Local workflows with device effects (Q8).
-- A device too small for a full replica (§8, C10).

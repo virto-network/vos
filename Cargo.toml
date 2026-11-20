@@ -48,8 +48,9 @@ members = [
     "tools/keeper",
 ]
 # A plain `cargo build` builds what ships: the development crates (the
-# checker, the JAM tooling, the scale harness) enable test features of the
-# node's crates, which a root build would unify into `vos`.
+# checker, the kernel tests, the JAM tooling, Kreivo's client, the scale
+# harness, the phone bench) enable test features of the node's crates,
+# which a root build would unify into `vos`.
 default-members = [
     "agent/wire",
     "agent/sdk",

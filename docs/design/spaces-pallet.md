@@ -4,8 +4,8 @@ Status: v2, the design for the Kreivo teammate who implements it. v2
 simplified the anchoring protocol: no migration, equivocation ends a
 space for good, registration from the venue's next window, rooted
 statements only, and the venue rules written once, in
-`vos_anchor::venue`, which the pallet calls. "Changes from v1" below
-lists what moved. VOS writes no pallet code. VOS delivers three
+`vos_anchor::venue`, which the pallet calls; v1's call, event and error
+indices are retired, never reused (§6, §8). VOS writes no pallet code. VOS delivers three
 things:
 - this design;
 - the verifier crates, packaged for vendoring with a sync check (§3.1);
@@ -23,55 +23,7 @@ things:
   `docs/design/identity-and-authority.md` §5, §11 and §12, and
   `docs/design/proving.md` §11.
 
-## 0. Changes from v1
-
-- **No migration.** Call 5 (`migrate`), `SpaceInfo.end_window`, errors 24
-  (`AlreadyMigrated`), 18 (`OutOfRange`) and 28 (`SameVenue`), event 5
-  (`Migrated`) and v1's G14 are gone. A space that changes venue founds
-  again under a new genesis.
-- **Equivocation ends a space for good.** Call 6 (`resume`), error 23
-  (`StillEquivocating`), event 9 (`SpaceResumed`) and `set_status`'s
-  unblock to `Suspended` are gone. A second root at a window held stores
-  the evidence and keeps the first root's record; the status becomes
-  `Ended` (`SpaceStatus` index 3; index 1, `Suspended`, retired); event 8
-  is `SpaceEnded`. The space is never pruned (a tombstone), its roots are
-  refused from then on, its registration deposit is released to the
-  sovereign, and `dispatch_as_sovereign` stays callable so its funds can
-  leave. v1's G19 is gone; G5 changed.
-- **Registration from the venue's next window.** `register` takes no
-  `start_window`; the founder signs `(venue, space, controller)`
-  (`register_digest`'s preimage loses its last 8 bytes); the space anchors
-  from `now_w + 1` (from window 0 when its clock has not started). Error
-  26 (`BadStartWindow`) is gone.
-- **One anchor key per authority, set once.** `add_authority` of an
-  account that is an authority already is refused (`AuthorityExists`,
-  29): a node's key changes only by replacing the node. An unpaired
-  founding key may be paired with a new authority.
-- **Strict ed25519.** Every signature is verified as `ed25519-dalek`'s
-  `verify_strict` does, and a key of small order is never listed: a
-  genesis holding one is `BadGenesis`, an `add_authority` pairing one is
-  `BadAnchorKey` (30). A genesis naming a key twice is `BadGenesis`.
-- **Rooted statements only.** `ProgramInfo.venue_bound`, `Pin` and
-  refusal 7 (`Venue`) are gone; `judge` takes the program; a statement of
-  no root, or of the space `SpaceId::NONE`, is refused 4. `Seen` entries
-  all expire. A statement is accepted where its space's roots are
-  anchored, which is where the space registered: one venue by the space's
-  discipline, not by any venue's rule (§6.2's known limit).
-- **The anchor rule as one function.** `vos_anchor::venue` holds the
-  registration, the anchor rule, `anchored`, the key-listing rule
-  (`add_key`), the freshness and `Seen` expiry as pure functions over two
-  traits; the pallet implements them
-  over its storage and calls them (§6.1–§6.3). `MaxRootAge`,
-  `MinWindowMs` and `MaxWindowMs` leave `Config`: they are the kit's
-  constants.
-- **A second root at an aged window** is `WindowTooOld`, never evidence,
-  whether or not the first is still stored.
-- **`anchor` before the space's origin** is `WindowInFuture` (no window
-  is closed yet), and an anchor before the space's first window is
-  `WindowNotAfterLast`; `BadClock` is a registration's alone.
-- **The vectors** are G1–G17, renumbered (§10).
-
-## 0.1 Build order for the teammate
+## 0. Build order for the teammate
 
 The pallet needs VOS's crates only for §3's calls: the venue rules
 (`vos_anchor::venue`), `judge`, `space_id`, the digests, the genesis

@@ -149,7 +149,7 @@ and one more, the full agent, for the fill:
   creation, after it and at the load's end, per personal replica the node
   holds; the wakes' kinds; and the fill.
 
-The gate (`slice-8-plan.md` 8.15) compares two runs of the same load, one
+The gate (`docs/design/light-node.md` §3.3, "The scale gate") compares two runs of the same load, one
 without personal agents and one with them: the shard agents' commit p99,
 each node's RSS per personal replica, and the full agent's install.
 

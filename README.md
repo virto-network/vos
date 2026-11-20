@@ -24,10 +24,14 @@ origin rather than who the member is.
   API, its gateways and operator requests.
 - [`docs/design/spaces-pallet.md`](docs/design/spaces-pallet.md): the
   design of Kreivo's spaces pallet, the venue VOS anchors at on Kreivo.
+- [`docs/design/light-node.md`](docs/design/light-node.md): the light
+  node on the user's devices, the personal agent and the personal space,
+  one proving path for device statements, payments, and Tor.
 - [`docs/design/clerk-across-spaces.md`](docs/design/clerk-across-spaces.md):
   the Clerk's settlement across spaces, proposed.
 - [`docs/design/open.md`](docs/design/open.md): known gaps and next work.
-- [`docs/operations.md`](docs/operations.md): operating a space's nodes.
+- [`docs/operations.md`](docs/operations.md): operating a space's nodes,
+  its anchors and its onion service.
 - The security notes: [`node/SECURITY.md`](node/SECURITY.md) (the
   credential surface), [`pvm/proof/SECURITY.md`](pvm/proof/SECURITY.md)
   (what a verified proof proves) and
@@ -63,12 +67,17 @@ origin rather than who the member is.
     `net` (node-to-node channels), `prover` (the leader's prover worker),
     `venue` (anchoring and submitting statements), `cli` (the `vos`
     command).
+  - `light/android`: the `vos.credential` facility, the light node in
+    s4's Android app (outside the workspace).
   - `http` and `gateway`: the HTTP front and the gateway, which hold no
-    authority.
+    authority; `gateway/demo`: the s4 demo on a local space, with test
+    homes.
   - `checker`: the exactly-once checker and the shared test harness;
-    `fuzz`: the node API's and ingress's fuzz targets.
+    `kernel-tests`: the agent's kernels proved against its reference
+    model; `fuzz`: the node API's and ingress's fuzz targets.
 - `support/`: `vos-raft` (a `no_std` Raft core with a deterministic
-  simulator) and `merkle-crdt`.
+  simulator), `merkle-crdt` and `mls` (VOS's one MLS layer, over
+  mls-rs).
 - `tools/`: tooling no node links: `jam` (an agent as a JAM service, from
   its builder's side), `jam-dev` (a PolkaJam testnet's driver), `kreivo`
   (a client of Kreivo's spaces pallet, its mock and the conformance
@@ -87,10 +96,10 @@ install-hooks`).
 
 | tier | adds | holds | when |
 |---|---|---|---|
-| `just check` | formatting, the gates' tripwire, the workspace's lints, every fast test (the heavy binaries are listed in `tools/gates/heavy.toml`) | the final verifier's layout constants, the conformance vectors | after every edit; minutes, warm |
-| `just gate` | the heavy tests, the docs' tripwire, deny, the `no_std` builds, every guest rebuilt to `blobs.lock`, the leak checks, the verifier kit, the fuzz corpora replayed and their reach, and the suites outside the workspace (the gateway's onion and SSH ports with the demo, the light node's Tor client, the `vos.credential` facility) | `blobs.lock`, the wrap's preprocessed root, the leaf tables, the kit's lock, the facility's release artifacts | before each commit |
-| `just ci` | every feature set's lints, the JAR check, the PVM vectors, the bench's cross-host checks, the slow fault runs, the prover's library tests | the formats' bit counts | before a push |
-| `just ci-full` | the prover suites (`just test-proof`: the forgery and soundness gates, leakage at medium sizes), the bench's proving tests, the fuzz targets a minute each | `H_FOLD`, the known programs' ids, the golden fixtures | by hand, before a release candidate, under a 12 GiB memory limit |
+| `just check` | formatting, the gates' tripwire, the replay archives' reader's refusals, the workspace's lints, every fast test (the heavy binaries are listed in `tools/gates/heavy.toml`); it builds only the guests its tests run (the agent's programs, the test actors, the venues' refine programs) | the final verifier's layout constants (format 39's), the conformance vectors | after every edit; minutes, warm |
+| `just gate` | the heavy tests and the fast suites' doc tests, the docs' tripwire, deny, the side workspaces' lock files held to the root's, the venue rules' tripwire, the `no_std` builds, every guest rebuilt to `blobs.lock`, the leak checks, the verifier kit, the fuzz corpora replayed and their reach, the lints of the feature sets a change touches, the suites outside the workspace (the gateway's onion and SSH ports with the demo, the light node's Tor client, the `vos.credential` facility), and the reads at a cut | `blobs.lock`, the wrap's preprocessed root, the leaf tables, the kit's lock, the facility's release artifacts | before each commit |
+| `just ci` | every feature set's lints, the JAR check, the PVM vectors, the bench's cross-host checks, the slow fault runs, the statement's heap peak, the prover's library tests | the formats' bit counts | before a push or a merge |
+| `just ci-full` | the release binary's scan, the prover suites (`just test-proof`: the forgery and soundness gates, leakage at medium sizes), the bench's proving tests, the fuzz targets a minute each | `H_FOLD`, the known programs' ids, the golden fixtures | by hand, at a milestone or before a release candidate, under a 12 GiB memory limit |
 | `just slice-gate` | the leakage tests at their full sizes, the fuzz targets five minutes each | | by hand, before a release |
 
 Beside the tiers:

@@ -2,9 +2,10 @@ set shell := ["nu", "-c"]
 
 # The pinning tests write their pins under `VOS_PINS=write` and hold them
 # otherwise. No recipe inherits it: the recipes that write pins (`repin`,
-# `repin-proof`, `fixtures`, each in no tier) set it on their own lines, so
-# a `VOS_PINS=write` left in the caller's environment cannot turn a gate's
-# check into a rewrite (`just check-tiers` holds the tiers to that).
+# `repin-proof`, `fixtures`, `conformance`, each in no tier) set it on
+# their own lines, so a `VOS_PINS=write` left in the caller's environment
+# cannot turn a gate's check into a rewrite (`just check-tiers` holds the
+# tiers to that).
 unexport VOS_PINS
 
 default:
@@ -14,30 +15,8 @@ default:
 #
 #   check ⊆ gate ⊆ ci ⊆ ci-full ⊆ slice-gate
 #
-# Each named for when it runs, by what it adds and the pins it holds.
+# What each adds, the pins it holds and when it runs: `README.md`'s table.
 # There is no hosted CI: "ci" names the pre-push hook's recipe.
-# - `check`, after every edit (minutes, warm): formatting, the gates' own
-#   tripwire, the workspace's lints and the fast tests. Holds the final
-#   verifier's layout constants (format 39's), the conformance vectors.
-# - `gate`, before each commit: `check`, the heavy test
-#   targets (`tools/gates/heavy.toml`), the docs' tripwire, deny, the
-#   builds without std, every guest and its blob, the leak checks, the
-#   verifier kit, the fuzz corpora replayed and their reach, and the
-#   suites outside the workspace. Holds `blobs.lock`, the wrap's
-#   preprocessed root, the compiler's leaf tables, the kit's lock and the
-#   facility's release artifacts.
-# - `ci`, before a push (the pre-push hook, `just install-hooks`): `gate`
-#   and every feature set's lints, the JAR check, the PVM vectors, the
-#   bench's cross-host checks, the slow fault runs and the prover's library
-#   tests. Holds the formats' bit counts (`COUNTS`).
-# - `ci-full`, by hand before a release candidate (under a 12 GiB memory
-#   cap): `ci` and the prover suites (`test-proof`: the forgery and
-#   soundness gates, the leakage tests at a medium N), the bench's proving
-#   tests and the fuzz targets a minute each. Holds `H_FOLD`, the known
-#   programs' ids and the golden fixtures.
-# - `slice-gate`, the full gate, by hand before a release: `ci-full` with
-#   the leakage tests at their full N and the fuzz targets five minutes
-#   each.
 # A suite belongs to the lowest tier that can afford it; `just check-tiers`
 # holds the recipes to that. `just test-changed` runs the tests a change
 # touches. Outside every tier, on purpose: what needs a PolkaJam testnet
@@ -48,7 +27,7 @@ default:
 # The fast suites' crates, which `check` and `gate` run.
 core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-pvm-codec-derive -p vos-pvm-proof-derive -p vos-raft -p merkle-crdt -p vos-mls -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-abi -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
 
-# The agent's suites' crates, which `test-agent`, `check` and `gate` run.
+# The agent's suites' crates, which `check` and `gate` run.
 agent_crates := "-p vos-exec -p vos-light -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-api -p vos-http -p vos-gateway -p vos-node -p vos-node-prover -p vos-venue -p vos-kreivo -p vos-net -p vos-cli -p vos-jam-dev -p vos-scale -p vos-keeper"
 
 # A guest build for the PVM: the statement's target, its standard library
@@ -77,12 +56,6 @@ _venue-guest package bin features:
 # with), the seeded one holding an x86 run's proof hashes: `tools/phone`.
 phone out="target/phone":
     tools/phone/build.sh {{out}}
-
-# The recursion AIR's prover tests and the device profile's, on its masked
-# prover, four at a time: at every core at once the recursion suite passed
-# 12 GiB, the limit the gates run under.
-test-recair:
-    cargo test -p vos-pvm-recair -p vos-pvm-device -- --test-threads=4 --skip wrap_files::
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
 build-bench-guests:
@@ -304,7 +277,7 @@ repro-aarch64: build-test-actors
 # change of the design, the mock or the fixtures. `check` refuses vectors
 # the mock does not write.
 conformance:
-    with-env { VOS_CONFORMANCE: "write" } { cargo test -p vos-kreivo conformance::the_vectors_are_the_generators }
+    with-env { VOS_PINS: "write" } { cargo test -p vos-kreivo conformance::the_vectors_are_the_generators }
 
 # The tests run on mimalloc as the node's binary does, and as it does with
 # transparent huge pages off.
@@ -329,16 +302,15 @@ doc-check:
     with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { \
         cargo doc -p vos-venue -p vos-kreivo --features vos-venue/model,vos-kreivo/kreivo-mock --no-deps --quiet }
 
+# Every feature set's lints, with `gate`'s (`ci` runs both).
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-bench --features prove --all-targets --quiet -- -D warnings
     cargo clippy -p vos-cli --features faults --all-targets --quiet -- -D warnings
     cargo clippy -p vos-cli --no-default-features --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-proof --features debug-internals --all-targets --quiet -- -D warnings
-    cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     cargo clippy -p vos-venue --features model --quiet -- -D warnings
     cargo clippy -p vos-kreivo --features kreivo-mock --quiet -- -D warnings
-    just clippy-prover
 
 # The node and `vos` with the masked prover (`prover`): they build and lint
 # clean.
@@ -369,6 +341,9 @@ build-test-actors:
     cd agent/test-actors; cargo fetch --locked
     touch agent/test-actors/target/riscv64em-vos/release/.built
 
+# Where a guest program of `programs.toml` is built, its ELF named after it.
+program_elf := "agent/programs/target/riscv64em-vos/release/"
+
 # The agent's guest programs (`programs.toml`), each built alone in the
 # agent's guest workspace (`agent/programs`) with the guest toolchain in
 # `pvm/guest`.
@@ -383,10 +358,9 @@ build-program package:
     if "{{package}}" not-in (open programs.toml | get program.name) { error make { msg: "{{package}} is no program of programs.toml" } }
     just _at-fixed-path agent/programs --release -p {{package}} --target ../../pvm/guest/riscv64em-vos.json
 
-# The guest programs, each with its crate, its ELF and the pin stores it
-# feeds (`programs.toml`).
+# The guest programs, each with its crate and its ELF (`programs.toml`).
 programs:
-    @open programs.toml | get program | each {|program| $"($program.name)  ($program.crate)  ($program.elf)  pins: ($program.pins | str join ', ')" } | str join "\n"
+    @open programs.toml | get program | each {|program| $"($program.name)  ($program.crate)  {{program_elf}}($program.name).elf" } | str join "\n"
 
 # The JAM statements service's program, `statement-service.elf`.
 build-statement-service: (_venue-guest "vos-statement-service" "statement-service" "pvm-guest")
@@ -411,7 +385,7 @@ _blob-hashes:
         msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; \
         let fixed = ["target/riscv64em-vos/release/final-verify.elf" \
         "target/riscv64em-vos/release/statement-service.elf"] ++ (open programs.toml \
-        | get program.elf) ++ ["pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; \
+        | get program.name | each {|name| $"{{program_elf}}($name).elf" }) ++ ["pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm"]; \
         let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 \
         | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort \
         | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); \
@@ -437,7 +411,7 @@ check-blob-roles:
         if not (do $judges $harness) { error make { msg: $"cargo tree ($harness) links no model judge: a harness's blob no longer, its role changed" } } }; \
     let harnesses = [target/riscv64em-vos/release/final-verify.elf pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm]; \
     let deployed = [target/riscv64em-vos/release/statement-service.elf]; \
-    let programs = (if ('programs.toml' | path exists) { open programs.toml | get program.elf } else { [] }); \
+    let programs = (if ('programs.toml' | path exists) { open programs.toml | get program.name | each {|name| $"{{program_elf}}($name).elf" } } else { [] }); \
     let pinned = (open --raw blobs.lock | lines | where {|line| not ($line | str starts-with '#') and $line != '' } | each {|line| $line | split row '  ' | last }); \
     let unknown = ($pinned | where {|path| $path not-in ($harnesses ++ $deployed ++ $programs) and not ($path | str starts-with 'agent/test-actors/') }); \
     if ($unknown | is-not-empty) { error make { msg: $"blobs.lock pins blobs of no role: ($unknown | str join ', ')" } }; \
@@ -520,14 +494,6 @@ check-blobs: build-blobs check-blob-roles
         if ($moved ++ $gone | is-not-empty) { error make { \
         msg: "the guest blobs are not blobs.lock's: `just repin` after a change that moves them" } }; \
         print $"every pinned guest blob is blobs.lock's: ($built | length) blobs"
-
-# The SDK, its macros' restrictions, the test actors on the testkit, the
-# default agent against it, the checker's own model, the node running the
-# agent, the network between nodes, and the `vos` command.
-test-agent: build-test-actors build-programs
-    cargo test {{agent_crates}}
-    just test-faults
-    just test-reads
 
 # The slow fault runs: the fault build's process tests and the
 # five-process fault suite.
@@ -881,6 +847,7 @@ check-no-leaks: (_forbidden "tools" "venue-model" "venue-mock" "seeded-masks" "d
 # pallet's mock (`vos-kreivo`), the scale harness and the phone bench.
 # Neither the `vos` binary, with or without the prover, nor `vos-node`
 # holds a package under `tools/`, on a normal or build edge.
+[private]
 check-no-tools: (_forbidden "tools")
     print "no development tool in the node"
 
@@ -894,6 +861,7 @@ check-no-tools: (_forbidden "tools")
 # the fuzz targets, the final verifier's Wasm blob and its runner), enables
 # it (the prover's tests enable it on a dev edge), and the proof crate's
 # `debug-internals` does not imply it.
+[private]
 check-no-seeded-masks: (_forbidden "seeded-masks") _seeded-masks-unimplied
     print "no seeded masks in a production build"
 
@@ -908,6 +876,7 @@ check-no-seeded-masks: (_forbidden "seeded-masks") _seeded-masks-unimplied
 # seams; and the node's binary, built with the prover, names none of the
 # debug outputs' environment variables nor the instruction trace's message,
 # so none of them is compiled in.
+[private]
 check-no-debug-internals: (_forbidden "debug-internals") _debug-names-absent
     print "no debug outputs in a production build"
 
@@ -915,6 +884,7 @@ check-no-debug-internals: (_forbidden "debug-internals") _debug-names-absent
 # the store holds) reaches neither the `vos` binary, with or without the
 # prover, nor `vos-node`, on a normal or build edge (the carrier audit's
 # checker enables it, a dev edge of both).
+[private]
 check-no-store-dump: (_forbidden "store-dump")
     print "no store dump in a production build"
 
@@ -1131,17 +1101,11 @@ fuzz secs="60":
         -len_control=0 ...$limits } }
     cd node/fuzz; python3 -I ../../pvm/proof/fuzz/corpus.py unpack replay target/replay; \
         with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{node_fuzz_targets}}" \
-        | split row ' ') { mkdir $"corpus/($target)"; \
+        | split row ' ') { let limits = {{_fuzz_default}}; mkdir $"corpus/($target)"; \
         cargo fuzz run --fuzz-dir . -a $target $"corpus/($target)" $"target/replay/($target)" -- \
-        -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
+        -max_total_time={{secs}} -len_control=0 ...$limits } }
 
-# The light check, after every edit, and the innermost tier: formatting,
-# the gates' own tripwire, the replay archives' reader's refusals
-# (`pvm/proof/fuzz/test_corpus.py`), the workspace's lints, and every test
-# target of the fast suites' crates but the heavy ones (`tools/gates/heavy.toml`,
-# each a binary past about 20 s): minutes, warm. It builds the guests its
-# tests run, the agent's programs, the test actors and the venues' refine
-# programs, and nothing else outside the workspace.
+# The first tier, after every edit (`README.md`'s table).
 check: fmt-check check-tiers check-layers check-device-verifier build-test-actors build-programs build-final-verify build-statement-service
     python3 -I pvm/proof/fuzz/test_corpus.py
     cargo clippy --workspace --all-targets --quiet -- -D warnings
@@ -1149,18 +1113,7 @@ check: fmt-check check-tiers check-layers check-device-verifier build-test-actor
     cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py fast -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4
     cargo test {{agent_crates}} ...(python3 -I tools/gates/tiers.py fast {{agent_crates}} | split row ' ')
 
-# The commit gate, before each commit: `check`,
-# then the docs' links, the dependencies' licences and advisories (`deny`),
-# the side workspaces' lock files held to the root's (`check-locks`), the
-# venue rules' tripwire, the builds without std
-# with every guest built and its blob checked, the production builds'
-# leaks, the verifier kit, the fuzz corpus replayed, the lints of the
-# feature sets a change touches, the heavy test targets and the doc tests of
-# the fast suites' crates, and the edge's suites: the gateway's onion and
-# SSH ports with the demo, the light node's Tor client and the
-# `vos.credential` facility; last the reads at a cut.
-# Left to `just ci`: the slow fault runs, the PVM vectors, the bench and
-# prover library tests, and the lints of other feature sets.
+# The second tier, before each commit: `check` and more (`README.md`'s table).
 gate: check doc-check deny check-locks check-venue-rules check-no-std check-no-leaks check-no-faults check-kit fuzz-replay fuzz-reach
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     cargo clippy -p vos-http --all-targets --quiet -- -D warnings
@@ -1266,28 +1219,23 @@ test-reads: build-test-actors build-programs
         if $listed != $named { error make { msg: $"test-reads names ($named) tests, of which ($listed) exist" } }
     cargo test -p vos-kernel-tests --test kernel -- --test-threads=1 --exact {{reads_tests}}
 
-# Before a merge, and at the end of each planned stage of work: `gate`,
-# and everything else but the prover suites: the lints of every feature
-# set, the JAR check, the PVM vectors, the bench's cross-host checks, the
-# slow fault runs, the statement's heap peak and the prover's library
-# tests.
+# The third tier, the pre-push hook's: `gate` and more (`README.md`'s table).
 ci: gate clippy jar-check vectors test-bench test-faults
     cargo test -p vos-statement --features heap-peak --test heap
     cargo test -p vos-pvm-proof --lib
 
-# The gate at a milestone: `ci` plus the release binary's scan, the prover
-# suites, the soundness gates (the leakage tests at their medium N), the
-# bench tests that prove and the fuzz targets a minute each. Run it under a 12 GiB limit, e.g.
+# The fourth tier, by hand: `ci` and the prover suites (`README.md`'s
+# table), under a 12 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 just ci-full`.
 # Run alone on the machine, its builds may take `CARGO_BUILD_JOBS` 8 to 12:
 # the proving tests keep their own thread limits (`test-proof`'s
 # `--test-threads`), so the peak stays under the cap.
 ci-full: ci check-release-names test-bench-proof test-proof (fuzz "60")
 
-# The release gate, before a release: `ci-full`'s recipes, with the leakage tests at
-# their full N (2,000 proofs a witness on the small circuit, 32 on the real
-# wrap, 256 a witness on the device segment) and the fuzz targets five
-# minutes each. Under the same limit.
+# The fifth tier, before a release: `ci-full`'s recipes with the leakage
+# tests at their full N (2,000 proofs a witness on the small circuit, 32 on
+# the real wrap, 256 a witness on the device segment) and the fuzz targets
+# five minutes each. Under the same limit.
 slice-gate: ci check-release-names test-bench-proof
     with-env { LEAKAGE_N: "2000", LEAKAGE_WRAP_N: "32", LEAKAGE_SEGMENT_N: "256" } { just test-proof }
     just fuzz 300

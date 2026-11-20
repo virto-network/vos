@@ -11,7 +11,7 @@
 //! after every step before the decommitments.
 //!
 //! `just build-programs`, then `cargo run --release -p vos-phone
-//! --example device_ingress`
+//! --example verify_cost`
 
 use std::time::{Duration, Instant};
 
