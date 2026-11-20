@@ -292,10 +292,24 @@ impl<H: Host> Link for AgentLink<'_, H> {
         &mut self,
         envelopes: &[Vec<u8>],
     ) -> Result<Vec<Result<Pushed, PersonalError>>, String> {
-        envelopes
-            .iter()
-            .map(|envelope| self.call::<Pushed>(method::PUSH, envelope.encode()))
-            .collect()
+        // Each sent once, up to the first `Settling`: sealed sync wakes the
+        // agent and pushes the rest again.
+        let mut answers = Vec::with_capacity(envelopes.len());
+        for envelope in envelopes {
+            let called = self.signed(
+                &mut Key::Sync,
+                method::PUSH,
+                envelope.encode(),
+                &mut |_, _| Ok(()),
+            )?;
+            let pushed = answer::<Pushed>(&called.outcome)?;
+            let settling = pushed == Err(PersonalError::Settling);
+            answers.push(pushed);
+            if settling {
+                break;
+            }
+        }
+        Ok(answers)
     }
 
     fn since(&mut self, scope: Scope, position: u64) -> Answer<Vec<Envelope>, String> {

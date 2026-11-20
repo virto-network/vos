@@ -683,7 +683,8 @@ impl Personal {
     fn chore(&mut self, chore: Due, at: u64, now: u64) -> bool {
         let device = match chore {
             Due::Silence(device) => device,
-            _ => return self.retire_one(now),
+            Due::Retire => return self.retire_one(now),
+            Due::Op(_) => unreachable!("an operation's maturity is no chore"),
         };
         if let Some((index, _)) =
             prefixed!(self.signed, By(Signer::Device(device)), u64::MAX).first()

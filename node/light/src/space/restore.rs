@@ -253,9 +253,17 @@ impl<H: Host> Personal<H> {
             answered(link.wake())?;
         }
         let key = held.light.sync_key().clone();
-        let mut sync = held.sync;
         let (view, envelopes, overview, devices, policy) = {
-            let mut link = link(&self.host, &kept, Purpose::Personal, agent, &key, &mut sync);
+            // The sync key's own session: a read that fails keeps what the
+            // wakes before it used.
+            let mut link = link(
+                &self.host,
+                &kept,
+                Purpose::Personal,
+                agent,
+                &key,
+                &mut held.sync,
+            );
             answered(link.settle())?;
             let view: RecoveryView = answered(link.query(method::RECOVERY, ()))?;
             let mut envelopes = Vec::new();
@@ -291,7 +299,6 @@ impl<H: Host> Personal<H> {
             let policy = crate::group::configured(&read);
             (view, envelopes, overview, devices, policy)
         };
-        held.sync = sync;
         let archive = recover(&kit, &view, &agent.1, &envelopes).ok_or(Error::WrongKit)?;
         let device = device_of(&held, &devices)?;
         // The agent's batch time, not this device's clock: no entry after

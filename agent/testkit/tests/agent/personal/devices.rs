@@ -1160,6 +1160,10 @@ fn a_removed_device_reads_the_log_its_removal_rests_on() {
         "its removal's entry"
     );
     assert_eq!(removed, log_read(&home, sync(0)).unwrap());
+    // Within the window, the set's entries after its removal too.
+    let within = home.operate(admin(0), "remove", 1u32).unwrap();
+    let removed = log_read(&home, sync(2)).unwrap();
+    assert!(removed.iter().any(|(index, _)| *index == within));
     assert_eq!(
         home.query::<Overview>(sync(2), "overview", ()),
         Err(PersonalError::NotAdmitted)
@@ -1171,7 +1175,7 @@ fn a_removed_device_reads_the_log_its_removal_rests_on() {
     );
 
     home.pass(4 * MINUTE);
-    let later = home.operate(admin(0), "remove", 1u32).unwrap();
+    let later = home.operate(KIT, "remove", 0u32).unwrap();
     assert_eq!(
         log_read(&home, sync(2)).unwrap(),
         removed,

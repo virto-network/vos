@@ -121,6 +121,11 @@ impl<H: Host> Personal<H> {
     pub fn devices(&self) -> Result<Vec<Device>, Error> {
         let mut held = self.held();
         let me = held.group.as_ref().and_then(crate::group::DeviceGroup::id);
+        // This device's removal is its own log's word, not the answer's.
+        let out = held
+            .group
+            .as_ref()
+            .is_some_and(|group| group.course() == crate::group::Course::Out);
         let now = self.host.now();
         let overview: Overview = self.with_link(&mut held, Purpose::Personal, |link, _| {
             answered(link.query(method::OVERVIEW, ()))
@@ -138,7 +143,11 @@ impl<H: Host> Personal<H> {
                 strong: view.device.keys.class == AdminClass::Strong,
                 standing: view.standing,
                 seen: view.seen,
-                removed: view.removal.is_some() || view.standing == Standing::Removed,
+                removed: if Some(view.id) == me {
+                    out
+                } else {
+                    view.removal.is_some() || view.standing == Standing::Removed
+                },
                 me: Some(view.id) == me,
             })
             .collect())

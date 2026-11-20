@@ -345,13 +345,16 @@ impl<H: Host> Personal<H> {
         // A device of that personal space pairs again only once out of it
         // on the log it verifies (its removal read through: the agent
         // serves a removed device's key that far), or if never added (its
-        // add's candidate void); while in the set it is refused, whatever a
-        // refusal says. Out, it leaves at the offer.
+        // add's candidate void), or named by a removal it verified the
+        // signature of (one whose maturity its log never shows it, its
+        // supporting evidence never posted): while in the set it is
+        // refused, whatever a refusal says. Out, it leaves at the offer.
         let in_set = |held: &Held| {
             held.group.as_ref().is_some_and(|group| {
                 group.agent().identity == code.identity
-                    && group.id().is_some()
-                    && group.course() != Course::Out
+                    && group.id().is_some_and(|me| {
+                        group.course() != Course::Out && !group.removal_signed(me)
+                    })
             })
         };
         if in_set(&held) {

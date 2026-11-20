@@ -1090,8 +1090,10 @@ arm64-v8a build; the phones' timings below of 2026-11-06]:
   alarm, and the next candidate stops it (re-pair). A call refused with
   `Settling` is made again after a `wake`, sent at most nine times with
   eight wakes between (`WAKES`), by one owner: a flow's call by the link
-  (`AgentLink::settled`), a pass's post by the pass (`job::post_settled`;
-  the link sends a post once). The sync key's calls and its wakes share
+  (`AgentLink::settled`), a pass's post by the pass (`job::post_settled`),
+  a push by sealed sync (`SealedSync::send`, the rest pushed again after
+  each of at most eight wakes); the link sends a post and each push once,
+  a push stopping at the first `Settling`. The sync key's calls and its wakes share
   one session and one sequence count, so no wake reuses a call's
   sequence. A flow reads the log as a pass does (`job::log`): each page
   through the onion, a page that does not move past the one before
@@ -1480,7 +1482,9 @@ where the rules above leave a choice, this is the one taken]:
   maturity by its index, a device's silencing, the kit's retirement, in
   that order at one time), and the open operations by their signer
   (`By`, a device's before the kit's entries), each an enum whose key
-  encoding sorts as it does. Every
+  encoding sorts as it does. These keys, and the removed keys' table
+  `gone`, are the layout of `Personal`'s first version: a home founded
+  on an earlier build is founded again, and a phone clears its data. Every
   handler that settles declares 40M gas [measured, the agent suite on a
   debug build, x86-64 Core Ultra 7 155H, 2026-11-06; gas is
   deterministic]: the worst call in a full set (eight seasoned devices,
@@ -1879,11 +1883,23 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   replicated on their nodes, and an actor has no secret of its own), so
   an agent's signature would only be the operators' word, while the
   log's evidence is the user's devices' and kit's signatures, which no
-  operator or gateway can make. The cost: a removed device's key reads up
-  to a confirming window of the log past its removal (the devices' public
-  keys an add in that window brings, the set's operations), which before
-  it read none of. What a gateway can still do is withhold, which any
-  route can: it cannot remove a device it does not show a removal of. A post the agent refuses as held already (`Voted`,
+  operator or gateway can make. The cost: a removed device's key reads,
+  for good, the log through its removal (for a restore or a regroup, the
+  operation that removed it: the restored device's keys, its "home"
+  nullifier and label, the new kit's public keys), and up to a confirming
+  window past it (an add's keys, nullifier and label, the votes, the
+  candidates, `alive`), which before it read none of: a stolen phone
+  removed and then replaced learns the new phone's nullifier. A device
+  named by a removal whose signature it verified, but whose maturity its
+  log never shows it supported (a cosign's evidence never posted), stays
+  in the set by its rules and pairs again from a code of its own space
+  (`DeviceGroup::removal_signed`). The Devices screen's own row says
+  removed only once the device is out (`space::Personal::devices`). What
+  a gateway can still do is withhold, which any route can, and replay: an
+  operation's evidence binds its call, not its place in the log, so a
+  route forking the log a device reads from its cursor can log again a
+  removal of it that was once signed and vetoed or cancelled, and mature
+  it unvetoed (`open.md`, "The control log's head in an admin call"). A post the agent refuses as held already (`Voted`,
   `Evidenced`) or as decided meanwhile (`NoCandidate`, `NotConfirming`) is
   done, the log read on; a page withheld is read again once. A pass that
   stops on an error hands back what it found (`Stopped`), its alarms with
@@ -3697,7 +3713,7 @@ device's crates faster); its size argument is small.
   one's once it is out of it on the log it verifies (its removal read
   through, the log followed first) or was never added, and is refused
   while it is in the set, whatever a refusal says. The light node's
-  store is laid out anew (`LAYOUT` 8): a phone of an earlier build clears
+  store is laid out anew (`LAYOUT` 10): a phone of an earlier build clears
   the facility's data and claims or pairs again.
 - **One engine, the flows in `vos-light`** [built, `vos_light::space`]:
   every flow is `vos_light::space::Personal`'s, over a `Host` (requests,
@@ -3931,6 +3947,8 @@ from the evidence stored beside it; an operation without evidence moves no
 device. Nor does a refusal: a removed device is out on its removal's
 evidence, which the agent serves its key (§3.6, the pass), and a refusal
 the route makes up stops a pass, never removes a device (`NotAdmitted`).
+*Known limit:* evidence binds a call, not its place in the log, so a
+signed removal once vetoed can be logged again on a forked log (§3.6).
 
 **B7. The operators advance the agent's clock,** maturing a hostile
 removal or a restore early. *Known limit:* delays trust the operators'

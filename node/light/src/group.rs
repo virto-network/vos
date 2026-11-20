@@ -860,6 +860,16 @@ impl DeviceGroup {
         self.merge_archive(&taken)
     }
 
+    /// Whether an open operation whose signature this device verified
+    /// removes `device`: a removal, a regroup naming it, a restore.
+    pub fn removal_signed(&self, device: DeviceId) -> bool {
+        self.operations().iter().any(|open| {
+            open.verified
+                && (matches!(open.op, Op::Restore { .. })
+                    || set::removes(&open.op).contains(&device))
+        })
+    }
+
     /// The device set's open operations, as this device verified them.
     pub fn operations(&self) -> Vec<Open> {
         let state = &self.state;
