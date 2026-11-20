@@ -62,15 +62,15 @@ pub enum Route {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Purpose {
-    /// A proven call: anonymous, each on a connection of its own, the
-    /// spare built ahead.
+    /// A proven call: anonymous, each on a connection of its own, a spare
+    /// built ahead.
     Proven = 0,
     /// A read that names nothing of the member's but must not link to it:
     /// the node's time, the onion set's refresh. Anonymous, each on a
-    /// connection of its own.
+    /// connection of its own, a spare built ahead.
     Fetch = 1,
-    /// The credential tree's feed: anonymous, one long-lived connection,
-    /// as every member reads the same feed.
+    /// The credential tree's feed and the space's device window: anonymous,
+    /// one long-lived connection, as every member reads the same.
     Feed = 2,
     /// The member's own key-signed calls and queries in the space: one
     /// connection a space.

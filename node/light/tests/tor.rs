@@ -317,11 +317,16 @@ fn config() -> Config {
         attempts: 3,
         again: Duration::from_millis(200),
         idle: Duration::from_secs(60),
+        spare_gap: Duration::from_millis(20),
+        spare_idle: Duration::from_secs(60),
     }
 }
 
+/// A client through `gateway`, the app in the foreground.
 fn client(gateway: &Arc<Gateway>, config: Config) -> Client {
-    Client::new(Arc::new(Dialer(Arc::clone(gateway))), config)
+    let client = Client::new(Arc::new(Dialer(Arc::clone(gateway))), config);
+    client.set_foreground(true);
+    client
 }
 
 /// A proven call's request: its kind and a stand-in body (the gateway
@@ -425,19 +430,19 @@ async fn a_proven_call_takes_the_spare_built_ahead() {
     let client = client(&gateway, config());
     let a = space(1);
     client.set_space(a, Routes::onions(vec![gateway.onion(1)]));
-    client.keep_spare(Some(a));
-    until(|| client.spare_ready()).await;
+    client.keep_spares(Some(a), &[Purpose::Proven]);
+    until(|| client.spare_ready(Purpose::Proven)).await;
     assert_eq!(gateway.dials(), 1);
     assert!(gateway.seen()[0].key.is_some(), "the handshake is done");
     assert!(gateway.seen()[0].kinds.is_empty());
     client.request(a, Purpose::Proven, &proven()).await.unwrap();
     assert_eq!(gateway.seen()[0].kinds, [Kind::Credentialed as u16]);
     // The next spare, on a circuit and key of its own.
-    until(|| client.spare_ready()).await;
+    until(|| client.spare_ready(Purpose::Proven)).await;
     assert_eq!(gateway.dials(), 2);
     client.request(a, Purpose::Proven, &proven()).await.unwrap();
     assert_eq!(gateway.seen()[1].kinds, [Kind::Credentialed as u16]);
-    until(|| client.spare_ready()).await;
+    until(|| client.spare_ready(Purpose::Proven)).await;
     // A key-signed call never takes the spare.
     client.request(a, Purpose::Member, &query()).await.unwrap();
     let seen = gateway.seen();
@@ -445,8 +450,87 @@ async fn a_proven_call_takes_the_spare_built_ahead() {
     assert!(seen[2].kinds.is_empty() && seen[3].kinds == [Kind::Query as u16]);
     assert_isolated(&seen);
     // No spare for a space it is not kept for.
-    client.keep_spare(None);
-    assert!(!client.spare_ready());
+    client.keep_spares(None, &[]);
+    assert!(!client.spare_ready(Purpose::Proven));
+}
+
+/// A fetch takes a spare of its own, kept beside the proven calls': used
+/// once and closed, the next built after it on a circuit and key of its
+/// own. A request that may take no spare opens its own connection and
+/// leaves the spare built.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fetch_takes_its_own_spare_once() {
+    let gateway = Gateway::new();
+    let client = client(&gateway, config());
+    let a = space(1);
+    client.set_space(a, Routes::onions(vec![gateway.onion(1)]));
+    client.keep_spares(Some(a), &[Purpose::Proven, Purpose::Fetch]);
+    let ready = || client.spare_ready(Purpose::Proven) && client.spare_ready(Purpose::Fetch);
+    until(ready).await;
+    assert_eq!(gateway.dials(), 2);
+    assert!(gateway.seen().iter().all(|seen| seen.kinds.is_empty()));
+    client
+        .request(a, Purpose::Fetch, &wire::time_request())
+        .await
+        .unwrap();
+    let carried: Vec<Seen> = gateway
+        .seen()
+        .into_iter()
+        .filter(|seen| !seen.kinds.is_empty())
+        .collect();
+    assert_eq!(carried.len(), 1, "the spare carried it");
+    assert_eq!(carried[0].kinds, [Kind::Time as u16]);
+    until(ready).await;
+    assert_eq!(gateway.dials(), 3);
+    until(|| {
+        gateway
+            .seen()
+            .iter()
+            .any(|seen| seen.kinds == [Kind::Time as u16] && seen.ended)
+    })
+    .await;
+    client
+        .request_with(a, Purpose::Fetch, &wire::time_request(), None)
+        .await
+        .unwrap();
+    assert_eq!(gateway.dials(), 4, "a connection of its own");
+    assert!(client.spare_ready(Purpose::Fetch));
+    assert_isolated(&gateway.seen());
+}
+
+/// Spares are built only in the foreground, and leaving it closes them; a
+/// spare left unused past its life is closed and built anew, so none is
+/// held open for long.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spares_live_in_the_foreground_and_not_for_long() {
+    let gateway = Gateway::new();
+    let client = client(
+        &gateway,
+        Config {
+            spare_idle: Duration::from_millis(400),
+            ..config()
+        },
+    );
+    client.set_foreground(false);
+    let a = space(1);
+    client.set_space(a, Routes::onions(vec![gateway.onion(1)]));
+    client.keep_spares(Some(a), &[Purpose::Proven]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(gateway.dials(), 0, "nothing built in the background");
+    client.set_foreground(true);
+    until(|| client.spare_ready(Purpose::Proven)).await;
+    assert_eq!(gateway.dials(), 1);
+    // Its life is 200 to 600 ms: then it closes, and another is built.
+    until(|| gateway.dials() == 2 && gateway.seen()[0].ended).await;
+    until(|| client.spare_ready(Purpose::Proven)).await;
+    assert!(gateway.seen().iter().all(|seen| seen.kinds.is_empty()));
+    client.set_foreground(false);
+    assert!(!client.spare_ready(Purpose::Proven));
+    until(|| gateway.seen().iter().all(|seen| seen.ended)).await;
+    let dials = gateway.dials();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(gateway.dials(), dials);
+    assert_isolated(&gateway.seen());
 }
 
 /// A fresh connection that fails, or hangs past its deadline, is retried
@@ -543,7 +627,7 @@ async fn an_anonymous_call_is_refused_on_a_clearnet_only_path() {
     let mut routes = Routes::new(Vec::new(), Some(clearnet), false);
     routes.opt_out().unwrap();
     client.set_space(a, routes);
-    client.keep_spare(Some(a));
+    client.keep_spares(Some(a), &[Purpose::Proven]);
     for (purpose, request, refused) in [
         (Purpose::Proven, proven(), Refused::Anonymous),
         (Purpose::Fetch, query(), Refused::Anonymous),
@@ -560,7 +644,7 @@ async fn an_anonymous_call_is_refused_on_a_clearnet_only_path() {
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(gateway.dials(), 0, "nothing left the client");
-    assert!(!client.spare_ready());
+    assert!(!client.spare_ready(Purpose::Proven));
     client.request(a, Purpose::Member, &query()).await.unwrap();
     let seen = gateway.seen();
     assert_eq!(seen.len(), 1);
@@ -582,9 +666,9 @@ async fn dormant_holds_no_connection_and_sends_nothing() {
     let client = client(&gateway, config());
     let a = space(1);
     client.set_space(a, Routes::onions(vec![gateway.onion(1)]));
-    client.keep_spare(Some(a));
+    client.keep_spares(Some(a), &[Purpose::Proven]);
     client.request(a, Purpose::Member, &query()).await.unwrap();
-    until(|| client.spare_ready()).await;
+    until(|| client.spare_ready(Purpose::Proven)).await;
     assert_eq!(gateway.dials(), 2);
     client.set_dormant(true);
     assert!(client.is_dormant());
@@ -604,10 +688,10 @@ async fn dormant_holds_no_connection_and_sends_nothing() {
     assert!(matches!(client.screens(a, ours).await, Err(Error::Dormant)));
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(gateway.dials(), 2);
-    assert!(!client.spare_ready());
+    assert!(!client.spare_ready(Purpose::Proven));
     client.set_dormant(false);
     assert_eq!(*gateway.dormant.lock().unwrap(), [true, false]);
-    until(|| client.spare_ready()).await;
+    until(|| client.spare_ready(Purpose::Proven)).await;
     client.request(a, Purpose::Member, &query()).await.unwrap();
     let seen = gateway.seen();
     assert_eq!(seen.len(), 4);
@@ -956,34 +1040,40 @@ async fn the_tree_is_read_on_one_feed_connection() {
 /// PG5's foreground schedule, on a clock a thousand times faster (a
 /// second a millisecond: the hour 3.6 s, the feed's timer 30 ms, drawn
 /// between 15 and 45; the kept-open connections' idle limit a second, past
-/// any stall of a loaded host): the feed
-/// read on its timer, the member's calls and the personal agent's every
-/// minute, and twelve sign-ins (one every four minutes), each a fetch of the node's time and a
-/// proven call. The hour's rendezvous are one a kept-open group (its
-/// connection outlives the gaps between its requests), one the spare built
-/// ahead, and two a sign-in: 3 + 1 + 2 × 12 = 28, within PG5's 30, so a
-/// foreground hour holds at most 13 sign-ins before the bound. Counted
-/// as the foreground's; a background run after it as the background's.
+/// any stall of a loaded host): the feed read on its timer, the member's
+/// calls and the personal agent's every minute, a facility session's
+/// clock read every eight minutes (a fetch), and twelve sign-ins (one every
+/// four minutes), each a proven call, spares kept for both, each living
+/// longer than the gaps between its purpose's requests and the last
+/// one's to the hour's end. The hour's
+/// rendezvous are one a kept-open group (its connection outlives the gaps
+/// between its requests), one a sign-in and one a clock reading (each takes
+/// its purpose's spare, built anew after it), and the two spares left
+/// built: 3 + 12 + 8 + 2 = 25, within PG5's 30. Counted as the
+/// foreground's; a background run after it as the background's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_foreground_hour_opens_a_rendezvous_a_kept_group_and_two_a_sign_in() {
+async fn a_foreground_hour_opens_a_rendezvous_a_kept_group_a_sign_in_and_a_clock_reading() {
     const SIGN_INS: u32 = 12;
+    const READINGS: u32 = 8;
     let gateway = Gateway::new();
     let client = client(
         &gateway,
         Config {
             idle: Duration::from_secs(1),
+            spare_idle: Duration::from_millis(3_000),
             ..config()
         },
     );
     let (a, home) = (space(1), space(3));
     client.set_space(a, Routes::onions(vec![gateway.onion(1)]));
     client.set_space(home, Routes::new(vec![gateway.onion(3)], None, true));
-    client.set_foreground(true);
-    client.keep_spare(Some(a));
-    until(|| client.spare_ready()).await;
-    let hour = std::time::Instant::now() + Duration::from_millis(3_600);
-    let (mut feed, mut minute, mut signed) =
-        (std::time::Instant::now(), std::time::Instant::now(), 0u32);
+    client.keep_spares(Some(a), &[Purpose::Proven, Purpose::Fetch]);
+    let ready = || client.spare_ready(Purpose::Proven) && client.spare_ready(Purpose::Fetch);
+    until(ready).await;
+    let start = std::time::Instant::now();
+    let hour = start + Duration::from_millis(3_600);
+    let (mut feed, mut minute) = (start, start);
+    let (mut signed, mut read) = (0u32, 0u32);
     let mut draw = 7u64;
     while std::time::Instant::now() < hour {
         let now = std::time::Instant::now();
@@ -1000,31 +1090,36 @@ async fn a_foreground_hour_opens_a_rendezvous_a_kept_group_and_two_a_sign_in() {
                 .unwrap();
             minute = now + Duration::from_millis(60);
         }
-        // A sign-in every four minutes, the spare rebuilt between them.
-        let due = Duration::from_millis(240 * u64::from(signed) + 100);
-        if signed < SIGN_INS && hour - Duration::from_millis(3_600) + due <= now {
-            until(|| client.spare_ready()).await;
+        // A sign-in every four minutes, a clock reading every eight, each
+        // on its purpose's spare, rebuilt between them.
+        if signed < SIGN_INS && start + Duration::from_millis(240 * u64::from(signed) + 100) <= now
+        {
+            until(|| client.spare_ready(Purpose::Proven)).await;
+            client.request(a, Purpose::Proven, &proven()).await.unwrap();
+            signed += 1;
+        }
+        if read < READINGS && start + Duration::from_millis(480 * u64::from(read) + 220) <= now {
+            until(|| client.spare_ready(Purpose::Fetch)).await;
             client
                 .request(a, Purpose::Fetch, &wire::time_request())
                 .await
                 .unwrap();
-            client.request(a, Purpose::Proven, &proven()).await.unwrap();
-            signed += 1;
+            read += 1;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert_eq!(signed, SIGN_INS);
-    until(|| client.spare_ready()).await;
+    assert_eq!((signed, read), (SIGN_INS, READINGS));
+    until(ready).await;
     let hours = client.opened();
     let foreground: u32 = hours.iter().map(|hour| hour.foreground.rendezvous()).sum();
     let of = |purpose| -> u32 { hours.iter().map(|hour| hour.foreground.of(purpose)).sum() };
-    // Every sign-in's proven call took a spare; the last spare is built.
+    // Every request took a spare; the last spares are built.
     assert_eq!(of(Purpose::Proven), SIGN_INS + 1);
-    assert_eq!(of(Purpose::Fetch), SIGN_INS);
+    assert_eq!(of(Purpose::Fetch), READINGS + 1);
     for purpose in [Purpose::Feed, Purpose::Member, Purpose::Personal] {
         assert_eq!(of(purpose), 1, "{purpose:?} kept open across the hour");
     }
-    assert_eq!(foreground, 3 + 1 + 2 * SIGN_INS);
+    assert_eq!(foreground, 3 + SIGN_INS + READINGS + 2);
     assert!(foreground <= 30, "PG5: {foreground} rendezvous in the hour");
     assert_eq!(foreground as usize, gateway.dials());
     assert!(hours.iter().all(|hour| hour.foreground.failed == 0));

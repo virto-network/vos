@@ -140,7 +140,7 @@ async fn main() {
     );
     let at = Instant::now();
     if args.proven > 0 {
-        client.keep_spare(Some(space));
+        client.keep_spares(Some(space), &[Purpose::Proven]);
     }
 
     // A kept-open group each: its first request opens its connection.
@@ -184,13 +184,13 @@ async fn main() {
     // timed to its answer.
     for round in 0..args.proven {
         let waited = Instant::now();
-        while !client.spare_ready() && waited.elapsed() < Duration::from_secs(120) {
+        while !client.spare_ready(Purpose::Proven) && waited.elapsed() < Duration::from_secs(120) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         if round == 0 {
             println!("M spare_ready_ms {}", ms(at));
         }
-        let ready = client.spare_ready();
+        let ready = client.spare_ready(Purpose::Proven);
         let mut request = (vos_api::Kind::Credentialed as u16).to_le_bytes().to_vec();
         request.extend_from_slice(&1u32.to_le_bytes());
         request.extend_from_slice(&[0; 1024]);

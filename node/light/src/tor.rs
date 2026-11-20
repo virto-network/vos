@@ -15,9 +15,13 @@
 //!   by key (§8, H10). A kept-open purpose's connection stays while it is
 //!   used, closed after [`Config::idle`] without a request; a proven call
 //!   and a fetch each take one of their own, closed once answered.
-//! - **A spare for proven calls** ([`Client::keep_spare`]): one connection
-//!   built ahead to the space, its SSH handshake and subsystem done, which
-//!   the next proven call takes; the next spare is built once it is.
+//! - **A spare a one-shot purpose** ([`Client::keep_spares`]): for a proven
+//!   call and for a fetch, one connection built ahead to the space, its SSH
+//!   handshake and subsystem done, which the purpose's next request takes,
+//!   used once. Spares are built one at a time, each after a delay drawn
+//!   below [`Config::spare_gap`], only while the app is in the foreground
+//!   ([`Client::set_foreground`]); one left unused past a time drawn around
+//!   [`Config::spare_idle`] is closed and built anew.
 //! - **A fresh connection that fails is retried on a new circuit**, up to
 //!   [`Config::attempts`], through the next onion of the pinned set: 10–20%
 //!   of fresh onion connections failed on the phones (§6.4). When every
@@ -81,13 +85,21 @@ pub struct Config {
     pub again: Duration,
     /// How long a kept-open connection stays without a request.
     pub idle: Duration,
+    /// The most a spare waits before it is built: each draws its delay
+    /// below it, so no two are built at once or on a schedule.
+    pub spare_gap: Duration,
+    /// How long a spare stays unused, about: each draws its life between
+    /// half and one and a half of it.
+    pub spare_idle: Duration,
 }
 
 impl Default for Config {
     /// The onion connection's measured tail (p95 7.6–13.6 s, a run's worst
     /// at 43–84 s, `light-node.md` §6.3–§6.4) cut at 45 s, as a retry on a
     /// new circuit beats the tail; the SSH handshake's 3–5 s at p95 given
-    /// 30 s; a 1 MiB upload's slowest 26 s given 90 s.
+    /// 30 s; a 1 MiB upload's slowest 26 s given 90 s. A spare is built
+    /// within 4 s of being wanted, and lives 5 to 15 minutes unused
+    /// (`light-node.md` §6.2: PG5's rendezvous an hour).
     fn default() -> Self {
         Self {
             connect: Duration::from_secs(45),
@@ -97,6 +109,8 @@ impl Default for Config {
             attempts: 3,
             again: Duration::from_secs(5),
             idle: Duration::from_secs(300),
+            spare_gap: Duration::from_secs(4),
+            spare_idle: Duration::from_secs(600),
         }
     }
 }

@@ -1,4 +1,4 @@
-//! The client: spaces, their routes, a connection a purpose, the spare,
+//! The client: spaces, their routes, a connection a purpose, the spares,
 //! dormancy, s4's screens and the onion set's refresh.
 //!
 //! Every connection is made under a [`Version`]: the space's routes as
@@ -105,6 +105,19 @@ struct Held {
     connection: Arc<Connection>,
 }
 
+/// A spare, and when it is closed unused.
+struct Spare {
+    held: Held,
+    until: Instant,
+}
+
+impl Spare {
+    /// Open, and not past its life.
+    fn usable(&self, now: Instant) -> bool {
+        !self.held.connection.is_closed() && now < self.until
+    }
+}
+
 /// A kept-open group's connection, and when its last open failed.
 #[derive(Default)]
 struct Kept {
@@ -130,16 +143,27 @@ struct State {
     /// Every open connection, by its space, closed when its routes change
     /// or the client goes dormant.
     live: Vec<(SpaceId, Weak<Connection>)>,
-    /// The space the spare is kept for, and the spare once built.
+    /// The space spares are kept for, and the purposes kept one.
     spare_for: Option<SpaceId>,
-    spare: Option<Held>,
-    /// The task building the spare.
+    spare_purposes: Vec<Purpose>,
+    /// Each purpose's spare once built.
+    spares: HashMap<Purpose, Spare>,
+    /// Moved each time spares are kept anew: a spare is kept, and taken,
+    /// only under the keeping it was built for.
+    spare_epoch: u64,
+    /// The task building the spares, one at a time, and closing each at
+    /// its life's end.
     building: Option<JoinHandle<()>>,
+    /// That task waits for a life's end alone: a spare wanted meanwhile
+    /// starts it anew.
+    waiting: bool,
     /// The task closing idle connections.
     reaper: Option<JoinHandle<()>>,
     /// s4's screen session's space and carrying task.
     screens: Option<(SpaceId, JoinHandle<()>)>,
     dormant: bool,
+    /// The app is in the foreground: spares are built only then.
+    foreground: bool,
     /// Moved at each dormancy and each waking.
     awake: u64,
 }
@@ -160,12 +184,39 @@ impl State {
         });
         self.groups.retain(|(_, other), _| !of(other));
         if self.spare_for.is_some_and(|spare| of(&spare)) {
-            self.spare = None;
+            self.drop_spares();
         }
         if self.screens.as_ref().is_some_and(|(other, _)| of(other)) {
             let (_, task) = self.screens.take().expect("the screens");
             task.abort();
         }
+    }
+
+    /// Close every spare.
+    fn drop_spares(&mut self) {
+        for (_, spare) in self.spares.drain() {
+            spare.held.connection.close();
+        }
+    }
+
+    /// The space and the purpose the next spare is built for, if one is
+    /// wanted: none while dormant or in the background.
+    fn wanted(&self) -> Option<(SpaceId, Purpose)> {
+        if self.dormant || !self.foreground {
+            return None;
+        }
+        let space = self.spare_for?;
+        let now = Instant::now();
+        self.spare_purposes
+            .iter()
+            .copied()
+            .find(|purpose| {
+                !self
+                    .spares
+                    .get(purpose)
+                    .is_some_and(|spare| spare.usable(now))
+            })
+            .map(|purpose| (space, purpose))
     }
 }
 
@@ -264,29 +315,43 @@ impl Client {
             .map(|(routes, _)| routes.clone())
     }
 
-    /// Keep a spare connection built ahead to `space` for its next proven
-    /// call, or none.
-    pub fn keep_spare(&self, space: Option<SpaceId>) {
+    /// Keep a spare connection built ahead to `space` for the next request
+    /// of each of the one-shot `purposes`, or none, for a new keeper: the
+    /// spares kept before, and any being built, are closed. The keeping's
+    /// number, which [`Client::request_with`] takes a spare under.
+    pub fn keep_spares(&self, space: Option<SpaceId>, purposes: &[Purpose]) -> u64 {
         let mut state = self.state();
-        if state.spare_for != space {
-            state.spare = None;
-            state.spare_for = space;
+        state.drop_spares();
+        if let Some(task) = state.building.take() {
+            task.abort();
         }
+        state.spare_epoch += 1;
+        state.spare_for = space;
+        state.spare_purposes = match space {
+            Some(_) => purposes
+                .iter()
+                .copied()
+                .filter(|purpose| purpose.one_shot())
+                .collect(),
+            None => Vec::new(),
+        };
+        let epoch = state.spare_epoch;
         drop(state);
         self.refill();
+        epoch
     }
 
-    /// Whether the spare is built and open.
-    pub fn spare_ready(&self) -> bool {
+    /// Whether `purpose`'s spare is built and open.
+    pub fn spare_ready(&self, purpose: Purpose) -> bool {
         self.state()
-            .spare
-            .as_ref()
-            .is_some_and(|spare| !spare.connection.is_closed())
+            .spares
+            .get(&purpose)
+            .is_some_and(|spare| spare.usable(Instant::now()))
     }
 
     /// Dormant, or awake: dormant closes every connection (requests in
-    /// flight end), the spare and the screens, stops every timer and tells
-    /// arti; awake starts them again and builds the spare.
+    /// flight end), the spares and the screens, stops every timer and tells
+    /// arti; awake starts them again and builds the spares.
     pub fn set_dormant(&self, dormant: bool) {
         let mut state = self.state();
         if state.dormant == dormant {
@@ -318,8 +383,27 @@ impl Client {
 
     /// The app came to the foreground, or left it: what the client opens
     /// from now on is counted as the foreground's, or the background's.
+    /// Spares are built only in the foreground: leaving it closes them.
     pub fn set_foreground(&self, foreground: bool) {
         self.tally().set_foreground(foreground);
+        let mut state = self.state();
+        if state.foreground == foreground {
+            return;
+        }
+        state.foreground = foreground;
+        if !foreground {
+            state.drop_spares();
+            if let Some(task) = state.building.take() {
+                task.abort();
+            }
+        }
+        drop(state);
+        self.refill();
+    }
+
+    /// Whether the app is in the foreground, as last told.
+    pub fn is_foreground(&self) -> bool {
+        self.state().foreground
     }
 
     /// What the client opened, each of the last [`super::HOURS`] hours in
@@ -349,13 +433,29 @@ impl Client {
 
     /// Send `request` (its kind's two little-endian bytes, then its body,
     /// as [`crate::wire`] makes them) to `space` under `purpose`: its
-    /// answer's kind and body. The policy decides first; a proven call
-    /// takes the spare when one is built for the space.
+    /// answer's kind and body. The policy decides first; a one-shot
+    /// purpose's request takes its spare when one is built for the space,
+    /// and the next is built after a drawn delay.
     pub async fn request(
         &self,
         space: SpaceId,
         purpose: Purpose,
         request: &[u8],
+    ) -> Result<Answer, Error> {
+        let epoch = self.state().spare_epoch;
+        self.request_with(space, purpose, request, Some(epoch))
+            .await
+    }
+
+    /// [`Client::request`], a spare taken only if one is kept under the
+    /// keeping `spare` ([`Client::keep_spares`]'s number): a caller's
+    /// requests take its own spares alone.
+    pub async fn request_with(
+        &self,
+        space: SpaceId,
+        purpose: Purpose,
+        request: &[u8],
+        spare: Option<u64>,
     ) -> Result<Answer, Error> {
         let (kind, body) = request.split_at_checked(2).ok_or(Error::Malformed)?;
         let kind =
@@ -370,11 +470,8 @@ impl Client {
         };
         let connection = if purpose.one_shot() {
             let (routes, route, version) = self.current(space, purpose)?;
-            let spare = self.take_spare(space, purpose, version);
-            if purpose == Purpose::Proven {
-                // The next spare is built while this call goes.
-                self.refill();
-            }
+            let spare = spare.and_then(|epoch| self.take_spare(space, purpose, version, epoch));
+            self.refill();
             match spare {
                 Some(spare) => spare,
                 None => self.open(space, purpose, &routes, route, version).await?,
@@ -490,15 +587,15 @@ impl Client {
     }
 
     /// Read `space`'s onion set from its registrar, through the pinned set,
-    /// as a fetch of its own; a usable set replaces the pinned one and is
-    /// returned, for the app to keep.
+    /// as fetches of their own, no spare among them; a usable set replaces
+    /// the pinned one and is returned, for the app to keep.
     pub async fn refresh_onions(
         &self,
         space: SpaceId,
         registrar: &Registrar,
     ) -> Result<Vec<Onion>, Error> {
         let (_, time) = self
-            .request(space, Purpose::Fetch, &wire::time_request())
+            .request_with(space, Purpose::Fetch, &wire::time_request(), None)
             .await?;
         let now = wire::time_answer(&time).map_err(Error::Answer)?;
         let query = wire::query_request(
@@ -510,7 +607,9 @@ impl Client {
             now + 60_000,
         )
         .map_err(Error::Answer)?;
-        let (_, answer) = self.request(space, Purpose::Fetch, &query).await?;
+        let (_, answer) = self
+            .request_with(space, Purpose::Fetch, &query, None)
+            .await?;
         let onions: Vec<Onion> = wire::query_answer(&answer).map_err(Error::Answer)?;
         let repeated = onions
             .iter()
@@ -607,75 +706,133 @@ impl Client {
         Ok(())
     }
 
-    /// The spare, for a proven call to `space` under `version`, if it is
-    /// built and still open.
+    /// `purpose`'s spare, for a request to `space` under `version` by the
+    /// keeping `epoch`, if it is built and still open: taken, so it carries
+    /// this request alone.
     fn take_spare(
         &self,
         space: SpaceId,
         purpose: Purpose,
         version: Version,
+        epoch: u64,
     ) -> Option<Arc<Connection>> {
-        if purpose != Purpose::Proven {
-            return None;
-        }
         let mut state = self.state();
-        if state.spare_for != Some(space) {
+        if state.spare_for != Some(space) || state.spare_epoch != epoch {
             return None;
         }
-        state
-            .spare
-            .take()
-            .filter(|spare| spare.version == version && !spare.connection.is_closed())
-            .map(|spare| spare.connection)
+        let spare = state.spares.remove(&purpose)?;
+        if spare.held.version == version && spare.usable(Instant::now()) {
+            return Some(spare.held.connection);
+        }
+        spare.held.connection.close();
+        None
     }
 
-    /// Build the spare if one is wanted and none is built or building.
+    /// Keep the spares: build each wanted, one at a time, each after a
+    /// delay drawn below [`Config::spare_gap`]; close each at the end of its
+    /// own drawn life, and build it anew. Unless a builder runs.
     fn refill(&self) {
-        let state = self.state();
-        let Some(space) = state.spare_for else {
-            return;
-        };
+        let mut state = self.state();
         let building = state
             .building
             .as_ref()
             .is_some_and(|task| !task.is_finished());
-        let built = state
-            .spare
-            .as_ref()
-            .is_some_and(|spare| !spare.connection.is_closed());
-        if building || built {
+        let wanted = state.wanted().is_some();
+        if building && !(state.waiting && wanted) {
             return;
         }
-        drop(state);
-        let Ok((routes, Route::Onion, version)) = self.current(space, Purpose::Proven) else {
+        if let Some(task) = state.building.take() {
+            task.abort();
+        }
+        state.waiting = false;
+        if !wanted && state.spares.is_empty() {
             return;
-        };
-        let client = Arc::downgrade(&self.inner);
-        let task = tokio::spawn(async move {
-            let Some(inner) = client.upgrade() else {
-                return;
-            };
-            let client = Client { inner };
-            let Ok(spare) = client
-                .open(space, Purpose::Proven, &routes, Route::Onion, version)
-                .await
-            else {
-                return;
-            };
-            let mut state = client.state();
-            if state.spare_for == Some(space) && state.spare.is_none() {
-                state.spare = Some(Held {
-                    version,
-                    connection: spare,
-                });
-            } else {
-                spare.close();
+        }
+        let (client, config) = (Arc::downgrade(&self.inner), self.inner.config);
+        state.building = Some(tokio::spawn(async move {
+            loop {
+                let next = {
+                    let Some(inner) = client.upgrade() else {
+                        return;
+                    };
+                    let mut state = inner.state.lock().expect("the client's state");
+                    let next = match state.wanted() {
+                        Some(wanted) => Ok(wanted),
+                        None => Err(state.spares.values().map(|spare| spare.until).min()),
+                    };
+                    state.waiting = next.is_err();
+                    next
+                };
+                let (space, purpose) = match next {
+                    Ok(wanted) => wanted,
+                    Err(None) => return,
+                    Err(Some(until)) => {
+                        // The next spare's life ends: closed then, at its
+                        // own drawn time, and built anew.
+                        tokio::time::sleep_until(until.into()).await;
+                        let Some(inner) = client.upgrade() else {
+                            return;
+                        };
+                        let mut state = inner.state.lock().expect("the client's state");
+                        let now = Instant::now();
+                        state.spares.retain(|_, spare| {
+                            let usable = spare.usable(now);
+                            if !usable {
+                                spare.held.connection.close();
+                            }
+                            usable
+                        });
+                        continue;
+                    }
+                };
+                tokio::time::sleep(below(config.spare_gap)).await;
+                let Some(inner) = client.upgrade() else {
+                    return;
+                };
+                let client = Client { inner };
+                let (wanted, epoch) = {
+                    let state = client.state();
+                    (state.wanted(), state.spare_epoch)
+                };
+                if wanted != Some((space, purpose)) {
+                    continue;
+                }
+                let Ok((routes, Route::Onion, version)) = client.current(space, purpose) else {
+                    return;
+                };
+                let Ok(connection) = client
+                    .open(space, purpose, &routes, Route::Onion, version)
+                    .await
+                else {
+                    return;
+                };
+                let mut state = client.state();
+                // Kept for whom it was opened for alone: not for a keeper
+                // that came since.
+                let wanted = state.wanted() == Some((space, purpose))
+                    && state.spare_epoch == epoch
+                    && Self::still(&state, space, version).is_ok();
+                if !wanted {
+                    connection.close();
+                    continue;
+                }
+                let life = config.spare_idle / 2 + below(config.spare_idle);
+                state.spares.insert(
+                    purpose,
+                    Spare {
+                        held: Held {
+                            version,
+                            connection,
+                        },
+                        until: Instant::now() + life,
+                    },
+                );
             }
-        });
-        self.state().building = Some(task);
+        }));
     }
 
-    /// Close kept-open connections idle past their time, each half of it.
+    /// Close kept-open connections idle past their time, each half of it;
+    /// a spare whose build failed is tried again then.
     fn start_reaper(&self) {
         let client = Arc::downgrade(&self.inner);
         let idle = self.inner.config.idle;
@@ -685,6 +842,10 @@ impl Client {
                 let Some(inner) = client.upgrade() else {
                     return;
                 };
+                Client {
+                    inner: Arc::clone(&inner),
+                }
+                .refill();
                 let slots: Vec<Slot> = {
                     let state = inner.state.lock().expect("the client's state");
                     state.groups.values().cloned().collect()
@@ -855,9 +1016,14 @@ impl Client {
 }
 
 /// A random 64-bit number, or zero without randomness: where a pinned
-/// set's rotation starts.
+/// set's rotation starts, and the spares' draws.
 fn rand_u64() -> u64 {
     let mut bytes = [0u8; 8];
     let _ = getrandom::getrandom(&mut bytes);
     u64::from_le_bytes(bytes)
+}
+
+/// A uniform draw below `period`.
+fn below(period: Duration) -> Duration {
+    Duration::from_micros(rand_u64() % (period.as_micros() as u64).max(1))
 }
