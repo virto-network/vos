@@ -262,14 +262,14 @@ fn kit(byte: jbyte) -> Result<KitKind, Refusal> {
     KitKind::from_byte(byte as u8).ok_or_else(|| refused(Code::Arguments, "no such kit kind"))
 }
 
-/// The native methods, each `fn` its JNI symbol, its arguments after the
-/// facility's handle, its answer and its body, given the environment and
-/// the facility. An `op` takes the operation's `out Refusal` last, which a
-/// refusal is written into, and a `personal` one its `out Refused`; a
-/// `quiet` one takes none; a `bare` one takes no
-/// handle either. Statements after `take` run first, before the
-/// environment is reached. `NATIVES` lists every symbol and its Java
-/// arity.
+/// The native methods of `VosNode`, each `fn` named as its Java method
+/// (its JNI symbol `VosNode`'s), its arguments after the facility's handle,
+/// its answer and its body, given the environment and the facility. An
+/// `op` takes the operation's `out Refusal` last, which a refusal is
+/// written into, and a `personal` one its `out Refused`; a `quiet` one
+/// takes none; a `bare` one takes no handle either. Statements after
+/// `take` run first, before the environment is reached. `NATIVES` lists
+/// every symbol and its Java arity.
 macro_rules! natives {
     ($(
         $(#[$doc:meta])*
@@ -285,95 +285,46 @@ macro_rules! natives {
         /// Every native method: its JNI symbol and its Java arity.
         #[cfg(test)]
         const NATIVES: &[(&str, usize)] = &[
-            $((stringify!($name), natives!(@arity $mode $($argument)*)),)*
+            $((natives!(@symbol $name), natives!(@arity $mode $($argument)*)),)*
         ];
     };
+    (@symbol $name:ident) => { concat!("Java_team_virto_s4_vos_VosNode_", stringify!($name)) };
     (@arity op $($argument:ident)*) => { 2 $(+ natives!(@one $argument))* };
     (@arity personal $($argument:ident)*) => { 2 $(+ natives!(@one $argument))* };
     (@arity quiet $($argument:ident)*) => { 1 $(+ natives!(@one $argument))* };
     (@arity bare $($argument:ident)*) => { 0 $(+ natives!(@one $argument))* };
     (@one $argument:ident) => { 1 };
-    (@op $(#[$doc:meta])* $name:ident($($argument:ident: $ty:ty),*) -> $answer:ty
-     [$($take:tt)*] |$env:ident, $node:ident| $body:block) => {
+    (@op $($rest:tt)*) => { natives!(@fn [handle] [refused Refusal] $($rest)*); };
+    (@personal $($rest:tt)*) => { natives!(@fn [handle] [refused Refused] $($rest)*); };
+    (@quiet $($rest:tt)*) => { natives!(@fn [handle] [] $($rest)*); };
+    (@bare $($rest:tt)*) => { natives!(@fn [] [] $($rest)*); };
+    (@refused) => { &JObject::null() };
+    (@refused $refused:ident) => { &$refused };
+    (@error) => { Refusal };
+    (@error $error:ty) => { $error };
+    (@fn [$($handle:ident)?] [$($refused:ident $error:ty)?]
+     $(#[$doc:meta])* $name:ident($($argument:ident: $ty:ty),*) -> $answer:ty
+     [$($take:tt)*] |$env:ident $(, $node:ident)?| $body:block) => {
         $(#[$doc])*
-        #[unsafe(no_mangle)]
+        #[allow(non_snake_case)]
+        #[unsafe(export_name = natives!(@symbol $name))]
         pub extern "system" fn $name<'l>(
             mut unowned: EnvUnowned<'l>,
             _class: JClass<'l>,
-            handle: jlong,
+            $($handle: jlong,)?
             $($argument: $ty,)*
-            refused: JObject<'l>,
+            $($refused: JObject<'l>,)?
         ) -> $answer {
             $($take)*
             unowned
                 .with_env(|env| -> jni::errors::Result<$answer> {
-                    Ok(answer(env, &refused, |$env| -> Result<_, Refusal> {
-                        // SAFETY: the handle `nativeOpen` answered.
-                        let $node = unsafe { node(handle) }?;
+                    Ok(answer(env, natives!(@refused $($refused)?), |$env| -> Result<_, natives!(@error $($error)?)> {
+                        $(
+                            // SAFETY: the handle `nativeOpen` answered.
+                            let $node = unsafe { node($handle) }?;
+                        )?
                         $body
                     }))
-                })
-                .resolve::<LogErrorAndDefault>()
-        }
-    };
-    (@personal $(#[$doc:meta])* $name:ident($($argument:ident: $ty:ty),*) -> $answer:ty
-     [$($take:tt)*] |$env:ident, $node:ident| $body:block) => {
-        $(#[$doc])*
-        #[unsafe(no_mangle)]
-        pub extern "system" fn $name<'l>(
-            mut unowned: EnvUnowned<'l>,
-            _class: JClass<'l>,
-            handle: jlong,
-            $($argument: $ty,)*
-            refused: JObject<'l>,
-        ) -> $answer {
-            $($take)*
-            unowned
-                .with_env(|env| -> jni::errors::Result<$answer> {
-                    Ok(answer(env, &refused, |$env| -> Result<_, Refused> {
-                        // SAFETY: the handle `nativeOpen` answered.
-                        let $node = unsafe { node(handle) }?;
-                        $body
-                    }))
-                })
-                .resolve::<LogErrorAndDefault>()
-        }
-    };
-    (@quiet $(#[$doc:meta])* $name:ident($($argument:ident: $ty:ty),*) -> $answer:ty
-     [$($take:tt)*] |$env:ident, $node:ident| $body:block) => {
-        $(#[$doc])*
-        #[unsafe(no_mangle)]
-        pub extern "system" fn $name<'l>(
-            mut unowned: EnvUnowned<'l>,
-            _class: JClass<'l>,
-            handle: jlong,
-            $($argument: $ty,)*
-        ) -> $answer {
-            $($take)*
-            unowned
-                .with_env(|env| -> jni::errors::Result<$answer> {
-                    Ok(answer(env, &JObject::null(), |$env| -> Result<_, Refusal> {
-                        // SAFETY: the handle `nativeOpen` answered.
-                        let $node = unsafe { node(handle) }?;
-                        $body
-                    }))
-                })
-                .resolve::<LogErrorAndDefault>()
-        }
-    };
-    (@bare $(#[$doc:meta])* $name:ident($($argument:ident: $ty:ty),*) -> $answer:ty
-     [$($take:tt)*] |$env:ident| $body:block) => {
-        $(#[$doc])*
-        #[unsafe(no_mangle)]
-        pub extern "system" fn $name<'l>(
-            mut unowned: EnvUnowned<'l>,
-            _class: JClass<'l>,
-            $($argument: $ty,)*
-        ) -> $answer {
-            $($take)*
-            unowned
-                .with_env(|env| -> jni::errors::Result<$answer> {
-                    Ok(answer(env, &JObject::null(), |$env| -> Result<_, Refusal> { $body }))
                 })
                 .resolve::<LogErrorAndDefault>()
         }
@@ -385,7 +336,7 @@ natives! {
     /// state under `tor`, the app's parcelables loaded through `loader`,
     /// the device read from `device` (the `VosNode`): its handle, never
     /// freed; 0 when it does not open.
-    bare fn Java_team_virto_s4_vos_VosNode_nativeOpen(
+    bare fn nativeOpen(
         directory: JString<'l>,
         tor: JString<'l>,
         loader: JObject<'l>,
@@ -404,31 +355,31 @@ natives! {
         Ok(Box::into_raw(Box::new(node)) as jlong)
     }
 
-    quiet fn Java_team_virto_s4_vos_VosNode_nativeSupported() -> jboolean, |_env, node| {
+    quiet fn nativeSupported() -> jboolean, |_env, node| {
         Ok(node.supported())
     }
 
-    quiet fn Java_team_virto_s4_vos_VosNode_nativeWarm(thrifty: jboolean) -> (), |_env, node| {
+    quiet fn nativeWarm(thrifty: jboolean) -> (), |_env, node| {
         node.warm(thrifty);
         Ok(())
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeOpenSession(gateway: JObject<'l>) -> jlong, |env, node| {
+    op fn nativeOpenSession(gateway: JObject<'l>) -> jlong, |env, node| {
         let gateway = Gateway::from_java(env, &gateway)?;
         Ok(node.open_session(gateway) as jlong)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeGranted(session: jlong) -> jboolean, |_env, node| {
+    op fn nativeGranted(session: jlong) -> jboolean, |_env, node| {
         node.granted(session as u64)?;
         Ok(true)
     }
 
-    quiet fn Java_team_virto_s4_vos_VosNode_nativeClose(session: jlong) -> (), |_env, node| {
+    quiet fn nativeClose(session: jlong) -> (), |_env, node| {
         node.close(session as u64);
         Ok(())
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeEnroll(
+    op fn nativeEnroll(
         session: jlong,
         request: JObject<'l>,
         lent: JObject<'l>,
@@ -440,7 +391,7 @@ natives! {
         made(env, &enrolled)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeSignIn(
+    op fn nativeSignIn(
         session: jlong,
         request: JObject<'l>,
         lent: JObject<'l>,
@@ -452,7 +403,7 @@ natives! {
         made(env, &signed)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativePay(
+    op fn nativePay(
         session: jlong,
         request: JObject<'l>,
         lent: JObject<'l>,
@@ -464,22 +415,22 @@ natives! {
         made(env, &paid)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeRefresh(session: jlong) -> jboolean, |_env, node| {
+    op fn nativeRefresh(session: jlong) -> jboolean, |_env, node| {
         node.refresh(session as u64)?;
         Ok(true)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeSync() -> JObject<'l>, |env, node| {
+    op fn nativeSync() -> JObject<'l>, |env, node| {
         let synced = node.sync()?;
         made(env, &synced)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeEnrollments(element: JClass<'l>) -> JObjectArray<'l>, |env, node| {
+    op fn nativeEnrollments(element: JClass<'l>) -> JObjectArray<'l>, |env, node| {
         let all: Vec<EnrolledSpace> = node.enrollments()?;
         array(env, &element, &all)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeRuns(element: JClass<'l>) -> JObjectArray<'l>, |env, node| {
+    op fn nativeRuns(element: JClass<'l>) -> JObjectArray<'l>, |env, node| {
         let all: Vec<JobRun> = node.runs()?;
         array(env, &element, &all)
     }
@@ -488,7 +439,7 @@ natives! {
     /// UI's end of a socket pair, `descriptor` (owned from here), and that
     /// gateway's SSH port: the SSH host key the space pinned for that port,
     /// or none (an empty array) for an onion service first contacted.
-    op fn Java_team_virto_s4_vos_VosNode_nativeScreens(
+    op fn nativeScreens(
         gateway: JObject<'l>,
         descriptor: jint,
     ) -> JByteArray<'l>,
@@ -502,23 +453,23 @@ natives! {
             .map_err(failed)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeSyncPersonal() -> JObject<'l>, |env, node| {
+    op fn nativeSyncPersonal() -> JObject<'l>, |env, node| {
         let synced = node.sync_personal()?;
         made(env, &synced)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeForeground(foreground: jboolean) -> jboolean, |_env, node| {
+    op fn nativeForeground(foreground: jboolean) -> jboolean, |_env, node| {
         node.foreground(foreground);
         Ok(true)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeCloseAll(sessions: JLongArray<'l>) -> jboolean, |env, node| {
+    op fn nativeCloseAll(sessions: JLongArray<'l>) -> jboolean, |env, node| {
         let sessions: Vec<u64> = longs(env, &sessions)?.into_iter().map(|session| session as u64).collect();
         node.close_all(&sessions);
         Ok(true)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeBridges(lines: JObjectArray<'l>) -> jboolean, |env, node| {
+    op fn nativeBridges(lines: JObjectArray<'l>) -> jboolean, |env, node| {
         let mut all = Vec::new();
         for index in 0..lines.len(env).map_err(failed)? {
             let line = lines.get_element(env, index).map_err(failed)?;
@@ -529,12 +480,12 @@ natives! {
         Ok(true)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeBootstrap() -> jboolean, |_env, node| {
+    op fn nativeBootstrap() -> jboolean, |_env, node| {
         node.bootstrap()?;
         Ok(true)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeOptOut(space: JByteArray<'l>, out: jboolean) -> jboolean, |env, node| {
+    op fn nativeOptOut(space: JByteArray<'l>, out: jboolean) -> jboolean, |env, node| {
         let space: [u8; 32] = bytes(env, &space)?
             .try_into()
             .map_err(|_| refused(Code::Arguments, "a space's handle is 32 bytes"))?;
@@ -542,7 +493,7 @@ natives! {
         Ok(true)
     }
 
-    op fn Java_team_virto_s4_vos_VosNode_nativeClearnet(host_key: JByteArray<'l>) -> jboolean, |env, node| {
+    op fn nativeClearnet(host_key: JByteArray<'l>) -> jboolean, |env, node| {
         let host_key: [u8; 32] = bytes(env, &host_key)?
             .try_into()
             .map_err(|_| refused(Code::Arguments, "an SSH host key is 32 bytes"))?;
@@ -550,31 +501,31 @@ natives! {
         Ok(true)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeClaim(request: JObject<'l>, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeClaim(request: JObject<'l>, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let request = Claim::from_java(env, &request)?;
         let lent = prompts(env, &lent)?;
         let claimed = node.personal()?.claim(&*lent, request)?;
         made(env, &claimed)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativePairOffer(lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativePairOffer(lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let lent = prompts(env, &lent)?;
         let code = node.personal()?.pair_offer(&*lent)?;
         made(env, &code)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativePairAwait(lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativePairAwait(lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let lent = prompts(env, &lent)?;
         let paired = node.personal()?.pair_await(&*lent)?;
         made(env, &paired)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativePairCancel() -> jboolean, |_env, node| {
+    personal fn nativePairCancel() -> jboolean, |_env, node| {
         node.space()?.pair_cancel();
         Ok(true)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativePairJoin(code: JByteArray<'l>, label: JString<'l>, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativePairJoin(code: JByteArray<'l>, label: JString<'l>, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let code = zeroize::Zeroizing::new(bytes(env, &code)?);
         let label = label.try_to_string(env).map_err(failed)?;
         let lent = prompts(env, &lent)?;
@@ -582,129 +533,129 @@ natives! {
         made(env, &paired)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeMemberships(element: JClass<'l>) -> JObjectArray<'l>, |env, node| {
+    personal fn nativeMemberships(element: JClass<'l>) -> JObjectArray<'l>, |env, node| {
         let all = node.space()?.memberships()?;
         array(env, &element, &all)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeEnrollDevice(membership: JObject<'l>, lent: JObject<'l>) -> jboolean, |env, node| {
+    personal fn nativeEnrollDevice(membership: JObject<'l>, lent: JObject<'l>) -> jboolean, |env, node| {
         let membership = Membership::from_java(env, &membership)?;
         let lent = prompts(env, &lent)?;
         node.personal()?.enroll_device(&*lent, membership)?;
         Ok(true)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeConfirmDevice(membership: JObject<'l>, lent: JObject<'l>) -> jboolean, |env, node| {
+    personal fn nativeConfirmDevice(membership: JObject<'l>, lent: JObject<'l>) -> jboolean, |env, node| {
         let membership = Membership::from_java(env, &membership)?;
         let lent = prompts(env, &lent)?;
         node.personal()?.confirm_device(&*lent, membership)?;
         Ok(true)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeDropEnrollment(membership: JObject<'l>) -> jboolean, |env, node| {
+    personal fn nativeDropEnrollment(membership: JObject<'l>) -> jboolean, |env, node| {
         let membership = Membership::from_java(env, &membership)?;
         node.space()?.drop_enrollment(membership)?;
         Ok(true)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeRevoke(device: jlong, lent: JObject<'l>) -> jint, |env, node| {
+    personal fn nativeRevoke(device: jlong, lent: JObject<'l>) -> jint, |env, node| {
         let lent = prompts(env, &lent)?;
         Ok(node.personal()?.revoke(&*lent, word(device)?)? as jint)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeDevices(element: JClass<'l>) -> JObjectArray<'l>, |env, node| {
+    personal fn nativeDevices(element: JClass<'l>) -> JObjectArray<'l>, |env, node| {
         let all = node.personal()?.devices()?;
         array(env, &element, &all)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeOperations(element: JClass<'l>) -> JObjectArray<'l>, |env, node| {
+    personal fn nativeOperations(element: JClass<'l>) -> JObjectArray<'l>, |env, node| {
         let all = node.space()?.operations()?;
         array(env, &element, &all)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeRemove(device: jlong, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeRemove(device: jlong, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let lent = prompts(env, &lent)?;
         let posted = node.personal()?.remove(&*lent, word(device)?)?;
         made(env, &posted)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeVeto(index: jlong, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeVeto(index: jlong, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let lent = prompts(env, &lent)?;
         let posted = node.personal()?.veto(&*lent, index as u64)?;
         made(env, &posted)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeCosign(index: jlong, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeCosign(index: jlong, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let lent = prompts(env, &lent)?;
         let posted = node.personal()?.cosign(&*lent, index as u64)?;
         made(env, &posted)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeResolve(index: jlong, upheld: jboolean, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeResolve(index: jlong, upheld: jboolean, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let lent = prompts(env, &lent)?;
         let posted = node.personal()?.resolve(&*lent, index as u64, upheld)?;
         made(env, &posted)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeRotateKit(kind: jbyte, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeRotateKit(kind: jbyte, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let lent = prompts(env, &lent)?;
         let posted = node.personal()?.rotate_kit(&*lent, kit(kind)?)?;
         made(env, &posted)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeReplaceAdmin(kind: jbyte, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeReplaceAdmin(kind: jbyte, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let lent = prompts(env, &lent)?;
         let posted = node.personal()?.replace_admin(&*lent, kit(kind)?)?;
         made(env, &posted)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeAdminOffer(lent: JObject<'l>) -> JByteArray<'l>, |env, node| {
+    personal fn nativeAdminOffer(lent: JObject<'l>) -> JByteArray<'l>, |env, node| {
         let lent = prompts(env, &lent)?;
         let offer = node.personal()?.admin_offer(&*lent)?;
         Ok(env.byte_array_from_slice(&offer).map_err(failed)?)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeReplaceAdminOf(code: JByteArray<'l>, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeReplaceAdminOf(code: JByteArray<'l>, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let code = bytes(env, &code)?;
         let lent = prompts(env, &lent)?;
         let posted = node.personal()?.replace_admin_of(&*lent, &code)?;
         made(env, &posted)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeRegroup(lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeRegroup(lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let lent = prompts(env, &lent)?;
         let posted = node.personal()?.regroup(&*lent)?;
         made(env, &posted)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeUpdate(lent: JObject<'l>) -> jboolean, |env, node| {
+    personal fn nativeUpdate(lent: JObject<'l>) -> jboolean, |env, node| {
         let lent = prompts(env, &lent)?;
         node.personal()?.update(&*lent)?;
         Ok(true)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeRestore(request: JObject<'l>, old: jbyte, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeRestore(request: JObject<'l>, old: jbyte, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let request = Claim::from_java(env, &request)?;
         let lent = prompts(env, &lent)?;
         let posted = node.personal()?.restore(&*lent, request, kit(old)?)?;
         made(env, &posted)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeKitView(home: JObject<'l>, kind: jbyte, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeKitView(home: JObject<'l>, kind: jbyte, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let home = Home::from_java(env, &home)?;
         let lent = prompts(env, &lent)?;
         let view = node.personal()?.kit_view(&*lent, home, kit(kind)?)?;
         made(env, &view)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeRemoveByKit(home: JObject<'l>, kind: jbyte, device: jlong, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeRemoveByKit(home: JObject<'l>, kind: jbyte, device: jlong, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let home = Home::from_java(env, &home)?;
         let lent = prompts(env, &lent)?;
         let posted = node.personal()?.remove_by_kit(&*lent, home, kit(kind)?, word(device)?)?;
         made(env, &posted)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeResolveByKit(home: JObject<'l>, kind: jbyte, index: jlong, upheld: jboolean, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeResolveByKit(home: JObject<'l>, kind: jbyte, index: jlong, upheld: jboolean, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let home = Home::from_java(env, &home)?;
         let lent = prompts(env, &lent)?;
         let index = u64::try_from(index).map_err(|_| refused(Code::Arguments, "a negative log index"))?;
@@ -712,20 +663,20 @@ natives! {
         made(env, &posted)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeRestored(kind: jbyte, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeRestored(kind: jbyte, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let lent = prompts(env, &lent)?;
         let claimed = node.personal()?.restored(&*lent, kit(kind)?)?;
         made(env, &claimed)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeMoveHome(request: JObject<'l>, lent: JObject<'l>) -> JObject<'l>, |env, node| {
+    personal fn nativeMoveHome(request: JObject<'l>, lent: JObject<'l>) -> JObject<'l>, |env, node| {
         let request = Claim::from_java(env, &request)?;
         let lent = prompts(env, &lent)?;
         let claimed = node.personal()?.move_home(&*lent, request)?;
         made(env, &claimed)
     }
 
-    personal fn Java_team_virto_s4_vos_VosNode_nativeStatus() -> JObject<'l>, |env, node| {
+    personal fn nativeStatus() -> JObject<'l>, |env, node| {
         let status = node.status()?;
         made(env, &status)
     }
