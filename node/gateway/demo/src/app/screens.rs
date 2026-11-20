@@ -20,6 +20,7 @@ pub enum Message {
     Enroll,
     Enrollment(EffectOutput),
     Enrolled(EffectOutput),
+    Held(EffectOutput),
     Claim,
     Claimed(EffectOutput),
     SignIn,
@@ -122,6 +123,16 @@ fn short(bytes: &[u8]) -> String {
 }
 
 impl Screens {
+    /// The enrollment of `member` and `owner` for the account typed, as the
+    /// service takes it.
+    fn enrollment(&self, member: [u8; 32], owner: [u8; 32]) -> Value {
+        object([
+            ("member", Value::Bytes(member.to_vec())),
+            ("owner", Value::Bytes(owner.to_vec())),
+            ("account", Value::from(self.account.clone())),
+        ])
+    }
+
     fn failed(&mut self, output: EffectOutput) {
         self.status = match output {
             EffectOutput::HostService(Err(error)) => error.message,
@@ -233,7 +244,15 @@ impl App for Screens {
                              them from there to the space's operator, then claim them.",
                         )
                         .button("Claim", Message::Claim),
-                    None => page,
+                    // The session s4 carries over Tor after an enrollment
+                    // claims what that session held, its digests never
+                    // shown here, so this one signs in.
+                    None => page
+                        .text(
+                            "Enrolled already? Once the operator invited your digests, claim \
+                             them here, then sign in from this session.",
+                        )
+                        .button("Claim my invitation", Message::Claim),
                 }
             }
             // A session the device's digests were shown in signs in
@@ -291,34 +310,49 @@ impl App for Screens {
                 match (digest("member"), digest("owner")) {
                     (Some(member), Some(owner)) => {
                         self.digests = Some((member, owner));
-                        self.status = "Enrolled on this device".into();
+                        self.status = "Enrolled on this device…".into();
+                        // Held for the claim from the session s4 carries
+                        // over Tor next.
+                        cx.effect(service(
+                            "hold",
+                            self.enrollment(member, owner),
+                            Message::Held,
+                        ));
                     }
                     _ => self.status = "the device's digests do not decode".into(),
                 }
             }
+            Message::Held(output) => match output {
+                EffectOutput::HostService(Ok(_)) => {
+                    self.status = "Enrolled on this device: once the operator invited you, claim \
+                                   here or from the next session"
+                        .into()
+                }
+                other => self.failed(other),
+            },
             Message::Claim => {
-                let Some((member, owner)) = self.digests else {
-                    return;
-                };
                 self.status = "Claiming…".into();
-                cx.effect(service(
-                    "claim",
-                    object([
-                        ("member", Value::Bytes(member.to_vec())),
-                        ("owner", Value::Bytes(owner.to_vec())),
-                        ("account", Value::from(self.account.clone())),
-                    ]),
-                    Message::Claimed,
-                ));
+                let args = match self.digests {
+                    Some((member, owner)) => self.enrollment(member, owner),
+                    None => Value::Null,
+                };
+                cx.effect(service("claim", args, Message::Claimed));
             }
             Message::Claimed(output) => match output {
-                EffectOutput::HostService(Ok(slot)) => {
-                    self.status = format!(
-                        "Claimed: member at slot {}, account {}. Pay from here; sign in from a \
-                         new session.",
-                        display(&slot),
-                        self.account
-                    );
+                EffectOutput::HostService(Ok(Value::Array(slots))) => {
+                    let slots: Vec<String> = slots.iter().map(display).collect();
+                    self.status = match self.digests {
+                        Some(_) => format!(
+                            "Claimed: member at slot {}, account {}. Pay from here; sign in \
+                             from a new session.",
+                            slots.join(", "),
+                            self.account
+                        ),
+                        None => format!(
+                            "Claimed: member at slot {}. Sign in or pay from here.",
+                            slots.join(", ")
+                        ),
+                    };
                 }
                 other => self.failed(other),
             },

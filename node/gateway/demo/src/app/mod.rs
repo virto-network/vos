@@ -35,7 +35,7 @@ mod service;
 
 pub use client::AppClient;
 pub use screens::{Message, Screen, Screens};
-pub use service::Service;
+pub use service::{Held, Service};
 
 /// The host service the screens call, server-side.
 pub const SERVICE: &str = "vos.gateway";
@@ -54,10 +54,12 @@ pub struct Demo {
 }
 
 /// The demo's screens as an SSH port serves them: on each port, its claims
-/// going as the app key's seed `key`, marked with the port's transport.
+/// going as the app key's seed `key`, marked with the port's transport;
+/// the enrollments `held` for a claim from a later session, every port's.
 pub struct DemoApp {
     pub demo: Demo,
     pub key: [u8; 32],
+    pub held: Held,
 }
 
 impl vos_gateway::ssh::App for DemoApp {
@@ -69,6 +71,7 @@ impl vos_gateway::ssh::App for DemoApp {
             Arc::clone(gateway),
             mark,
             app,
+            self.held.clone(),
         ));
         let demo = self.demo.clone();
         Server::new(APPLICATION, move || Screens::new(demo.clone()))

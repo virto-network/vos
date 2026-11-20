@@ -48,6 +48,9 @@ pub struct LocalSpace {
     agent: AgentId,
     operator: Mutex<Client>,
     programs: [(InstanceId, Vec<u8>); 3],
+    /// The enrollments the screens hold for a claim from a later session,
+    /// every port's ([`app::Held`]).
+    held: app::Held,
 }
 
 fn ran(name: &str, answer: Result<Response, client::ClientError>) -> Result<Vec<u8>, String> {
@@ -145,6 +148,7 @@ impl LocalSpace {
                 (POLL, vos_testkit::programs::actor("poll")),
                 (PAYMENTS, vos_testkit::programs::program("vos-payments")),
             ],
+            held: app::Held::default(),
         };
         space.write(CREDENTIALS, "found", handle)?;
         Ok(space)
@@ -318,7 +322,11 @@ impl LocalSpace {
             onions,
             ..self.demo()
         };
-        let app = DemoApp { demo, key: app };
+        let app = DemoApp {
+            demo,
+            key: app,
+            held: self.held.clone(),
+        };
         let server = vos_gateway::ssh::server(host_key, gateway, port, &app);
         tokio::spawn(async move {
             if let Err(error) = server.serve_on(listener).await {
@@ -463,7 +471,11 @@ key = "{onion}"
             onions: vec![onion.to_bytes()],
             ..self.demo()
         };
-        Ok(Box::new(DemoApp { demo, key }))
+        Ok(Box::new(DemoApp {
+            demo,
+            key,
+            held: self.held.clone(),
+        }))
     }
 
     /// A gateway in front of this node as the file `config` names it.
@@ -478,7 +490,13 @@ key = "{onion}"
     }
 
     /// `served`'s onion, hosted by arti over the live Tor network, its keys
-    /// and arti's state under `data`.
+    /// and arti's state under `data`. Each onion is an arti client of its
+    /// own, its state, cache and keystore under its own directory
+    /// (`onion/`, `homes-onion/`), so the nickname both services take
+    /// (`vos-gateway`) names a key in two keystores apart and neither
+    /// takes the other's. Until a launch's descriptor reaches its
+    /// directories a device's first contact finds the service missing,
+    /// which the light node tries once more for.
     async fn launch(&self, served: Served, data: &Path) -> Result<Onion, String> {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()

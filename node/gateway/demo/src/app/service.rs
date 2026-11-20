@@ -23,7 +23,19 @@ pub struct Service {
     /// The app key's session with the agent and its next sequence: one
     /// claim at a time, in order.
     session: Mutex<Option<(Session, u64)>>,
+    held: Held,
 }
+
+/// The enrollments a session's screens hold (the member and owner digests
+/// its device showed, the account typed) until a claim makes them: after
+/// a clearnet enrollment s4 connects again over the onion, carried, and
+/// the claim is made from there without the digests shown in it, so that
+/// session signs in. At most [`HELD`], the oldest dropped first.
+#[derive(Clone, Default)]
+pub struct Held(Arc<std::sync::Mutex<Vec<([u8; 32], [u8; 32], Vec<u8>)>>>);
+
+/// The enrollments held at most.
+const HELD: usize = 32;
 
 /// How long a claim waits for the session, held by another client's: the
 /// session is one for all clients.
@@ -60,6 +72,19 @@ fn text<'a>(args: &'a Value, name: &str) -> Result<&'a str, HostServiceError> {
 }
 
 /// A frame's body, or why there is none.
+/// An enrollment's member and owner digests and account, as `args` name
+/// them.
+fn enrollment(args: &Value) -> Result<([u8; 32], [u8; 32], Vec<u8>), HostServiceError> {
+    let member: [u8; 32] = bytes(args, "member")?
+        .try_into()
+        .map_err(|_| failed("`member` is 32 bytes"))?;
+    let owner: [u8; 32] = bytes(args, "owner")?
+        .try_into()
+        .map_err(|_| failed("`owner` is 32 bytes"))?;
+    let account = text(args, "account")?.as_bytes().to_vec();
+    Ok((member, owner, account))
+}
+
 fn answered((kind, body): vos_api::client::Answer) -> Result<Vec<u8>, HostServiceError> {
     if kind == FRAME_ERROR {
         return Err(failed("the node is unavailable"));
@@ -137,6 +162,7 @@ impl Service {
         gateway: Arc<Gateway>,
         mark: Mark,
         app: Arc<AppClient>,
+        held: Held,
     ) -> Self {
         Self {
             demo,
@@ -146,6 +172,7 @@ impl Service {
             app,
             space: OnceCell::new(),
             session: Mutex::new(None),
+            held,
         }
     }
 
@@ -348,17 +375,67 @@ impl Service {
         ]))
     }
 
+    /// An enrollment held for a claim from a later session: its member
+    /// and owner digests, and the account's name.
+    fn hold(&self, args: &Value) -> Result<Value, HostServiceError> {
+        let (member, owner, account) = enrollment(args)?;
+        let mut held = self.held.0.lock().expect("held poisoned");
+        held.retain(|(kept, ..)| *kept != member);
+        held.push((member, owner, account));
+        if held.len() > HELD {
+            held.remove(0);
+        }
+        Ok(Value::Null)
+    }
+
+    /// The claim of the enrollment `args` names, or with `null` of every
+    /// one held whose invitation stands: the slots claimed, each then held
+    /// no more. One not invited yet stays held.
+    async fn claim(&self, args: &Value) -> Result<Value, HostServiceError> {
+        if *args != Value::Null {
+            let (member, owner, account) = enrollment(args)?;
+            let slot = self.claimed(member, owner, account).await?;
+            self.held
+                .0
+                .lock()
+                .expect("held poisoned")
+                .retain(|(kept, ..)| *kept != member);
+            return Ok(Value::Array(vec![Value::from(slot)]));
+        }
+        let held = self.held.0.lock().expect("held poisoned").clone();
+        let mut slots = Vec::new();
+        let mut why = None;
+        for (member, owner, account) in held {
+            match self.claimed(member, owner, account).await {
+                Ok(slot) => {
+                    self.held
+                        .0
+                        .lock()
+                        .expect("held poisoned")
+                        .retain(|(kept, ..)| *kept != member);
+                    slots.push(Value::from(slot));
+                }
+                Err(error) => why = Some(error),
+            }
+        }
+        match (slots.is_empty(), why) {
+            (true, Some(error)) => Err(error),
+            (true, None) => Err(failed(
+                "no enrollment is held for a claim: enroll this device first",
+            )),
+            (false, _) => Ok(Value::Array(slots)),
+        }
+    }
+
     /// The member's claim and the account's opening, which the operator's
     /// invitations name: the credential actor's `claim(member)`, then the
     /// ledger's `open(account, owner)`.
-    async fn claim(&self, args: &Value) -> Result<Value, HostServiceError> {
-        let member: [u8; 32] = bytes(args, "member")?
-            .try_into()
-            .map_err(|_| failed("`member` is 32 bytes"))?;
-        let owner: [u8; 32] = bytes(args, "owner")?
-            .try_into()
-            .map_err(|_| failed("`owner` is 32 bytes"))?;
-        let account = text(args, "account")?.as_bytes().to_vec();
+    async fn claimed(
+        &self,
+        member: [u8; 32],
+        owner: [u8; 32],
+        account: Vec<u8>,
+    ) -> Result<u32, HostServiceError> {
         let slot = self
             .call(
                 self.demo.credentials,
@@ -375,7 +452,7 @@ impl Service {
             payment_error,
         )
         .await?;
-        Ok(Value::from(slot))
+        Ok(slot)
     }
 
     /// The name and balance of the account the owner digest `owner`
@@ -433,6 +510,7 @@ impl Service {
         let args = &request.args;
         match request.operation.as_str() {
             "enrollment" => self.enrollment().await,
+            "hold" => self.hold(args),
             "claim" => self.claim(args).await,
             "balance" => self.balance(args).await,
             "root" => self.root().await,

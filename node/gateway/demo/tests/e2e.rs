@@ -507,13 +507,24 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
         let shown = phone
             .settle(
                 at,
-                &["Signed in as", "no-path", "Not done", "refused", "failed"],
+                &[
+                    "Signed in as",
+                    "no-path",
+                    "unclaimed",
+                    "Not done",
+                    "refused",
+                    "failed",
+                ],
             )
             .await;
         if shown.contains("Signed in as") {
             break shown;
         }
-        assert!(shown.contains("no-path"), "{shown}");
+        // The tree not read to its end, or read before the claim.
+        assert!(
+            shown.contains("no-path") || shown.contains("unclaimed"),
+            "{shown}"
+        );
         user.answers.lock().unwrap().clear();
         tokio::time::sleep(Duration::from_millis(300)).await;
     };
@@ -526,6 +537,104 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
             .iter()
             .any(|(_, value)| value.contains("login (scope “login”)"))
     );
+}
+
+/// After an enrollment s4 connects again (over Tor on a phone, carried):
+/// the new session, the device's digests never shown in it, claims the
+/// invitation the enrolling session held, and signs in from there. Before
+/// the claim a sign-in says to claim first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_session_after_the_enrollment_claims_and_signs_in() {
+    let user = Arc::new(User::default());
+    let (space, mut phone, _dirs) = demo(Arc::clone(&user)).await;
+    phone.type_into("Your account's name", "bob").await;
+    user.will(confirm(&[]));
+    user.will(confirm(&[]));
+    let at = phone.click("Enroll this device").await;
+    phone.settle(at, &["here or from the next session"]).await;
+    let digests = user.shown.lock().unwrap()[1].clone();
+    let member = digest(&digests.rows[0].1);
+    let owner = digest(&digests.rows[1].1);
+    let facility = phone.facility.clone();
+    let address =
+        std::net::SocketAddr::new(phone.gateway.host.parse().unwrap(), phone.gateway.port);
+    drop(phone);
+    let mut phone = Headless::connect(address, facility, Arc::clone(&user)).await;
+    let at = phone.click("Sign in").await;
+    phone.settle(at, &["Sign in with your device"]).await;
+    let unclaimed = loop {
+        user.will(confirm(&[]));
+        let at = phone.click("Sign in with my device").await;
+        let shown = phone
+            .settle(
+                at,
+                &[
+                    "no-path",
+                    "unclaimed",
+                    "Signed in as",
+                    "Not done",
+                    "refused",
+                ],
+            )
+            .await;
+        if !shown.contains("no-path") {
+            break shown;
+        }
+        user.answers.lock().unwrap().clear();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    assert!(
+        unclaimed.contains("claim your invitation first"),
+        "{unclaimed}"
+    );
+    user.answers.lock().unwrap().clear();
+
+    tokio::task::block_in_place(|| space.invite(member, "bob", owner).unwrap());
+    let at = phone.click("Enroll").await;
+    phone.settle(at, &["Enroll this device"]).await;
+    let at = phone.click("Claim my invitation").await;
+    let claimed = phone
+        .settle(
+            at,
+            &["Claimed", "refused", "failed", "Not", "no enrollment"],
+        )
+        .await;
+    assert!(claimed.starts_with("Claimed: member at slot"), "{claimed}");
+    assert_eq!(
+        tokio::task::block_in_place(|| space.balance("bob").unwrap()),
+        Some(0),
+        "the account the enrolling session named, opened"
+    );
+
+    let at = phone.click("Sign in").await;
+    phone.settle(at, &["Sign in with your device"]).await;
+    let signed = loop {
+        user.will(confirm(&[]));
+        let at = phone.click("Sign in with my device").await;
+        let shown = phone
+            .settle(
+                at,
+                &[
+                    "Signed in as",
+                    "no-path",
+                    "unclaimed",
+                    "Not done",
+                    "refused",
+                    "failed",
+                ],
+            )
+            .await;
+        if shown.contains("Signed in as") {
+            break shown;
+        }
+        assert!(
+            shown.contains("no-path") || shown.contains("unclaimed"),
+            "{shown}"
+        );
+        user.answers.lock().unwrap().clear();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    assert!(signed.contains("proved in"), "{signed}");
 }
 
 /// A client that answers the sign-in with a request of its own, for another
