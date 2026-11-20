@@ -158,7 +158,11 @@ fn evidence_is_stored_beside_its_call_its_arguments_byte_for_byte() {
 
     // A removal's evidence carries no Welcome.
     let removal: Recorded = home.call(admin(0), "remove", 1u32).unwrap();
-    let signed = message(device(0).admin, home.method("remove"), &1u32.encode());
+    let signed = message(
+        device(0).admin,
+        home.method("remove"),
+        &home.logged(removal.index),
+    );
     assert_eq!(
         home.call::<Recorded>(
             sync(0),

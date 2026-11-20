@@ -14,7 +14,9 @@
 //!   signed by a device's admin key, verified at ingress; the agent checks
 //!   the origin, `Principal::Client(key)`, against the device set and
 //!   verifies nothing. The device then posts the call's evidence, the
-//!   signed message and its signature, stored as data beside it.
+//!   signed message and its signature, stored as data beside it. A
+//!   device-set call names its place first, the log's head its signer read,
+//!   and is taken only there (`StaleHead`), before what its batch settles.
 //! - **The commit log:** one candidate an epoch, the confirmed epoch plus
 //!   one; its confirming set (the devices seen by a call in the window,
 //!   less every matured removal) written into its log entry; the votes,
@@ -51,9 +53,9 @@ use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
     Acknowledged, AdminCall, AdminClass, Attached, Author, Body, Candidacy, Device, DeviceId,
     DeviceView, Effect, Entry, Envelope, Header, Holder, InboxItem, Item, Kit, KitEntry,
-    MAX_ENVELOPE, NewAdmin, NewDevice, NewKit, Op, Operation, Overview, PersonalError, Policy,
-    Pushed, RECOVERY, Recipient, Recorded, RecoveryView, Removal, Scope, Signer, Status, Vote,
-    Voted, Woken, commit_id, envelope_id, r2_hash, welcome_hash,
+    MAX_ENVELOPE, NewAdmin, NewDevice, NewKit, Op, Operation, Overview, PersonalError, Place,
+    Policy, Pushed, RECOVERY, Recipient, Recorded, RecoveryView, Removal, Scope, Signer, Status,
+    Vote, Voted, Woken, commit_id, envelope_id, r2_hash, welcome_hash,
 };
 
 use rows::{
@@ -249,9 +251,10 @@ impl Personal {
     pub async fn remove(
         &mut self,
         ctx: &mut Command<Self>,
+        place: Place,
         target: DeviceId,
     ) -> Result<Recorded, PersonalError> {
-        let (now, call, by) = self.admin(ctx, &personal::Remove { target })?;
+        let (now, call, by) = self.admin(ctx, place, &personal::Remove { place, target })?;
         self.open_operation(now, call, by, Op::Remove(target))
     }
 
@@ -261,11 +264,14 @@ impl Personal {
     pub async fn add(
         &mut self,
         ctx: &mut Command<Self>,
+        place: Place,
         device: NewDevice,
     ) -> Result<Recorded, PersonalError> {
         let (now, call, by) = self.admin(
             ctx,
+            place,
             &personal::Add {
+                place,
                 device: device.clone(),
             },
         )?;
@@ -279,12 +285,15 @@ impl Personal {
     pub async fn replace(
         &mut self,
         ctx: &mut Command<Self>,
+        place: Place,
         device: DeviceId,
         admin: NewAdmin,
     ) -> Result<Recorded, PersonalError> {
         let (now, call, by) = self.admin(
             ctx,
+            place,
             &personal::Replace {
+                place,
                 device,
                 admin: admin.clone(),
             },
@@ -298,9 +307,17 @@ impl Personal {
     pub async fn rotate(
         &mut self,
         ctx: &mut Command<Self>,
+        place: Place,
         kit: NewKit,
     ) -> Result<Recorded, PersonalError> {
-        let (now, call, by) = self.admin(ctx, &personal::Rotate { kit: kit.clone() })?;
+        let (now, call, by) = self.admin(
+            ctx,
+            place,
+            &personal::Rotate {
+                place,
+                kit: kit.clone(),
+            },
+        )?;
         self.open_operation(now, call, by, Op::Rotate(kit))
     }
 
@@ -310,11 +327,14 @@ impl Personal {
     pub async fn regroup(
         &mut self,
         ctx: &mut Command<Self>,
+        place: Place,
         remove: Vec<DeviceId>,
     ) -> Result<Recorded, PersonalError> {
         let (now, call, by) = self.admin(
             ctx,
+            place,
             &personal::Regroup {
+                place,
                 remove: remove.clone(),
             },
         )?;
@@ -329,12 +349,15 @@ impl Personal {
     pub async fn restore(
         &mut self,
         ctx: &mut Command<Self>,
+        place: Place,
         device: NewDevice,
         kit: NewKit,
     ) -> Result<Recorded, PersonalError> {
         let (now, call, by) = self.admin(
             ctx,
+            place,
             &personal::Restore {
+                place,
                 device: device.clone(),
                 kit: kit.clone(),
             },
@@ -349,8 +372,10 @@ impl Personal {
     pub async fn veto(
         &mut self,
         ctx: &mut Command<Self>,
+        place: Place,
         op: u64,
     ) -> Result<Recorded, PersonalError> {
+        self.placed(place)?;
         let now = self.settle(ctx.now())?;
         self.assigned()?;
         if let Some((_, Holder::Kit(_))) = self.holder(ctx.caller()) {
@@ -360,7 +385,7 @@ impl Personal {
         let call = AdminCall {
             origin,
             method: personal::Veto::ID,
-            arguments: personal::Veto { op }.encode(),
+            arguments: personal::Veto { place, op }.encode(),
         };
         self.veto_operation(now, call, device, op)
     }
@@ -370,9 +395,10 @@ impl Personal {
     pub async fn cosign(
         &mut self,
         ctx: &mut Command<Self>,
+        place: Place,
         op: u64,
     ) -> Result<Recorded, PersonalError> {
-        let (now, call, by) = self.admin(ctx, &personal::Cosign { op })?;
+        let (now, call, by) = self.admin(ctx, place, &personal::Cosign { place, op })?;
         self.cosign_operation(now, call, by, op)
     }
 
@@ -382,10 +408,11 @@ impl Personal {
     pub async fn resolve(
         &mut self,
         ctx: &mut Command<Self>,
+        place: Place,
         op: u64,
         upheld: bool,
     ) -> Result<Recorded, PersonalError> {
-        let (now, call, by) = self.admin(ctx, &personal::Resolve { op, upheld })?;
+        let (now, call, by) = self.admin(ctx, place, &personal::Resolve { place, op, upheld })?;
         self.resolve_operation(now, call, by, op, upheld)
     }
 

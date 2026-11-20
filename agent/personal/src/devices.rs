@@ -19,8 +19,8 @@ use alloc::vec::Vec;
 use vos_sdk::prelude::*;
 use vos_wire::personal::{
     AdminCall, AdminClass, Body, Cancel, Device, DeviceId, Holder, KitEntry, NewDevice, Op,
-    OpState, Operation, PersonalError, RECOVERY, Recorded, Removal, Signer, Standing, Status,
-    Verdict, Void,
+    OpState, Operation, PersonalError, Place, RECOVERY, Recorded, Removal, Signer, Standing,
+    Status, Verdict, Void,
 };
 
 use crate::rows::{Before, By, Due, Gone, Kind, Recovery};
@@ -208,14 +208,16 @@ impl Personal {
         }
     }
 
-    /// An admin call's start: what fell due settled at the call's time,
-    /// the agent assigned, and its signer's; with the call as the log
-    /// carries it, `message` its arguments.
+    /// An admin call's start: its place the log's head, what fell due
+    /// settled at the call's time, the agent assigned, and its signer's;
+    /// with the call as the log carries it, `message` its arguments.
     pub(crate) fn admin<M: vos_sdk::context::Method>(
         &mut self,
         ctx: &Command<Self>,
+        place: Place,
         message: &M,
     ) -> Result<(u64, AdminCall, Signer), PersonalError> {
+        self.placed(place)?;
         let now = self.settle(ctx.now())?;
         self.assigned()?;
         let (origin, by) = self.signer(ctx.caller(), now)?;
@@ -225,6 +227,17 @@ impl Personal {
             arguments: message.encode(),
         };
         Ok((now, call, by))
+    }
+
+    /// Whether `place` is the log's head, before anything the call's batch
+    /// settles: an admin call is taken only where its signer read the log
+    /// to, so a device that read past it never takes it elsewhere.
+    pub(crate) fn placed(&self, place: Place) -> Result<(), PersonalError> {
+        let head = self.head.get_or_default();
+        if head.next != place.next || head.chain != place.chain {
+            return Err(PersonalError::StaleHead);
+        }
+        Ok(())
     }
 
     fn open_at(&self, index: u64) -> Result<Operation, PersonalError> {
