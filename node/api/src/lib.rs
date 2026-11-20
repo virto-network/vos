@@ -6,11 +6,13 @@
 
 #[cfg(feature = "client")]
 pub mod client;
+mod enrollment;
 mod frame;
 mod operated;
 #[cfg(feature = "quic")]
 pub mod quic;
 
+pub use enrollment::{ENROLLMENT_CODE, enrollment_check, enrollment_code, read_enrollment_code};
 pub use frame::{
     Event, Frame, Framing, Header, MAX_ANSWER, Reader, Requests, error_frame, frame, marked,
 };
