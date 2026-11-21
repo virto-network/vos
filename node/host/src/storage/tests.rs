@@ -309,15 +309,7 @@ impl Hooks for Syncs {
 /// A writer whose first commit waits for the hold's release, with the
 /// commits `queued` sent behind it in their order, all in its next group;
 /// the syncs held, each started told on the receiver given back.
-fn queued_behind_a_held_commit(
-    dir: &std::path::Path,
-    queued: Vec<Vec<Change>>,
-) -> (
-    Arc<StorageThread>,
-    Vec<mpsc::Receiver<Result<(), String>>>,
-    mpsc::Receiver<()>,
-    mpsc::Sender<()>,
-) {
+fn queued_behind_a_held_commit(dir: &std::path::Path, queued: Vec<Vec<Change>>) -> Queued {
     let (syncing, started) = mpsc::channel();
     let (release, synced) = mpsc::channel();
     let hooks = Arc::new(Syncs {
@@ -352,7 +344,21 @@ fn queued_behind_a_held_commit(
     *hooks.syncing.lock().unwrap() = Some(syncing);
     hooks.hold.store(false, Ordering::SeqCst);
     first.recv().unwrap().unwrap();
-    (writer, answers, started, release)
+    Queued {
+        writer,
+        answers,
+        started,
+        release,
+    }
+}
+
+/// [`queued_behind_a_held_commit`]'s writer, its queued commits' answers,
+/// and its syncs: each one's start, and its release.
+struct Queued {
+    writer: Arc<StorageThread>,
+    answers: Vec<mpsc::Receiver<Result<(), String>>>,
+    started: mpsc::Receiver<()>,
+    release: mpsc::Sender<()>,
 }
 
 const B: AgentId = AgentId(2);
@@ -368,8 +374,12 @@ fn an_unsynced_commit_does_not_wait_for_another_agents_sync() {
         index: 1,
         writes: Vec::new(),
     };
-    let (writer, answers, started, release) =
-        queued_behind_a_held_commit(dir.path(), vec![vec![hard(2, true)], vec![other]]);
+    let Queued {
+        writer,
+        answers,
+        started,
+        release,
+    } = queued_behind_a_held_commit(dir.path(), vec![vec![hard(2, true)], vec![other]]);
     started.recv().unwrap();
     answers[1]
         .recv_timeout(Duration::from_secs(30))
@@ -394,8 +404,12 @@ fn an_unsynced_commit_does_not_wait_for_another_agents_sync() {
 #[test]
 fn an_agents_unsynced_commit_waits_for_its_earlier_sync() {
     let dir = tempfile::tempdir().unwrap();
-    let (_writer, answers, started, release) =
-        queued_behind_a_held_commit(dir.path(), vec![vec![hard(2, true)], vec![apply(1)]]);
+    let Queued {
+        answers,
+        started,
+        release,
+        ..
+    } = queued_behind_a_held_commit(dir.path(), vec![vec![hard(2, true)], vec![apply(1)]]);
     started.recv().unwrap();
     assert!(
         answers[1].recv_timeout(Duration::from_millis(200)).is_err(),
@@ -419,7 +433,12 @@ fn a_commit_held_back_holds_back_its_agents_later_ones() {
         writes: Vec::new(),
     };
     let both = vec![apply_of(B, 1), apply(1)];
-    let (_writer, answers, started, release) = queued_behind_a_held_commit(
+    let Queued {
+        answers,
+        started,
+        release,
+        ..
+    } = queued_behind_a_held_commit(
         dir.path(),
         vec![
             vec![Change::Hard {
