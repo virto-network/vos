@@ -268,10 +268,14 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Personals, Str
     let total = request.count + 1;
     let placements: Vec<Vec<u8>> = (0..total).map(|_| place(&weights, &mut mix)).collect();
     let policy = policy();
+    // A creator's first agent is made one creator at a time: it dials the
+    // creator's connections, and a node takes only a few handshakes at once
+    // from one address.
+    let dialing = std::sync::Mutex::new(());
     let mut agents = crate::hosts::in_parallel(
         total,
         request.creators,
-        |creator| -> Result<(Vec<Operator>, Client, Vec<Client>), String> {
+        |creator| -> Result<(Vec<Operator>, Client, Vec<Client>, bool), String> {
             let operators = crate::agents::operators(inventory, &deployed)?;
             let at_home = crate::nodes::target(
                 &deployed.nodes[usize::from(home_placed.replicas[0]) - 1],
@@ -290,9 +294,15 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Personals, Str
                     ))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            Ok((operators, caller, readers))
+            Ok((operators, caller, readers, false))
         },
-        |(operators, caller, readers), at| {
+        |(operators, caller, readers, dialed), at| {
+            let _dialing = (!*dialed).then(|| {
+                dialing
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
+            *dialed = true;
             let replicas = placements[at as usize].clone();
             let creator = &operators[usize::from(replicas[0]) - 1];
             let agent = created(creator.create_agent(replicas.clone()))?;
