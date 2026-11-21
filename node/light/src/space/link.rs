@@ -103,7 +103,7 @@ pub fn answer<T: Decode>(outcome: &Outcome) -> Result<Result<T, PersonalError>, 
 
 /// The node's time as each kept-open purpose's connection to a routes'
 /// key last read it, and when: every link of that purpose there counts on
-/// it while it is young (half of [`QUERY_MS`]), so a flow reads the
+/// it while it is young (half a query's 60 s life), so a flow reads the
 /// node's time once, however many links it makes. A one-shot purpose's
 /// reading is its own connection's alone, and is never kept here.
 #[derive(Default)]
