@@ -540,7 +540,8 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
 /// After an enrollment s4 connects again (over Tor on a phone, carried):
 /// the new session, the device's digests never shown in it nor named by
 /// it, signs in once the operator's invitation claimed the device the
-/// screens enrolled; before that, a sign-in says to claim first.
+/// screens enrolled; before that, a sign-in waits for the invitation and,
+/// none coming, says the operator has not invited the device yet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_session_after_the_enrollment_signs_in_once_invited() {
     let user = Arc::new(User::default());
@@ -581,7 +582,7 @@ async fn the_session_after_the_enrollment_signs_in_once_invited() {
         tokio::time::sleep(Duration::from_millis(300)).await;
     };
     assert!(
-        unclaimed.contains("claim your invitation first"),
+        unclaimed.contains("the operator has not invited it yet"),
         "{unclaimed}"
     );
     user.answers.lock().unwrap().clear();
