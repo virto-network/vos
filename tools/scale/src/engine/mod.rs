@@ -473,6 +473,8 @@ impl Engine {
             }
         }
         let mut line = taken.mix().line(t_ms, seconds, "all", false);
+        // The mix's fine counts are its kinds' summed: not written twice.
+        line["fine"]["counts"].take();
         line["cpu_s"] = (cpu - cpu_then).into();
         pool_fields(&mut line, &pooled);
         let _ = writeln!(file, "{line}");
@@ -680,6 +682,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
             }
         }
         let mut total = whole.mix().line(t_ms, span, "all", true);
+        total["fine"]["counts"].take();
         // The load's span, from its first send to its last: a report's
         // window, the drain left out.
         total["load_from_ms"] = from_ms.into();

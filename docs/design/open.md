@@ -491,9 +491,16 @@ are under "Identity and privacy" above.
   bucket, three days offline, a force-stop, an operation's latency to its
   notification), which the device-change windows are pinned against.
 - **The personal agents' scale gate** (`light-node.md` §3.3, "The scale gate"):
-  of its three limits, the early run met the snapshot's and missed the
-  other two as measured; the rerun splits a replica's memory from the
-  store's and reads the p99 at finer buckets.
+  the snapshot's limit and the memory's as a fixed overhead (+56–59 KiB a
+  replica) are met; the commit p99's is missed. The rerun at capped load
+  (2026-11-20) found the rise real at 5,000 calls a second, a load at a
+  knee in front of the nodes (the API's stream bound and a user's calls
+  in order): +87%, and one run collapsed, the executors' waits doubled at
+  the nodes, consistent with the agents' long calls holding executors the
+  shards' batches wait for. At 3,000, near the knee, +23%, one pair, the
+  executors unmoved and the rise unexplained. Open: a lane for those calls
+  (or a queue ordered by gas), then the gate run below the knee with a
+  second pair for its spread (`api_in_flight` raised, or a lower rate).
 - **The control log's head in an admin call** [not built]: an admin
   call's arguments do not name the control log's head it was made
   against, so a device cannot check that an operation was signed against

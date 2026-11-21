@@ -126,6 +126,7 @@ impl KindStats {
             "p50_us": self.latency.quantile(0.5),
             "p99_us": self.latency.quantile(0.99),
             "p999_us": self.latency.quantile(0.999),
+            "fine": self.latency.fine_json(),
             "refused_p50_us": self.refused.quantile(0.5),
             "refused_p99_us": self.refused.quantile(0.99),
             "late_us": self.late_us,

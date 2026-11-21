@@ -326,7 +326,7 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Personals, Str
         },
         |done| {
             if done.is_multiple_of(500) || done == total {
-                eprintln!("{done} of {total} personal agents created and assigned");
+                eprintln!("{done} of {total} personal agents created and claimed");
             }
         },
     )?

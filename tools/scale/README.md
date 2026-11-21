@@ -91,7 +91,10 @@ second while active (`--per-user`, 0.1; or `--rate` for `U·a·r` itself).
   its window's close, after a jitter of up to 0.5 s, every 0.5 s.
 - **The record**, every interval: a line a kind (sent, answered, refusals
   by name, rate, p50, p99, p99.9, sends late, signatures the sending thread
-  made), and a line for the mix with the driver's CPU in the interval and
+  made; the latencies also at buckets at most 1/128 of their value wide,
+  as quantiles and as the counts themselves, about 10 MiB an hour of load,
+  so a quantile can be read again over any span of intervals), and a line
+  for the mix with the driver's CPU in the interval and
   the most requests in flight at once on one node's connection. The totals
   add the load's span (its first and last sends, the report's window), the
   mix as sent against its target, the CPU over the load, and each shard's
