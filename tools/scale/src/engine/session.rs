@@ -5,8 +5,8 @@
 //! starts another.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;

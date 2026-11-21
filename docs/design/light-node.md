@@ -801,15 +801,16 @@ minutes]:
   +3–9%, while the executors' waits moved both ways; every stage climbed
   over the hour in both runs (the batch 78 to 103 ms without the agents),
   the store growing under the load and, with them, the 255 MiB they
-  pushed. The rise is the writer's flush growing a few percent, paid
-  twice by every batch (its commit and its apply) on a writer with no
-  slack; at 5,000 the executors' waits rose too (their means from 6–17
-  to 8–23 ms).
+  pushed [inferred]. The rise reads as the writer's flush growing a few
+  percent, which a batch meets in its commit and again in its apply, on
+  a writer with no slack [inferred]; at 5,000 the executors' waits rose
+  too (their means from 6–17 to 8–23 ms), which this does not explain.
 - **The fix:** a drain's unsynced commits go first, written and answered
   before its sync (`core-model.md` §9.5, the log writer), so an apply
-  waits out at most the flush in progress, not another one after it;
-  nothing durable changes. Executor lanes for long calls are not built:
-  the data does not show them holding the batches.
+  whose agent has no synced commit before it in the drain waits out the
+  flush in progress, not another one after it; nothing durable changes.
+  Executor lanes for long calls are not built: at 3,000 the data does
+  not show them holding the batches.
 
 **Reaching the agent: every gateway lists every node.** A node that does
 not replicate an agent answers `Elsewhere { replicas }`

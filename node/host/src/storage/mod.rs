@@ -141,6 +141,8 @@ pub enum Change {
 
 impl Change {
     /// Whether the change must be on the disk before its commit is answered.
+    /// One that need not changes only its own agent's rows: the writer
+    /// answers it ahead of other agents' synced commits (`unsynced_first`).
     fn synced(&self) -> bool {
         match self {
             Self::Apply { .. }

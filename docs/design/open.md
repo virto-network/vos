@@ -498,11 +498,12 @@ are under "Identity and privacy" above.
   in order): +87%, and one run collapsed, the executors' waits doubled at
   the nodes, consistent with the agents' long calls holding executors the
   shards' batches wait for. At 3,000, near the knee, +23%, one pair.
-  The cause, traced (2026-11-21): not the calls nor the executors but the
-  log writer, an fsync back to back, whose flush the agents' store
-  lengthens a few percent and every batch pays twice; the fix (unsynced
-  commits answered before the sync) is built. Open: the gate run below
-  the knee with the fix, two pairs.
+  At 3,000 the rise traces to the log writer, not the calls or the
+  executors [measured, `light-node.md` §3.3, "The cause"]: its flushes run
+  back to back, and a batch meets them in its commit and its apply; the
+  fix (unsynced commits answered before the sync) is built. Open: the
+  gate run below the knee with the fix, two pairs; and at 5,000 the
+  executors' waits, which rose with the agents.
 - **An operation withheld from a device's log** (`light-node.md` §3.5,
   "The place"; B6): a device-set call names its place, so a route can no
   longer log a vetoed removal again and mature it; what is left is a

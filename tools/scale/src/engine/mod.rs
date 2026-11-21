@@ -478,6 +478,17 @@ impl Engine {
     }
 }
 
+/// Stops the intervals to the writing thread when dropped.
+struct Hangup(Rc<Engine>);
+
+impl Drop for Hangup {
+    fn drop(&mut self) {
+        if let Ok(mut intervals) = self.0.intervals.try_borrow_mut() {
+            intervals.take();
+        }
+    }
+}
+
 /// An interval's counts, as the sending thread took them.
 struct Interval {
     t_ms: u64,
@@ -585,8 +596,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
         .iter()
         .map(|node| Pool::quic(&node.api, crate::keys::hex32(&node.key)?, client))
         .collect::<Result<Vec<_>, String>>()?;
-    let file =
-        std::fs::File::create(out).map_err(|error| format!("{}: {error}", out.display()))?;
+    let file = std::fs::File::create(out).map_err(|error| format!("{}: {error}", out.display()))?;
     let secs = plan.secs as f64;
     let (sender, receiver) = smol::channel::unbounded::<Op>();
     // The load starts once the sending thread opened its connections:
@@ -666,6 +676,9 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
             load_ended: Cell::new(None),
             jitter: Cell::new(Mix(plan.model.seed ^ plan.driver ^ 0x7177)),
         });
+        // The writing thread ends once the intervals stop, a panic here
+        // included: the scope then joins it and goes on unwinding.
+        let hangup = Hangup(Rc::clone(&engine));
         let every = Duration::from_secs(plan.every_s.max(1));
         let drain = Duration::from_millis(plan.drain_ms());
         let mut load_cpu = 0.0;
@@ -716,7 +729,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
         }));
         let _ = planner.join();
         engine.flush();
-        engine.intervals.borrow_mut().take();
+        drop(hangup);
         let (mut file, whole) = writer.join().expect("the writing thread");
         let t_ms = crate::now_ms();
         let (from_ms, to_ms) = engine.sends.get().unwrap_or((t_ms, t_ms));

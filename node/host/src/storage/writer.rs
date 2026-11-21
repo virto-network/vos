@@ -332,21 +332,27 @@ impl Writer {
 }
 
 /// `group` split in two, each in its order: the commits that need no sync
-/// and touch no agent an earlier commit that needs one touches, then the
-/// rest. No commit of a group is answered before it is written, so its
-/// commits are concurrent and any order that keeps each agent's is one
-/// they could have come in: the first part is written and answered as a
-/// flush of its own, without waiting for the second's sync.
+/// and touch no agent a commit held back before them touches, then the
+/// rest. Every caller awaits its commit's answer before it acts on it, so
+/// no commit of a group depends on another of the group; and an unsynced
+/// change touches only its own agent's rows ([`Change::synced`]). So an
+/// order that keeps each agent's is one the group could have come in: the
+/// first part is written and answered as a flush of its own, without
+/// waiting for the second's sync.
 fn unsynced_first(group: Vec<Commit>) -> (Vec<Commit>, Vec<Commit>) {
-    let mut synced_agents = HashSet::new();
+    let mut held = HashSet::new();
     let (mut unsynced, mut rest) = (Vec::new(), Vec::new());
     for commit in group {
         let synced = commit.changes.iter().any(Change::synced);
-        let agents = || commit.changes.iter().map(Change::agent);
-        if synced {
-            synced_agents.extend(agents().flatten());
-            rest.push(commit);
-        } else if agents().any(|agent| agent.is_none_or(|agent| synced_agents.contains(&agent))) {
+        // A change of no agent, a barrier, is synced: none reaches the
+        // first part.
+        let agents = commit.changes.iter().map(Change::agent);
+        if synced
+            || agents
+                .clone()
+                .any(|agent| agent.is_none_or(|agent| held.contains(&agent)))
+        {
+            held.extend(agents.flatten());
             rest.push(commit);
         } else {
             unsynced.push(commit);
