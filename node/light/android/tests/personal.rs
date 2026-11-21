@@ -70,7 +70,12 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
     // The claim said its stages: the home reached, the proof, the kit
     // written, the log followed.
     let stages = first.hand.stages.lock().unwrap().clone();
-    for stage in [Stage::Reaching, Stage::Proving, Stage::WritingKit, Stage::Joining] {
+    for stage in [
+        Stage::Reaching,
+        Stage::Proving,
+        Stage::WritingKit,
+        Stage::Joining,
+    ] {
         assert!(stages.contains(&(stage as u8)), "{stage:?} in {stages:?}");
     }
 
@@ -627,7 +632,10 @@ fn a_restores_sitting_takes_the_kit_once_and_wipes_it_three_ways() {
     view();
     assert!(fresh.node.space().unwrap().kit_held());
     std::thread::sleep(std::time::Duration::from_millis(1_500));
-    assert!(!fresh.node.space().unwrap().kit_held(), "wiped at its life's end");
+    assert!(
+        !fresh.node.space().unwrap().kit_held(),
+        "wiped at its life's end"
+    );
     view();
     assert_eq!(entered(), 5);
 

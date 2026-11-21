@@ -341,7 +341,8 @@ fn two_of(count: usize) -> (usize, usize) {
     getrandom::getrandom(&mut bytes).expect("the system's randomness");
     let count = count.max(2);
     let first = u16::from_le_bytes([bytes[0], bytes[1]]) as usize % count;
-    let second = (first + 1 + u16::from_le_bytes([bytes[2], bytes[3]]) as usize % (count - 1)) % count;
+    let second =
+        (first + 1 + u16::from_le_bytes([bytes[2], bytes[3]]) as usize % (count - 1)) % count;
     (first.min(second), first.max(second))
 }
 
@@ -591,7 +592,8 @@ impl space::Prompts for Asked<'_> {
             .ok_or_else(|| Error::Source("the source's key handle".into()))?;
         let bytes = reference.to_bytes();
         thirty_two(
-            self.prompts.evaluate_key(reference.kind(), &bytes[1..], input),
+            self.prompts
+                .evaluate_key(reference.kind(), &bytes[1..], input),
             "the source's output",
         )
     }
@@ -924,7 +926,9 @@ impl Space {
         match &done {
             Err(Error::NotAKit | Error::WrongKit | Error::NoAgentForKit) => self.sitting.wipe(),
             _ => {
-                if let Some((generation, life)) = entered.and_then(|kit| self.sitting.keep(kit, opened)) {
+                if let Some((generation, life)) =
+                    entered.and_then(|kit| self.sitting.keep(kit, opened))
+                {
                     let sitting = Arc::clone(&self.sitting);
                     self.personal.host().runtime.spawn(async move {
                         tokio::time::sleep(Duration::from_millis(life)).await;
@@ -1049,7 +1053,10 @@ impl Space {
         label: &str,
     ) -> Result<Paired, Refused> {
         contract::label(label)?;
-        Ok(self.personal.pair_join(&Asked::new(prompts), code, label)?.into())
+        Ok(self
+            .personal
+            .pair_join(&Asked::new(prompts), code, label)?
+            .into())
     }
 
     pub fn memberships(&self) -> Result<Vec<Membership>, Refused> {
@@ -1058,11 +1065,15 @@ impl Space {
     }
 
     pub fn enroll_device(&self, prompts: Lent<'_>, owed: Membership) -> Result<(), Refused> {
-        Ok(self.personal.enroll_device(&Asked::new(prompts), owed.into())?)
+        Ok(self
+            .personal
+            .enroll_device(&Asked::new(prompts), owed.into())?)
     }
 
     pub fn confirm_device(&self, prompts: Lent<'_>, owed: Membership) -> Result<(), Refused> {
-        Ok(self.personal.confirm_device(&Asked::new(prompts), owed.into())?)
+        Ok(self
+            .personal
+            .confirm_device(&Asked::new(prompts), owed.into())?)
     }
 
     pub fn drop_enrollment(&self, owed: Membership) -> Result<(), Refused> {
@@ -1148,15 +1159,24 @@ impl Space {
     }
 
     pub fn resolve(&self, prompts: Lent<'_>, index: u64, upheld: bool) -> Result<Posted, Refused> {
-        Ok(self.personal.resolve(&Asked::new(prompts), index, upheld)?.into())
+        Ok(self
+            .personal
+            .resolve(&Asked::new(prompts), index, upheld)?
+            .into())
     }
 
     pub fn rotate_kit(&self, prompts: Lent<'_>, kind: KitKind) -> Result<Posted, Refused> {
-        Ok(self.personal.rotate_kit(&Asked::new(prompts), kind.into())?.into())
+        Ok(self
+            .personal
+            .rotate_kit(&Asked::new(prompts), kind.into())?
+            .into())
     }
 
     pub fn replace_admin(&self, prompts: Lent<'_>, kind: KitKind) -> Result<Posted, Refused> {
-        Ok(self.personal.replace_admin(&Asked::new(prompts), kind.into())?.into())
+        Ok(self
+            .personal
+            .replace_admin(&Asked::new(prompts), kind.into())?
+            .into())
     }
 
     pub fn admin_offer(&self, prompts: Lent<'_>) -> Result<Vec<u8>, Refused> {
@@ -1164,7 +1184,10 @@ impl Space {
     }
 
     pub fn replace_admin_of(&self, prompts: Lent<'_>, code: &[u8]) -> Result<Posted, Refused> {
-        Ok(self.personal.replace_admin_of(&Asked::new(prompts), code)?.into())
+        Ok(self
+            .personal
+            .replace_admin_of(&Asked::new(prompts), code)?
+            .into())
     }
 
     pub fn regroup(&self, prompts: Lent<'_>) -> Result<Posted, Refused> {
@@ -1225,7 +1248,10 @@ impl Space {
 
     pub fn move_home(&self, prompts: Lent<'_>, request: Claim) -> Result<Claimed, Refused> {
         let request = claim(request)?;
-        Ok(self.personal.move_home(&Asked::new(prompts), request)?.into())
+        Ok(self
+            .personal
+            .move_home(&Asked::new(prompts), request)?
+            .into())
     }
 }
 
@@ -1385,7 +1411,10 @@ mod tests {
 
     #[test]
     fn a_phrase_entered_is_read_as_the_kit_reads_it() {
-        assert_eq!(normalized("  Zoo\tWRIST \n vote ").as_str(), "zoo wrist vote");
+        assert_eq!(
+            normalized("  Zoo\tWRIST \n vote ").as_str(),
+            "zoo wrist vote"
+        );
         for _ in 0..64 {
             let (first, second) = two_of(24);
             assert!(first < second && second < 24);

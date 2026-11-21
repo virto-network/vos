@@ -24,8 +24,8 @@ use vos_wire::ingress::DeviceWindow;
 use crate::chrome::{Answer, Chrome, Field, Form, short};
 use crate::enrollment::{Agent, Enrollment, Guard, Method, Origin, Store, write_private};
 use crate::job::now_ms;
-use crate::personal::Stage;
 use crate::net::{Net, Pinned};
+use crate::personal::Stage;
 use crate::source::{Kind, Reference, Source, SourceError};
 use crate::warm::{self, Programs, Warming};
 use crate::{

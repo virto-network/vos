@@ -53,7 +53,10 @@ fn the_screens_kit_words_are_the_kits() {
         ("CHECK", vos_facility::personal::CHECK_PHRASE),
     ] {
         let declared = format!("{constant} = \"{title}\";");
-        assert!(words.contains(&declared), "KitWords.java does not declare {declared}");
+        assert!(
+            words.contains(&declared),
+            "KitWords.java does not declare {declared}"
+        );
     }
     let list = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
