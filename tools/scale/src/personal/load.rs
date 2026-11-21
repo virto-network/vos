@@ -82,6 +82,7 @@ impl Counts {
             "p50_us": self.latency.quantile(0.5),
             "p99_us": self.latency.quantile(0.99),
             "p999_us": self.latency.quantile(0.999),
+            "fine": self.latency.fine_json(),
             "bytes": self.bytes,
         })
     }
