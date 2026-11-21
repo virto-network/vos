@@ -11,7 +11,7 @@ use vos_light::release::Package;
 use vos_testkit::personal::Agent;
 use vos_testkit::programs;
 use vos_wire::ingress::{self, call_message};
-use vos_wire::personal::{Body, Entry, Kit, NewDevice, PersonalError, Policy};
+use vos_wire::personal::{Body, Entry, Kit, NewDevice, Overview, PersonalError, Place, Policy};
 
 pub use vos_wire::personal::PERSONAL;
 /// The agent's identity, which calls are signed for.
@@ -59,6 +59,8 @@ pub struct Home {
     pub identity: [u8; 32],
     /// The policy the home's claims set.
     policy: Policy,
+    /// The keys whose reads the agent answered, to read its head by.
+    readers: std::cell::RefCell<Vec<[u8; 32]>>,
 }
 
 /// The home's agent, whose `Homes` claims the agent.
@@ -95,6 +97,7 @@ impl Home {
             agent,
             identity,
             policy,
+            readers: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -152,9 +155,42 @@ impl Home {
             .is_ok()
     }
 
+    /// The log's head, read as `key` or, refused, as a key whose reads
+    /// the agent answered: the log's start before any.
+    pub fn head(&self, key: [u8; 32]) -> Place {
+        let readers = self.readers.borrow().clone();
+        [key]
+            .into_iter()
+            .chain(readers)
+            .find_map(|reader| self.query::<Overview>(reader, "overview", Vec::new()).ok())
+            .map_or(
+                Place {
+                    next: 0,
+                    chain: [0; 32],
+                },
+                |overview| Place {
+                    next: overview.next,
+                    chain: overview.chain,
+                },
+            )
+    }
+
     /// A call of `name` with `arguments` signed by `key`, in its session
-    /// for a call now, not yet sent.
+    /// for a call now, not yet sent: a device-set admin call placed at the
+    /// log's head first.
     pub fn sign(&mut self, key: &SigningKey, name: &str, arguments: Vec<u8>) -> Signed {
+        let arguments = if vos_wire::personal::method::PLACED.contains(&self.method(name)) {
+            self.head(key.verifying_key().to_bytes())
+                .arguments(&arguments)
+        } else {
+            arguments
+        };
+        self.sign_as(key, name, arguments)
+    }
+
+    /// A call of `name` with `arguments` as given, signed by `key` in its
+    /// session for a call now, not yet sent.
+    pub fn sign_as(&mut self, key: &SigningKey, name: &str, arguments: Vec<u8>) -> Signed {
         let method = self.method(name);
         let (session, sequence) = self.agent.session(key.verifying_key().to_bytes());
         let message = call_message(
@@ -201,6 +237,9 @@ impl Home {
         arguments: Vec<u8>,
     ) -> Result<T, PersonalError> {
         let outcome = self.agent.read(key, self.method(name), arguments);
+        if matches!(outcome, Outcome::Done(_)) && !self.readers.borrow().contains(&key) {
+            self.readers.borrow_mut().push(key);
+        }
         Reply {
             at: self.agent.now(),
             outcome,

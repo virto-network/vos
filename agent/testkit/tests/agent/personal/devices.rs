@@ -225,7 +225,11 @@ fn an_operation_due_without_its_evidence_is_cancelled() {
         home.operate(admin(1), "cosign", removal),
         Err(PersonalError::Unevidenced)
     );
-    let signed = message(device(0).admin, home.method("remove"), &2u32.encode());
+    let signed = message(
+        device(0).admin,
+        home.method("remove"),
+        &home.logged(removal),
+    );
     home.call::<Recorded>(
         sync(0),
         "evidence",
@@ -249,7 +253,11 @@ fn a_resolution_onto_an_unevidenced_operation_is_refused() {
         home.operate(KIT, "resolve", (removal, true)),
         Err(PersonalError::Unevidenced)
     );
-    let signed = message(device(0).admin, home.method("remove"), &1u32.encode());
+    let signed = message(
+        device(0).admin,
+        home.method("remove"),
+        &home.logged(removal),
+    );
     home.call::<Recorded>(
         sync(0),
         "evidence",
@@ -777,13 +785,73 @@ fn a_contest_lifted_inside_the_delay_matures_at_its_own_time() {
     assert_eq!(standing(&home, sync(0), 2), Standing::Removed);
 }
 
+/// B6: an admin call names its place, the log's head its signer read, and
+/// is taken at a place no earlier than the entry after the last admin call
+/// logged and no later than the head. One behind that call, naming a chain
+/// the log never had or a head ahead of it is refused `StaleHead`, and
+/// logs nothing: a call the log took cannot be taken again later, so a
+/// route that logs it again on a fork logs what no agent took. Entries
+/// that are no admin call move no place on, and what fell due is settled
+/// ahead of a call placed before the batch settles it.
+#[test]
+fn an_admin_call_is_taken_only_at_the_place_it_names() {
+    let mut home = seasoned(3);
+    let before = home.head(admin(0));
+    let removal = home.unevidenced(admin(0), "remove", 2u32).unwrap();
+    assert_eq!(removal, before.next, "logged at its place");
+    let head = home.head(admin(1));
+    let elsewhere = [
+        before,
+        Place {
+            next: head.next,
+            chain: [0xab; 32],
+        },
+        Place {
+            next: head.next + 1,
+            chain: head.chain,
+        },
+    ];
+    for place in elsewhere {
+        let run = home.run_as(admin(1), "veto", place.arguments(&removal.encode()));
+        assert_eq!(
+            answer::<Recorded>("veto", &run.outcome),
+            Err(PersonalError::StaleHead)
+        );
+        let run = home.run_as(admin(0), "remove", place.arguments(&1u32.encode()));
+        assert_eq!(
+            answer::<Recorded>("remove", &run.outcome),
+            Err(PersonalError::StaleHead)
+        );
+    }
+    assert_eq!(home.head(admin(1)), head, "nothing logged");
+    // A lease renewed is no admin call: the veto signed before it is taken.
+    let run = home.run_as(HOMES, "renew", Vec::new());
+    answer::<Recorded>("renew", &run.outcome).unwrap();
+    let run = home.run_as(admin(1), "veto", head.arguments(&removal.encode()));
+    let veto = answer::<Recorded>("veto", &run.outcome).unwrap();
+    assert!(veto.index > head.next, "{veto:?} after {head:?}");
+    assert_eq!(home.logged(veto.index), head.arguments(&removal.encode()));
+    // A removal falls due unevidenced: a call placed before the batch
+    // settles it is taken after the cancellation.
+    let due = home.unevidenced(admin(0), "remove", 1u32).unwrap();
+    let place = home.head(admin(2));
+    home.pass(3 * MINUTE + 1);
+    let run = home.run_as(admin(2), "remove", place.arguments(&0u32.encode()));
+    let taken = answer::<Recorded>("remove", &run.outcome).unwrap();
+    assert!(taken.index > place.next, "{taken:?} after {place:?}");
+    assert_eq!(
+        cancelled(state(&home, sync(0), due)),
+        Some(Cancel::Unevidenced)
+    );
+}
+
 /// B6: every operation and veto is an admin call whose evidence its
 /// signer posts, a device under its sync key and the kit under its own.
 #[test]
 fn operations_are_signed_end_to_end_and_their_evidence_stored() {
     let mut home = seasoned(2);
     let removal = home.unevidenced(KIT, "remove", 1u32).unwrap();
-    let signed = message(KIT_KEY, home.method("remove"), &1u32.encode());
+    let signed = message(KIT_KEY, home.method("remove"), &home.logged(removal));
     assert_eq!(
         home.call::<Recorded>(
             sync(0),
@@ -799,7 +867,7 @@ fn operations_are_signed_end_to_end_and_their_evidence_stored() {
     )
     .unwrap();
     let veto = home.operate(admin(1), "veto", removal).unwrap();
-    let signed = message(device(1).admin, home.method("veto"), &removal.encode());
+    let signed = message(device(1).admin, home.method("veto"), &home.logged(veto));
     home.call::<Recorded>(
         sync(1),
         "evidence",

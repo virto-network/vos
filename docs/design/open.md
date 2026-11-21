@@ -501,15 +501,14 @@ are under "Identity and privacy" above.
   executors unmoved and the rise unexplained. Open: a lane for those calls
   (or a queue ordered by gas), then the gate run below the knee with a
   second pair for its spread (`api_in_flight` raised, or a lower rate).
-- **The control log's head in an admin call** [not built]: an admin
-  call's arguments do not name the control log's head it was made
-  against, so a device cannot check that an operation was signed against
-  the log it was shown: a route forking the log a device reads can log
-  again a removal of it once signed and vetoed, and mature it unvetoed,
-  which takes the device out of its group for good (`light-node.md`
-  §3.6, "never on a refusal"). Binding an operation's batch time to its
-  call's session (`t0` to `t0` plus the session's life) would narrow the
-  replay to the calls of the last session's life.
+- **An operation withheld from a device's log** (`light-node.md` §3.5,
+  "The place"; B6): a device-set call names its place, so a route can no
+  longer log a vetoed removal again and mature it; what is left is a
+  route showing a device that has not yet read an operation's veto the
+  operation without it, matured at a time the route claims (a clock alarm
+  past an hour's skew). Closing it needs a second route's or the other
+  devices' word on the log before a device takes its own removal (views
+  in envelopes reach it only while it still reads its scopes).
 - **Messaging between members** on `vos-mls` [E12], in a space or across
   spaces, the personal agent's inbox its door (`light-node.md` §3.7,
   §3.10). MLS virtual clients share a virtual leaf's signature and HPKE

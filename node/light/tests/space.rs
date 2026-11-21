@@ -316,6 +316,93 @@ fn a_veto_the_operators_drop_is_seen() {
     );
 }
 
+/// A removal of a phone, signed and vetoed, logged again on a route that
+/// forks the log the phone reads, and matured there unvetoed: the call
+/// names the place it took, which the fork's copy is not, so the phone
+/// takes no entry of the fork, alarms, and stays in the set.
+#[test]
+fn a_vetoed_removal_logged_again_on_the_route_turns_no_phone_away() {
+    let world = world_of(Policy {
+        probation_ms: 1_000,
+        ..suite()
+    });
+    let home = world.home(HOME, 2, 1);
+    let first = device(&world, 0x53);
+    first.claim(&world, home);
+    let second = device(&world, 0x54);
+    let id = first.pair(&second);
+    after(1_000);
+    let removal = first.space.remove(&first.phone, id).unwrap();
+    second.pass();
+    second.space.veto(&second.phone, removal.index).unwrap();
+    second.pass();
+    world.relog(0x54, removal.index);
+    after(suite().operation_delay_ms);
+    for _ in 0..2 {
+        let passed = second.space.pass(vos_light::testing::wall());
+        let passed = match passed {
+            Ok(passed) => passed,
+            Err(stopped) => panic!("{stopped:?}"),
+        };
+        assert!(
+            !passed.notices.contains(&vos_light::job::Notice::Removed),
+            "{:?}",
+            passed.notices
+        );
+        assert!(
+            passed
+                .alarms
+                .iter()
+                .any(|alarm| matches!(alarm, Alarm::Log { .. })),
+            "{:?}",
+            passed.alarms
+        );
+        assert_eq!(second.space.status().unwrap().phase, Phase::Held);
+    }
+    assert_eq!(first.standing(id), Some(Standing::Active));
+}
+
+/// An entry that is no admin call, logged between the reading and the
+/// call, moves no place on: the call is signed once and taken. One refused
+/// `StaleHead` is read and signed again, at most three signatures in all:
+/// then the refusal is the user's to see.
+#[test]
+fn an_admin_call_is_signed_again_only_for_its_place() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let first = device(&world, 0x55);
+    first.claim(&world, home);
+    let second = device(&world, 0x56);
+    let third = device(&world, 0x57);
+    let (two, three) = (first.pair(&second), first.pair(&third));
+    world.renew_before(0x55, Step::call(method::REMOVE));
+    world.trace_from_now(0x55);
+    let removal = first.space.remove(&first.phone, two).unwrap();
+    let calls = world.trace(0x55);
+    let removes = calls
+        .iter()
+        .filter(|step| **step == Step::call(method::REMOVE));
+    assert_eq!(removes.count(), 1, "signed once: {calls:?}");
+    world.refuse(
+        0x55,
+        Step::call(method::REMOVE),
+        PersonalError::StaleHead,
+        3,
+    );
+    assert_eq!(
+        first.space.remove(&first.phone, three).unwrap_err(),
+        Error::AgentRefused(PersonalError::StaleHead)
+    );
+    let operations = first.space.operations().unwrap();
+    assert!(
+        operations.iter().any(|notice| matches!(
+            notice,
+            vos_light::job::Notice::Operation { index, .. } if *index == removal.index
+        )),
+        "{operations:?}"
+    );
+}
+
 /// A removal that matures between the commit's reading of the log and its
 /// call is refused as the commit's to carry: the commit reads again and is
 /// made once more, carrying it.

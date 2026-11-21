@@ -32,8 +32,8 @@ use vos_wire::credentials::{CredentialError, Open, Path};
 use vos_wire::homes::HomesError;
 use vos_wire::ingress::{Call as Signed, Response};
 use vos_wire::personal::{
-    AdminClass, Attached, Attestation, Body, Candidacy, Entry, InboxItem, NewDevice, PersonalError,
-    Policy, Recorded, Vote,
+    AdminClass, Attached, Attestation, Body, Candidacy, Entry, InboxItem, NewDevice, Overview,
+    PersonalError, Place, Policy, Recorded, Vote,
 };
 
 use crate::harness::{NODES, OPERATOR_SEED, answer, assert_done, witness};
@@ -796,8 +796,20 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
         .call::<Recorded>(&mut sockets, &mut second.sync, "alive", Vec::new())
         .0
         .unwrap();
-    let (removal, message, signature) =
-        personal.call::<Recorded>(&mut sockets, &mut second.admin, "remove", 0u32.encode());
+    // Placed at the log's head, as a device-set call names it.
+    let overview: Overview = personal
+        .query(&mut sockets, &second.sync.key, "overview", ())
+        .unwrap();
+    let place = Place {
+        next: overview.next,
+        chain: overview.chain,
+    };
+    let (removal, message, signature) = personal.call::<Recorded>(
+        &mut sockets,
+        &mut second.admin,
+        "remove",
+        place.arguments(&0u32.encode()),
+    );
     let index = removal.unwrap().index;
     let attached = Attached {
         welcome: None,

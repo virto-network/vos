@@ -1316,8 +1316,9 @@ host-verified]:
 - **One call, one prompt:** every device-set operation (add, remove, veto,
   resolve, kit rotation, restore, regroup, admin-key replacement) and
   every commit is a one-shot client call whose key is the device's admin
-  key (or the kit's, for its own operations); its arguments do not name
-  the control log's head it was made against (`open.md`). The prompt authorizes the one
+  key (or the kit's, for its own operations); a device-set call names
+  its place first, the control log's head it was made against (below,
+  "The place"). The prompt authorizes the one
   signature the call needs; ingress verifies it as it verifies any client
   call, and the agent checks the origin, `Principal::Client(key)`, against
   the device set: whose key it is, and whether that device's state (active,
@@ -1352,6 +1353,45 @@ host-verified]:
   operation's evidence is in, which its author's next pass posts. The
   operators run ingress and could append anything to the log, so a device
   trusts an operation only by its signature (§8, B6).
+- **The place** [decided 2026-11-20, built]: every device-set call
+  (add, remove, replace, rotate, regroup, restore, veto, cosign, resolve)
+  names first in its arguments the log's head its signer read before the
+  prompt, `Place { next, chain }`: the next index and the chain through the
+  entry before it. The agent and every device take the call only at a
+  place at or after their floor, the entry after the last admin call
+  before it (a device's start, for one that read none; a paired device
+  takes its pairing device's), and at or before the call's own entry, the
+  chain there the log's. The agent compares it before anything the call's
+  batch settles and refuses any other `StaleHead`, logging nothing; a
+  device raises `Alarm::Log` and reads no further, as for an entry that
+  does not chain. A call logged again elsewhere names a place before the
+  call it copies, which every device that read that call has passed: a
+  route cannot log a removal once signed, vetoed or cancelled a second
+  time and mature it there unvetoed. Entries that are no admin call
+  (evidence, votes, `alive`, a renewal, what a batch settles) move no
+  floor, so another device's background pass between the reading and the
+  call refuses nothing; the cost is that a signed call withheld stays
+  takeable until the next admin call is logged. The device reads the log
+  to its head just before the prompt (one read, two when there is
+  something new), and signs nothing when that log stops at an entry it
+  refuses or it is out of the set. The same call made before and taken,
+  its answer lost, has its evidence posted rather than being signed again.
+  A call refused `StaleHead` (another admin call between the reading and
+  the call) or `Settling` (a wake first) is read and signed again, a
+  prompt each time, three signatures at most; a route can make up either
+  refusal, which costs at most those prompts and takes no device out, and
+  a call it forwarded before making one up stays held, its evidence
+  posted. The kit's and a restore's calls take the head from the log they
+  read or the agent's overview, the agent's word, which binds the place,
+  not its truth. Commits are not placed: an epoch and the votes, which
+  bind the voters' logs, place them. Why not the call session's `t0` with
+  a window, or the devices remembering each call's message: the evidence
+  is a separate later entry a route can withhold, so a device that read an
+  operation and its veto but never the message has nothing to recognize
+  the copy by; the place is checked at the call's own entry. What is left
+  is withholding: a device that has not read a veto yet can be shown the
+  operation without it, and its maturity at a time the route claims (B7,
+  B8).
 - Delays run on the agent's batch time alone; a device whose clock
   disagrees with the agent's by more than an hour raises an alarm and
   otherwise acts as the log says. A restored device starts from the
@@ -1570,8 +1610,11 @@ where the rules above leave a choice, this is the one taken]:
   due by their time, which a call may yet cancel in time order (a
   removal's signer removed first); the operations read as the last call
   left them.
-- **Not built:** an admin call's arguments naming the control log's head
-  it was made against (`open.md`).
+- **The place,** each device-set call's first argument (§3.5, "Admin
+  calls"): compared at the start of every such handler, before `settle`,
+  against the head, the log's chains and `floor`, the index after the last
+  admin call logged, so what its batch settles is logged ahead of the
+  call.
 
 **The kit and its flows as built** [built, `vos_light::kit`, the device
 group and sealed sync, tested against `Personal` in
@@ -2016,12 +2059,15 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   rules, and pairs again from a code of its own space
   (`DeviceGroup::removal_unsupported`); a removal pending its delay lets
   no device in the set pair again. The Devices screen's own row says
-  removed only once the device is out (`space::Personal::devices`). What
-  a gateway can still do is withhold, which any route can, and replay: an
-  operation's evidence binds its call, not its place in the log, so a
-  route forking the log a device reads from its cursor can log again a
-  removal of it that was once signed and vetoed or cancelled, and mature
-  it unvetoed (`open.md`, "The control log's head in an admin call"). A post the agent refuses as held already (`Voted`,
+  removed only once the device is out (`space::Personal::devices`). Nor
+  does a removal replayed: a route forking the log a device reads, to log
+  again a removal of it once signed and vetoed or cancelled and mature it
+  unvetoed, logs a call whose place (§3.5, "The place") is behind the
+  device's floor, which the device refuses (`Alarm::Log`), reading no
+  further on that log [built 2026-11-20; tested in `node/light/tests/
+  space.rs`, a route's `World::relog`]. What a gateway can still do is
+  withhold, which any route can: a device that has not read a veto yet
+  can be shown the operation without it. A post the agent refuses as held already (`Voted`,
   `Evidenced`) or as decided meanwhile (`NoCandidate`, `NotConfirming`) is
   done, the log read on; a page withheld is read again once. A pass that
   stops on an error hands back what it found (`Stopped`), its alarms with
@@ -4113,7 +4159,8 @@ nothing a device can show a third party, so an alarm is not proof
 (`open.md`, "Node-signed feed heads").
 
 **B5. The operators inject or replay.** A forged envelope fails its AEAD; a
-replayed one is a duplicate; a replayed commit breaks the epoch rule.
+replayed one is a duplicate; a replayed commit breaks the epoch rule; a
+replayed device-set call names a place the device has passed (B6).
 *Mitigation:* as stated.
 
 **B6. The operators forge device-set operations.** *Mitigation:* every
@@ -4122,8 +4169,11 @@ from the evidence stored beside it; an operation without evidence moves no
 device. Nor does a refusal: a removed device is out on its removal's
 evidence, which the agent serves its key (§3.6, the pass), and a refusal
 the route makes up stops a pass, never removes a device (`NotAdmitted`).
-*Known limit:* evidence binds a call, not its place in the log, so a
-signed removal once vetoed can be logged again on a forked log (§3.6).
+Nor a replay: every device-set call names its place, the log's head its
+signer read, and is taken there alone, by the agent and by every device,
+so a signed removal once vetoed logged again on a forked log is refused
+(§3.5, "The place"; §3.6). *Known limit:* a device that has not read a
+veto can be shown the operation without it (withholding, B8).
 
 **B7. The operators advance the agent's clock,** maturing a hostile
 removal or a restore early. *Known limit:* delays trust the operators'

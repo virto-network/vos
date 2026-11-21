@@ -12,14 +12,14 @@ use vos_abi::ids::MethodId;
 use vos_wire::homes;
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
-    AdminClass, Attached, Body, DeviceView, Entry, KitKind, OpState, Operation, Recorded, Standing,
-    method,
+    AdminClass, Attached, Body, DeviceView, Entry, KitKind, OpState, Operation, Overview, Place,
+    Recorded, Standing, method,
 };
 
 use super::link::{AgentLink, Key, Signer, answer};
-use super::set::{Device, evidence};
+use super::set::{Device, call_placed, evidence};
 use super::{
-    Error, Host, Kept, KitCall, Personal, Posted, Prompts, answered, entered_kit, logged, unreached,
+    Error, Host, Kept, KitCall, Personal, Posted, Prompts, answered, entered_kit, logged,
 };
 use crate::job::{Kind, Notice};
 use crate::kit::KitSecret;
@@ -142,23 +142,27 @@ impl<H: Host> Personal<H> {
             }
             let sign = |message: &[u8]| Ok(signing.sign(message).to_bytes());
             let mut signer = Signer::new(origin);
-            let mut previous: Option<Vec<u8>> = None;
+            // Each signature kept: one signed again after a refusal the
+            // route made up may be the log's, and the next kit call posts
+            // its evidence, or drops it once the log does not hold it.
             let mut hold = |message: &[u8], signature: &[u8; 64]| {
-                self.keep_kit_call(
-                    identity,
-                    previous.replace(message.to_vec()),
-                    Some((message, signature)),
-                )
-                .map_err(|error| error.to_string())
+                self.keep_kit_call(identity, None, Some((message, signature)))
+                    .map_err(|error| error.to_string())
             };
-            let called = link
-                .settled(
-                    &mut Key::Lent(&mut signer, &sign),
-                    method,
-                    arguments,
-                    &mut hold,
-                )
-                .map_err(unreached)?;
+            // Placed at the log's head as the agent answers it: the log just
+            // read, then its overview for a call signed again.
+            let mut read = Some(head(&entries));
+            let called = call_placed(
+                link,
+                &mut Key::Lent(&mut signer, &sign),
+                method,
+                &arguments,
+                &mut |link| match read.take() {
+                    Some(place) => Ok(place),
+                    None => overview_head(link),
+                },
+                &mut hold,
+            )?;
             let recorded = match answer::<Recorded>(&called.outcome).map_err(super::failed)? {
                 Ok(recorded) => recorded,
                 Err(error) => {
@@ -251,7 +255,10 @@ impl<H: Host> Personal<H> {
                     Ok(()) | Err(Error::AgentRefused(_)) => {}
                     Err(error) => return Err(error),
                 }
-                if signed.method == method && signed.arguments == arguments {
+                if signed.method == method
+                    && Place::split(&signed.arguments)
+                        .is_some_and(|(_, signed)| signed == arguments)
+                {
                     answered = Some(Posted {
                         index: *index,
                         at: entry.at,
@@ -328,6 +335,30 @@ impl<H: Host> Personal<H> {
         answered(link.settle())?;
         f(&mut link, identity)
     }
+}
+
+/// The head of the log `entries` read from its start: where a call made
+/// now takes its place.
+fn head(entries: &[(u64, Entry)]) -> Place {
+    entries.last().map_or(
+        Place {
+            next: 0,
+            chain: [0; 32],
+        },
+        |(index, entry)| Place {
+            next: index + 1,
+            chain: entry.chain,
+        },
+    )
+}
+
+/// The log's head as the agent's overview answers it.
+pub(super) fn overview_head<H: Host>(link: &mut AgentLink<'_, H>) -> Result<Place, Error> {
+    let overview: Overview = answered(link.query(method::OVERVIEW, ()))?;
+    Ok(Place {
+        next: overview.next,
+        chain: overview.chain,
+    })
 }
 
 /// A device of the set as the kit's screen lists it.

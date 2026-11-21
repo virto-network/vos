@@ -4,7 +4,7 @@
 use vos_abi::{Decode, Encode};
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
-    AdminCall, AdminClass, DeviceId, Effect, KitEntry, NewDevice, Op, Policy, Signer, Vote,
+    AdminCall, AdminClass, DeviceId, Effect, KitEntry, NewDevice, Op, Place, Policy, Signer, Vote,
 };
 
 use super::Agent;
@@ -225,7 +225,8 @@ pub(crate) struct Made {
 impl Made {
     /// Whether it is a veto of the operation at `op`.
     pub(crate) fn vetoes(&self, op: u64) -> bool {
-        self.vetoes_any() && self.arguments == op.encode()
+        self.vetoes_any()
+            && Place::split(&self.arguments).is_some_and(|(_, vetoed)| vetoed == op.encode())
     }
 
     pub(super) fn vetoes_any(&self) -> bool {
@@ -262,7 +263,8 @@ impl Sent {
         self.index == Some(op)
             || CallMessage::parse(&self.message).is_some_and(|signed| {
                 [VETO, COSIGN, RESOLVE].contains(&signed.method)
-                    && signed.arguments.starts_with(&op.encode())
+                    && Place::split(&signed.arguments)
+                        .is_some_and(|(_, named)| named.starts_with(&op.encode()))
             })
     }
 }
@@ -322,6 +324,10 @@ pub(crate) struct State {
     /// The next log index to read, and the chain through the one before.
     pub(crate) next: u64,
     pub(crate) chain: [u8; 32],
+    /// The index after the last admin call read (its start, for a device
+    /// that read none): no admin call it reads later names a place before
+    /// it.
+    pub(crate) floor: u64,
     /// The latest batch time the log showed, which no entry after goes
     /// back on.
     pub(crate) time: u64,

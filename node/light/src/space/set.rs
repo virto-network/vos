@@ -7,16 +7,21 @@ use vos_abi::Encode;
 use vos_abi::ids::MethodId;
 use vos_wire::personal::{
     AdminClass, Attached, Attestation, Candidacy, DeviceView, NewAdmin, Overview, PersonalError,
-    Recorded, Standing, Status, method,
+    Place, Recorded, Standing, Status, method,
 };
 
-use super::link::{AgentLink, Key, Signer, answer};
+use super::link::{AgentLink, Called, Hold, Key, Signer, answer};
 use super::{
     AdminKey, Approval, Error, Held, Host, Personal, Posted, Prompts, admin_sign, answered,
-    entered_kit, failed, new_kit, unreached,
+    entered_kit, failed, logged, new_kit, unreached,
 };
 use crate::group::{Event, Prepared};
 use crate::route::Purpose;
+
+/// The most signatures one admin call takes, each signed at the log's head
+/// read anew after the one before was refused for a head the log moved
+/// past or for `Settling`: for the admin key, a prompt each.
+pub(super) const PLACINGS: usize = 3;
 
 /// A device's new admin key, offered to another device of the set to sign
 /// its replacement: `device` (u32 big-endian) ‖ `key` ‖ a flags byte (1
@@ -476,11 +481,16 @@ impl<H: Host> Personal<H> {
         Ok(carried)
     }
 
-    /// The admin call of `method` with `arguments`, signed by the admin key
-    /// at its prompt and held in the group before it leaves, its evidence
-    /// posted under the sync key with `r2` beside it: an evidence post that
-    /// fails on the way is posted again by the next pass, from the held
-    /// call ([`crate::group::DeviceGroup::sending`]).
+    /// The admin call of `method` with `arguments`, placed at the log's
+    /// head this device read just before (the call names it first, and the
+    /// agent takes it there alone), signed by the admin key at its prompt
+    /// and held in the group before it leaves, its evidence posted under
+    /// the sync key with `r2` beside it: an evidence post that fails on the
+    /// way is posted again by the next pass, from the held call
+    /// ([`crate::group::DeviceGroup::sending`]). Refused because the log
+    /// moved past the head (another device's entry meanwhile) or `Settling`
+    /// (a wake first), the log is read again and the call signed there, a
+    /// prompt each time, at most [`PLACINGS`] signatures in all.
     fn operate(
         &self,
         held: &mut Held,
@@ -495,10 +505,25 @@ impl<H: Host> Personal<H> {
         let sign = admin_sign(prompts, admin);
         let recorded = self.with_link(held, Purpose::Personal, |link, held| {
             let group = held.group.as_mut().ok_or(Error::NoSpace)?;
-            // A call signed again after `Settling` replaces the one before,
-            // which the agent did not take.
+            let read = read_to_head(link, group)?;
+            // The same call made before and taken, its answer lost: its
+            // evidence posted, never signed again at another place.
+            if let Some((index, at, message, signature)) = group.taken(method, &arguments) {
+                post_evidence(link, group, index, (&message, &signature), r2)?;
+                return Ok(Recorded { at, index });
+            }
+            let group = std::cell::RefCell::new(group);
+            let mut read = Some(read);
+            // The log read to its head before each signature again.
+            let mut head = |link: &mut AgentLink<'_, H>| match read.take() {
+                Some(place) => Ok(place),
+                None => read_to_head(link, &mut group.borrow_mut()),
+            };
+            // A call signed again replaces the one before, which the agent
+            // did not take.
             let mut previous: Option<Vec<u8>> = None;
             let mut hold = |message: &[u8], signature: &[u8; 64]| {
+                let mut group = group.borrow_mut();
                 if let Some(previous) = previous.replace(message.to_vec()) {
                     group.unsent(&previous).map_err(|error| error.to_string())?;
                 }
@@ -506,14 +531,15 @@ impl<H: Host> Personal<H> {
                     .sending(message.to_vec(), *signature, r2)
                     .map_err(|error| error.to_string())
             };
-            let called = link
-                .settled(
-                    &mut Key::Lent(&mut signer, &sign),
-                    method,
-                    arguments,
-                    &mut hold,
-                )
-                .map_err(unreached)?;
+            let called = call_placed(
+                link,
+                &mut Key::Lent(&mut signer, &sign),
+                method,
+                &arguments,
+                &mut head,
+                &mut hold,
+            )?;
+            let group = group.into_inner();
             let recorded = match answer::<Recorded>(&called.outcome).map_err(failed)? {
                 Ok(recorded) => recorded,
                 Err(error) => {
@@ -524,21 +550,14 @@ impl<H: Host> Personal<H> {
             group
                 .made(recorded.index, &called.message)
                 .map_err(failed)?;
-            match evidence(
+            post_evidence(
                 link,
+                group,
                 recorded.index,
                 (&called.message, &called.signature),
-                Attached { welcome: None, r2 },
-            ) {
-                // Held: the next pass posts it.
-                Ok(())
-                | Err(Error::Unreachable(_))
-                | Err(Error::AgentRefused(PersonalError::Settling)) => Ok(recorded),
-                Err(error) => {
-                    group.evidence_refused(recorded.index).map_err(failed)?;
-                    Err(error)
-                }
-            }
+                r2,
+            )?;
+            Ok(recorded)
         });
         held.admin = signer;
         self.posted(held, recorded?)
@@ -613,6 +632,86 @@ impl<H: Host> Personal<H> {
         });
         held.admin = signer;
         result
+    }
+}
+
+/// The admin call of `method` with `arguments`, signed by `key` at the
+/// place `head` reads, the log's head, before each signature, each message
+/// given to `hold` before its call leaves ([`AgentLink::signed`]): signed
+/// again at the head read anew while the agent refuses it for a head the
+/// log moved past (an entry logged between the reading and the call) or,
+/// after a wake, `Settling`, at most [`PLACINGS`] signatures in all. The
+/// last call's answer.
+pub(super) fn call_placed<H: Host>(
+    link: &mut AgentLink<'_, H>,
+    key: &mut Key<'_>,
+    method: MethodId,
+    arguments: &[u8],
+    head: &mut dyn FnMut(&mut AgentLink<'_, H>) -> Result<Place, Error>,
+    hold: Hold<'_>,
+) -> Result<Called, Error> {
+    let mut signed = 1;
+    loop {
+        let place = head(link)?;
+        let called = link
+            .signed(key, method, place.arguments(arguments), &mut *hold)
+            .map_err(unreached)?;
+        let again = match answer::<()>(&called.outcome) {
+            Ok(Err(PersonalError::Settling)) => {
+                answered(link.settle())?;
+                true
+            }
+            Ok(Err(PersonalError::StaleHead)) => true,
+            _ => false,
+        };
+        if !again || signed == PLACINGS {
+            return Ok(called);
+        }
+        signed += 1;
+    }
+}
+
+/// The log read to its head and followed: the place a call made now names.
+/// A device whose log stops at an entry it refuses, or that is out of the
+/// set, signs nothing: no place it names is the agent's.
+fn read_to_head<H: Host>(
+    link: &mut AgentLink<'_, H>,
+    group: &mut crate::group::DeviceGroup,
+) -> Result<Place, Error> {
+    let entries = logged(link, group.cursor())?;
+    let end = entries.last().map(|(index, _)| index + 1);
+    group.follow(entries).map_err(failed)?;
+    if group.course() == crate::group::Course::Out {
+        return Err(Error::AgentRefused(PersonalError::Removed));
+    }
+    if end.is_some_and(|end| group.cursor() < end) {
+        return Err(Error::Unreachable(
+            "the log stops at an entry this device refuses".into(),
+        ));
+    }
+    let (next, chain) = group.view();
+    Ok(Place { next, chain })
+}
+
+/// The evidence of this device's admin call at `index`, signed as
+/// `signed`, posted with `r2` beside it: held for the next pass when it
+/// does not get through, given up when the agent refuses it.
+fn post_evidence<H: Host>(
+    link: &mut AgentLink<'_, H>,
+    group: &mut crate::group::DeviceGroup,
+    index: u64,
+    signed: (&[u8], &[u8; 64]),
+    r2: Option<[u8; 32]>,
+) -> Result<(), Error> {
+    match evidence(link, index, signed, Attached { welcome: None, r2 }) {
+        // Held: the next pass posts it.
+        Ok(())
+        | Err(Error::Unreachable(_))
+        | Err(Error::AgentRefused(PersonalError::Settling | PersonalError::Evidenced)) => Ok(()),
+        Err(error) => {
+            group.evidence_refused(index).map_err(failed)?;
+            Err(error)
+        }
     }
 }
 

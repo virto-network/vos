@@ -8,8 +8,8 @@ use vos_abi::Decode;
 use vos_mls::{Expected, Kind};
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
-    Attached, Body, DeviceId, Effect, Entry, Op, OpState, Policy, Signer, Verdict, Void, Vote,
-    chain, vote_message, welcome_hash,
+    AdminCall, Attached, Body, DeviceId, Effect, Entry, Op, OpState, Place, Policy, Signer,
+    Verdict, Void, Vote, chain, vote_message, welcome_hash,
 };
 
 use super::{
@@ -21,6 +21,18 @@ use vos_wire::personal::method;
 /// A commit call's arguments: its epoch, effect, handshake and Welcome's
 /// hash.
 type CommitArguments = ((u64, Effect), (Vec<u8>, Option<[u8; 32]>));
+
+/// The admin call an entry logs, if it logs one.
+fn admin_call(body: &Body) -> Option<&AdminCall> {
+    match body {
+        Body::Operation { call, .. }
+        | Body::Candidate { call, .. }
+        | Body::Veto { call, .. }
+        | Body::Cosign { call, .. }
+        | Body::Resolve { call, .. } => Some(call),
+        _ => None,
+    }
+}
 
 pub(crate) fn verifies(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
     VerifyingKey::from_bytes(key).is_ok_and(|key| {
@@ -70,6 +82,15 @@ impl DeviceGroup {
                 events.push(Event::Alarm(Alarm::Log { index }));
                 break;
             }
+            if !self.placed(index, &entry.body)? {
+                // An admin call where its signer did not sign it: one the
+                // agent took elsewhere, logged again on a fork.
+                events.push(Event::Alarm(Alarm::Log { index }));
+                break;
+            }
+            if admin_call(&entry.body).is_some() {
+                self.state.floor = index + 1;
+            }
             self.state.next += 1;
             self.state.chain = entry.chain;
             self.state.time = entry.at;
@@ -98,14 +119,7 @@ impl DeviceGroup {
                 events.push(Event::Alarm(Alarm::View { index: next }));
             }
         }
-        let call = match &entry.body {
-            Body::Operation { call, .. }
-            | Body::Candidate { call, .. }
-            | Body::Veto { call, .. }
-            | Body::Cosign { call, .. }
-            | Body::Resolve { call, .. } => Some(call),
-            _ => None,
-        };
+        let call = admin_call(&entry.body);
         // A call held before it left and never answered (a kill, a lost
         // answer) is found here: its evidence is posted from now on.
         if let Some(call) = call
@@ -134,6 +148,38 @@ impl DeviceGroup {
         if !held {
             events.push(Event::Alarm(Alarm::Dropped { index }));
         }
+    }
+
+    /// Whether the entry at `index`, about to be read, holds where it is:
+    /// a device-set admin call names its place first, which must be at or
+    /// after the floor (the entry after the last admin call read) and at
+    /// or before `index`, its chain the one this device read there. Before
+    /// a paired device's start, where it read no chain, the floor alone
+    /// holds it: its pairing device read those entries.
+    fn placed(&self, index: u64, body: &Body) -> Result<bool, GroupError> {
+        let Some(call) = admin_call(body).filter(|_| !matches!(body, Body::Candidate { .. }))
+        else {
+            return Ok(true);
+        };
+        let Some((place, _)) = Place::split(&call.arguments) else {
+            return Ok(false);
+        };
+        if place.next < self.state.floor || place.next > index {
+            return Ok(false);
+        }
+        let read = if place.next == index {
+            Some(self.state.chain)
+        } else if place.next == 0 {
+            Some([0; 32])
+        } else if let Some((_, chain)) = self.chains.iter().find(|(next, _)| *next == place.next) {
+            Some(*chain)
+        } else {
+            self.store
+                .group_row(&super::chain_key(place.next))?
+                .map(|read| <[u8; 32]>::try_from(&read[..]).map_err(|_| GroupError::Corrupt))
+                .transpose()?
+        };
+        Ok(read.is_none_or(|read| read == place.chain))
     }
 
     fn entry(
