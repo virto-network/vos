@@ -1005,7 +1005,7 @@ impl<H: Host> Personal<H> {
     /// followed and every vote, evidence and `alive` posted, the scopes
     /// pushed and read. Whether it left the device with nothing a flow
     /// waits for ([`crate::job::complete`]). A pass that reads this
-    /// device's own leave through forgets the space ([`Personal::forget`]).
+    /// device's own leave through forgets the space (`Personal::forget`).
     fn follow(&self, held: &mut Held) -> Result<bool, Error> {
         let now = self.host.now();
         let (complete, left) = self.with_link(held, Purpose::Personal, |link, held| {

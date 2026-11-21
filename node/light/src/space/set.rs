@@ -237,7 +237,7 @@ impl<H: Host> Personal<H> {
     /// its admin key (on its probation too), which the agent matures once
     /// its evidence is posted; the log then read through to `Out`, as a
     /// removed device reads its removal, and the space forgotten at once
-    /// by the follow that read it ([`Personal::forget`]): the group's MLS
+    /// by the follow that read it (`Personal::forget`): the group's MLS
     /// state, the key archive and `R`'s share, the kit's state, the home,
     /// the agent, the admin key's public half, every flow's state and the
     /// local actors' rows go with the store; the secret source's key and
