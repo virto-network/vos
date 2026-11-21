@@ -8,6 +8,7 @@ import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
 import android.view.View;
+import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -43,6 +44,20 @@ abstract class Screen {
 
   /** A permission the screen asked for was answered. */
   void permitted(boolean granted) {}
+
+  /** The app came back to the foreground with this screen shown. */
+  void started() {}
+
+  /** Gone for good: closed, or the screens under it left; not when one opens over it. */
+  void closed() {}
+
+  /** A background pass of the personal space ended: read again what it may have changed. */
+  void passed() {}
+
+  /** What the flow under way is doing, at {@code stage} (a {@link Stage}). */
+  String stage(byte stage) {
+    return Words.stage(stage);
+  }
 
   final void attach(LinearLayout into) {
     this.into = into;
@@ -133,12 +148,19 @@ abstract class Screen {
     return field;
   }
 
-  /** A text field: no suggestions learned from it. */
+  /**
+   * A text field: no suggestions offered, nothing of it learned by the keyboard (a pairing code is
+   * a bearer secret; a home's code and a label are kept out of the keyboard's history too).
+   */
   final EditText field(String hint, String value, boolean lines) {
     EditText field = new EditText(app);
     field.setHint(hint);
     field.setText(value);
-    int type = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+    field.setImeOptions(EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
+    int type =
+        InputType.TYPE_CLASS_TEXT
+            | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD;
     if (lines) {
       type |= InputType.TYPE_TEXT_FLAG_MULTI_LINE;
       field.setMinLines(3);
@@ -181,19 +203,17 @@ abstract class Screen {
     }
   }
 
-  /** A home's code field, with its scan and what the code names. */
+  /** A home's code: its scan first, then the field it may be pasted into, and what it names. */
   final class HomeField {
     final EditText code;
     private final TextView named;
 
     HomeField(LinearLayout into, String value, Keep keep) {
-      code = kept(field("The home's code (" + Codes.HOME + "…)", value, true), keep);
+      code = kept(field("Or paste the home's code (" + Codes.HOME + "…)", value, true), keep);
       named = mono("");
+      into.addView(buttons(button("Scan the home's code", v -> app.scan(text -> set(text)))));
       into.addView(code);
-      into.addView(
-          buttons(
-              button("Scan the home's code", v -> app.scan(text -> set(text))),
-              button("Check", v -> show())));
+      into.addView(buttons(button("Check", v -> show())));
       into.addView(named);
       show();
     }
@@ -220,7 +240,7 @@ abstract class Screen {
     Home home() {
       Home home = Codes.home(code.getText().toString());
       if (home == null) {
-        app.say("Enter or scan the home's code first.");
+        app.say("Scan or paste the home's code first.");
       }
       return home;
     }

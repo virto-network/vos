@@ -19,7 +19,7 @@ use vos_node::client::{signed_call, signed_query};
 use vos_wire::ingress::{AdmissionRefusal, CallMessage, Rejection as Rejected};
 use vos_wire::personal::{
     AdminClass, Attached, Attestation, Body, Candidacy, Effect, Entry, Envelope, Header, Kit,
-    KitEntry, KitKind, NewDevice, Overview, PersonalError, Policy, Pushed, Recorded, Voted,
+    KitEntry, KitKind, NewDevice, Overview, PersonalError, Place, Policy, Pushed, Recorded, Voted,
 };
 
 use super::api::{connect, receive};
@@ -479,7 +479,13 @@ fn a_removed_device_keeps_its_session_and_the_agent_refuses_it() {
         .unwrap();
     assert_eq!(pushed.position, 1);
     personal.pass(60_000);
-    let (call, answer) = personal.call(&mut admin, "remove", 1u32.encode());
+    // Placed at the log's head, as a device-set call names it.
+    let overview: Overview = personal.query(&phone.sync, "overview", ()).unwrap();
+    let place = Place {
+        next: overview.next,
+        chain: overview.chain,
+    };
+    let (call, answer) = personal.call(&mut admin, "remove", place.arguments(&1u32.encode()));
     let removal: Recorded = outcome(answer).unwrap();
     // Its evidence posted: an operation without it matures for no device.
     let message = call.message(&personal.identity);

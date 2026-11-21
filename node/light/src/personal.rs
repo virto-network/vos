@@ -621,11 +621,19 @@ impl<'a, L: Link> SealedSync<'a, L> {
         drop(Zeroizing::new(self.group.key(scope)?));
         let mut caught = Caught::default();
         let mut scan = Scan::new(self.tracked()?);
+        // A page read ahead of its turn may be from before a writer's
+        // envelope another scope's reading showed it had read past: read
+        // once more before the end of the scope counts.
+        let mut again = true;
         loop {
             let from = self.light.cursor(instance)?.unwrap_or(0);
             let page = self.since(scope, from)?;
             if page.is_empty() {
                 let watch = self.watch(&mut scan, scope)?;
+                if watch.claimed > from && watch.claimed > watch.alarmed && again {
+                    again = false;
+                    continue;
+                }
                 if watch.claimed > from && watch.claimed > watch.alarmed {
                     watch.alarmed = watch.claimed;
                     let position = watch.claimed;
@@ -1108,6 +1116,37 @@ impl<'a, L: Link> SealedSync<'a, L> {
                 .rewind()
                 .map_or(cursor, |first| first.min(cursor)),
         ))
+    }
+
+    /// The first page each scope's reading asks for, as the store holds
+    /// their cursors now: each data scope's, the archive's, and the
+    /// recovery scope's while this device holds `R`.
+    pub fn first_pages(&mut self) -> Result<Vec<(Scope, u64)>, SyncError<L::Error>> {
+        let mut pages = Vec::with_capacity(self.instances.len() + 2);
+        for instance in &self.instances {
+            let scope = self.light.scope_id(*instance)?.0;
+            pages.push((scope, self.light.cursor(*instance)?.unwrap_or(0)));
+        }
+        let archive: Reading = self.row(ARCHIVE_ROW)?;
+        pages.push((self.group.archive().scope(ARCHIVE_NAME), archive.cursor));
+        let since = self
+            .group
+            .archive()
+            .recovery
+            .as_ref()
+            .map(|recovery| recovery.since);
+        if self.group.holds_recovery()
+            && let Some(since) = since
+        {
+            let reading: Recovering = self.row(RECOVERY_ROW)?;
+            let cursor = if reading.since == Some(since) {
+                reading.cursor
+            } else {
+                0
+            };
+            pages.push((RECOVERY, cursor));
+        }
+        Ok(pages)
     }
 
     /// Read the archive's scope from its cursor, merging every archive

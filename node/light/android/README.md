@@ -46,7 +46,12 @@ go back to the system: what stays is the programs and the pools.
 A request naming a space, an agent or a method enrollment did not pin is
 refused. Every text a form shows is checked free of control and bidirectional
 formatting characters. The session's grant and each call's confirmation are
-two prompts; the grant never stands in for a confirmation.
+two prompts; the grant never stands in for a confirmation. A reconnect s4
+makes by itself keeps the grant of the session it replaces, in s4's memory:
+the facility's session on it is new, knowing nothing of the one before. A
+sign-in and a payment report their stages to the chrome ("Proving…",
+"Sending…"); the digests show as a code and a six-digit check
+(`vos_api::enrollment_code`, `enrollment_check`).
 
 ## Its own process
 
@@ -84,7 +89,12 @@ in `:vos` with no UI (`src/job.rs`): `sync`, every enrollment's tree read from
 its feed if due, and `syncPersonal`, the personal space's pass at its agent;
 Tor's bridges and the per-space opt-out; the personal space's status
 (`status`: its phase, a restore's maturity, Tor's state, the memberships owed,
-the notices standing, what needs repair), which the screens branch on; and the
+the notices standing, what needs repair, the kind of kit a kit's call enters,
+why the last pass did not finish), which the screens branch on; the screens'
+watcher (`watch`: each flow's stage and each pass's end); the restore screen's
+sitting (`kitHold`, `kitForget`: the kit entered once and held in `:vos` for
+its flows, ten minutes at most, wiped when the screen closes or the app goes
+to the background); and the
 personal space's operations (`src/personal/`, called as
 `node.personal()?.claim(..)`), each refusing with a `Refused` of its `Why`
 (`vos_light::space::Error`'s kinds), worded by the screens' `Words`. Every

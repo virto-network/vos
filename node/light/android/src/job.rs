@@ -60,6 +60,10 @@ const STANDING: usize = 16;
 /// The runs' row of the facility's database ([`crate::kept`]).
 const RUNS_ROW: &[u8] = b"runs";
 
+/// The row naming why the last personal pass failed (empty when it did
+/// not), standing until a pass changes it.
+const FAILED_ROW: &[u8] = b"runs/personal-failed";
+
 /// The device's personal space, as a pass syncs it.
 pub trait Personal: Send + Sync {
     /// One pass at the device's time `now` (milliseconds), called beside
@@ -234,7 +238,10 @@ impl Row {
 /// Whether a pass raises `notice` once rather than while its condition
 /// holds.
 fn once(notice: &Notice) -> bool {
-    matches!(notice.pending, Pending::Restoring | Pending::Alarm)
+    matches!(
+        notice.pending,
+        Pending::Restoring | Pending::Alarm | Pending::Unfinished
+    )
 }
 
 /// The job's runs, a row of the facility's database under its directory.
@@ -263,6 +270,14 @@ impl Runs {
 
     fn write(&self, state: &State) -> Result<(), String> {
         self.kept()?.put(RUNS_ROW, &Row::from(state))
+    }
+
+    fn failed(&self) -> Result<Option<String>, String> {
+        self.kept()?.get(FAILED_ROW)
+    }
+
+    fn write_failed(&self, failures: &str) -> Result<(), String> {
+        self.kept()?.put(FAILED_ROW, &failures.to_owned())
     }
 
     /// The runs kept, the latest last.
@@ -335,6 +350,49 @@ impl Job {
 
     pub fn runs(&self) -> Result<Vec<JobRun>, Refusal> {
         self.runs.all().map_err(job_error)
+    }
+
+    /// Why the last personal pass failed, as its run's failures say; empty
+    /// when it did not.
+    pub fn failed(&self) -> Result<String, Refusal> {
+        Ok(self.runs.failed().map_err(job_error)?.unwrap_or_default())
+    }
+
+    /// A flow's follows left for after it failed at the device's time
+    /// `now`: a notice stands until a pass of the personal
+    /// space runs to its end, which finishes what they left.
+    pub fn unfinished(&self, now: u64) {
+        let _one = crate::lock(&self.running);
+        let Ok(mut state) = self.runs.read() else {
+            return;
+        };
+        let notice = Notice {
+            pending: Pending::Unfinished,
+            at: now,
+            fresh: true,
+            ..Notice::default()
+        };
+        state
+            .raised
+            .retain(|raised| raised.notice.pending != Pending::Unfinished);
+        state.raised.push(Raised { notice, since: now });
+        let _ = self.runs.write(&state);
+    }
+
+    /// A flow's follows left for after it finished: a notice of earlier
+    /// ones failing goes.
+    pub fn finished(&self) {
+        let _one = crate::lock(&self.running);
+        let Ok(mut state) = self.runs.read() else {
+            return;
+        };
+        let before = state.raised.len();
+        state
+            .raised
+            .retain(|raised| raised.notice.pending != Pending::Unfinished);
+        if state.raised.len() != before {
+            let _ = self.runs.write(&state);
+        }
     }
 
     /// The notices standing after the last pass.
@@ -418,6 +476,13 @@ impl Job {
             }
         }
         state.raised = standing(std::mem::take(&mut state.raised), found, now);
+        // A personal pass run to its end finishes what a flow's follows
+        // left.
+        if part == Part::Personal && synced.synced == 1 {
+            state
+                .raised
+                .retain(|raised| raised.notice.pending != Pending::Unfinished);
+        }
         synced.notices = state
             .raised
             .iter()
@@ -444,6 +509,11 @@ impl Job {
             };
         }
         self.runs.write(&state).map_err(job_error)?;
+        if part == Part::Personal {
+            self.runs
+                .write_failed(&synced.failures)
+                .map_err(job_error)?;
+        }
         // Kept: the group may let them go. One not acknowledged is raised
         // again, and stands as one already raised.
         if let Some(personal) = acknowledging

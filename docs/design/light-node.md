@@ -1316,8 +1316,9 @@ host-verified]:
 - **One call, one prompt:** every device-set operation (add, remove, veto,
   resolve, kit rotation, restore, regroup, admin-key replacement) and
   every commit is a one-shot client call whose key is the device's admin
-  key (or the kit's, for its own operations); its arguments do not name
-  the control log's head it was made against (`open.md`). The prompt authorizes the one
+  key (or the kit's, for its own operations); a device-set call names
+  its place first, the control log's head it was made against (below,
+  "The place"). The prompt authorizes the one
   signature the call needs; ingress verifies it as it verifies any client
   call, and the agent checks the origin, `Principal::Client(key)`, against
   the device set: whose key it is, and whether that device's state (active,
@@ -1352,6 +1353,45 @@ host-verified]:
   operation's evidence is in, which its author's next pass posts. The
   operators run ingress and could append anything to the log, so a device
   trusts an operation only by its signature (§8, B6).
+- **The place** [decided 2026-11-20, built]: every device-set call
+  (add, remove, replace, rotate, regroup, restore, veto, cosign, resolve)
+  names first in its arguments the log's head its signer read before the
+  prompt, `Place { next, chain }`: the next index and the chain through the
+  entry before it. The agent and every device take the call only at a
+  place at or after their floor, the entry after the last admin call
+  before it (a device's start, for one that read none; a paired device
+  takes its pairing device's), and at or before the call's own entry, the
+  chain there the log's. The agent compares it before anything the call's
+  batch settles and refuses any other `StaleHead`, logging nothing; a
+  device raises `Alarm::Log` and reads no further, as for an entry that
+  does not chain. A call logged again elsewhere names a place before the
+  call it copies, which every device that read that call has passed: a
+  route cannot log a removal once signed, vetoed or cancelled a second
+  time and mature it there unvetoed. Entries that are no admin call
+  (evidence, votes, `alive`, a renewal, what a batch settles) move no
+  floor, so another device's background pass between the reading and the
+  call refuses nothing; the cost is that a signed call withheld stays
+  takeable until the next admin call is logged. The device reads the log
+  to its head just before the prompt (one read, two when there is
+  something new), and signs nothing when that log stops at an entry it
+  refuses or it is out of the set. The same call made before and taken,
+  its answer lost, has its evidence posted rather than being signed again.
+  A call refused `StaleHead` (another admin call between the reading and
+  the call) or `Settling` (a wake first) is read and signed again, a
+  prompt each time, three signatures at most; a route can make up either
+  refusal, which costs at most those prompts and takes no device out, and
+  a call it forwarded before making one up stays held, its evidence
+  posted. The kit's and a restore's calls take the head from the log they
+  read or the agent's overview, the agent's word, which binds the place,
+  not its truth. Commits are not placed: an epoch and the votes, which
+  bind the voters' logs, place them. Why not the call session's `t0` with
+  a window, or the devices remembering each call's message: the evidence
+  is a separate later entry a route can withhold, so a device that read an
+  operation and its veto but never the message has nothing to recognize
+  the copy by; the place is checked at the call's own entry. What is left
+  is withholding: a device that has not read a veto yet can be shown the
+  operation without it, and its maturity at a time the route claims (B7,
+  B8).
 - Delays run on the agent's batch time alone; a device whose clock
   disagrees with the agent's by more than an hour raises an alarm and
   otherwise acts as the log says. A restored device starts from the
@@ -1570,8 +1610,11 @@ where the rules above leave a choice, this is the one taken]:
   due by their time, which a call may yet cancel in time order (a
   removal's signer removed first); the operations read as the last call
   left them.
-- **Not built:** an admin call's arguments naming the control log's head
-  it was made against (`open.md`).
+- **The place,** each device-set call's first argument (§3.5, "Admin
+  calls"): compared at the start of every such handler, before `settle`,
+  against the head, the log's chains and `floor`, the index after the last
+  admin call logged, so what its batch settles is logged ahead of the
+  call.
 
 **The kit and its flows as built** [built, `vos_light::kit`, the device
 group and sealed sync, tested against `Personal` in
@@ -1635,6 +1678,25 @@ where the text above leaves a choice, this is the one taken]:
   posts `alive` (`Event::Alive`) until the log cancels it, and shows a
   kit-signed operation for as long as it is open (`Alarm::Kit`); the
   owner then rotates the kit.
+- **The kit's secrecy on the phone** [built, `node/light/android`'s
+  `personal::Sitting`; the owner, 2026-11-20, D2]: a phrase is shown once
+  and two of its words are asked back before the claim goes on (a wrong
+  one shows the phrase again). Entered, its words are checked one by one
+  against the list in the UI as they are typed (the bad word named, the
+  list's own completion row, the keyboard's suggestions and learning
+  off), then its checksum. The restore screen takes the kit once a
+  sitting: the words, or a security key's `hmac-secret` of the kit's
+  salt, are held in `:vos` alone (never the UI's process, never written
+  or logged) for the next of its flows (reading the devices, removing a
+  lost phone, resolving a contest, opening and finishing the restore), and
+  zeroized when the screen closes, when the app goes to the background
+  (the UI's stop, and `:vos`'s own background signal), when the UI's
+  process dies, at most ten minutes after the entry, and when a flow finds
+  it not a kit or not this space's. So the kit's secret lives minutes in
+  `:vos` instead of one call; a flow outside the restore screen (a
+  rotation, an admin key's replacement) still asks for it each time. The
+  kind of kit a restore was opened with is kept in the facility's
+  database (not a secret) so its finish asks only for the kit itself.
 - **Delayed admins:** a delayed admin's inline add is refused; its add
   operation waits the operation delay, then its own commit carries it.
 
@@ -1798,7 +1860,35 @@ the one taken]:
   whose route is not the onion, and checks it again before every
   request, so no request to the personal agent leaves over the clearnet
   [E17]. The onion transport is §6.2's.
-- **Not built here:** pipelined reads, re-reading an envelope passed
+- **Reads asked ahead** [built, `job::Read`, `AgentLink`]: a pass asks
+  the overview and the device set with its first log read, and every
+  scope's first `since` page together once the log is followed, each on
+  the link's one connection, all in flight at once; each answer is taken
+  by the read that asks it in its turn. A call the link sends meanwhile
+  drops what it may change (a push every answer but the other scopes'
+  pages, any other call every one), so a read is answered as it would
+  have been in its turn; an overview asked beside a log page that names
+  a head short of it is read again before it counts as a rollback. The
+  same queries, under the same key, on the same connection: only their
+  order in flight changes. A quiet pass is four round trips after the
+  node's time instead of nine.
+- **A flow is done at its first complete follow** [built, the owner's
+  choice D3, `job::complete`]: a pairing (the joiner's), a commit now and
+  a restore's finish return once a follow leaves this device in the set
+  and following, its vote on a pending candidate posted (the epoch may
+  still wait for the other devices'), the archive and the recovery
+  envelopes kept with nothing stale and no scope's reading waiting. The
+  extra follows each flow used to make before returning (two for a
+  joiner, what is left of three after a commit) run after it returns, on
+  one thread of the facility's at a time, each holding the space alone,
+  the status read meanwhile answered as the flow left it; an embedder
+  other than the facility runs them itself (`Personal::follow_behind`)
+  or leaves them to the next pass. One that fails stands as a notice
+  (`Pending::Unfinished`) until a pass of the personal space runs to its
+  end. A page asked ahead that ends a scope short of where another
+  scope's writer said it had read is read once more before the
+  partition alarm counts it.
+- **Not built here:** re-reading an envelope passed
   over once a later archive brings a key that opens it, and garbage
   collection of covered envelopes and of earlier epochs' archives
   (`open.md`).
@@ -1969,12 +2059,15 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   rules, and pairs again from a code of its own space
   (`DeviceGroup::removal_unsupported`); a removal pending its delay lets
   no device in the set pair again. The Devices screen's own row says
-  removed only once the device is out (`space::Personal::devices`). What
-  a gateway can still do is withhold, which any route can, and replay: an
-  operation's evidence binds its call, not its place in the log, so a
-  route forking the log a device reads from its cursor can log again a
-  removal of it that was once signed and vetoed or cancelled, and mature
-  it unvetoed (`open.md`, "The control log's head in an admin call"). A post the agent refuses as held already (`Voted`,
+  removed only once the device is out (`space::Personal::devices`). Nor
+  does a removal replayed: a route forking the log a device reads, to log
+  again a removal of it once signed and vetoed or cancelled and mature it
+  unvetoed, logs a call whose place (§3.5, "The place") is behind the
+  device's floor, which the device refuses (`Alarm::Log`), reading no
+  further on that log [built 2026-11-20; tested in `node/light/tests/
+  space.rs`, a route's `World::relog`]. What a gateway can still do is
+  withhold, which any route can: a device that has not read a veto yet
+  can be shown the operation without it. A post the agent refuses as held already (`Voted`,
   `Evidenced`) or as decided meanwhile (`NoCandidate`, `NotConfirming`) is
   done, the log read on; a page withheld is read again once. A pass that
   stops on an error hands back what it found (`Stopped`), its alarms with
@@ -2184,12 +2277,27 @@ nodes through their sockets with the onion's mark in
 `node/host/tests/served/personal.rs`, at a test home of seconds and an open
 claim's difficulty of 4; where the text above leaves a choice, this is the
 one taken]:
-- **The claim at a home-only space** (`home::Claim`): the device's open
-  claim first (`home::open_claim`, `claim_open(member, nonce)` in a session
-  of its own, its key drawn for that call alone), then the claim of the
-  agent `Homes` answers `pooled` for, sealed to that agent's identity
-  (§3.3, "The device names the agent"), with a phrase's or a security
-  key's kit or both. The claim (the device, the kit with `R2`, `R`, the
+- **The claim at a home-only space** (`home::Claim`): the open claim's
+  terms (`opening`) and the agent `Homes` answers `pooled` for asked
+  first, the two a home can refuse before anything is shown; then the
+  kit shown, and while the user writes it down the device's open claim
+  (its work, then `claim_open(member, nonce)` in a session of its own,
+  its key drawn for that call alone), the home's tree read from its
+  feed, the node's time read on a fetch of its own and the proof's
+  connection opened ahead, one at a time, each after a pause drawn below
+  4 s, as a session's spares are built; then the claim of that agent,
+  sealed to its identity (§3.3, "The device names the agent"), with a
+  phrase's or a security key's kit or both. The proof's expiry is the
+  fetch's reading moved on by the monotonic clock (five minutes at
+  most, read again past it or past a step of the device's clock), never
+  a time taken before the kit; the tree's root read meanwhile is proved
+  on while half its grace (`ROOT_GRACE_MS`) has not passed since, else
+  the feed is read on, each page's expiry from the feed's own reading (one
+  round trip). A home that refuses the open claim or the claim once the
+  kit was shown voids that kit: the claim is abandoned and new words are
+  shown with the reason ("the words shown before are void"), at most
+  three kits; one unreached keeps the claim and its kit, as a retry
+  sends it. The claim (the device, the kit with `R2`, `R`, the
   agent) is held in the store from before its call until the device's
   group starts from the agent's log (`Claim::claimed`, the `R` the kit's
   from the `Assigned` entry), so a retry after a lost answer sends the
@@ -3006,10 +3114,37 @@ nodes may ask the onion's mark of its proven calls, or of every request
   session never holds both what names the device (its digests, its
   account's owner proof) and a sign-in: either is refused on a session
   that holds the other, so a server cannot join the two (built
-  2026-11-18).
-  The onion set's refresh (`refresh_onions`) is a `Time` and an `onions`
-  query, each a fetch; a set of one to sixteen distinct onions replaces
-  the pinned one, closing the space's connections.
+  2026-11-18). The user grants `vos.credential` once a session, in s4's
+  chrome; every reconnect s4 makes by itself (the one after an
+  enrollment, a retry after a dropped connection) keeps the grant of the
+  session it replaces, for the same host, port and application, in s4's
+  memory alone, and a session the user starts asks as ever (owner,
+  2026-11-20; built). The new session is the facility's new session all
+  the same: it starts knowing nothing (`Learned::Nothing`), never
+  inherits what the old one was shown, so a session that showed the
+  digests or paid still signs in nothing, and the next one signs in. A
+  sign-in's and a payment's form name their stages in s4's chrome while
+  they run ("Proving…", "Sending…", and a sign-in waiting
+  for the operator's invitation, "Waiting for the space to list your
+  device…": `IVosPrompts.stage`). The digests
+  show as a code a camera reads (`VOSENROLL1:`, member ‖ owner) and a
+  six-digit check the operator's tool shows too
+  (`vos_api::enrollment_check`): the check catches a misread code or the wrong
+  screen, and proves nothing of who chose the digests (a million tries
+  find six digits), so the operator still takes them from the device's
+  chrome alone.
+  The onion set's refresh (`refresh_onions`, and the home's at the
+  personal space's pass) is a **timed fetch** (`Client::fetch_timed`): a
+  `Time` and then the one `onions` query whose expiry it sets, on one
+  connection of the fetch's isolation opened for the two alone, no spare,
+  closed after; any other request is refused before it leaves. A set of
+  one to sixteen distinct onions replaces the pinned one, closing the
+  space's connections. What the gateway sees of it: one fresh connection
+  a day carrying a time read and, half a round trip later, an anonymous
+  query for the set every member asks, under a key drawn for it; before,
+  the same two on two connections a few seconds apart, which it could
+  join by their timing all the same. Every other fetch still carries one
+  request.
 - **What the gateway learns from connections opened ahead** [built,
   `Client::keep_spares`, the facility's `Session`]: a facility session
   keeps one spare for its proven calls and one for its fetches, reads the
@@ -3061,12 +3196,29 @@ nodes may ask the onion's mark of its proven calls, or of every request
     is proved), so it goes on the feed's connection and is kept for the
     space.
   - **What is left:** a small gateway can join one session's
-    connections by their timing, as before; the drawn delays spread the
+    connections by their timing, as before; and a sign-in made seconds
+    after the first root holding a new leaf points at that newest member:
+    a sign-in with no path waits for the space to list the device,
+    reading the feed now and every 5 s for up to a minute (built
+    2026-11-20, the owner's choice D7: no drawn delay), so a device's
+    first sign-in after its invitation follows the leaf's root by a few
+    seconds; a member tapping again shows the same, less tightly; the drawn delays spread the
     open times of several devices' spares into each other, and against a
     single device online nothing does. A session's clock reading is
     renewed every 4 to 12 minutes while the app is in the foreground,
     each a fetch: open times again, none of them joined to another
     session.
+  - **Two sessions joined by their timing:** a reconnect s4 makes by
+    itself follows the session it replaces within seconds, so its
+    server can join the two by timing, as an immediate reconnect always
+    let it; keeping the grant adds no prompt the user could notice
+    between them, nothing more. What the two sessions held stays apart
+    (each its own `Learned`), so the join gives the server the timing it
+    had. And s4 now opens a session with no act of the user (a retry
+    after a dropped connection asks nothing): the server sees a session,
+    granted, that the user did not start, though every call in it still
+    asks its own confirmation, so it gets no proof the user did not
+    confirm (owner's decision D5, 2026-11-20).
   - **Rendezvous (PG5, §2.4):** a foreground hour with a session open costs one
     a kept group (the feed, the member's, the personal agent's: 3), the
     proven spare's lives (4 to 12 unused, one a sign-in otherwise) and the
@@ -3583,7 +3735,10 @@ against a no-flood baseline:
   minutes idle). Read on a jittered timer (30 s, between 15 s and 45 s),
   never because a proof is about to be made, since that connection is one
   circuit of the device's and a read before each proof would join the
-  proofs through it; a page that says more is due at once; `RootUnknown`
+  proofs through it (two exceptions, each once a device's life at a
+  space: a sign-in waiting for its leaf, which reads the feed every 5 s
+  until it is listed, and the claim of a personal agent, which reads its
+  home's tree while the kit is written down); a page that says more is due at once; `RootUnknown`
   or `RootStale` makes the feed due at once and halves the period.
 - **The root in the log:** the claim keeps the root, which the apply
   checks; its place in the ring is the feed's (each change's root and
@@ -3753,6 +3908,9 @@ device's crates faster); its size argument is small.
 - **The screens** [built]: one activity of plain views
   over `IVosPersonal`, each operation off the main thread with its
   prompts lent and released when it returns or the screen gives it up.
+  A release build keeps every one of them and their forms from capture
+  (`FLAG_SECURE`); a debuggable build does not, so its screenshots show
+  them [the owner, 2026-11-20].
   A home is entered as its code (`VOSHOME1:` and hex: the home as a device
   reaches it, which its operator publishes); a restore takes the home's
   code too, its handle checked against the card. A pairing's code is a QR
@@ -3799,12 +3957,31 @@ device's crates faster); its size argument is small.
   in the batch of the group change it describes (`Claim::prepare`,
   `DeviceGroup::join`, `group::restoring`), with no state file
   and nothing to reconcile at open. The facility's enrollments, routes,
-  bridges and jobs' runs are rows of its own database (`facility/`, its
+  bridges, jobs' runs (with why the last personal pass failed) and a
+  restore's kit kind are rows of its own database (`facility/`, its
   layout 1), SCALE of its own types, read strictly. `IVosPersonal.status`
   names the phase (with a restore's maturity), Tor's state, the
-  memberships owed and the notices standing; the personal flows refuse
-  with `Refused` (a `Why` per error kind); a notice carries who signed
-  it, whether it is contested, an alarm's kind and its `Remedy`. One test
+  memberships owed, the notices standing, the kind of kit a kit's call
+  enters and why the last pass did not finish (standing until a pass
+  changes it); the personal flows refuse with `Refused` (a `Why` per
+  error kind); a notice carries who signed it, whether it is contested,
+  an alarm's kind and its `Remedy`. While a flow runs, `:vos` tells the
+  screens its stages (`IVosWatcher.stage`, a `Stage`'s byte: the home
+  reached, the proof, the kit written, the log followed; a pairing's
+  scan, check, handover and approval), no value or secret in any (a
+  sign-in's and a payment's stages, and a sign-in's wait for the
+  operator's invitation, are words in s4's chrome instead,
+  `IVosPrompts.stage`), and each background pass's end
+  (`passed`), after which the overview reads its status again; it reads
+  it too on each return to the app, and the device list on each return,
+  never on a timer. A removed phone's overview offers pairing again and
+  a restore with the kit (which, from a device out of its group, leaves
+  it first as a pairing does); "Commit now" from a matured removal's
+  notice carries it and revokes the removed device in every space its
+  handles name in one flow (`commitRemovals`, one prompt a signature).
+  Leaving the personal space from the phone itself is not built: the
+  agent refuses a device's own removal (`Targeted`), so another device
+  retires it (`open.md`). One test
   double for all of it: `vos_light::testing` (`Phone`, `World`,
   `Reach`) and `vos_testkit::personal::Agent`.
 - **Pairing after the set changed** [built, `node/light/android`]: the
@@ -4013,7 +4190,8 @@ nothing a device can show a third party, so an alarm is not proof
 (`open.md`, "Node-signed feed heads").
 
 **B5. The operators inject or replay.** A forged envelope fails its AEAD; a
-replayed one is a duplicate; a replayed commit breaks the epoch rule.
+replayed one is a duplicate; a replayed commit breaks the epoch rule; a
+replayed device-set call names a place the device has passed (B6).
 *Mitigation:* as stated.
 
 **B6. The operators forge device-set operations.** *Mitigation:* every
@@ -4022,8 +4200,11 @@ from the evidence stored beside it; an operation without evidence moves no
 device. Nor does a refusal: a removed device is out on its removal's
 evidence, which the agent serves its key (§3.6, the pass), and a refusal
 the route makes up stops a pass, never removes a device (`NotAdmitted`).
-*Known limit:* evidence binds a call, not its place in the log, so a
-signed removal once vetoed can be logged again on a forked log (§3.6).
+Nor a replay: every device-set call names its place, the log's head its
+signer read, and is taken there alone, by the agent and by every device,
+so a signed removal once vetoed logged again on a forked log is refused
+(§3.5, "The place"; §3.6). *Known limit:* a device that has not read a
+veto can be shown the operation without it (withholding, B8).
 
 **B7. The operators advance the agent's clock,** maturing a hostile
 removal or a restore early. *Known limit:* delays trust the operators'

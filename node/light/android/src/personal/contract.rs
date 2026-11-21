@@ -54,18 +54,48 @@ byte_enum! {
         /// A commit is owed that re-seals the kit under a new `R`: the
         /// agent's verdict left it sealed under one a removed device holds.
         Reseal = 12 as RESEAL,
+        /// What a flow left to its last follows did not finish (the
+        /// pairing, the commit or the restore is done): the next pass
+        /// finishes it.
+        Unfinished = 13 as UNFINISHED,
     }
 }
 
 byte_enum! {
     package "team.virto.vos.personal";
     /// What a recovery kit is.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
     pub enum KitKind {
         /// 24 words, shown once in the chrome and written down.
+        #[default]
         Phrase = 1 as PHRASE,
         /// A FIDO2 security key's `hmac-secret`.
         SecurityKey = 2 as SECURITY_KEY,
+    }
+}
+
+byte_enum! {
+    package "team.virto.vos.personal";
+    /// Where a flow is, said to the screen that runs it (`IVosWatcher.stage`):
+    /// a kind alone, no secret and no value in it, in no order a flow keeps.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Stage {
+        /// Reaching the home: its open claim, an agent from its pool.
+        Reaching = 1 as REACHING,
+        /// The device's proof made for its home.
+        Proving = 2 as PROVING,
+        /// The recovery kit written at the agent.
+        WritingKit = 3 as WRITING_KIT,
+        /// The device set's log followed: the group joined or caught up.
+        Joining = 4 as JOINING,
+        /// A pairing's code read by the new device.
+        Scanned = 5 as SCANNED,
+        /// A pairing's check confirmed.
+        Checked = 6 as CHECKED,
+        /// The device set's keys handed over to the new device.
+        HandingOver = 7 as HANDING_OVER,
+        /// The new device's add waiting for the opener's admin key.
+        Approving = 8 as APPROVING,
     }
 }
 
@@ -300,7 +330,7 @@ byte_enum! {
 
 parcel! {
     package "team.virto.vos.personal";
-    registry REGISTRY with [Pending, KitKind, Owed, Phase, Tor, Alarm, Remedy, Why];
+    registry REGISTRY with [Pending, KitKind, Stage, Owed, Phase, Tor, Alarm, Remedy, Why];
 
     /// One pass of the facility's sync, a background job's: of the
     /// enrollments kept, how many synced and how many failed (the personal
@@ -349,7 +379,10 @@ parcel! {
     /// The personal space's state, read without a request: its phase (a
     /// restore's maturing at `matures`), its home (none: zeros, no onion),
     /// agent and this device's id, Tor's state and why it is blocked, the
-    /// memberships owed, the notices standing, and what needs repair.
+    /// memberships owed, the notices standing, what needs repair, the kind
+    /// of kit a kit's call here enters (a restore's, else the device
+    /// set's; known when `kit_known`), and why the last personal pass
+    /// failed (empty when it did not), standing until a pass changes it.
     #[derive(Clone, Debug, PartialEq, Eq, Default)]
     pub struct PersonalStatus {
         pub phase: Phase => enum Phase,
@@ -362,6 +395,9 @@ parcel! {
         pub owed: u32 => int,
         pub standing: Vec<Notice> => Notice[],
         pub repair: String => String,
+        pub kit: KitKind => enum KitKind,
+        pub kit_known: bool => boolean,
+        pub failed: String => String,
     }
 
     /// Why a personal operation was refused: its kind, a device it names

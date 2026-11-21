@@ -25,6 +25,43 @@ pub trait Host: Send + Sync + 'static {
         request: &[u8],
     ) -> Result<Vec<u8>, String>;
 
+    /// `requests` sent as [`Host::request`] sends each, under `purpose`:
+    /// on a kept-open purpose's connection all in flight at once, so they
+    /// cost one round trip; a one-shot purpose's each on a connection of
+    /// its own. Each one's answer, in order.
+    fn requests(
+        &self,
+        space: &[u8; 32],
+        purpose: Purpose,
+        requests: &[Vec<u8>],
+    ) -> Vec<Result<Vec<u8>, String>> {
+        requests
+            .iter()
+            .map(|request| self.request(space, purpose, request))
+            .collect()
+    }
+
+    /// A timed fetch over the routes kept under `space`: the node's time,
+    /// then the one query `query` makes from it, on one connection of
+    /// [`Purpose::Fetch`]'s of their own, closed after: the query's answer.
+    /// Where the host has no such fetch, two fetches, each its own
+    /// connection.
+    fn fetch_timed(
+        &self,
+        space: &[u8; 32],
+        query: &mut dyn FnMut(u64) -> Result<Vec<u8>, String>,
+    ) -> Result<Vec<u8>, String> {
+        let time = self.request(space, Purpose::Fetch, &crate::wire::time_request())?;
+        let now = crate::wire::time_answer(&time).map_err(|error| error.to_string())?;
+        self.request(space, Purpose::Fetch, &query(now)?)
+    }
+
+    /// A connection of the one-shot `purpose` over the routes kept under
+    /// `space` opened from now on, beside the flow (this returns at once),
+    /// for that purpose's next request there, so a flow's proof does not
+    /// wait for its connection. Nothing where the host builds none ahead.
+    fn prepare(&self, _space: &[u8; 32], _purpose: Purpose) {}
+
     /// The routes of a home, kept under its key `home`
     /// ([`crate::route::home`]): its `onions`, onion only.
     fn pin(&self, home: &[u8; 32], onions: &[Onion]);
@@ -127,14 +164,44 @@ pub struct Approval {
     pub hardware: bool,
 }
 
+/// Where a flow is, said to the user while it runs ([`Prompts::stage`]):
+/// a kind alone, no secret and no value in it, and no order a flow keeps.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Reaching the home: its open claim, an agent from its pool.
+    Reaching = 1,
+    /// The device's proof at its home made and sent.
+    Proving = 2,
+    /// The recovery kit written at the agent: the claim's assignment.
+    WritingKit = 3,
+    /// The device set's log followed: the group joined or caught up.
+    Joining = 4,
+    /// A pairing's code read by the new device.
+    Scanned = 5,
+    /// A pairing's check confirmed.
+    Checked = 6,
+    /// The device set's keys handed over to the new device.
+    HandingOver = 7,
+    /// The new device's add waiting for the opener's admin key.
+    Approving = 8,
+}
+
 /// The user's prompts, each blocking until they answer. A prompt is asked
 /// only inside a flow the user started; none outside one.
 pub trait Prompts {
+    /// The flow reached `stage`: what the screen says it is doing. Nothing
+    /// is answered.
+    fn stage(&self, _stage: Stage) {}
+
     /// A new phrase kit's 24 `words`, shown once beside its `card`:
-    /// whether the user wrote them down.
-    fn show_phrase(&self, words: &str, card: &Card) -> bool;
-    /// A new security-key kit's `card`: whether the user wrote it down.
-    fn show_card(&self, card: &Card) -> bool;
+    /// whether the user wrote them down. `void`: why the kit shown before
+    /// is void (the home refused the backup after it was shown), so the
+    /// user writes these in its place.
+    fn show_phrase(&self, words: &str, card: &Card, void: Option<&str>) -> bool;
+    /// A new security-key kit's `card`: whether the user wrote it down,
+    /// `void` as [`Prompts::show_phrase`]'s.
+    fn show_card(&self, card: &Card, void: Option<&str>) -> bool;
     /// The kit's 24 words, entered; `None` when the user declined.
     fn enter_phrase(&self) -> Option<Zeroizing<String>>;
     /// Whether the user approves another device's new admin key.

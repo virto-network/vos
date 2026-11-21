@@ -58,13 +58,13 @@ mod state;
 
 use std::collections::BTreeMap;
 
-use vos_abi::ids::InstanceId;
+use vos_abi::ids::{InstanceId, MethodId};
 use vos_abi::{Decode, Encode};
 use vos_mls::{Mls, Namespace};
 use vos_wire::ingress::CallMessage;
 use vos_wire::personal::{
-    Attached, DeviceId, DeviceView, Effect, NewDevice, Op, Policy, Scope, Signer, Status, Vote,
-    welcome_hash,
+    Attached, DeviceId, DeviceView, Effect, NewDevice, Op, Place, Policy, Scope, Signer, Status,
+    Vote, welcome_hash,
 };
 use zeroize::Zeroize;
 
@@ -258,13 +258,14 @@ impl Prepared {
 
 /// What a device that pairs another hands it over the pairing channel:
 /// the agent, the device group's devices and the device set's operations
-/// as the pairing device verified them, its place in the log, and the key
-/// archive.
+/// as the pairing device verified them, its place in the log and the
+/// index after the last admin call it read there, and the key archive.
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct Pairing {
     agent: Agent,
     next: u64,
     chain: [u8; 32],
+    floor: u64,
     time: u64,
     confirmed: u64,
     offset: u64,
@@ -487,6 +488,7 @@ impl DeviceGroup {
             id: Some(0),
             next: 0,
             chain: [0; 32],
+            floor: 0,
             time: 0,
             calls: vec![now],
             confirmed: 0,
@@ -562,6 +564,7 @@ impl DeviceGroup {
             agent,
             next,
             chain,
+            floor,
             time,
             confirmed,
             offset,
@@ -578,6 +581,7 @@ impl DeviceGroup {
             id: None,
             next,
             chain,
+            floor,
             time,
             calls: Vec::new(),
             confirmed,
@@ -664,6 +668,7 @@ impl DeviceGroup {
             id: Some(id),
             next: read.next,
             chain: read.chain,
+            floor: read.next,
             time: read.time,
             calls: vec![read.time],
             confirmed: read.confirmed,
@@ -756,6 +761,17 @@ impl DeviceGroup {
     /// Whether a candidate is pending, or this device's own commit.
     pub fn pending(&self) -> bool {
         self.state.pending.is_some() || self.state.own.is_some()
+    }
+
+    /// Whether this device owes no vote: no commit of its own waits to be
+    /// logged, and the candidate pending, if one is, holds its vote. The
+    /// epoch may still wait for the other devices'.
+    pub fn voted(&self) -> bool {
+        let me = self.id();
+        self.state.own.is_none()
+            && self.state.pending.as_ref().is_none_or(|pending| {
+                me.is_some_and(|me| pending.votes.iter().any(|(device, _)| *device == me))
+            })
     }
 
     pub fn archive(&self) -> &Archive {
@@ -1032,14 +1048,36 @@ impl DeviceGroup {
     }
 
     /// The agent refused this device's admin call signed as `message`: it
-    /// is held no more.
+    /// is held no more, unless the log holds it (a refusal the route made
+    /// up), whose evidence is posted still.
     pub fn unsent(&mut self, message: &[u8]) -> Result<(), GroupError> {
         let before = self.state.sent.len();
-        self.state.sent.retain(|sent| sent.message != message);
+        self.state
+            .sent
+            .retain(|sent| sent.message != message || sent.index.is_some());
         if self.state.sent.len() < before {
             self.mls.write(rows(&self.state, None))?;
         }
         Ok(())
+    }
+
+    /// This device's admin call of `method` with `arguments` (its place
+    /// aside) that the log holds open with its evidence still to post: one
+    /// whose answer was lost. Its log index, its batch time, and the
+    /// message and signature its evidence carries.
+    pub fn taken(
+        &self,
+        method: MethodId,
+        arguments: &[u8],
+    ) -> Option<(u64, u64, Vec<u8>, [u8; 64])> {
+        self.state.sent.iter().find_map(|sent| {
+            let index = sent.index?;
+            let signed = CallMessage::parse(&sent.message)?;
+            let (_, unplaced) = Place::split(&signed.arguments)?;
+            let call = self.state.call_at(index)?;
+            (signed.method == method && unplaced == arguments)
+                .then(|| (index, call.at, sent.message.clone(), sent.signature))
+        })
     }
 
     /// The agent refused the evidence posted for the call at `index`, past
@@ -1392,6 +1430,7 @@ impl DeviceGroup {
             agent: self.state.agent,
             next: self.state.next,
             chain: self.state.chain,
+            floor: self.state.floor,
             time: self.state.time,
             confirmed: self.state.confirmed,
             offset: self.state.offset,

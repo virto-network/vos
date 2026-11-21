@@ -39,7 +39,7 @@ use crate::chrome::Chrome;
 use crate::enrollment::Store;
 use crate::job::{Job, Part};
 use crate::net::{Arti, Net};
-use crate::personal::{Artifacts, PersonalStatus, Phase, Refused, Space, Why};
+use crate::personal::{Artifacts, PersonalStatus, Phase, Refused, Space, Stage, Why};
 use crate::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
 use crate::{
     Answer, Code, Enroll, Enrolled, EnrolledSpace, Facility, Form, Gateway, JobRun, Paid, Pay,
@@ -61,6 +61,11 @@ pub trait Prompts: Send + Sync + 'static {
     /// The admin key's Ed25519 signature over `message`, which this process
     /// prepared, after a strong biometric at its prompt: 64 bytes.
     fn sign_key(&self, kind: Kind, key: &[u8], message: &[u8]) -> KeyAnswer;
+    /// The personal flow reached `stage`, which the app's screens say while
+    /// it runs: nothing answered, nothing of a secret in it.
+    fn step(&self, _stage: Stage) {}
+    /// Where the operation is, in words, for the client's chrome to show.
+    fn stage(&self, _stage: &str) {}
 }
 
 /// What the device offers, which this process reads itself.
@@ -154,6 +159,10 @@ impl Chrome for Shown {
                 .unwrap_or(Answer::Declined)
         })
     }
+
+    fn stage(&self, stage: &str) {
+        self.0.stage(stage);
+    }
 }
 
 /// The most sessions kept at once: a client that dies leaves its sessions
@@ -165,7 +174,7 @@ const SESSIONS: usize = 64;
 pub struct Node {
     runtime: tokio::runtime::Runtime,
     facility: Facility,
-    job: Job,
+    job: Arc<Job>,
     /// The personal space, or why it does not open: sign-in and payments
     /// run whatever it is.
     personal: Option<Result<Arc<Space>, Refused>>,
@@ -173,7 +182,10 @@ pub struct Node {
     warming: Mutex<Vec<Warming>>,
     /// Whether the app is in the foreground, and the operations and jobs
     /// running: the client is dormant only when neither.
-    waking: Mutex<(bool, usize)>,
+    waking: Arc<Mutex<(bool, usize)>>,
+    /// The thread making the follows a flow left for after it, one at a
+    /// time: joined before the node goes.
+    behind: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[derive(Default)]
@@ -296,11 +308,12 @@ impl Node {
         Ok(Self {
             runtime,
             facility,
-            job,
+            job: Arc::new(job),
             personal,
             sessions: Mutex::new(Sessions::default()),
             warming: Mutex::new(Vec::new()),
-            waking: Mutex::new((false, 0)),
+            waking: Arc::new(Mutex::new((false, 0))),
+            behind: Mutex::new(None),
         })
     }
 
@@ -492,6 +505,10 @@ impl Node {
         let _entered = self.runtime.enter();
         let mut waking = crate::lock(&self.waking);
         waking.0 = foreground;
+        // The app in the background: a restore's sitting holds no kit.
+        if !foreground && let Some(Ok(space)) = &self.personal {
+            space.forget_kit();
+        }
         self.facility.net().set_foreground(foreground);
         self.facility.net().keep_rendezvous();
         if foreground {
@@ -634,6 +651,7 @@ impl Node {
             None => return Err(no_personal()),
         };
         (status.tor, status.tor_why, status.standing) = (tor, tor_why, standing);
+        status.failed = self.job.failed().unwrap_or_default();
         if let Some(repair) = repair {
             (status.phase, status.repair) = (Phase::NeedsRepair, repair);
         }
@@ -651,12 +669,48 @@ impl Node {
             _awake: self.wake(),
         })
     }
+
+    /// The follows a flow left for after it returned
+    /// ([`vos_light::space::Personal::follow_behind`]), on a thread of
+    /// their own with the client awake: the flow's answer does not wait
+    /// for them, and one that fails stands as a notice until a pass
+    /// finishes what it left.
+    fn follow_behind(&self, space: &Arc<Space>) {
+        let mut running = crate::lock(&self.behind);
+        // One thread at a time: one running makes these follows too.
+        if !space.behind() || running.as_ref().is_some_and(|thread| !thread.is_finished()) {
+            return;
+        }
+        let (space, job, waking) = (
+            Arc::clone(space),
+            Arc::clone(&self.job),
+            Arc::clone(&self.waking),
+        );
+        let (facility, runtime) = (self.facility.clone(), self.runtime.handle().clone());
+        crate::lock(&waking).1 += 1;
+        facility.net().set_dormant(false);
+        *running = Some(std::thread::spawn(move || {
+            {
+                let _entered = runtime.enter();
+                match space.follow_behind() {
+                    Ok(()) => job.finished(),
+                    Err(_) => job.unfinished(crate::job::now_ms()),
+                }
+            }
+            let _entered = runtime.enter();
+            let mut waking = crate::lock(&waking);
+            waking.1 -= 1;
+            if *waking == (false, 0) {
+                facility.net().set_dormant(true);
+            }
+        }));
+    }
 }
 
 /// The personal space lent to one flow ([`Node::personal`]).
 pub struct Personal<'a> {
     space: &'a Arc<Space>,
-    job: &'a Job,
+    job: &'a Arc<Job>,
     _awake: Awake<'a>,
 }
 
@@ -674,6 +728,7 @@ impl Drop for Personal<'_> {
             self.job
                 .attach(Arc::clone(self.space) as Arc<dyn crate::job::Personal>);
         }
+        self._awake.node.follow_behind(self.space);
     }
 }
 
@@ -695,6 +750,14 @@ impl Drop for Awake<'_> {
 
 impl Drop for Node {
     fn drop(&mut self) {
+        // The follows left stop after the one running, before the runtime
+        // goes: the next pass makes the rest.
+        if let Some(Ok(space)) = &self.personal {
+            space.drop_behind();
+        }
+        if let Some(thread) = crate::lock(&self.behind).take() {
+            let _ = thread.join();
+        }
         for warming in crate::lock(&self.warming).iter() {
             warming.cancel();
         }

@@ -9,11 +9,22 @@
 //! sent again after a `wake`. A read is a query signed by the sync key.
 //! Every round trip blocks the calling thread: sealed sync and the pass
 //! are synchronous.
+//!
+//! **Reads asked ahead** ([`Control::ahead`]): reads a pass makes one
+//! after another with nothing between them that changes their answers go
+//! out together on the link's connection, one round trip for all; each
+//! answer is kept for the read that asks it in its turn, which takes it
+//! instead of sending the same query again. A call the link sends after
+//! them drops the answers it may change (a push every one but the other
+//! scopes' pages, any other call every one), so a read in its turn is answered as
+//! it would have been sent then. An answer asked ahead and failed reaches
+//! only its own read, and is never sent again by the link: the read's
+//! caller is the one that retries.
 
 use std::time::Instant;
 
 use super::Host;
-use crate::job::{Control, Post};
+use crate::job::{Control, Post, Read};
 use crate::personal::{Answer, Frontier, Link, WAKES};
 use crate::route::{Purpose, Route};
 use crate::wire;
@@ -90,6 +101,40 @@ pub fn answer<T: Decode>(outcome: &Outcome) -> Result<Result<T, PersonalError>, 
     wire::answer(outcome).map_err(|_| format!("the agent answered {outcome:?}"))
 }
 
+/// The node's time as each kept-open purpose's connection to a routes'
+/// key last read it, and when: every link of that purpose there counts on
+/// it while it is young (half a query's 60 s life), so a flow reads the
+/// node's time once, however many links it makes. A one-shot purpose's
+/// reading is its own connection's alone, and is never kept here.
+#[derive(Default)]
+pub struct Clocks(std::sync::Mutex<std::collections::HashMap<([u8; 32], Purpose), Reading>>);
+
+/// The node's time as read, and when.
+type Reading = (u64, Instant);
+
+impl Clocks {
+    /// The node's time now under `purpose` at `space`, by a reading young
+    /// enough.
+    pub fn now(&self, space: &[u8; 32], purpose: Purpose) -> Option<u64> {
+        let clocks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (node, at) = clocks.get(&(*space, purpose))?;
+        young(at).then(|| node + at.elapsed().as_millis() as u64)
+    }
+
+    /// The node's time `node` read now under `purpose` at `space`.
+    pub fn read(&self, space: &[u8; 32], purpose: Purpose, node: u64, at: Instant) {
+        if !purpose.one_shot() {
+            let mut clocks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            clocks.insert((*space, purpose), (node, at));
+        }
+    }
+}
+
+/// Whether a reading made `at` is still counted on.
+fn young(at: &Instant) -> bool {
+    at.elapsed().as_millis() < u128::from(QUERY_MS / 2)
+}
+
 /// A link to the personal agent at the home `space`.
 pub struct AgentLink<'a, H: Host> {
     host: &'a H,
@@ -100,6 +145,19 @@ pub struct AgentLink<'a, H: Host> {
     signer: &'a mut Signer,
     /// The node's time read last, and when.
     clock: Option<(u64, Instant)>,
+    /// The readings every link of a flow counts on, if it shares them.
+    clocks: Option<&'a Clocks>,
+    /// The reads asked ahead and not yet taken: each query's method and
+    /// arguments, the scope a `since` reads, and its answer.
+    ahead: Vec<Ahead>,
+}
+
+/// A read asked ahead of its turn, and what it was answered.
+struct Ahead {
+    method: MethodId,
+    arguments: Vec<u8>,
+    scope: Option<Scope>,
+    answer: Result<Outcome, String>,
 }
 
 impl<'a, H: Host> AgentLink<'a, H> {
@@ -119,7 +177,15 @@ impl<'a, H: Host> AgentLink<'a, H> {
             sync,
             signer,
             clock: None,
+            clocks: None,
+            ahead: Vec::new(),
         }
+    }
+
+    /// The same, counting on `clocks`' readings and leaving its own there.
+    pub fn with_clocks(mut self, clocks: &'a Clocks) -> Self {
+        self.clocks = Some(clocks);
+        self
     }
 
     pub fn agent(&self) -> Agent {
@@ -131,16 +197,27 @@ impl<'a, H: Host> AgentLink<'a, H> {
         self.host.request(&self.space, self.purpose, request)
     }
 
-    /// The node's time now: read once a link, then counted on.
+    /// The node's time now: read once a link (or once a flow, its links
+    /// sharing [`Clocks`]), then counted on.
     pub fn now(&mut self) -> Result<u64, String> {
         if let Some((node, at)) = self.clock
-            && at.elapsed().as_millis() < u128::from(QUERY_MS / 2)
+            && young(&at)
         {
             return Ok(node + at.elapsed().as_millis() as u64);
         }
+        if let Some(now) = self
+            .clocks
+            .and_then(|clocks| clocks.now(&self.space, self.purpose))
+        {
+            return Ok(now);
+        }
         let node = wire::time_answer(&self.send(&wire::time_request())?)
             .map_err(|error| error.to_string())?;
-        self.clock = Some((node, Instant::now()));
+        let at = Instant::now();
+        self.clock = Some((node, at));
+        if let Some(clocks) = self.clocks {
+            clocks.read(&self.space, self.purpose, node, at);
+        }
         Ok(node)
     }
 
@@ -149,7 +226,7 @@ impl<'a, H: Host> AgentLink<'a, H> {
     /// the call is sent (a call `hold` refuses is not): its outcome, and
     /// what was signed. A call whose answer was lost keeps its sequence, so
     /// it is sent again as it was.
-    fn signed(
+    pub(super) fn signed(
         &mut self,
         key: &mut Key<'_>,
         method: MethodId,
@@ -191,6 +268,7 @@ impl<'a, H: Host> AgentLink<'a, H> {
             Key::Lent(_, sign) => sign(&message)?,
         };
         hold(&message, &call.signature)?;
+        self.spent(method, &call.arguments);
         let request = wire::request(Kind::Call as u16, (AgentId(agent.agent), call.clone()));
         match Response::decode_exact(&self.send(&request)?) {
             Some(Response::Ran { outcome, .. }) => {
@@ -255,12 +333,31 @@ impl<'a, H: Host> AgentLink<'a, H> {
         Ok(Ok(()))
     }
 
-    /// The sync key's query of `name` with `arguments`.
+    /// The sync key's query of `name` with `arguments`: the answer asked
+    /// ahead for it, if one is kept, or one asked now.
     pub fn query<T: Decode>(
         &mut self,
         method: MethodId,
         arguments: impl Encode,
     ) -> Answer<T, String> {
+        let arguments = arguments.encode();
+        let kept = self
+            .ahead
+            .iter()
+            .position(|ahead| ahead.method == method && ahead.arguments == arguments);
+        let outcome = match kept {
+            Some(at) => self.ahead.remove(at).answer?,
+            None => {
+                let request = self.query_request(method, arguments)?;
+                wire::outcome(&self.send(&request)?).map_err(|error| error.to_string())?
+            }
+        };
+        answer(&outcome)
+    }
+
+    /// The request of the sync key's query of `method` with `arguments`,
+    /// good for [`QUERY_MS`] by the node's clock.
+    fn query_request(&mut self, method: MethodId, arguments: Vec<u8>) -> Result<Vec<u8>, String> {
         let not_after = self.now()? + QUERY_MS;
         let mut query = QueryCall {
             key: self.sync.verifying_key().to_bytes(),
@@ -268,16 +365,34 @@ impl<'a, H: Host> AgentLink<'a, H> {
             consistency: Consistency::Applied { at: 0 },
             instance: self.agent.instance,
             method,
-            arguments: arguments.encode(),
+            arguments,
             signature: [0; 64],
         };
         query.signature = self
             .sync
             .sign(&query.message(&self.agent.identity))
             .to_bytes();
-        let request = wire::request(Kind::Query as u16, (AgentId(self.agent.agent), query));
-        let outcome = wire::outcome(&self.send(&request)?).map_err(|error| error.to_string())?;
-        answer(&outcome)
+        Ok(wire::request(
+            Kind::Query as u16,
+            (AgentId(self.agent.agent), query),
+        ))
+    }
+
+    /// The answers asked ahead that the call of `method` with `arguments`
+    /// may change, dropped before it leaves: a push's every one but the
+    /// other scopes' pages; any other call's every one.
+    fn spent(&mut self, method: MethodId, arguments: &[u8]) {
+        let pushed = (method == method::PUSH)
+            .then(|| Vec::<u8>::decode_exact(arguments))
+            .flatten()
+            .and_then(|envelope| crate::sealed::header_of(&envelope).ok())
+            .map(|header| header.scope);
+        match pushed {
+            Some(scope) => self
+                .ahead
+                .retain(|ahead| ahead.scope.is_some_and(|read| read != scope)),
+            None => self.ahead.clear(),
+        }
     }
 }
 
@@ -327,6 +442,48 @@ impl<H: Host> Link for AgentLink<'_, H> {
 }
 
 impl<H: Host> Control for AgentLink<'_, H> {
+    fn ahead(&mut self, reads: &[Read]) {
+        let mut asked = Vec::with_capacity(reads.len());
+        for read in reads {
+            let (method, arguments, scope) = match read {
+                Read::Log(from) => (method::LOG, from.encode(), None),
+                Read::Overview => (method::OVERVIEW, ().encode(), None),
+                Read::Devices => (method::DEVICES, ().encode(), None),
+                Read::Since(scope, position) => {
+                    (method::SINCE, (*scope, *position).encode(), Some(*scope))
+                }
+            };
+            let kept = self
+                .ahead
+                .iter()
+                .chain(&asked)
+                .any(|ahead| ahead.method == method && ahead.arguments == arguments);
+            if !kept {
+                asked.push(Ahead {
+                    method,
+                    arguments,
+                    scope,
+                    answer: Err(String::new()),
+                });
+            }
+        }
+        // A link that cannot build the queries asks nothing ahead: each
+        // read then asks in its turn, and meets the failure there.
+        let Ok(requests) = asked
+            .iter()
+            .map(|ahead| self.query_request(ahead.method, ahead.arguments.clone()))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return;
+        };
+        let answers = self.host.requests(&self.space, self.purpose, &requests);
+        for (mut ahead, answer) in asked.into_iter().zip(answers) {
+            ahead.answer =
+                answer.and_then(|body| wire::outcome(&body).map_err(|error| error.to_string()));
+            self.ahead.push(ahead);
+        }
+    }
+
     fn log(&mut self, from: u64) -> Answer<Vec<(u64, Entry)>, String> {
         self.query(method::LOG, from)
     }
@@ -374,6 +531,7 @@ mod tests {
     struct Recording {
         settling: usize,
         calls: Mutex<Vec<(Session, u64, MethodId)>>,
+        queries: Mutex<Vec<MethodId>>,
     }
 
     impl Recording {
@@ -381,6 +539,7 @@ mod tests {
             Self {
                 settling,
                 calls: Mutex::new(Vec::new()),
+                queries: Mutex::new(Vec::new()),
             }
         }
 
@@ -402,6 +561,14 @@ mod tests {
             let (kind, body) = request.split_at(2);
             if u16::from_le_bytes([kind[0], kind[1]]) == Kind::Time as u16 {
                 return Ok(0u64.encode());
+            }
+            if u16::from_le_bytes([kind[0], kind[1]]) == Kind::Query as u16 {
+                let (_, query) = <(AgentId, QueryCall)>::decode_exact(body).ok_or("a query")?;
+                let mut queries = self.queries.lock().unwrap();
+                queries.push(query.method);
+                // Each answer names how many queries came before it.
+                let outcome = Outcome::Done((queries.len() as u64).encode());
+                return Ok(Response::Ran { outcome, at: 0 }.encode());
             }
             let (_, call) = <(AgentId, ingress::Call)>::decode_exact(body).ok_or("a call")?;
             let mut calls = self.calls.lock().unwrap();
@@ -471,6 +638,26 @@ mod tests {
         link.wake().unwrap().unwrap();
         assert_eq!(signer.next, 6);
         assert_eq!(host.sent(method::PUT), 2);
+    }
+
+    /// Reads asked ahead go out together and are each taken once by the
+    /// read that asks it in its turn; a call sent meanwhile drops them,
+    /// so the read after it asks again.
+    #[test]
+    fn a_read_asked_ahead_is_taken_once_and_a_call_drops_it() {
+        let host = Recording::new(0);
+        let sync = SigningKey::from_bytes(&[7; 32]);
+        let mut signer = Signer::new(sync.verifying_key().to_bytes());
+        let mut link = link(&host, &sync, &mut signer);
+        link.ahead(&[Read::Log(3), Read::Overview, Read::Log(3)]);
+        assert_eq!(host.queries.lock().unwrap().len(), 2);
+        let first: u64 = link.query(method::LOG, 3u64).unwrap().unwrap();
+        assert_eq!(first, 1);
+        let again: u64 = link.query(method::LOG, 3u64).unwrap().unwrap();
+        assert_eq!(again, 3, "taken once, then asked anew");
+        link.wake().unwrap().unwrap();
+        let overview: u64 = link.query(method::OVERVIEW, ()).unwrap().unwrap();
+        assert_eq!(overview, 4, "a call dropped the overview asked ahead");
     }
 
     /// A call is sent at most `WAKES + 1` times, a wake between each two;

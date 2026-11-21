@@ -34,10 +34,18 @@ pub struct Phone {
     made: Mutex<u8>,
     /// Every phrase shown, the newest last.
     pub phrases: Mutex<Vec<String>>,
+    /// Why each kit shown in place of an earlier one was so.
+    pub voids: Mutex<Vec<String>>,
     /// Every kit's card shown, the newest last.
     pub cards: Mutex<Vec<Card>>,
     /// The words to enter when asked.
     pub words: Mutex<Option<String>>,
+    /// How many times the kit's words were asked.
+    pub entered: Mutex<usize>,
+    /// Every stage a flow said, by its byte, in order.
+    pub stages: Mutex<Vec<u8>>,
+    /// Every stage an operation said in words, for the client's chrome.
+    pub said: Mutex<Vec<String>>,
     /// The admin key that signed last.
     pub signed: Mutex<Option<[u8; 32]>>,
     /// Every approval asked.
@@ -78,8 +86,12 @@ impl Phone {
             admins: Mutex::new(HashMap::new()),
             made: Mutex::new(seed.wrapping_mul(16)),
             phrases: Mutex::new(Vec::new()),
+            voids: Mutex::new(Vec::new()),
             cards: Mutex::new(Vec::new()),
             words: Mutex::new(None),
+            entered: Mutex::new(0),
+            stages: Mutex::new(Vec::new()),
+            said: Mutex::new(Vec::new()),
             signed: Mutex::new(None),
             approvals: Mutex::new(Vec::new()),
             declines: Mutex::new(0),
@@ -199,19 +211,30 @@ impl Phone {
 }
 
 impl Prompts for Phone {
-    fn show_phrase(&self, words: &str, card: &Card) -> bool {
+    fn stage(&self, stage: crate::space::Stage) {
+        self.stages.lock().unwrap().push(stage as u8);
+    }
+
+    fn show_phrase(&self, words: &str, card: &Card, void: Option<&str>) -> bool {
+        if let Some(void) = void {
+            self.voids.lock().unwrap().push(void.to_owned());
+        }
         assert_eq!(words.split(' ').count(), 24, "a phrase's 24 words");
         self.phrases.lock().unwrap().push(words.to_owned());
         self.cards.lock().unwrap().push(card.clone());
         !self.declines()
     }
 
-    fn show_card(&self, card: &Card) -> bool {
+    fn show_card(&self, card: &Card, void: Option<&str>) -> bool {
+        if let Some(void) = void {
+            self.voids.lock().unwrap().push(void.to_owned());
+        }
         self.cards.lock().unwrap().push(card.clone());
         !self.declines()
     }
 
     fn enter_phrase(&self) -> Option<Zeroizing<String>> {
+        *self.entered.lock().unwrap() += 1;
         if self.declines() {
             return None;
         }

@@ -39,7 +39,9 @@
 //! [`TreeKeeper::PERIOD_MS`] (30 s, between 15 s and 45 s), never because a
 //! proof is about to be made: the feed's connection is one circuit of the
 //! device's for as long as it is open, and a read just before each proof
-//! would join the proofs through it. A page that says more follows is due
+//! would join the proofs through it. A device's first sign-in, which waits
+//! for its leaf, and a claim of a personal agent read it otherwise
+//! (`light-node.md` §6.2, §3.8). A page that says more follows is due
 //! at once. The credential actor's ring holds the last 64 roots, one a
 //! tree-changing batch, and accepts a superseded root for `ROOT_GRACE_MS`
 //! (90 s, two of the timer's longest gaps) while the ring still holds it:

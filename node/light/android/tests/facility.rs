@@ -53,7 +53,25 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
         bytes(field(&enrolled, "owner")),
         vos_light::owner(&secret).to_bytes().to_vec()
     );
-    assert_eq!(digests.rows[0], ("Member".to_owned(), hex::encode(member)));
+    // The digests as a code for the operator's camera, its six-digit
+    // check, and whole.
+    let owner = vos_light::owner(&secret).to_bytes();
+    assert_eq!(
+        digests.rows[0],
+        (
+            "Check".to_owned(),
+            vos_api::enrollment_check(&member, &owner)
+        )
+    );
+    assert_eq!(digests.rows[1], ("Member".to_owned(), hex::encode(member)));
+    assert_eq!(digests.rows[2], ("Owner".to_owned(), hex::encode(owner)));
+    assert_eq!(
+        digests
+            .code
+            .as_deref()
+            .and_then(vos_api::read_enrollment_code),
+        Some((member, owner))
+    );
     world.enroll(AGENT, &member);
     session.granted();
 
@@ -194,7 +212,13 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
     ]);
     chrome.will(confirm(&["shop", "twenty"]));
     chrome.will(confirm(&[" shop ", "20"]));
+    chrome.stages.lock().unwrap().clear();
     let paid = session.ask("pay", &pay, &chrome).await.unwrap();
+    assert_eq!(
+        *chrome.stages.lock().unwrap(),
+        ["Proving…", "Sending…"],
+        "the chrome shows where the payment is"
+    );
     let forms = chrome.shown.lock().unwrap().clone();
     let (first, second) = (&forms[forms.len() - 2], &forms[forms.len() - 1]);
     assert_eq!(
@@ -739,15 +763,18 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
     }
 }
 
-/// A sign-in before the claim, the tree read to its end and no leaf of
-/// the member's in it, is refused as unclaimed, not as a path still being
-/// read; once the member is claimed and the tree read again, it signs in.
+/// A sign-in before the claim says it waits for the space to list the
+/// device and reads the feed meanwhile; the tree read to its end with no
+/// leaf of the member's in it after the wait, it is refused as not invited
+/// yet, not as a path still being read. Invited while a sign-in waits, it
+/// goes on by itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_sign_in_before_the_claim_says_to_claim_first() {
+async fn a_sign_in_before_the_claim_waits_for_the_invitation() {
     let world = world();
     let directory = tempfile::tempdir().unwrap();
     let source = Arc::new(Phone::new(9));
-    let facility = facility(&world, directory.path(), source as Arc<dyn Source>);
+    let facility = facility(&world, directory.path(), source as Arc<dyn Source>)
+        .with_listed_wait(Duration::from_millis(1_500), Duration::from_millis(300));
     let session = facility.session(gateway());
     let chrome = Scripted::default();
     chrome.will(confirm(&[]));
@@ -767,11 +794,37 @@ async fn a_sign_in_before_the_claim_says_to_claim_first() {
     };
     assert_eq!(refused.code, Code::Unclaimed, "{refused:?}");
     assert!(
-        refused.message.contains("claim your invitation first"),
+        refused
+            .message
+            .contains("the operator has not invited it yet"),
         "{refused:?}"
     );
-    world.enroll(AGENT, &member);
-    let signed = sign_in_held(&session, &chrome).await.unwrap();
+    // The wait shows in the chrome as the sign-in's stage, and no proof
+    // was made for the refused sign-in.
+    let stages = chrome.stages.lock().unwrap().clone();
+    assert!(
+        stages
+            .iter()
+            .any(|stage| stage == vos_facility::WAITING_FOR_LIST),
+        "{stages:?}"
+    );
+    assert!(
+        stages
+            .iter()
+            .all(|stage| stage == vos_facility::WAITING_FOR_LIST),
+        "{stages:?}"
+    );
+    // Invited while the sign-in waits: it signs in with no second tap.
+    let invite = {
+        let world = Arc::clone(&world);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            world.enroll(AGENT, &member);
+        })
+    };
+    chrome.will(confirm(&[]));
+    let signed = session.ask("sign_in", &login, &chrome).await.unwrap();
+    invite.await.unwrap();
     assert!(matches!(
         Response::decode_exact(&bytes(field(&signed, "answer"))),
         Some(Response::Ran { .. })

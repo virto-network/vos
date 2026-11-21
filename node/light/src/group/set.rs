@@ -7,7 +7,7 @@
 use vos_abi::Encode;
 use vos_abi::ids::MethodId;
 use vos_wire::ingress::CallMessage;
-use vos_wire::personal::{AdminCall, AdminClass, DeviceId, Op, Signer, method};
+use vos_wire::personal::{AdminCall, AdminClass, DeviceId, Op, Place, Signer, method};
 
 use super::follow::verifies;
 use super::{Act, Alarm, Call, Check, Claim, DeviceGroup, Event, GroupError, Support};
@@ -149,7 +149,7 @@ impl DeviceGroup {
         let holds = self.holds(by, &call.origin, at);
         let evidence = if allowed
             && call.method == name.0
-            && call.arguments == arguments
+            && Place::split(&call.arguments).is_some_and(|(_, signed)| signed == arguments)
             && holds != Holds::No
         {
             Check::Missing

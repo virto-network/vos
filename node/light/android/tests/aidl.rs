@@ -3,7 +3,8 @@
 
 //! The facility's own interface's AIDL (the AAR's `src/main/aidl`) declares
 //! every parcelable and enum of `personal::contract` as its type is, and
-//! nothing else.
+//! nothing else; what the screens' Java holds of the facility's (a label's
+//! bound, the kit's forms and its word list) is the facility's.
 
 use std::path::Path;
 
@@ -31,4 +32,37 @@ fn the_screens_label_bound_is_the_contracts() {
         words.contains(&declared),
         "Words.java does not declare {declared}"
     );
+}
+
+fn java(class: &str) -> String {
+    std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("aar/src/main/java/team/virto/vos/personal")
+            .join(class),
+    )
+    .unwrap()
+}
+
+/// The screens know a kit's forms by the facility's titles, and check its
+/// words against the kit's own list, BIP39's English, as the kit reads it.
+#[test]
+fn the_screens_kit_words_are_the_kits() {
+    let words = java("KitWords.java");
+    for (constant, title) in [
+        ("ENTER", vos_facility::personal::ENTER_PHRASE),
+        ("CHECK", vos_facility::personal::CHECK_PHRASE),
+    ] {
+        let declared = format!("{constant} = \"{title}\";");
+        assert!(
+            words.contains(&declared),
+            "KitWords.java does not declare {declared}"
+        );
+    }
+    let list = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("aar/src/main/resources/team/virto/vos/personal/kit-words.txt"),
+    )
+    .unwrap();
+    let list: Vec<&str> = list.lines().collect();
+    assert_eq!(list, bip39::Language::English.word_list().to_vec());
 }

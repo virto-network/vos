@@ -74,7 +74,7 @@ impl vos_gateway::ssh::App for DemoApp {
             self.held.clone(),
         ));
         let demo = self.demo.clone();
-        Server::new(APPLICATION, move || Screens::new(demo.clone()))
+        Server::new(APPLICATION, move || Screens::new(demo.clone(), mark))
             .facility(FACILITY, 1)
             .host_service_fn(SERVICE, move |request| Arc::clone(&service).serve(request))
     }

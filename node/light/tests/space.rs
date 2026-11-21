@@ -165,6 +165,31 @@ fn a_space_is_claimed_and_paired_through_the_light_node() {
     first.space.pair_cancel();
 }
 
+/// The open claim runs while the phrase is written down: refused after
+/// the phrase was shown, the claim says those words are void and shows
+/// new ones, and goes on to the end with them.
+#[test]
+fn an_open_claim_refused_behind_the_phrase_shows_new_words() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let first = device(&world, 0x13);
+    world.refuse(
+        0x13,
+        Step::call(vos_wire::credentials::method::CLAIM_OPEN),
+        PersonalError::NotAdmitted,
+        1,
+    );
+    let words = first.claim_phrase(&world, home);
+    let phrases = first.phone.phrases.lock().unwrap().clone();
+    assert_eq!(phrases.len(), 2, "new words after the refusal");
+    assert_eq!(phrases[1], words);
+    assert_ne!(phrases[0], phrases[1]);
+    let voids = first.phone.voids.lock().unwrap().clone();
+    assert_eq!(voids.len(), 1, "{voids:?}");
+    assert!(voids[0].contains("refused the backup") && voids[0].contains("void"));
+    assert_eq!(first.space.status().unwrap().phase, Phase::Held);
+}
+
 /// A phone whose removal is pending its delay is in the set still: its
 /// own space's code scanned is refused, as for any live device.
 #[test]
@@ -288,6 +313,93 @@ fn a_veto_the_operators_drop_is_seen() {
             .iter()
             .any(|alarm| matches!(alarm, Alarm::Dropped { .. })),
         "{alarms:?}"
+    );
+}
+
+/// A removal of a phone, signed and vetoed, logged again on a route that
+/// forks the log the phone reads, and matured there unvetoed: the call
+/// names the place it took, which the fork's copy is not, so the phone
+/// takes no entry of the fork, alarms, and stays in the set.
+#[test]
+fn a_vetoed_removal_logged_again_on_the_route_turns_no_phone_away() {
+    let world = world_of(Policy {
+        probation_ms: 1_000,
+        ..suite()
+    });
+    let home = world.home(HOME, 2, 1);
+    let first = device(&world, 0x53);
+    first.claim(&world, home);
+    let second = device(&world, 0x54);
+    let id = first.pair(&second);
+    after(1_000);
+    let removal = first.space.remove(&first.phone, id).unwrap();
+    second.pass();
+    second.space.veto(&second.phone, removal.index).unwrap();
+    second.pass();
+    world.relog(0x54, removal.index);
+    after(suite().operation_delay_ms);
+    for _ in 0..2 {
+        let passed = second.space.pass(vos_light::testing::wall());
+        let passed = match passed {
+            Ok(passed) => passed,
+            Err(stopped) => panic!("{stopped:?}"),
+        };
+        assert!(
+            !passed.notices.contains(&vos_light::job::Notice::Removed),
+            "{:?}",
+            passed.notices
+        );
+        assert!(
+            passed
+                .alarms
+                .iter()
+                .any(|alarm| matches!(alarm, Alarm::Log { .. })),
+            "{:?}",
+            passed.alarms
+        );
+        assert_eq!(second.space.status().unwrap().phase, Phase::Held);
+    }
+    assert_eq!(first.standing(id), Some(Standing::Active));
+}
+
+/// An entry that is no admin call, logged between the reading and the
+/// call, moves no place on: the call is signed once and taken. One refused
+/// `StaleHead` is read and signed again, at most three signatures in all:
+/// then the refusal is the user's to see.
+#[test]
+fn an_admin_call_is_signed_again_only_for_its_place() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let first = device(&world, 0x55);
+    first.claim(&world, home);
+    let second = device(&world, 0x56);
+    let third = device(&world, 0x57);
+    let (two, three) = (first.pair(&second), first.pair(&third));
+    world.renew_before(0x55, Step::call(method::REMOVE));
+    world.trace_from_now(0x55);
+    let removal = first.space.remove(&first.phone, two).unwrap();
+    let calls = world.trace(0x55);
+    let removes = calls
+        .iter()
+        .filter(|step| **step == Step::call(method::REMOVE));
+    assert_eq!(removes.count(), 1, "signed once: {calls:?}");
+    world.refuse(
+        0x55,
+        Step::call(method::REMOVE),
+        PersonalError::StaleHead,
+        3,
+    );
+    assert_eq!(
+        first.space.remove(&first.phone, three).unwrap_err(),
+        Error::AgentRefused(PersonalError::StaleHead)
+    );
+    let operations = first.space.operations().unwrap();
+    assert!(
+        operations.iter().any(|notice| matches!(
+            notice,
+            vos_light::job::Notice::Operation { index, .. } if *index == removal.index
+        )),
+        "{operations:?}"
     );
 }
 
@@ -777,4 +889,43 @@ fn a_pass_reads_the_homes_onions_again_and_keeps_them() {
     let later = vos_light::testing::wall() + day + vos_light::space::ONIONS_KEPT_MS + day;
     space.pass(later).unwrap();
     assert_eq!(keys(&space), vec![5]);
+}
+
+/// A phone another device removed reads its removal through to `Out`
+/// once a commit carried it; out, it opens a restore with the kit as a
+/// fresh install would, what it kept left, rather than being refused as a
+/// device that holds a space.
+#[test]
+fn a_removed_phone_opens_a_restore_with_the_kit() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let staying = device(&world, 0x91);
+    let words = staying.claim_phrase(&world, home);
+    let removed = device(&world, 0x92);
+    let id = staying.pair(&removed);
+    staying.space.remove(&staying.phone, id).unwrap();
+    after(suite().operation_delay_ms);
+    assert_eq!(staying.space.update(&staying.phone).unwrap(), vec![id]);
+    let passed = removed.pass();
+    assert!(
+        passed.notices.contains(&vos_light::job::Notice::Removed),
+        "{:?}",
+        passed.notices
+    );
+    assert_eq!(removed.space.status().unwrap().phase, Phase::Removed);
+
+    removed.phone.will_enter(words);
+    let restore = Claim {
+        home: world.home_of(home),
+        kit: KitKind::Phrase,
+        label: "back".into(),
+    };
+    removed
+        .space
+        .restore(&removed.phone, restore, KitKind::Phrase)
+        .unwrap();
+    assert!(matches!(
+        removed.space.status().unwrap().phase,
+        Phase::Restoring { .. }
+    ));
 }

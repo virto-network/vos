@@ -30,9 +30,9 @@ use vos_testkit::programs::program_elf;
 use vos_wire::batch::{Query, Work};
 use vos_wire::ingress::call_message;
 use vos_wire::personal::{
-    AdminClass, Attached, Attestation, Candidacy, DeviceId, DeviceView, Effect, HOUR_MS, Header,
-    Kit, KitEntry, KitKind, NewDevice, NewKit, Operation, Overview, PersonalError, Policy, Pushed,
-    Recorded, RecoveryView, Scope, Voted, Woken, r_hash, r2_hash,
+    AdminClass, Attached, Attestation, Body, Candidacy, DeviceId, DeviceView, Effect, Entry,
+    HOUR_MS, Header, Kit, KitEntry, KitKind, NewDevice, NewKit, Operation, Overview, PersonalError,
+    Place, Policy, Pushed, Recorded, RecoveryView, Scope, Voted, Woken, r_hash, r2_hash,
 };
 
 use crate::common::{AGENT, Node};
@@ -314,6 +314,55 @@ impl<W: Borrow<World>> Home<W> {
         self.world.borrow().method(self.agent, PERSONAL, name)
     }
 
+    /// The log's head, read as `caller` or, refused, as the kit or the
+    /// first device the agent answers: the start of the log before a claim.
+    pub fn head(&self, caller: Principal) -> Place {
+        let readers = [caller, KIT].into_iter().chain((0..32).map(sync));
+        readers
+            .filter_map(|reader| self.query::<Overview>(reader, "overview", ()).ok())
+            .map(|overview| Place {
+                next: overview.next,
+                chain: overview.chain,
+            })
+            .next()
+            .unwrap_or(Place {
+                next: 0,
+                chain: [0; 32],
+            })
+    }
+
+    /// `arguments` of `name` as `caller` signs them: placed at the log's
+    /// head first for a device-set admin call.
+    pub fn placed(&self, caller: Principal, name: &str, arguments: &[u8]) -> Vec<u8> {
+        if vos_wire::personal::method::PLACED.contains(&self.method(name)) {
+            self.head(caller).arguments(arguments)
+        } else {
+            arguments.to_vec()
+        }
+    }
+
+    /// The arguments of the admin call the log holds at `index`, as its
+    /// signer signed them, read as the kit or the first device the agent
+    /// answers.
+    pub fn logged(&self, index: u64) -> Vec<u8> {
+        let entry = [KIT]
+            .into_iter()
+            .chain((0..32).map(sync))
+            .find_map(|reader| self.query::<Vec<(u64, Entry)>>(reader, "log", index).ok())
+            .and_then(|page| page.into_iter().next())
+            .filter(|(at, _)| *at == index)
+            .expect("the entry")
+            .1;
+        match entry.body {
+            Body::Operation { call, .. }
+            | Body::Veto { call, .. }
+            | Body::Cosign { call, .. }
+            | Body::Resolve { call, .. }
+            | Body::Candidate { call, .. } => call.arguments,
+            other => panic!("no admin call at {index}: {other:?}"),
+        }
+    }
+
     /// `caller`'s query of `name` at the current batch time.
     pub fn query<T: Decode>(
         &self,
@@ -340,12 +389,20 @@ impl<W: BorrowMut<World>> Home<W> {
         self.world().pass(ms);
     }
 
-    /// `caller`'s call of `name`, alone in a batch: its run.
+    /// `caller`'s call of `name`, alone in a batch, a device-set admin
+    /// call placed at the log's head: its run.
     pub fn run(&mut self, caller: Principal, name: &str, arguments: impl Encode) -> Run {
+        let arguments = self.placed(caller, name, &arguments.encode());
+        self.run_as(caller, name, arguments)
+    }
+
+    /// `caller`'s call of `name` with `arguments` as given, alone in a
+    /// batch: its run.
+    pub fn run_as(&mut self, caller: Principal, name: &str, arguments: Vec<u8>) -> Run {
         let agent = self.agent;
         self.world()
             .agent(agent)
-            .call(caller, PERSONAL, name, arguments)
+            .call(caller, PERSONAL, name, Raw(&arguments))
     }
 
     /// `caller`'s call of `name`: its reply, or the actor's error. Refused
@@ -524,7 +581,7 @@ impl<W: BorrowMut<World>> Home<W> {
             let Principal::Client(key) = caller else {
                 return Ok(index);
             };
-            let signed = message(key, self.method(name), &arguments);
+            let signed = message(key, self.method(name), &self.logged(index));
             let attached = Attached {
                 welcome: None,
                 r2: None,
@@ -576,7 +633,12 @@ impl<W: BorrowMut<World>> Home<W> {
         arguments: impl Encode,
         r2: [u8; 32],
     ) -> Result<Recorded, PersonalError> {
-        let signed = message(key, self.method(name), &arguments.encode());
+        // A device-set call's arguments are as the log holds them, placed.
+        let arguments = match vos_wire::personal::method::PLACED.contains(&self.method(name)) {
+            true => self.logged(index),
+            false => arguments.encode(),
+        };
+        let signed = message(key, self.method(name), &arguments);
         self.call(poster, "evidence", evidence(index, signed, with_r2(r2)))
     }
 

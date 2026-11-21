@@ -16,7 +16,9 @@ import android.widget.LinearLayout;
  * Pairing: on a device of the personal space, its code shown as a QR code (and copied, for a
  * device with no camera) while the facility waits for the new device, cancellable; on the new
  * device, the code scanned (or pasted) and joined, this phone named. A device that moved home with
- * the others pairs again here too.
+ * the others pairs again here too. Both phones say the pairing's steps as they pass (scan, check,
+ * the keys handed over, the approval, done); once paired, the memberships it left are offered at
+ * once, one prompt each.
  */
 final class PairScreen extends Screen {
   /** The device that shows the code, or the one that scans it. */
@@ -42,6 +44,11 @@ final class PairScreen extends Screen {
     if (opener && code == null) {
       offer();
     }
+  }
+
+  @Override
+  String stage(byte stage) {
+    return Words.pairing(stage, opener);
   }
 
   @Override
@@ -95,20 +102,17 @@ final class PairScreen extends Screen {
   /** Wait for the new device, the screen covered, cancellable. */
   private void await() {
     app.run(
-        "Waiting for the new device to scan the code…",
+        Words.pairing((byte) 0, true),
         (personal, prompts, refused) -> personal.pairAwait(prompts, refused),
         (Paired paired) -> {
           forget();
           app.home();
-          app.say(
-              "Device "
-                  + paired.device
-                  + " joined your personal space."
-                  + (paired.memberships > 0
-                      ? " Enroll it in your "
-                          + paired.memberships
-                          + " other space(s) from Devices, changes and keys."
-                      : ""));
+          String joined = "Paired: device " + paired.device + " joined your personal space.";
+          if (paired.memberships > 0) {
+            memberships(joined, paired.memberships);
+          } else {
+            app.say(joined);
+          }
         },
         (personal, prompts, refused) -> {
           personal.pairCancel();
@@ -141,6 +145,44 @@ final class PairScreen extends Screen {
       clip.getDescription().setExtras(extras);
     }
     clipboard.setPrimaryClip(clip);
+  }
+
+  /**
+   * The memberships a pairing left on the phone that showed the code, offered right after it: the
+   * new device enrolled in each, in one flow, one prompt each; left for Devices, changes and keys
+   * when the user waits.
+   */
+  private void memberships(String paired, int count) {
+    app.ask(
+        "Paired",
+        paired
+            + " Confirm it in your "
+            + count
+            + " other space(s) now: it is enrolled there by this phone's proof. Later, from"
+            + " Devices, changes and keys.",
+        "Now",
+        () ->
+            app.run(
+                "Enrolling the new device…",
+                (personal, prompts, refused) -> {
+                  Membership[] owed = personal.memberships(refused);
+                  if (owed == null) {
+                    return null;
+                  }
+                  int done = 0;
+                  for (Membership membership : owed) {
+                    boolean made =
+                        membership.owed == Owed.ENROLL
+                            ? personal.enrollDevice(membership, prompts, refused)
+                            : personal.confirmDevice(membership, prompts, refused);
+                    if (!made) {
+                      return null;
+                    }
+                    done++;
+                  }
+                  return done;
+                },
+                (Integer done) -> app.say("Done in " + done + " space(s).")));
   }
 
   // ----- the new device -----
@@ -177,18 +219,17 @@ final class PairScreen extends Screen {
 
   private void joined(byte[] scanned, String name) {
     app.run(
-        "Joining your personal space…",
+        Words.pairing(Stage.SCANNED, false),
         (personal, prompts, refused) -> personal.pairJoin(scanned, name, prompts, refused),
         (Paired paired) -> {
           app.home();
+          String joined = "Paired: this phone is device " + paired.device + " of your space.";
           app.say(
-              "This phone joined your personal space as device "
-                  + paired.device
-                  + "."
+              joined
                   + (paired.memberships > 0
-                      ? " Confirm its "
+                      ? " Once your other phone enrolled it in your "
                           + paired.memberships
-                          + " membership(s) from Devices, changes and keys."
+                          + " other space(s), confirm it there from Devices, changes and keys."
                       : ""));
         },
         (personal, prompts, refused) -> {

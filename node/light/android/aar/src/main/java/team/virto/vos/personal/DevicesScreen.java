@@ -8,8 +8,9 @@ import android.widget.LinearLayout;
 /**
  * The device set: each device's standing and last call, a phone retired (removed, then its
  * memberships revoked), the changes open (veto, cosign, a contest resolved), the memberships a
- * pairing left, the recovery kit's rotation, this phone's admin key replaced, a regroup, and a
- * commit now. Each change is the admin key's, behind its strong biometric.
+ * pairing left, the recovery kit's rotation, this phone's admin key replaced, a regroup, a commit
+ * now. Each change is the admin key's, behind its strong
+ * biometric. Read from the agent when shown and on each return to the app, never on a timer.
  */
 final class DevicesScreen extends Screen {
   private Device[] devices;
@@ -28,6 +29,11 @@ final class DevicesScreen extends Screen {
 
   @Override
   void shown() {
+    reload();
+  }
+
+  @Override
+  void started() {
     reload();
   }
 
@@ -123,7 +129,7 @@ final class DevicesScreen extends Screen {
                     + " Open the kit's screen, read the devices with the kit, then uphold or drop"
                     + " it there."));
         into.addView(
-            button("Resolve it with the kit", v -> app.open(new RestoreScreen(app))));
+            button("Resolve it with the kit", v -> app.open(new RestoreScreen(app, true))));
       } else if (notice.contested && notice.cannotResolve) {
         into.addView(
             text(

@@ -64,6 +64,8 @@ pub enum Error {
     Local(String),
     /// The registrar's answer to the onion set's refresh.
     Answer(DeviceError),
+    /// A timed fetch's query could not be made.
+    Query(String),
     /// The registrar served an empty set, or one past
     /// [`MAX_ONIONS`](vos_wire::credentials::MAX_ONIONS) or naming an onion
     /// twice: the pinned set is kept.
@@ -86,6 +88,7 @@ impl std::fmt::Display for Error {
             Error::Malformed => f.write_str("not a node-API request"),
             Error::Local(why) => write!(f, "the descriptor: {why}"),
             Error::Answer(error) => write!(f, "the onion set: {error}"),
+            Error::Query(why) => write!(f, "the query: {why}"),
             Error::Onions => f.write_str("the registrar served no usable onion set"),
         }
     }
@@ -149,6 +152,12 @@ struct State {
     spare_purposes: Vec<Purpose>,
     /// Each purpose's spare once built.
     spares: HashMap<Purpose, Spare>,
+    /// Connections a caller opened ahead for a one-shot purpose's next
+    /// request to a space ([`Client::prepare`]).
+    prepared: HashMap<(SpaceId, Purpose), Spare>,
+    /// Held while such a connection opens: the request it is for waits
+    /// for it rather than opening another.
+    preparing: HashMap<(SpaceId, Purpose), Arc<tokio::sync::Mutex<()>>>,
     /// Moved each time spares are kept anew: a spare is kept, and taken,
     /// only under the keeping it was built for.
     spare_epoch: u64,
@@ -184,6 +193,12 @@ impl State {
             false
         });
         self.groups.retain(|(_, other), _| !of(other));
+        self.prepared.retain(|(other, _), prepared| {
+            if of(other) {
+                prepared.held.connection.close();
+            }
+            !of(other)
+        });
         if self.spare_for.is_some_and(|spare| of(&spare)) {
             self.drop_spares();
         }
@@ -223,21 +238,25 @@ impl State {
     /// The space and the purpose the next spare is built for, if one is
     /// wanted: none while dormant or in the background.
     fn wanted(&self) -> Option<(SpaceId, Purpose)> {
-        if self.dormant || !self.foreground {
-            return None;
-        }
         let space = self.spare_for?;
-        let now = Instant::now();
         self.spare_purposes
             .iter()
             .copied()
-            .find(|purpose| {
-                !self
-                    .spares
-                    .get(purpose)
-                    .is_some_and(|spare| spare.usable(now))
-            })
+            .find(|purpose| self.wants(space, *purpose))
             .map(|purpose| (space, purpose))
+    }
+
+    /// Whether a spare for `purpose` to `space` is wanted: kept for them,
+    /// awake and in the foreground, and none built and usable.
+    fn wants(&self, space: SpaceId, purpose: Purpose) -> bool {
+        !self.dormant
+            && self.foreground
+            && self.spare_for == Some(space)
+            && self.spare_purposes.contains(&purpose)
+            && !self
+                .spares
+                .get(&purpose)
+                .is_some_and(|spare| spare.usable(Instant::now()))
     }
 }
 
@@ -471,8 +490,14 @@ impl Client {
             self.inner.config.request
         };
         let connection = if purpose.one_shot() {
+            let preparing = self.state().preparing.get(&(space, purpose)).cloned();
+            if let Some(preparing) = preparing {
+                drop(preparing.lock().await);
+            }
             let (routes, route, version) = self.current(space, purpose)?;
-            let spare = spare.and_then(|epoch| self.take_spare(space, purpose, version, epoch));
+            let spare = self.take_prepared(space, purpose, version).or_else(|| {
+                spare.and_then(|epoch| self.take_spare(space, purpose, version, epoch))
+            });
             self.refill();
             match spare {
                 Some(spare) => spare,
@@ -494,6 +519,67 @@ impl Client {
                 Err(Error::Lost)
             }
         }
+    }
+
+    /// `requests` to `space` under `purpose`, in order: on a kept-open
+    /// purpose's connection all in flight at once, each answered as
+    /// [`Client::request`] answers it; a one-shot purpose's one after
+    /// another, each on a connection of its own. No spare carries them.
+    pub async fn requests(
+        &self,
+        space: SpaceId,
+        purpose: Purpose,
+        requests: &[Vec<u8>],
+    ) -> Vec<Result<Answer, Error>> {
+        if purpose.one_shot() {
+            let mut answers = Vec::with_capacity(requests.len());
+            for request in requests {
+                answers.push(self.request_with(space, purpose, request, None).await);
+            }
+            return answers;
+        }
+        all(requests
+            .iter()
+            .map(|request| self.request_with(space, purpose, request, None))
+            .collect())
+        .await
+    }
+
+    /// A timed fetch: the node's time, then the one query `query` makes
+    /// from it, both on one connection of [`Purpose::Fetch`]'s opened for
+    /// them alone (no spare), closed after. A read that names nothing of
+    /// the member's and needs the node's time for its expiry, so the time
+    /// read for it carries nothing else and the two cost one connection.
+    /// Anything but a query is refused before it leaves.
+    pub async fn fetch_timed(
+        &self,
+        space: SpaceId,
+        query: impl FnOnce(u64) -> Result<Vec<u8>, Error>,
+    ) -> Result<Answer, Error> {
+        let purpose = Purpose::Fetch;
+        let (routes, route, version) = self.current(space, purpose)?;
+        let connection = self.open(space, purpose, &routes, route, version).await?;
+        let deadline = self.inner.config.request;
+        let asked = async {
+            let (_, time) =
+                tokio::time::timeout(deadline, connection.request(Kind::Time as u16, &[]))
+                    .await
+                    .map_err(|_| Error::Lost)?
+                    .map_err(|_| Error::Lost)?;
+            let now = wire::time_answer(&time).map_err(Error::Answer)?;
+            let request = query(now)?;
+            let (kind, body) = request.split_at_checked(2).ok_or(Error::Malformed)?;
+            if u16::from_le_bytes([kind[0], kind[1]]) != Kind::Query as u16 {
+                return Err(Refused::Kind.into());
+            }
+            tokio::time::timeout(deadline, connection.request(Kind::Query as u16, body))
+                .await
+                .map_err(|_| Error::Lost)?
+                .map_err(|_| Error::Lost)
+        }
+        .await;
+        connection.close();
+        asked
     }
 
     /// A kept-open group's connection, open under the space's current
@@ -596,21 +682,18 @@ impl Client {
         space: SpaceId,
         registrar: &Registrar,
     ) -> Result<Vec<Onion>, Error> {
-        let (_, time) = self
-            .request_with(space, Purpose::Fetch, &wire::time_request(), None)
-            .await?;
-        let now = wire::time_answer(&time).map_err(Error::Answer)?;
-        let query = wire::query_request(
-            registrar.agent,
-            &registrar.identity,
-            registrar.instance,
-            vos_wire::credentials::method::ONIONS,
-            Vec::new(),
-            now + 60_000,
-        )
-        .map_err(Error::Answer)?;
         let (_, answer) = self
-            .request_with(space, Purpose::Fetch, &query, None)
+            .fetch_timed(space, |now| {
+                wire::query_request(
+                    registrar.agent,
+                    &registrar.identity,
+                    registrar.instance,
+                    vos_wire::credentials::method::ONIONS,
+                    Vec::new(),
+                    now + 60_000,
+                )
+                .map_err(Error::Answer)
+            })
             .await?;
         let onions: Vec<Onion> = wire::query_answer(&answer).map_err(Error::Answer)?;
         if !crate::route::usable_onions(&onions) {
@@ -702,6 +785,76 @@ impl Client {
             return Err(Error::Lost);
         }
         Ok(())
+    }
+
+    /// A connection of the one-shot `purpose` to `space` opened now and
+    /// held for that purpose's next request there, which takes it before
+    /// any spare: a flow opens the connection its proof goes on while the
+    /// user reads, as a spare is built, apart from every session's spares.
+    /// Closed unused at a life drawn around [`Config::spare_idle`], or with
+    /// the space's other connections.
+    pub async fn prepare(&self, space: SpaceId, purpose: Purpose) -> Result<(), Error> {
+        if !purpose.one_shot() {
+            return Ok(());
+        }
+        let (routes, route, version) = self.current(space, purpose)?;
+        let opening = Arc::new(tokio::sync::Mutex::new(()));
+        let _opening = Arc::clone(&opening).lock_owned().await;
+        self.state()
+            .preparing
+            .insert((space, purpose), Arc::clone(&opening));
+        let opened = self.open(space, purpose, &routes, route, version).await;
+        self.state()
+            .preparing
+            .retain(|_, held| !Arc::ptr_eq(held, &opening));
+        let connection = opened?;
+        let until =
+            Instant::now() + self.inner.config.spare_idle / 2 + below(self.inner.config.spare_idle);
+        let held = Spare {
+            held: Held {
+                version,
+                connection,
+            },
+            until,
+        };
+        let kept = Arc::downgrade(&held.held.connection);
+        if let Some(old) = self.state().prepared.insert((space, purpose), held) {
+            old.held.connection.close();
+        }
+        // Closed at its life's end unless a request took it.
+        let client = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(until.into()).await;
+            let (Some(inner), Some(connection)) = (client.upgrade(), kept.upgrade()) else {
+                return;
+            };
+            let mut state = inner.state.lock().expect("the client's state");
+            let unused = state
+                .prepared
+                .get(&(space, purpose))
+                .is_some_and(|prepared| Arc::ptr_eq(&prepared.held.connection, &connection));
+            if unused {
+                state.prepared.remove(&(space, purpose));
+                connection.close();
+            }
+        });
+        Ok(())
+    }
+
+    /// The connection prepared for `purpose`'s next request to `space`
+    /// under `version`, if it is still open: taken.
+    fn take_prepared(
+        &self,
+        space: SpaceId,
+        purpose: Purpose,
+        version: Version,
+    ) -> Option<Arc<Connection>> {
+        let prepared = self.state().prepared.remove(&(space, purpose))?;
+        if prepared.held.version == version && prepared.usable(Instant::now()) {
+            return Some(prepared.held.connection);
+        }
+        prepared.held.connection.close();
+        None
     }
 
     /// `purpose`'s spare, for a request to `space` under `version` by the
@@ -806,8 +959,9 @@ impl Client {
                 };
                 let mut state = client.state();
                 // Kept for whom it was opened for alone: not for a keeper
-                // that came since.
-                let wanted = state.wanted() == Some((space, purpose))
+                // that came since. Another purpose's spare taken meanwhile
+                // is built after this one, which stays.
+                let wanted = state.wants(space, purpose)
                     && state.spare_epoch == epoch
                     && Self::still(&state, space, version).is_ok();
                 if !wanted {
@@ -1019,6 +1173,34 @@ fn rand_u64() -> u64 {
     let mut bytes = [0u8; 8];
     let _ = getrandom::getrandom(&mut bytes);
     u64::from_le_bytes(bytes)
+}
+
+/// Every one of `futures` run at once on the calling task: their outputs,
+/// in order.
+async fn all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures: Vec<_> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if output.is_none() {
+                match future.as_mut().poll(cx) {
+                    std::task::Poll::Ready(done) => *output = Some(done),
+                    std::task::Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    outputs
+        .into_iter()
+        .map(|output| output.expect("every future done"))
+        .collect()
 }
 
 /// A uniform draw below `period`.

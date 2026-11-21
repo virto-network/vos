@@ -4,9 +4,12 @@
 package team.virto.vos.personal;
 
 import android.app.AlertDialog;
+import android.content.DialogInterface;
 import android.graphics.Typeface;
+import android.text.Editable;
 import android.text.InputType;
-import android.view.WindowManager;
+import android.text.TextWatcher;
+import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -27,8 +30,12 @@ import team.virto.s4.vos.Row;
 
 /**
  * The facility's forms over the personal space's screens, the app's own chrome: shown whole (its
- * rows as they are, its fields pre-filled, its notice apart), never screenshotted, answered by one
- * of its choices or declined. Asked on a Binder thread, which waits for the user.
+ * rows as they are, its fields pre-filled, its notice apart), never screenshotted in a release
+ * build, answered by one of its choices or declined. A field takes no suggestion and teaches the
+ * keyboard nothing; a kit's words ({@link KitWords#ENTER}, {@link KitWords#CHECK}) are checked
+ * against the kit's list as they are typed, completed from it in a row of the form's own, and not
+ * taken until they are a phrase (or the words asked). Asked on a Binder thread, which waits for
+ * the user.
  */
 final class FormDialog implements VosPrompts.Forms {
   /** How long a form waits for the user: the operation holds the personal space meanwhile. */
@@ -102,7 +109,10 @@ final class FormDialog implements VosPrompts.Forms {
       body.addView(label);
       body.addView(text(row.value, true));
     }
+    boolean phrase = KitWords.ENTER.equals(form.title);
+    boolean check = KitWords.CHECK.equals(form.title);
     List<EditText> fields = new ArrayList<>();
+    List<TextView> problems = new ArrayList<>();
     for (Row row : form.fields) {
       EditText field = new EditText(activity);
       field.setHint(row.label);
@@ -110,11 +120,15 @@ final class FormDialog implements VosPrompts.Forms {
       field.setInputType(
           InputType.TYPE_CLASS_TEXT
               | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-              | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+              | (check ? 0 : InputType.TYPE_TEXT_FLAG_MULTI_LINE)
               | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+      field.setImeOptions(EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
       body.addView(text(row.label, false));
       body.addView(field);
       fields.add(field);
+      if (phrase || check) {
+        problems.add(kitWords(body, field, check));
+      }
     }
     if (form.notice != null && !form.notice.isEmpty()) {
       TextView notice = text(form.notice, false);
@@ -148,9 +162,76 @@ final class FormDialog implements VosPrompts.Forms {
             .setNegativeButton("Cancel", (d, which) -> answer.complete(declined()))
             .create();
     dialog[0].setOnDismissListener(d -> shown.remove(dialog[0]));
-    dialog[0].getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+    if (phrase || check) {
+      // Taken only once the words are a phrase, or the words asked: the dialog stays meanwhile.
+      dialog[0].setOnShowListener(
+          d ->
+              dialog[0]
+                  .getButton(DialogInterface.BUTTON_POSITIVE)
+                  .setOnClickListener(
+                      v -> {
+                        boolean taken = true;
+                        for (int i = 0; i < fields.size(); i++) {
+                          String text = fields.get(i).getText().toString();
+                          String problem =
+                              check ? KitWords.wordProblem(text) : KitWords.problem(text, true);
+                          problems.get(i).setText(problem == null ? "" : problem);
+                          taken &= problem == null;
+                        }
+                        if (taken) {
+                          answer.complete(confirmed(0, fields));
+                          dialog[0].dismiss();
+                        }
+                      }));
+    }
+    PersonalActivity.secure(activity, dialog[0].getWindow());
     shown.add(dialog[0]);
     dialog[0].show();
+  }
+
+  /**
+   * Under {@code field}, which takes a kit's words (one, for a {@code check}): what is wrong with
+   * them as they are typed, and the kit's words completing the one under way, each a button that
+   * fills it in. The problem's view, for the form's answer to say it again.
+   */
+  private TextView kitWords(LinearLayout body, EditText field, boolean check) {
+    LinearLayout row = new LinearLayout(activity);
+    row.setOrientation(LinearLayout.HORIZONTAL);
+    TextView problem = text("", false);
+    problem.setTextColor(0xFFFFB74D);
+    body.addView(row);
+    body.addView(problem);
+    field.addTextChangedListener(
+        new TextWatcher() {
+          @Override
+          public void beforeTextChanged(CharSequence text, int start, int count, int after) {}
+
+          @Override
+          public void onTextChanged(CharSequence text, int start, int before, int count) {}
+
+          @Override
+          public void afterTextChanged(Editable editable) {
+            String text = editable.toString();
+            String said = KitWords.problem(text, false);
+            problem.setText(said == null ? "" : said);
+            row.removeAllViews();
+            for (String word : KitWords.completions(text)) {
+              Button complete = new Button(activity);
+              complete.setText(word);
+              complete.setAllCaps(false);
+              complete.setOnClickListener(
+                  v -> {
+                    String completed = KitWords.complete(field.getText().toString(), word);
+                    field.setText(check ? completed.trim() : completed);
+                    field.setSelection(field.getText().length());
+                  });
+              row.addView(
+                  complete,
+                  new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+            }
+          }
+        });
+    return problem;
   }
 
   private TextView text(String value, boolean mono) {

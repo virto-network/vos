@@ -705,19 +705,18 @@ async fn the_pinned_onion_set_is_refreshed_from_the_registrar() {
     *gateway.onions.lock().unwrap() = fresh.clone();
     assert_eq!(client.refresh_onions(a, &registrar).await.unwrap(), fresh);
     assert_eq!(client.routes(&a).unwrap().onions, fresh);
-    // The time and the query, each a fetch of its own; the member's
+    // The time and the query on one fetch of their own; the member's
     // connection closed with the set it was made from.
     let seen = gateway.seen();
-    assert_eq!(seen.len(), 3);
-    assert_eq!(seen[1].kinds(), [Kind::Time as u16]);
-    assert_eq!(seen[2].kinds(), [Kind::Query as u16]);
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1].kinds(), [Kind::Time as u16, Kind::Query as u16]);
     until(|| gateway.seen()[0].ended).await;
     client.request(a, Purpose::Member, &query()).await.unwrap();
     let addresses: Vec<String> = fresh
         .iter()
         .map(|onion| onion_address(&onion.key))
         .collect();
-    let Target::Onion { address, .. } = &gateway.seen()[3].target else {
+    let Target::Onion { address, .. } = &gateway.seen()[2].target else {
         panic!("a clearnet dial");
     };
     assert!(addresses.contains(address));

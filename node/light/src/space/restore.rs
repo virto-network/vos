@@ -7,15 +7,15 @@ use ed25519_dalek::Signer as _;
 use vos_abi::Encode;
 use vos_wire::homes;
 use vos_wire::personal::{
-    Attached, Body, DeviceView, Entry, KitKind, NewDevice, OpState, Overview, RECOVERY, Recorded,
-    RecoveryView, method,
+    Attached, Body, DeviceView, Entry, KitKind, NewDevice, OpState, Overview, Place, RECOVERY,
+    Recorded, RecoveryView, method,
 };
 
 use super::link::{Key, Signer, answer};
-use super::set::evidence;
+use super::set::{call_placed, evidence};
 use super::{
     Claim, Claimed, Error, Held, Host, PERSONAL, Personal, Posted, Prompts, Restoring, answered,
-    entered_kit, failed, link, logged, new_kit, secret, unreached,
+    entered_kit, failed, logged, new_kit, secret,
 };
 use crate::group::{Agent as GroupAgent, DeviceGroup, Restored};
 use crate::personal::{Link as _, recover};
@@ -36,13 +36,23 @@ impl<H: Host> Personal<H> {
         old: KitKind,
     ) -> Result<Posted, Error> {
         let mut held = self.held();
-        if held.group.is_some() {
+        // A device out of its group (its removal read through) restores as
+        // a fresh install, as it pairs again: what it kept is left once the
+        // kit is entered.
+        let out = held
+            .group
+            .as_ref()
+            .map(|group| group.course() == crate::group::Course::Out);
+        if out == Some(false) {
             return Err(Error::AlreadyHeld);
         }
         let kept = request.home.clone();
         self.pin(&kept);
         let home = kept.home.clone();
         let kit = entered_kit(prompts, old)?;
+        if out == Some(true) {
+            self.leave(&mut held)?;
+        }
         let signing = kit.signing();
         let mut session = Signer::new(signing.verifying_key().to_bytes());
         let mut resumed = match (&held.state.restoring, &held.state.home, held.state.agent) {
@@ -57,14 +67,7 @@ impl<H: Host> Personal<H> {
             && let Some(restoring) = held.state.restoring.clone()
             && restoring.signed.is_some()
         {
-            let mut link = link(
-                &self.host,
-                &kept,
-                Purpose::Personal,
-                agent,
-                &signing,
-                &mut session,
-            );
+            let mut link = self.link(&kept, Purpose::Personal, agent, &signing, &mut session);
             entries = logged(&mut link, 0)?;
             if restore_cancelled(&entries, &restoring.arguments) {
                 held.state.restoring = None;
@@ -103,7 +106,7 @@ impl<H: Host> Personal<H> {
                 let source = self.source(prompts, &mut held)?;
                 let secret = secret(prompts, &source, &home.handle)?;
                 let device = self.device(&mut held, prompts, &home, &secret, &request.label)?;
-                let kit = new_kit(prompts, request.kit, &kept)?;
+                let kit = new_kit(prompts, request.kit, &kept, None)?;
                 // The home, the agent and the restore are the device's in
                 // the split's batch.
                 let mut next = held.state.clone();
@@ -128,21 +131,15 @@ impl<H: Host> Personal<H> {
                 agent
             }
         };
-        let mut link = link(
-            &self.host,
-            &kept,
-            Purpose::Personal,
-            agent,
-            &signing,
-            &mut session,
-        );
+        let mut link = self.link(&kept, Purpose::Personal, agent, &signing, &mut session);
         let restoring = held.state.restoring.clone().ok_or(Error::NoSpace)?;
         if entries.is_empty() && restoring.signed.is_some() {
             entries = logged(&mut link, 0)?;
         }
         let taken = entries.iter().find_map(|(index, entry)| match &entry.body {
             Body::Operation { call, matures, .. }
-                if call.method == method::RESTORE.0 && call.arguments == restoring.arguments =>
+                if call.method == method::RESTORE.0
+                    && unplaced(&call.arguments) == Some(&restoring.arguments[..]) =>
             {
                 Some((
                     Posted {
@@ -170,14 +167,15 @@ impl<H: Host> Personal<H> {
                     self.keep(&held.light, &held.state)
                         .map_err(|error| error.to_string())
                 };
-                let called = link
-                    .settled(
-                        &mut Key::Lent(&mut kit_signer, &sign),
-                        method::RESTORE,
-                        restoring.arguments.clone(),
-                        &mut hold,
-                    )
-                    .map_err(unreached)?;
+                // Placed at the log's head as the agent answers it.
+                let called = call_placed(
+                    &mut link,
+                    &mut Key::Lent(&mut kit_signer, &sign),
+                    method::RESTORE,
+                    &restoring.arguments,
+                    &mut |link| super::kit::overview_head(link),
+                    &mut hold,
+                )?;
                 let recorded = answer::<Recorded>(&called.outcome)
                     .map_err(failed)?
                     .map_err(Error::AgentRefused)?;
@@ -242,28 +240,14 @@ impl<H: Host> Personal<H> {
         let signing = kit.signing();
         let mut kit_signer = Signer::new(signing.verifying_key().to_bytes());
         {
-            let mut link = link(
-                &self.host,
-                &kept,
-                Purpose::Personal,
-                agent,
-                &signing,
-                &mut kit_signer,
-            );
+            let mut link = self.link(&kept, Purpose::Personal, agent, &signing, &mut kit_signer);
             answered(link.wake())?;
         }
         let key = held.light.sync_key().clone();
         let (view, envelopes, overview, devices, policy) = {
             // The sync key's own session: a read that fails keeps what the
             // wakes before it used.
-            let mut link = link(
-                &self.host,
-                &kept,
-                Purpose::Personal,
-                agent,
-                &key,
-                &mut held.sync,
-            );
+            let mut link = self.link(&kept, Purpose::Personal, agent, &key, &mut held.sync);
             answered(link.settle())?;
             let view: RecoveryView = answered(link.query(method::RECOVERY, ()))?;
             let mut envelopes = Vec::new();
@@ -363,7 +347,7 @@ fn device_of(held: &Held, devices: &[DeviceView]) -> Result<NewDevice, Error> {
 fn restore_cancelled(entries: &[(u64, Entry)], arguments: &[u8]) -> bool {
     let Some(at) = entries.iter().find_map(|(index, entry)| match &entry.body {
         Body::Operation { call, .. }
-            if call.method == method::RESTORE.0 && call.arguments == arguments =>
+            if call.method == method::RESTORE.0 && unplaced(&call.arguments) == Some(arguments) =>
         {
             Some(*index)
         }
@@ -377,4 +361,9 @@ fn restore_cancelled(entries: &[(u64, Entry)], arguments: &[u8]) -> bool {
             Body::Settled { op, state: OpState::Cancelled { .. } } if *op == at
         )
     })
+}
+
+/// An admin call's arguments after the place it names.
+fn unplaced(arguments: &[u8]) -> Option<&[u8]> {
+    Place::split(arguments).map(|(_, rest)| rest)
 }

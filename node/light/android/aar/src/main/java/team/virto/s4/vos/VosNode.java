@@ -26,6 +26,7 @@ import team.virto.vos.personal.Claimed;
 import team.virto.vos.personal.Device;
 import team.virto.vos.personal.Home;
 import team.virto.vos.personal.IVosPersonal;
+import team.virto.vos.personal.IVosWatcher;
 import team.virto.vos.personal.KitView;
 import team.virto.vos.personal.Membership;
 import team.virto.vos.personal.Notice;
@@ -79,6 +80,11 @@ public final class VosNode {
   private final Map<Integer, IBinder> tokens = new HashMap<>();
   /** When each session was granted, by the monotonic clock: how long it was open, the logs say. */
   private final Map<Long, Long> grants = new java.util.concurrent.ConcurrentHashMap<>();
+  /** The personal space's screens, told each flow's stage and each pass's end; null: none. */
+  private volatile IVosWatcher watcher;
+  /** The token of the UI whose restore screen holds the kit, watched for its death. */
+  private IBinder sitting;
+  private final IBinder.DeathRecipient sittingDied = VosNode::nativeKitForget;
 
   /** The process's facility, opened on first use. */
   public static synchronized VosNode get(Context context) {
@@ -187,7 +193,32 @@ public final class VosNode {
     }
     Log.i(TAG, "personal sync done: " + synced.failed + " failed" + why(synced));
     Notices.post(context, synced);
+    IVosWatcher watching = watcher;
+    if (watching != null) {
+      try {
+        watching.passed();
+      } catch (RemoteException gone) {
+        watcher = null;
+      }
+    }
     return synced;
+  }
+
+  /**
+   * A personal flow's stage, from the library, said to the screens' watcher ({@code prompts} are
+   * the flow's, unused: a sign-in's and a payment's stages reach s4's chrome through {@link
+   * IVosPrompts#stage}). A stage carries no secret and no value.
+   */
+  void stage(IVosPrompts prompts, byte stage) {
+    IVosWatcher watching = watcher;
+    if (watching == null) {
+      return;
+    }
+    try {
+      watching.stage(stage);
+    } catch (RemoteException gone) {
+      watcher = null;
+    }
   }
 
   /** Bootstrap Tor now: false when it refuses, {@code refused} naming why. */
@@ -543,6 +574,46 @@ public final class VosNode {
     }
 
     @Override
+    public int commitRemovals(IVosPrompts prompts, Refused refused) {
+      return nativeCommitRemovals(prompts, refused);
+    }
+
+    @Override
+    public void kitHold(IBinder token) {
+      nativeKitHold();
+      synchronized (sittingDied) {
+        unwatchSitting();
+        try {
+          // The UI's process gone, the kit it entered goes with it.
+          token.linkToDeath(sittingDied, 0);
+          sitting = token;
+        } catch (RemoteException dead) {
+          nativeKitForget();
+        }
+      }
+    }
+
+    @Override
+    public void kitForget() {
+      nativeKitForget();
+      synchronized (sittingDied) {
+        unwatchSitting();
+      }
+    }
+
+    private void unwatchSitting() {
+      if (sitting != null) {
+        sitting.unlinkToDeath(sittingDied, 0);
+        sitting = null;
+      }
+    }
+
+    @Override
+    public void watch(IVosWatcher watching) {
+      watcher = watching;
+    }
+
+    @Override
     public Posted restore(ClaimRequest request, byte old, IVosPrompts prompts, Refused refused) {
       return nativeRestore(request, old, prompts, refused);
     }
@@ -577,11 +648,11 @@ public final class VosNode {
 
   /**
    * The UI's prompts, saying when a key was used (the proof starts then, with nothing more asked of
-   * the UI), and logging each stage of a sign-in or a payment with the milliseconds since it was
-   * asked: the form shown and answered, the key asked and answered, then done. A late form is the
-   * reads before it; a gap from the form's answer to the key's ask is the node's time read; a long
-   * wait from the key's answer to done, past the proof, is the send. Nothing of the form's values
-   * or the key's output is logged.
+   * the UI), passing on the stages the operation reports, and logging each stage of a sign-in or a
+   * payment with the milliseconds since it was asked: the form shown and answered, the key asked
+   * and answered, proving, sending, then done. A late form is the reads before it; a gap from the
+   * form's answer to the key's ask is the node's time read. Nothing of the form's values or the
+   * key's output is logged.
    */
   private static final class Announced extends IVosPrompts.Stub {
     private final IVosPrompts prompts;
@@ -600,7 +671,7 @@ public final class VosNode {
               + (granted == null ? "" : ", the session open " + (start - granted) + " ms"));
     }
 
-    private void stage(String stage) {
+    private void mark(String stage) {
       long now = SystemClock.elapsedRealtime() - start;
       Log.i(TAG, what + " " + stage + " at +" + now + " ms (+" + (now - last) + ")");
       last = now;
@@ -617,9 +688,9 @@ public final class VosNode {
 
     @Override
     public Answer confirm(Form form) throws RemoteException {
-      stage("form shown");
+      mark("form shown");
       Answer answer = prompts.confirm(form);
-      stage("form answered");
+      mark("form answered");
       return answer;
     }
 
@@ -629,15 +700,21 @@ public final class VosNode {
     }
 
     @Override
+    public void stage(String stage) throws RemoteException {
+      mark(stage);
+      prompts.stage(stage);
+    }
+
+    @Override
     public KeyResult signKey(byte kind, byte[] key, byte[] message) throws RemoteException {
       return prompts.signKey(kind, key, message);
     }
 
     @Override
     public KeyResult evaluateKey(byte kind, byte[] key, byte[] input) throws RemoteException {
-      stage("key asked");
+      mark("key asked");
       KeyResult result = prompts.evaluateKey(kind, key, input);
-      stage("key answered");
+      mark("key answered");
       if (result != null && result.status == KeyStatus.DONE) {
         Log.i(TAG, "proof started");
       }
@@ -758,6 +835,12 @@ public final class VosNode {
       Refused refused);
 
   private static native boolean nativeUpdate(IVosPrompts prompts, Refused refused);
+
+  private static native int nativeCommitRemovals(IVosPrompts prompts, Refused refused);
+
+  private static native void nativeKitHold();
+
+  private static native void nativeKitForget();
 
   private static native Posted nativeRestore(
       ClaimRequest request, byte old, IVosPrompts prompts, Refused refused);

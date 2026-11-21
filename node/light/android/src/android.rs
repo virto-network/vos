@@ -35,6 +35,11 @@ use crate::{Enroll, EnrolledSpace, JobRun, Pay, SignIn, StreamTarget, refused};
 
 static VM: OnceLock<JavaVM> = OnceLock::new();
 
+/// The process's `VosNode`, which each flow's stage is handed to
+/// (`VosNode.stage`): a sign-in's or a payment's to its announcing prompts,
+/// a personal flow's to the screens' watcher.
+static VOS_NODE: OnceLock<Global<JObject<'static>>> = OnceLock::new();
+
 fn failed(error: impl std::fmt::Display) -> Refusal {
     refused(Code::Failed, error.to_string())
 }
@@ -143,6 +148,41 @@ impl Prompts for Lent {
             key_answer(env, answer)
         })
         .unwrap_or_else(|refusal| KeyAnswer::Failed(refusal.message))
+    }
+
+    fn step(&self, stage: crate::personal::Stage) {
+        let Some(node) = VOS_NODE.get() else {
+            return;
+        };
+        let _ = attached(|env| {
+            env.call_method(
+                &**node,
+                jni_str!("stage"),
+                jni_sig!("(Lteam/virto/s4/vos/IVosPrompts;B)V"),
+                &[JValue::Object(&self.prompts), JValue::Byte(stage as i8)],
+            )
+            .map(drop)
+            .map_err(|_| java::refusal(env))
+        });
+    }
+
+    /// A one-way call: a client gone shows nothing, and the operation goes on.
+    fn stage(&self, stage: &str) {
+        let _ = attached(|env| {
+            let stage = env.new_string(stage).map_err(failed)?;
+            if env
+                .call_method(
+                    &self.prompts,
+                    jni_str!("stage"),
+                    jni_sig!("(Ljava/lang/String;)V"),
+                    &[JValue::Object(&stage)],
+                )
+                .is_err()
+            {
+                java::refusal(env);
+            }
+            Ok(())
+        });
     }
 }
 
@@ -348,6 +388,7 @@ natives! {
         let _ = VM.set(env.get_java_vm().map_err(failed)?);
         java::init(env, &loader).map_err(failed)?;
         java::load(env, &loader, contract::REGISTRY).map_err(failed)?;
+        let _ = VOS_NODE.set(env.new_global_ref(&device).map_err(failed)?);
         let device = Arc::new(JavaDevice {
             node: env.new_global_ref(&device).map_err(failed)?,
         });
@@ -633,6 +674,28 @@ natives! {
         let lent = prompts(env, &lent)?;
         node.personal()?.update(&*lent)?;
         Ok(true)
+    }
+
+    personal fn nativeCommitRemovals(lent: JObject<'l>) -> jint, |env, node| {
+        let lent = prompts(env, &lent)?;
+        let revoked = node.personal()?.commit_removals(&*lent)?;
+        Ok(revoked as jint)
+    }
+
+    /// The restore screen's sitting opened: the kit its flows enter held.
+    quiet fn nativeKitHold() -> (), |_env, node| {
+        if let Ok(space) = node.space() {
+            space.hold_kit();
+        }
+        Ok(())
+    }
+
+    /// The sitting closed: the kit it held, if any, zeroized.
+    quiet fn nativeKitForget() -> (), |_env, node| {
+        if let Ok(space) = node.space() {
+            space.forget_kit();
+        }
+        Ok(())
     }
 
     personal fn nativeRestore(request: JObject<'l>, old: jbyte, lent: JObject<'l>) -> JObject<'l>, |env, node| {

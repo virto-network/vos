@@ -67,6 +67,10 @@ const WINDOW: &str =
     "the space admits none of this app's programs: the app or the space must update";
 /// A window a space's node could not compute whole yet.
 const UNAVAILABLE: &str = "the space's node cannot read its device window yet: try again";
+/// The stages of a sign-in or a payment the chrome shows, after its form
+/// and its key: the proof made on the device, then sent over Tor.
+const PROVING: &str = "Proving…";
+const SENDING: &str = "Sending…";
 /// A space's handle, an agent and an instance there: whose device window.
 type WindowKey = ([u8; 32], u32, u32);
 /// How long a space's device window is taken as read.
@@ -79,6 +83,16 @@ static SESSIONS: AtomicU64 = AtomicU64::new(1);
 /// The least time between two `refresh` requests the facility honours, and
 /// the spread of the read one schedules.
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
+/// How long a sign-in with no path waits for the space to list the
+/// member (the operator's invitation), and how often it reads the feed
+/// meanwhile.
+const LISTED_WAIT: Duration = Duration::from_secs(60);
+const LISTED_EVERY: Duration = Duration::from_secs(5);
+/// What a sign-in says while it waits for the space to list the device.
+pub const WAITING_FOR_LIST: &str =
+    "Waiting for the space to list your device (the operator's invitation)…";
+/// Why a sign-in found no leaf of the member's after its wait.
+const NOT_INVITED: &str = "Your device is enrolled; the operator has not invited it yet.";
 const REFRESH_SPREAD: Duration = Duration::from_secs(5);
 
 /// The release artifacts of VOS's stock kernels, each an encoded
@@ -133,6 +147,9 @@ pub(crate) struct Inner {
     /// Held for a proof: two at once would hold a proof's memory twice.
     device_proof: Mutex<()>,
     tick: Duration,
+    /// How long a sign-in with no path waits for the space to list the
+    /// member, and how often it reads the feed meanwhile.
+    listed: (Duration, Duration),
     /// The one client every request to a space goes through.
     pub(crate) net: Arc<Net>,
     /// Each enrollment's tree and its refresher, by origin, for the
@@ -267,6 +284,7 @@ impl Facility {
                 programs: Programs::default(),
                 device_proof: Mutex::new(()),
                 tick: TICK,
+                listed: (LISTED_WAIT, LISTED_EVERY),
                 net,
                 trees: Mutex::new(HashMap::new()),
                 personal: Mutex::new(None),
@@ -295,6 +313,13 @@ impl Facility {
     /// The same, its refreshers asking their keepers every `tick` (tests).
     pub fn with_tick(mut self, tick: Duration) -> Self {
         self.inner_mut().tick = tick;
+        self
+    }
+
+    /// The same, a sign-in with no path waiting `wait` for its leaf and
+    /// reading the feed `every` meanwhile (tests).
+    pub fn with_listed_wait(mut self, wait: Duration, every: Duration) -> Self {
+        self.inner_mut().listed = (wait, every);
         self
     }
 
@@ -1062,6 +1087,7 @@ impl Session {
                 (None, Some(paired)) => vec![choice(paired.kind()).into()],
                 (None, None) => kinds.iter().map(|kind| choice(*kind).into()).collect(),
             },
+            code: None,
         };
         let Answer::Confirmed { choice, .. } = chrome.confirm(form).await else {
             return Err(declined());
@@ -1115,25 +1141,27 @@ impl Session {
         drop(self.warm());
         // The digests the operator invites, shown here: a server's document
         // could show its own in their place.
+        let (member, owner) = (member.to_bytes(), owner.to_bytes());
         chrome
             .confirm(Form {
                 title: "This device's digests".into(),
-                detail: "Read these to the space's operator from this screen, never from \
-                         the server's, so no one else's are invited in their place."
+                detail: "Let the space's operator scan this code from this screen, never \
+                         from the server's, so no one else's are invited in their place; \
+                         then compare the check: the operator's tool shows the same six \
+                         digits."
                     .into(),
                 rows: vec![
-                    ("Member".into(), hex::encode(member.to_bytes())),
-                    ("Owner".into(), hex::encode(owner.to_bytes())),
+                    ("Check".into(), vos_api::enrollment_check(&member, &owner)),
+                    ("Member".into(), hex::encode(member)),
+                    ("Owner".into(), hex::encode(owner)),
                 ],
                 fields: Vec::new(),
                 notice: None,
                 choices: vec!["Done".into()],
+                code: Some(vos_api::enrollment_code(&member, &owner)),
             })
             .await;
-        Ok(Enrolled {
-            member: member.to_bytes(),
-            owner: owner.to_bytes(),
-        })
+        Ok(Enrolled { member, owner })
     }
 
     /// The pinned method `name`, which `wanted` accepts.
@@ -1206,11 +1234,46 @@ impl Session {
         }
     }
 
-    /// Why the member has no path: its tree read to the feed's end holds
-    /// no leaf of its (its invitation not claimed yet, or claimed since
-    /// that read: the tree's own timer reads it again within a minute, no
-    /// read made now, so none follows the sign-in); or the tree is not read
-    /// to its end yet.
+    /// The member's path once the space lists it: a sign-in with none
+    /// yet (its invitation not claimed when the tree was read, or the
+    /// tree not read to its end) says it waits and reads the feed now and
+    /// every [`LISTED_EVERY`] for up to [`LISTED_WAIT`] (a read that has
+    /// a path makes none), so the user need not tap again. Past the wait,
+    /// why there is none: the tree read to the feed's end holds no leaf of
+    /// the member's, or is not read to its end yet. The gateway can join a
+    /// sign-in made seconds after the first root holding a new leaf to the
+    /// newest member, as it can a sign-in tapped again (`light-node.md`
+    /// §6.2).
+    async fn listed(
+        &self,
+        enrollment: &Enrollment,
+        chrome: &dyn Chrome,
+    ) -> Result<AuthWitness, Refusal> {
+        if let Some(witness) = self.witness() {
+            return Ok(witness);
+        }
+        chrome.stage(WAITING_FOR_LIST);
+        let (wait, every) = self.inner.listed;
+        let until = Instant::now() + wait;
+        if let Some(tree) = self.inner.tree_of(enrollment) {
+            loop {
+                // The read fails or is due again at the next turn alike.
+                let _ = read_now(&self.inner.net, &tree, enrollment).await;
+                if let Some(witness) = self.witness() {
+                    return Ok(witness);
+                }
+                if Instant::now() + every > until {
+                    break;
+                }
+                tokio::time::sleep(every).await;
+            }
+        }
+        Err(self.pathless().await)
+    }
+
+    /// Why the member has no path after the wait: its tree read to the
+    /// feed's end holds no leaf of its (the operator has not invited the
+    /// device yet); or the tree is not read to its end yet.
     async fn pathless(&self) -> Refusal {
         let leafless = match self.tree() {
             Some(tree) => {
@@ -1220,11 +1283,7 @@ impl Session {
             None => false,
         };
         if leafless {
-            refused(
-                Code::Unclaimed,
-                "claim your invitation first: the space's tree holds no leaf of this device's \
-                 member (claimed just now? the device reads the tree again within a minute)",
-            )
+            refused(Code::Unclaimed, NOT_INVITED)
         } else {
             refused(
                 Code::NoPath,
@@ -1257,9 +1316,7 @@ impl Session {
             ));
         }
         self.inner.admits(&enrollment, Kernel::Auth).await?;
-        let Some(witness) = self.witness() else {
-            return Err(self.pathless().await);
-        };
+        let witness = self.listed(&enrollment, chrome).await?;
         self.apart(Learned::SignedIn)?;
         self.read_clock_meanwhile(&enrollment);
         let form = Form {
@@ -1301,6 +1358,7 @@ impl Session {
             } else {
                 "Prove".into()
             }],
+            code: None,
         };
         if !matches!(chrome.confirm(form).await, Answer::Confirmed { .. }) {
             return Err(declined());
@@ -1315,9 +1373,11 @@ impl Session {
             .await?;
         let refused_root = witness.root;
         let secret = self.secret(&enrollment).await?;
+        chrome.stage(PROVING);
         let started = Instant::now();
         let request = self.prove_sign_in(call, scope, &secret, witness).await?;
         let mut proving_ms = started.elapsed().as_millis() as u64;
+        chrome.stage(SENDING);
         let mut answer = self.send(&enrollment, &request).await?;
         let again = match root_refused(&answer) {
             Some(stale) => self.next_witness(&enrollment, refused_root, stale).await,
@@ -1325,10 +1385,12 @@ impl Session {
         };
         if let Some(again) = again {
             let call = self.call_for(&enrollment, method, arguments).await?;
+            chrome.stage(PROVING);
             let started = Instant::now();
             let request = self.prove_sign_in(call, scope, &secret, again).await?;
             proving_ms += started.elapsed().as_millis() as u64;
             drop(secret);
+            chrome.stage(SENDING);
             answer = self.send(&enrollment, &request).await?;
         }
         Ok(SignedIn { answer, proving_ms })
@@ -1457,6 +1519,7 @@ impl Session {
                 ],
                 notice: notice.take(),
                 choices: vec!["Pay".into()],
+                code: None,
             };
             let Answer::Confirmed { values, .. } = chrome.confirm(form).await else {
                 return Err(declined());
@@ -1496,11 +1559,13 @@ impl Session {
                 .filter(|last| last.values == values && now + 5_000 < last.expires_ms)
         });
         if let Some(again) = again {
+            chrome.stage(SENDING);
             return Ok(answer(self.send(&enrollment, &again.request).await?, 0));
         }
         let arguments = vos_light::transfer_arguments(&values.0, amount);
         let call = self.call_at(&enrollment, method, arguments, now)?;
         let secret = self.secret(&enrollment).await?;
+        chrome.stage(PROVING);
         let started = Instant::now();
         let expires_ms = call.expires_ms;
         let bytes = Inner::prove(
@@ -1522,6 +1587,7 @@ impl Session {
                 request: bytes.clone(),
             });
         }
+        chrome.stage(SENDING);
         Ok(answer(self.send(&enrollment, &bytes).await?, proving_ms))
     }
 
@@ -1641,11 +1707,27 @@ impl Session {
     }
 }
 
-/// The feed read into `tree` if its keeper says so, on the space's feed
+/// The feed read into `tree` now, due or not: a sign-in waiting for the
+/// space to list its member ([`Session::listed`]).
+async fn read_now(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<(), String> {
+    read_feed(net, tree, enrollment, true).await
+}
+
+/// The feed read into `tree` if its keeper says so (`read_feed`).
+async fn read_once(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<(), String> {
+    read_feed(net, tree, enrollment, false).await
+}
+
+/// The feed read into `tree` if its keeper says so, or `now`, on the space's feed
 /// connection, and the keeper kept if the read changed it (a change
 /// applied, or the tree dropped to start over from the feed's start); a
 /// `refresh` asked for and due makes it so first.
-async fn read_once(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<(), String> {
+async fn read_feed(
+    net: &Net,
+    tree: &Tree,
+    enrollment: &Enrollment,
+    now: bool,
+) -> Result<(), String> {
     let registrar = registrar(enrollment)?;
     let mut keeper = tree.keeper.lock().await;
     {
@@ -1656,7 +1738,7 @@ async fn read_once(net: &Net, tree: &Tree, enrollment: &Enrollment) -> Result<()
             *tree.last_refresh.lock().expect("refresh poisoned") = Some(Instant::now());
         }
     }
-    if !keeper.due(now_ms()) {
+    if !now && !keeper.due(now_ms()) {
         return Ok(());
     }
     let before = keeper.encode();
