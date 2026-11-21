@@ -12,7 +12,7 @@ pub mod contract;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vos_abi::ids::InstanceId;
 use vos_light::group::Alarm;
@@ -261,16 +261,19 @@ impl Sitting {
         holding.kit = None;
     }
 
-    /// `kit`, entered in the sitting `opened`, held while that sitting is
-    /// still open: the generation and life to time its wipe at.
-    fn keep(&self, kit: Entered, opened: u64) -> Option<(u64, u64)> {
+    /// `kit`, entered in the sitting `opened` at `entry`, held while that
+    /// sitting is still open and its life from `entry` lasts: the
+    /// generation to time its wipe at, and the life left.
+    fn keep(&self, kit: Entered, opened: u64, entry: Instant) -> Option<(u64, Duration)> {
         let mut holding = self.lock();
-        if !holding.open || holding.opened != opened {
+        let life = Duration::from_millis(holding.life_ms.unwrap_or(KIT_LIFE_MS));
+        let left = life.saturating_sub(entry.elapsed());
+        if !holding.open || holding.opened != opened || left.is_zero() {
             return None;
         }
         holding.generation += 1;
         holding.kit = Some(kit);
-        Some((holding.generation, holding.life_ms.unwrap_or(KIT_LIFE_MS)))
+        Some((holding.generation, left))
     }
 
     fn expire(&self, generation: u64) {
@@ -301,8 +304,9 @@ impl Sitting {
 pub struct Asked<'a> {
     prompts: &'a dyn Prompts,
     sitting: Option<&'a Sitting>,
-    /// The kit this flow entered, for the sitting to hold once it is done.
-    entered: Mutex<Option<Entered>>,
+    /// The kit this flow entered and when, for the sitting to hold once it
+    /// is done, for what is left of its life from the entry.
+    entered: Mutex<Option<(Entered, Instant)>>,
 }
 
 impl<'a> Asked<'a> {
@@ -523,7 +527,7 @@ impl space::Prompts for Asked<'_> {
         };
         let words = normalized(&Zeroizing::new(values.join(" ")));
         if self.sitting.is_some() {
-            *crate::lock(&self.entered) = Some(Entered::Words(words.clone()));
+            *crate::lock(&self.entered) = Some((Entered::Words(words.clone()), Instant::now()));
         }
         Some(words)
     }
@@ -622,10 +626,11 @@ impl space::Prompts for Asked<'_> {
             "the security key's output",
         )?;
         if entered {
-            *crate::lock(&self.entered) = Some(Entered::Touched {
+            let kit = Entered::Touched {
                 salt: *salt,
                 secret: secret.clone(),
-            });
+            };
+            *crate::lock(&self.entered) = Some((kit, Instant::now()));
         }
         Ok(secret)
     }
@@ -921,7 +926,8 @@ impl Space {
     }
 
     /// `flow` within the sitting: the kit it entered held after, unless it
-    /// is not a kit or not this space's, which is wiped; its wipe timed.
+    /// is not a kit or not this space's, which is wiped, or its life from
+    /// the entry ended while the flow ran; its wipe timed from the entry.
     fn with_kit<T>(
         &self,
         prompts: Lent<'_>,
@@ -934,12 +940,12 @@ impl Space {
         match &done {
             Err(Error::NotAKit | Error::WrongKit | Error::NoAgentForKit) => self.sitting.wipe(),
             _ => {
-                if let Some((generation, life)) =
-                    entered.and_then(|kit| self.sitting.keep(kit, opened))
+                if let Some((generation, left)) =
+                    entered.and_then(|(kit, entry)| self.sitting.keep(kit, opened, entry))
                 {
                     let sitting = Arc::clone(&self.sitting);
                     self.personal.host().runtime.spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(life)).await;
+                        tokio::time::sleep(left).await;
                         sitting.expire(generation);
                     });
                 }
@@ -1415,11 +1421,30 @@ mod tests {
         sitting.close();
         sitting.open();
         let words = Entered::Words(Zeroizing::new("zoo".into()));
-        assert!(sitting.keep(words, opened).is_none());
+        assert!(sitting.keep(words, opened, Instant::now()).is_none());
         assert!(sitting.lock().kit.is_none());
         let now = sitting.lock().opened;
         let words = Entered::Words(Zeroizing::new("zoo".into()));
-        assert!(sitting.keep(words, now).is_some());
+        assert!(sitting.keep(words, now, Instant::now()).is_some());
+    }
+
+    /// A kit's life runs from its entry: one whose life ended while its
+    /// flow ran is not held, and one held is held for what is left.
+    #[test]
+    fn a_kit_is_held_for_its_life_from_the_entry() {
+        let sitting = Sitting::default();
+        sitting.open();
+        sitting.lock().life_ms = Some(1_000);
+        let opened = sitting.lock().opened;
+        let entry = Instant::now() - Duration::from_millis(1_000);
+        let words = Entered::Words(Zeroizing::new("zoo".into()));
+        assert!(sitting.keep(words, opened, entry).is_none());
+        assert!(sitting.lock().kit.is_none());
+        let entry = Instant::now() - Duration::from_millis(600);
+        let words = Entered::Words(Zeroizing::new("zoo".into()));
+        let (_, left) = sitting.keep(words, opened, entry).unwrap();
+        assert!(left <= Duration::from_millis(400));
+        assert!(sitting.lock().kit.is_some());
     }
 
     #[test]
