@@ -702,7 +702,57 @@ snapshot in 1.04 s. The other two missed as measured:
   a replica at the load's end, which counts the 255 MiB the agents pushed
   and the store's caches.
 
-The rerun is `open.md`'s.
+**The rerun** [measured, compumax (capped) + sigma, 2026-11-20; the same
+layout, each node pinned to four of compumax's 64 threads (16 in all, one
+thread of a core each); the transfers' p99 read by the driver at buckets
+under 1% wide; four runs of an hour alternating at 5,000 calls a second,
+then a pair at 3,000; every run with the same build, seed and cap]: the
+rise is real at 5,000 calls a second, and that load is the stream bound's
+knee, not a margin.
+- **At 5,000 calls a second:** without personal agents the p99 was
+  2.88 s and 2.83 s (the two runs 1.7% apart), but it climbed through each
+  hour (its ten-minute p99 from 1.2–1.3 s to 3.3–3.8 s) with up to 7,200
+  requests in flight on one node's connection against the node's 1,024
+  streams: the driver queues in front of the node. With the agents, one
+  run tipped over 35 minutes in (3.4% of its transfers timed out, the
+  answered rate fell from 4,700 to 2,700 a second, 58,668 in flight) and
+  the other held at 5.31 s, +87%. The nodes' CPU was the same, 63–69%, in
+  all four.
+- **Where it comes from:** the nodes' stages, at their own buckets: the
+  commit, the fsync and the apply did not move; the batch's p99 rose from
+  0.52 to 0.79 s, the time a call is queued at its p50 from 65 to 82 ms,
+  and the waits for an executor doubled at p99 (the dry run's 66 to 131 ms, the
+  refine's 57 to 115 ms). The agents' calls take the same three executors
+  as the shards' batches and run long (their steps' gas p99 20 times the
+  shards'), so a shard's batch waits behind a push; at the knee the
+  driver's queue multiplies that wait (the calls waiting behind their
+  user's last rose from 567,000 to 919,000).
+- **At 3,000 calls a second** (in flight mostly under 1,024, at most about
+  2,000; CPU 53–60%): 0.72 s without agents, 0.89 s with them, **+23%**,
+  one pair, its ten-minute p99s 0.53–0.96 s and 0.63–1.04 s; the nodes'
+  stages within a bucket of each other.
+- **The gate reads:** missed in both pairs at 5,000 (the first collapsed);
+  at 3,000, 23% against 20%, inside the run's own ten-minute spread and
+  with no second pair to set it against. A fix keeps a long personal call
+  off the executors the batches wait for (a lane of its own, or the queue
+  ordered by gas), and the gate is run below the stream bound's knee
+  (`api_in_flight` raised, or a driver connection per stream budget), so
+  that it reads the node and not the driver's queue.
+- **Memory:** +56–59 KiB a replica right after creation, in all three runs
+  with agents: **met** as the fixed overhead. At the load's end, against
+  the run without them: +89 KiB a replica at 3,000 and +113–120 KiB at
+  5,000, which counts the 255 MiB of pushed envelopes (about 26 KiB a
+  replica, every node holding all three) and the larger log cache.
+- **Creation through `claim`:** 10,001 agents in about 1,850 s, 5.4 a
+  second. **Wakes:** 40,000 each of `alive`, `since`, `push` and the
+  whole wake in every run, none failed; a wake p50 0.59–0.63 s and p99
+  2.2–2.3 s at 5,000, 0.22 s and 1.25 s at 3,000.
+
+This compumax ran kernel 6.18 with all 64 threads online, its clock 340 ms
+off the coordinator's (its NTP source's; the drivers time by their own
+monotonic clock) and sigma's governor `powersave`; on 2026-11-06 it was
+7.2, 32 threads, `performance`. The 1.84 s and 2.83 s baselines are not
+set against each other. What remains is `open.md`'s.
 
 **Reaching the agent: every gateway lists every node.** A node that does
 not replicate an agent answers `Elsewhere { replicas }`
