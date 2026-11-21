@@ -896,7 +896,8 @@ pub enum PersonalError {
     /// An admin call from a device's sync key.
     #[codec(index = 3)]
     SyncKey,
-    /// The device is in probation: it signs no operation or commit.
+    /// The device is in probation: it signs no operation or commit but its
+    /// own removal.
     #[codec(index = 4)]
     Probation,
     /// The device's removal matured: it has no voice.
@@ -998,7 +999,7 @@ pub enum PersonalError {
     #[codec(index = 37)]
     Unseasoned,
     /// A device the operation acts on signs no resolution or second
-    /// signature of it.
+    /// signature of it, nor the operation itself but its own removal.
     #[codec(index = 38)]
     Targeted,
     /// The signer holds as many open operations as it may.
@@ -1029,4 +1030,12 @@ pub enum PersonalError {
     /// again and sign the call at its head.
     #[codec(index = 46)]
     StaleHead,
+    /// A device's own removal, its leave: it matures with its evidence, and
+    /// no one vetoes, cosigns or resolves it.
+    #[codec(index = 47)]
+    Leaving,
+    /// The set's last live device leaves nothing to commit its leave: a
+    /// restore with the kit replaces it instead.
+    #[codec(index = 48)]
+    Alone,
 }

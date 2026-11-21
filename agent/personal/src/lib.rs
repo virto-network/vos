@@ -251,7 +251,9 @@ impl Personal {
 
     /// Remove `target`, signed by an active device or the kit: pending for
     /// the signer's delay, then matured unless vetoed, from which the
-    /// device has no voice and the next commit carries it.
+    /// device has no voice and the next commit carries it. Signed by
+    /// `target` itself, on its probation too, it is its leave: it matures
+    /// when its evidence is posted, and no one vetoes it.
     #[msg(gas = 40_000_000)]
     pub async fn remove(
         &mut self,
@@ -259,7 +261,8 @@ impl Personal {
         place: Place,
         target: DeviceId,
     ) -> Result<Recorded, PersonalError> {
-        let (now, call, by) = self.admin(ctx, place, &personal::Remove { place, target })?;
+        let message = personal::Remove { place, target };
+        let (now, call, by) = self.admin_as(ctx, place, &message, Some(target))?;
         self.open_operation(now, call, by, Op::Remove(target))
     }
 
@@ -647,6 +650,7 @@ impl Personal {
             },
         );
         self.evidenced.insert(&index, &at);
+        self.evidenced_leave(index, now);
         Ok(Recorded { at: now, index: at })
     }
 

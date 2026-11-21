@@ -2,7 +2,7 @@
 //! minute: standing and seasoning, operations and their delays, vetoes,
 //! contests and resolutions, immediate removal, a probation frozen under
 //! a removal, the kit's operations, a restore and its `R2`, kit rotation,
-//! admin-key replacement, a delayed admin's add and a regroup.
+//! admin-key replacement, a delayed admin's add, a regroup and a leave.
 
 use vos_wire::personal::{
     AdminClass, Attestation, Body, Cancel, DeviceView, Entry, NewAdmin, OpState, RECOVERY,
@@ -71,11 +71,6 @@ fn a_device_is_in_probation_then_active_then_seasoned() {
     let (zero, one) = (view(&home, sync(0), 0), view(&home, sync(0), 1));
     assert_eq!((zero.standing, zero.seasoned), (Standing::Active, false));
     assert_eq!((one.standing, one.seasoned), (Standing::Probation, false));
-    assert_eq!(
-        home.operate(admin(0), "remove", 0u32),
-        Err(PersonalError::Targeted),
-        "no device removes itself"
-    );
     let removal = home.operate(KIT, "remove", 0u32).unwrap();
     assert_eq!(
         home.operate(admin(1), "veto", removal),
@@ -1259,4 +1254,116 @@ fn a_removed_device_reads_the_log_its_removal_rests_on() {
         home.query::<Vec<(u64, Entry)>>(Principal::Client([0x77; 32]), "log", 0u64),
         Err(PersonalError::NotAdmitted)
     );
+}
+
+/// A leave: a device's own removal, signed by its own admin key, on its
+/// probation too, matures when its evidence is posted, with no delay;
+/// no device vetoes or cosigns it, and from then the device has no voice.
+/// The set's last live device may not leave: nothing would commit it.
+#[test]
+fn a_device_leaves_by_its_own_removal_on_its_probation_too() {
+    let mut home = seasoned(1);
+    home.pair(0, 1);
+    assert_eq!(standing(&home, sync(0), 1), Standing::Probation);
+    let leave = home.unevidenced(admin(1), "remove", 1u32).unwrap();
+    assert_eq!(state(&home, sync(0), leave), OpState::Pending);
+    assert_eq!(
+        home.unevidenced(admin(1), "remove", 1u32),
+        Err(PersonalError::Pending),
+        "one leave open at once"
+    );
+    assert_eq!(
+        home.operate(admin(0), "veto", leave),
+        Err(PersonalError::Leaving)
+    );
+    assert_eq!(
+        home.operate(admin(0), "cosign", leave),
+        Err(PersonalError::Leaving)
+    );
+    assert_eq!(
+        home.operate(admin(1), "veto", leave),
+        Err(PersonalError::Probation),
+        "a leave signs nothing else on probation"
+    );
+    let signed = message(device(1).admin, home.method("remove"), &home.logged(leave));
+    home.call::<Recorded>(
+        sync(1),
+        "evidence",
+        evidence(leave, signed, Attached::default()),
+    )
+    .unwrap();
+    assert!(matured(state(&home, sync(0), leave)));
+    assert_eq!(standing(&home, sync(0), 1), Standing::Removed);
+    let log = log_read(&home, sync(1)).unwrap();
+    assert!(
+        log.iter()
+            .any(|(_, entry)| entry.body == Body::Matured { device: 1 }),
+        "the leaver reads its removal through"
+    );
+    assert_eq!(
+        home.operate(admin(1), "remove", 0u32),
+        Err(PersonalError::NotAdmitted),
+        "its keys admitted no more"
+    );
+    assert_eq!(
+        home.operate(admin(0), "remove", 0u32),
+        Err(PersonalError::Alone)
+    );
+}
+
+/// A leave whose evidence never comes is cancelled `Unevidenced` once the
+/// operation delay passes, its signer keeping its voice.
+#[test]
+fn a_leave_without_its_evidence_is_cancelled() {
+    let mut home = seasoned(2);
+    let leave = home.unevidenced(admin(1), "remove", 1u32).unwrap();
+    home.pass(3 * MINUTE + 1);
+    home.wake(sync(0)).unwrap();
+    assert_eq!(
+        cancelled(state(&home, sync(0), leave)),
+        Some(Cancel::Unevidenced)
+    );
+    assert_eq!(standing(&home, sync(0), 1), Standing::Active);
+    home.operate(admin(1), "remove", 1u32).unwrap();
+    assert_eq!(standing(&home, sync(0), 1), Standing::Removed);
+}
+
+/// A leave while another device's removal of the leaver is open, pending,
+/// vetoed by the leaver, or one of a pair aimed at each other: the leave
+/// takes no other removal's place and matures; the removal of the leaver
+/// ends `Moot` with it, and the leaver's own removal of its rival is
+/// cancelled with its silencing, the rival keeping its voice.
+#[test]
+fn a_leave_ends_the_removals_aimed_at_its_device() {
+    for case in ["pending", "vetoed", "rivals"] {
+        let mut home = seasoned(3);
+        let removal = home.operate(admin(0), "remove", 2u32).unwrap();
+        let rival = match case {
+            "vetoed" => {
+                home.operate(admin(2), "veto", removal).unwrap();
+                None
+            }
+            "rivals" => Some(home.operate(admin(2), "remove", 0u32).unwrap()),
+            _ => None,
+        };
+        let leave = home.operate(admin(2), "remove", 2u32).unwrap();
+        assert!(matured(state(&home, sync(0), leave)), "{case}");
+        assert_eq!(standing(&home, sync(0), 2), Standing::Removed, "{case}");
+        assert_eq!(
+            cancelled(state(&home, sync(0), removal)),
+            Some(Cancel::Moot),
+            "{case}"
+        );
+        home.wake(sync(0)).unwrap();
+        if let Some(rival) = rival {
+            assert_eq!(
+                cancelled(state(&home, sync(0), rival)),
+                Some(Cancel::Signer),
+                "{case}"
+            );
+        }
+        assert_eq!(standing(&home, sync(0), 0), Standing::Active, "{case}");
+        home.pass(10 * MINUTE);
+        assert_eq!(standing(&home, sync(1), 0), Standing::Active, "{case}");
+    }
 }
