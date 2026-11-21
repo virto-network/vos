@@ -1063,6 +1063,17 @@ node-level log, keyed by (agent, index):
   holding back every agent;
 - storage I/O never runs on executor threads;
 - writes that only move the commit index are not fsynced;
+- **unsynced commits go first** [decided; built]: of the commits the
+  writer drains, those that need no sync (an apply, a root build's rows, a
+  commit-index move, a compaction) and touch no agent an earlier synced
+  commit of the same drain touches are written as a buffered flush of
+  their own and answered, then the rest in their order, synced once. No
+  commit of a drain is answered before it is written, so they are
+  concurrent and this is an order they could have come in; each agent's
+  order is kept, and synced rows stay invisible until their fsync (the
+  store inserts a synced batch only after it). A leader's apply so no
+  longer waits out another agent's fsync, which at T1's load was half of
+  a batch's time (`light-node.md` §3.3, "The cause");
 - **a stalled writer hands over leadership** [decided]: a commit waiting
   past the stall bound (`Config::writer_stall`, by default the election
   timeout's upper end, 3 s at the defaults), its queueing behind other

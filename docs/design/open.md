@@ -497,10 +497,12 @@ are under "Identity and privacy" above.
   knee in front of the nodes (the API's stream bound and a user's calls
   in order): +87%, and one run collapsed, the executors' waits doubled at
   the nodes, consistent with the agents' long calls holding executors the
-  shards' batches wait for. At 3,000, near the knee, +23%, one pair, the
-  executors unmoved and the rise unexplained. Open: a lane for those calls
-  (or a queue ordered by gas), then the gate run below the knee with a
-  second pair for its spread (`api_in_flight` raised, or a lower rate).
+  shards' batches wait for. At 3,000, near the knee, +23%, one pair.
+  The cause, traced (2026-11-21): not the calls nor the executors but the
+  log writer, an fsync back to back, whose flush the agents' store
+  lengthens a few percent and every batch pays twice; the fix (unsynced
+  commits answered before the sync) is built. Open: the gate run below
+  the knee with the fix, two pairs.
 - **An operation withheld from a device's log** (`light-node.md` §3.5,
   "The place"; B6): a device-set call names its place, so a route can no
   longer log a vetoed removal again and mature it; what is left is a

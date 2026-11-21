@@ -774,6 +774,43 @@ was `powersave`, and the driver's sends went late about six times as often
 (both arms alike). The 1.84 s and 2.83 s baselines are not set against
 each other. What remains is `open.md`'s.
 
+**The cause** [measured, compumax (capped) + sigma, 2026-11-21; the
+rerun's layout and build with every executor job, batch, apply and
+writer flush timed exactly on the nodes; 3,000 calls a second for eight
+minutes]:
+- **The calls are not it.** 2,000 personal agents waking every 180 s,
+  the same calls a second as 10,000 every 900 s, left the transfers'
+  p99 at 590 ms against 610 ms without them; 10,000 agents eight minutes
+  after their creation moved nothing at the nodes either (a batch p50
+  75 ms in both). An idle agent writes nothing: the writer's changes a
+  second (appends, terms and commit indexes, applies, root builds) rose
+  3% with 10,000 agents, the wakes' own, and its bytes 2%.
+- **The node's time is the writer's.** A shard's batch took 75 ms at
+  p50: 6 ms to its proposal (refine and dry run, the executors 40–45%
+  busy, a wait for one 1.5–1.9 ms at p50), 35 ms to its commit (the
+  synced appends here and at a follower) and 32 ms to its apply, of
+  which 29 ms was the apply's commit: an apply needs no sync, but it
+  queued behind and then rode the writer's next synced flush, which took
+  18 ms at p50 and ran back to back (47 a second, 62 commits each, about
+  9 MB a second a node). Where shards' batches waited past 10 ms for an
+  executor, other shards' batches and root builds held them; a personal
+  agent's job, 1.4% of that time.
+- **Over the hour** (the rerun's 3,000 pair, exact means from the
+  histograms' sums): the batch +4%, +11% and +10% on the three nodes,
+  its commit +8–11%, the synced flush 21–22 to 23 ms (+3–8%), the apply
+  +3–9%, while the executors' waits moved both ways; every stage climbed
+  over the hour in both runs (the batch 78 to 103 ms without the agents),
+  the store growing under the load and, with them, the 255 MiB they
+  pushed. The rise is the writer's flush growing a few percent, paid
+  twice by every batch (its commit and its apply) on a writer with no
+  slack; at 5,000 the executors' waits rose too (their means from 6–17
+  to 8–23 ms).
+- **The fix:** a drain's unsynced commits go first, written and answered
+  before its sync (`core-model.md` §9.5, the log writer), so an apply
+  waits out at most the flush in progress, not another one after it;
+  nothing durable changes. Executor lanes for long calls are not built:
+  the data does not show them holding the batches.
+
 **Reaching the agent: every gateway lists every node.** A node that does
 not replicate an agent answers `Elsewhere { replicas }`
 (`node/host/src/node/mod.rs`), and a gateway retries toward any upstream
