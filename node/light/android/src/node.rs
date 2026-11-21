@@ -61,13 +61,11 @@ pub trait Prompts: Send + Sync + 'static {
     /// The admin key's Ed25519 signature over `message`, which this process
     /// prepared, after a strong biometric at its prompt: 64 bytes.
     fn sign_key(&self, kind: Kind, key: &[u8], message: &[u8]) -> KeyAnswer;
-    /// The operation reached `stage`, which the UI says while it runs:
-    /// nothing answered, nothing of a secret in it.
-    fn stage(&self, _stage: Stage) {}
-    /// What the operation is doing while the user waits, in words (a
-    /// sign-in waiting for its space to list the device): shown beside it,
-    /// never answered, nothing of a secret in it.
-    fn progress(&self, _text: &str) {}
+    /// The personal flow reached `stage`, which the app's screens say while
+    /// it runs: nothing answered, nothing of a secret in it.
+    fn step(&self, _stage: Stage) {}
+    /// Where the operation is, in words, for the client's chrome to show.
+    fn stage(&self, _stage: &str) {}
 }
 
 /// What the device offers, which this process reads itself.
@@ -162,12 +160,8 @@ impl Chrome for Shown {
         })
     }
 
-    fn stage(&self, stage: Stage) {
+    fn stage(&self, stage: &str) {
         self.0.stage(stage);
-    }
-
-    fn progress(&self, text: &str) {
-        self.0.progress(text);
     }
 }
 

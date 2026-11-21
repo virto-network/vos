@@ -150,7 +150,7 @@ impl Prompts for Lent {
         .unwrap_or_else(|refusal| KeyAnswer::Failed(refusal.message))
     }
 
-    fn stage(&self, stage: crate::personal::Stage) {
+    fn step(&self, stage: crate::personal::Stage) {
         let Some(node) = VOS_NODE.get() else {
             return;
         };
@@ -166,28 +166,22 @@ impl Prompts for Lent {
         });
     }
 
-    fn progress(&self, text: &str) {
-        self.said(text);
-    }
-}
-
-impl Lent {
-    /// The progress `text` handed to `VosNode.progress`, beside these
-    /// prompts.
-    fn said(&self, text: &str) {
-        let Some(node) = VOS_NODE.get() else {
-            return;
-        };
+    /// A one-way call: a client gone shows nothing, and the operation goes on.
+    fn stage(&self, stage: &str) {
         let _ = attached(|env| {
-            let text = env.new_string(text).map_err(failed)?;
-            env.call_method(
-                &**node,
-                jni_str!("progress"),
-                jni_sig!("(Lteam/virto/s4/vos/IVosPrompts;Ljava/lang/String;)V"),
-                &[JValue::Object(&self.prompts), JValue::Object(&text)],
-            )
-            .map(drop)
-            .map_err(|_| java::refusal(env))
+            let stage = env.new_string(stage).map_err(failed)?;
+            if env
+                .call_method(
+                    &self.prompts,
+                    jni_str!("stage"),
+                    jni_sig!("(Ljava/lang/String;)V"),
+                    &[JValue::Object(&stage)],
+                )
+                .is_err()
+            {
+                java::refusal(env);
+            }
+            Ok(())
         });
     }
 }

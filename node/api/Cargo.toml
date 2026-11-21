@@ -16,6 +16,8 @@ quic = ["dep:quinn"]
 scale = { package = "vos-pvm-codec", path = "../../pvm/codec", default-features = false }
 vos-abi = { workspace = true }
 vos-wire = { workspace = true }
+# The enrollment check's hash.
+vos-pvm-precompiles = { workspace = true }
 quinn = { version = "0.11.12", default-features = false, optional = true }
 futures-lite = { version = "2", optional = true }
 async-channel = { version = "2", optional = true }

@@ -18,9 +18,7 @@ use vos_wire::personal::{
 
 use super::link::{AgentLink, Key, Signer, answer};
 use super::set::{Device, call_placed, evidence};
-use super::{
-    Error, Host, Kept, KitCall, Personal, Posted, Prompts, answered, entered_kit, logged,
-};
+use super::{Error, Host, Kept, KitCall, Personal, Posted, Prompts, answered, entered_kit, logged};
 use crate::job::{Kind, Notice};
 use crate::kit::KitSecret;
 use crate::route::Purpose;

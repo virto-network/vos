@@ -82,7 +82,7 @@ byte_enum! {
     pub enum Stage {
         /// Reaching the home: its open claim, an agent from its pool.
         Reaching = 1 as REACHING,
-        /// A proof made: the device's at its home, a sign-in's or a payment's.
+        /// The device's proof made for its home.
         Proving = 2 as PROVING,
         /// The recovery kit written at the agent.
         WritingKit = 3 as WRITING_KIT,
@@ -96,8 +96,6 @@ byte_enum! {
         HandingOver = 7 as HANDING_OVER,
         /// The new device's add waiting for the opener's admin key.
         Approving = 8 as APPROVING,
-        /// A proved call sent to its space.
-        Sending = 9 as SENDING,
     }
 }
 

@@ -410,6 +410,7 @@ impl Asked<'_> {
                 .collect(),
             notice: None,
             choices: vec!["Check".into()],
+            code: None,
         });
         let Answer::Confirmed { values, .. } = answer else {
             return None;
@@ -440,7 +441,7 @@ impl From<space::Stage> for Stage {
 
 impl space::Prompts for Asked<'_> {
     fn stage(&self, stage: space::Stage) {
-        self.prompts.stage(stage.into());
+        self.prompts.step(stage.into());
     }
 
     /// The phrase shown (with why the one before is void, if one is),
@@ -467,6 +468,7 @@ impl space::Prompts for Asked<'_> {
                 fields: Vec::new(),
                 notice: notice.take(),
                 choices: vec!["I wrote them down".into()],
+                code: None,
             });
             if !shown {
                 return false;
@@ -495,6 +497,7 @@ impl space::Prompts for Asked<'_> {
             fields: Vec::new(),
             notice: void.map(str::to_owned),
             choices: vec!["I wrote it down".into()],
+            code: None,
         })
     }
 
@@ -512,6 +515,7 @@ impl space::Prompts for Asked<'_> {
             }],
             notice: None,
             choices: vec!["Go on".into()],
+            code: None,
         });
         let Answer::Confirmed { values, .. } = answer else {
             return None;
@@ -547,6 +551,7 @@ impl space::Prompts for Asked<'_> {
             fields: Vec::new(),
             notice: None,
             choices: vec!["Approve".into()],
+            code: None,
         })
     }
 
@@ -560,6 +565,7 @@ impl space::Prompts for Asked<'_> {
             fields: Vec::new(),
             notice: None,
             choices: vec!["It shows the same".into()],
+            code: None,
         })
     }
 
@@ -573,6 +579,7 @@ impl space::Prompts for Asked<'_> {
             fields: Vec::new(),
             notice: None,
             choices: vec!["Go on".into()],
+            code: None,
         })
     }
 

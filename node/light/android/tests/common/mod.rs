@@ -56,8 +56,8 @@ pub struct Scripted {
     pub read: Duration,
     pub shown_at: Mutex<Vec<std::time::Instant>>,
     pub answered_at: Mutex<Vec<std::time::Instant>>,
-    /// Every progress text shown, in order.
-    pub progress: Mutex<Vec<String>>,
+    /// The stages the calls reported, in turn.
+    pub stages: Mutex<Vec<String>>,
 }
 
 impl Scripted {
@@ -98,8 +98,8 @@ impl Chrome for Scripted {
         })
     }
 
-    fn progress(&self, text: &str) {
-        self.progress.lock().unwrap().push(text.to_owned());
+    fn stage(&self, stage: &str) {
+        self.stages.lock().unwrap().push(stage.to_owned());
     }
 }
 

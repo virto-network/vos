@@ -46,7 +46,12 @@ go back to the system: what stays is the programs and the pools.
 A request naming a space, an agent or a method enrollment did not pin is
 refused. Every text a form shows is checked free of control and bidirectional
 formatting characters. The session's grant and each call's confirmation are
-two prompts; the grant never stands in for a confirmation.
+two prompts; the grant never stands in for a confirmation. A reconnect s4
+makes by itself keeps the grant of the session it replaces, in s4's memory:
+the facility's session on it is new, knowing nothing of the one before. A
+sign-in and a payment report their stages to the chrome ("Proving…",
+"Sending…"); the digests show as a code and a six-digit check
+(`vos_api::enrollment_code`, `enrollment_check`).
 
 ## Its own process
 

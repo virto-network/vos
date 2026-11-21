@@ -226,8 +226,6 @@ public final class Words {
       case Stage.HANDING_OVER:
       case Stage.APPROVING:
         return pairing(stage, true);
-      case Stage.SENDING:
-        return "Sending…";
       default:
         return "Working…";
     }

@@ -44,7 +44,7 @@ pub struct Phone {
     pub entered: Mutex<usize>,
     /// Every stage a flow said, by its byte, in order.
     pub stages: Mutex<Vec<u8>>,
-    /// Every progress text an operation said while the user waited.
+    /// Every stage an operation said in words, for the client's chrome.
     pub said: Mutex<Vec<String>>,
     /// The admin key that signed last.
     pub signed: Mutex<Option<[u8; 32]>>,

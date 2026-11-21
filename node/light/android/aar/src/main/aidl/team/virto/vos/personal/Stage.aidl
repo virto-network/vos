@@ -11,7 +11,7 @@ package team.virto.vos.personal;
 enum Stage {
     /** Reaching the home: its open claim, an agent from its pool. */
     REACHING = 1,
-    /** A proof made: the device's at its home, a sign-in's or a payment's. */
+    /** The device's proof made for its home. */
     PROVING = 2,
     /** The recovery kit written at the agent. */
     WRITING_KIT = 3,
@@ -25,6 +25,4 @@ enum Stage {
     HANDING_OVER = 7,
     /** The new device's add waiting for the opener's admin key. */
     APPROVING = 8,
-    /** A proved call sent to its space. */
-    SENDING = 9,
 }

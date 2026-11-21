@@ -165,12 +165,12 @@ impl Prompts for Phone {
         }
     }
 
-    fn stage(&self, stage: crate::personal::Stage) {
+    fn step(&self, stage: crate::personal::Stage) {
         self.stages.lock().unwrap().push(stage as u8);
     }
 
-    fn progress(&self, text: &str) {
-        self.said.lock().unwrap().push(text.to_owned());
+    fn stage(&self, stage: &str) {
+        self.said.lock().unwrap().push(stage.to_owned());
     }
 
     fn sign_key(&self, kind: Kind, key: &[u8], message: &[u8]) -> KeyAnswer {
