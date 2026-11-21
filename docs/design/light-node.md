@@ -704,55 +704,75 @@ snapshot in 1.04 s. The other two missed as measured:
 
 **The rerun** [measured, compumax (capped) + sigma, 2026-11-20; the same
 layout, each node pinned to four of compumax's 64 threads (16 in all, one
-thread of a core each); the transfers' p99 read by the driver at buckets
-under 1% wide; four runs of an hour alternating at 5,000 calls a second,
-then a pair at 3,000; every run with the same build, seed and cap]: the
-rise is real at 5,000 calls a second, and that load is the stream bound's
-knee, not a margin.
-- **At 5,000 calls a second:** without personal agents the p99 was
-  2.88 s and 2.83 s (the two runs 1.7% apart), but it climbed through each
-  hour (its ten-minute p99 from 1.2–1.3 s to 3.3–3.8 s) with up to 7,200
-  requests in flight on one node's connection against the node's 1,024
-  streams: the driver queues in front of the node. With the agents, one
-  run tipped over 35 minutes in (3.4% of its transfers timed out, the
-  answered rate fell from 4,700 to 2,700 a second, 58,668 in flight) and
-  the other held at 5.31 s, +87%. The nodes' CPU was the same, 63–69%, in
-  all four.
-- **Where it comes from:** the nodes' stages, at their own buckets: the
-  commit, the fsync and the apply did not move; the batch's p99 rose from
-  0.52 to 0.79 s, the time a call is queued at its p50 from 65 to 82 ms,
-  and the waits for an executor doubled at p99 (the dry run's 66 to 131 ms, the
-  refine's 57 to 115 ms). The agents' calls take the same three executors
-  as the shards' batches and run long (their steps' gas p99 20 times the
-  shards'), so a shard's batch waits behind a push; at the knee the
-  driver's queue multiplies that wait (the calls waiting behind their
-  user's last rose from 567,000 to 919,000).
-- **At 3,000 calls a second** (in flight mostly under 1,024, at most about
-  2,000; CPU 53–60%): 0.72 s without agents, 0.89 s with them, **+23%**,
-  one pair, its ten-minute p99s 0.53–0.96 s and 0.63–1.04 s; the nodes'
-  stages within a bucket of each other.
-- **The gate reads:** missed in both pairs at 5,000 (the first collapsed);
-  at 3,000, 23% against 20%, inside the run's own ten-minute spread and
-  with no second pair to set it against. A fix keeps a long personal call
-  off the executors the batches wait for (a lane of its own, or the queue
-  ordered by gas), and the gate is run below the stream bound's knee
-  (`api_in_flight` raised, or a driver connection per stream budget), so
-  that it reads the node and not the driver's queue.
+thread of a core each); the transfers' latencies read by the driver at
+buckets at most 1% wide; four runs of an hour alternating at 5,000 calls a
+second, then a pair at 3,000, added once the 5,000 baseline proved
+unsteady; every run with the same build, seed and cap]: the rise is real.
+At 5,000 calls a second the load sits at a knee in front of the nodes, as
+the early run's did (more than 1,024 requests in flight on a node's
+connection in 302 of its 369 intervals), which amplifies it.
+- **At 5,000 calls a second:** without personal agents, p50 0.36 s and
+  0.31 s, p99 2.88 s and 2.83 s (1.7% apart over the hour, up to 44% in a
+  ten-minute block), no errors. Neither held steady: the ten-minute p99
+  climbed from 1.2–1.3 s to 3.3–3.8 s with up to 7,200 requests in flight
+  on one node's connection against the node's 1,024 streams, while the
+  nodes' own queue and batch p99 stayed at 0.52 s in every window: the
+  growth is in front of the nodes, in the stream bound and in a user's
+  calls going one at a time (a hot user whose rate times latency passes 1
+  queues without bound). With the agents, one run tipped over 35 minutes
+  in: 485,760 transfers (3.4%) timed out, 58,668 in flight, the answered
+  rate from about 5,000 to about 4,300 a second (10 s intervals down to
+  2,500). The other held, with no errors, at p50 0.41 s (+33%) and p99
+  5.31 s (+87%), above its baseline in every ten-minute block (+34% to
+  +167%; the first blocks 1.95 s and 2.59 s against 1.23 s and 1.29 s).
+  The nodes' CPU was 63–69% in all four.
+- **Where it comes from:** at the nodes' buckets, the commit, the fsync
+  and the apply did not move; the batch's p99 rose from 0.52 to 0.79 s;
+  the waits for an executor doubled at p99 on two of the three nodes (the
+  dry run's 66 to 131 ms, the refine's 57 to 115 ms; the third moved a
+  bucket). A few long items appeared on the executors, which were 50–55%
+  busy in both runs: the batches' step-gas p99 from about 0.1 to 2.1
+  million, the root build's p99.9 from 8 to 41 ms. That is consistent
+  with a personal agent's call holding an executor a shard's batch waits
+  for, not shown to be it. A few hundred milliseconds more at the node
+  became seconds at the driver, through the queue in front of it (the
+  calls waiting behind their user's last rose from 567,000 to 919,000).
+  Compaction did not differ (the store's workers 32–34% of a core, the
+  disk 49–55% busy, its time an I/O no higher with the agents); each node
+  led about 3,300–3,500 groups with them against about 20 without; the
+  onion mark was not looked at apart.
+- **At 3,000 calls a second** (in flight above 1,024 in 26 and 47 of about
+  365 intervals, at most about 2,000; CPU 53–60%; no errors): p50 0.14 s
+  and 0.15 s (+7%), p99 0.72 s and 0.89 s, **+23%**, the run with agents
+  above in five of six ten-minute blocks (−3% to +41%) and climbing (0.63
+  to 1.04 s). The executors' waits did not move; the batch, the apply and
+  the fsync rose a bucket each, on all three nodes, unexplained. One pair,
+  run back to back.
+- **The gate reads:** missed in both pairs at 5,000 (the first
+  collapsed). At 3,000 not resolved: probably a rise of 20–25%, against
+  20%, with no second pair for its spread. A fix to try keeps a long
+  personal call off the executors the batches wait for (a lane of its
+  own, or the queue ordered by gas); the gate is then run below the knee
+  (`api_in_flight` raised, a lower rate, or more users at a lower rate
+  each), so that it reads the node and not the driver's queue.
 - **Memory:** +56–59 KiB a replica right after creation, in all three runs
-  with agents: **met** as the fixed overhead. At the load's end, against
-  the run without them: +89 KiB a replica at 3,000 and +113–120 KiB at
-  5,000, which counts the 255 MiB of pushed envelopes (about 26 KiB a
-  replica, every node holding all three) and the larger log cache.
-- **Creation through `claim`:** 10,001 agents in about 1,850 s, 5.4 a
+  with agents: **met** as the fixed overhead, 5–8 KiB under the limit and
+  about 5 KiB more than the early run's through `assign`. At the load's
+  end, against the run without them: +87–90 KiB a replica at 3,000 and
+  +94–120 KiB at 5,000 (+94–106 and +110–120 for the two pairs), the
+  log cache among it (+300 MB a node at 5,000, about +30 KiB a replica).
+- **Creation through `claim`:** 10,001 agents in 1,836–1,847 s, 5.4 a
   second. **Wakes:** 40,000 each of `alive`, `since`, `push` and the
   whole wake in every run, none failed; a wake p50 0.59–0.63 s and p99
   2.2–2.3 s at 5,000, 0.22 s and 1.25 s at 3,000.
 
-This compumax ran kernel 6.18 with all 64 threads online, its clock 340 ms
-off the coordinator's (its NTP source's; the drivers time by their own
-monotonic clock) and sigma's governor `powersave`; on 2026-11-06 it was
-7.2, 32 threads, `performance`. The 1.84 s and 2.83 s baselines are not
-set against each other. What remains is `open.md`'s.
+Beside 2026-11-06 (kernel 7.2, 32 threads online, `performance` on both
+hosts, clock within 6 ms), this compumax ran kernel 6.18 with all 64
+threads online and its clock 340 ms off the coordinator's (its NTP
+source's; the drivers time by their own monotonic clock), sigma's governor
+was `powersave`, and the driver's sends went late about six times as often
+(both arms alike). The 1.84 s and 2.83 s baselines are not set against
+each other. What remains is `open.md`'s.
 
 **Reaching the agent: every gateway lists every node.** A node that does
 not replicate an agent answers `Elsewhere { replicas }`

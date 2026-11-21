@@ -42,7 +42,7 @@ pub fn summary(run: &Run) -> Option<String> {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "\npersonal agents: {} and the full one, the home agent {}; {} admitting their device through the onion; created and assigned in {:.0} s",
+        "\npersonal agents: {} and the full one, the home agent {}; {} admitting their device through the onion; created and claimed in {:.0} s",
         personals.agents.len(),
         personals.home.as_ref().map_or(0, |home| home.agent),
         personals.admitted,

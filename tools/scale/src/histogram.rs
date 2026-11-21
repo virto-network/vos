@@ -17,7 +17,7 @@ pub fn floor(index: usize) -> u64 {
 }
 
 /// A fine bucket's sub-buckets to each power of two, and the values held
-/// exactly: a fine bucket is under 1/128 of its least value wide.
+/// exactly: a fine bucket is at most 1/128 of its least value wide.
 pub const SUB: u64 = 128;
 const SUB_BITS: u32 = SUB.trailing_zeros();
 
