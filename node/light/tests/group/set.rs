@@ -5,7 +5,8 @@
 //! evidence the log carries supports it, a second signature's or a
 //! resolution's posted after the maturity it made among it, so none of
 //! these honest flows raises `Unsigned`; a maturity asserted before its
-//! delay does, and a device that cannot follow regroups.
+//! delay does, and a device that cannot follow regroups. A leave is held
+//! on its own evidence alone.
 
 use ed25519_dalek::SigningKey;
 use vos_abi::Encode;
@@ -854,4 +855,83 @@ fn a_resolved_replacement_waits_out_its_probation() {
             .iter()
             .all(|open| open.index != replacement)
     );
+}
+
+/// A leave is held on its own evidence alone: the evidence logged before
+/// the maturity, which is asserted at its own entry's time. The leaver
+/// reads itself out with `Left`, and the others owe its removal. A
+/// maturity the operators assert before the leave's evidence, or one
+/// backdated before the entry that asserts it, is `Unsigned` and owes
+/// nothing.
+#[test]
+fn a_leave_is_held_on_its_own_evidence_alone() {
+    let (mut home, mut phones) = seasoned(4);
+    let (leave, message, signature) =
+        unevidenced(&mut home, &phones[3].admin, "remove", 3u32.encode());
+    let called = home.now();
+
+    let (cursor, before) = phones[1].group().view();
+    let mut entries = home.log(phones[1].sync_key(), cursor).unwrap();
+    let early = append(
+        &mut entries,
+        before,
+        home.now(),
+        Body::Settled {
+            op: leave,
+            state: OpState::Matured { at: home.now() },
+        },
+    );
+    append(
+        &mut entries,
+        before,
+        home.now(),
+        Body::Matured { device: 3 },
+    );
+    let events = phones[1].group().follow(entries).unwrap();
+    assert!(
+        events.contains(&Event::Alarm(Alarm::Unsigned { index: early })),
+        "{events:?}"
+    );
+    assert!(owed(&home, &mut phones[1]).is_empty());
+
+    home.pass(1_000);
+    post(&mut home, &phones[3].sync, leave, message, signature, None);
+    assert!(matches!(
+        state(&home, &phones[0], leave),
+        OpState::Matured { .. }
+    ));
+
+    // The log through the leave's evidence, then a maturity at the call's
+    // time.
+    let (cursor, before) = phones[2].group().view();
+    let mut entries = home.log(phones[2].sync_key(), cursor).unwrap();
+    let evidenced = entries
+        .iter()
+        .position(|(_, entry)| matches!(entry.body, Body::Evidence { index, .. } if index == leave))
+        .unwrap();
+    entries.truncate(evidenced + 1);
+    let at = entries.last().unwrap().1.at;
+    let backdated = append(
+        &mut entries,
+        before,
+        at,
+        Body::Settled {
+            op: leave,
+            state: OpState::Matured { at: called },
+        },
+    );
+    append(&mut entries, before, at, Body::Matured { device: 3 });
+    let events = phones[2].group().follow(entries).unwrap();
+    assert!(
+        events.contains(&Event::Alarm(Alarm::Unsigned { index: backdated })),
+        "{events:?}"
+    );
+    assert!(owed(&home, &mut phones[2]).is_empty());
+
+    let events = phones[0].read(&mut home);
+    signed(&[events]);
+    assert_eq!(owed(&home, &mut phones[0]), vec![3]);
+    let events = phones[3].read(&mut home);
+    assert!(events.contains(&Event::Removed), "{events:?}");
+    assert!(events.contains(&Event::Left), "{events:?}");
 }

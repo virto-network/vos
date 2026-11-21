@@ -25,6 +25,6 @@ enum Stage {
     HANDING_OVER = 7,
     /** The new device's add waiting for the opener's admin key. */
     APPROVING = 8,
-    /** This device's leave taken: the space being forgotten. */
+    /** This device's leave taken by the agent: read through, the space forgotten. */
     LEAVING = 9,
 }

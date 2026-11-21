@@ -1367,3 +1367,68 @@ fn a_leave_ends_the_removals_aimed_at_its_device() {
         assert_eq!(standing(&home, sync(1), 0), Standing::Active, "{case}");
     }
 }
+
+/// A leave on a probation frozen under the kit's removal of the device,
+/// with a replacement of its admin key open too: both end `Moot` with the
+/// leave. Evidence posted past the leave's deadline leaves it cancelled.
+/// An active leaver vetoes and cosigns its own leave no more than another.
+#[test]
+fn a_leave_on_a_frozen_probation_ends_what_acts_on_it() {
+    let mut home = seasoned(2);
+    home.pair(0, 2);
+    let removal = home.operate(KIT, "remove", 2u32).unwrap();
+    let replacement = home
+        .operate(admin(0), "replace", (2u32, new_admin(2)))
+        .unwrap();
+    assert_eq!(standing(&home, sync(0), 2), Standing::Probation);
+    let leave = home.operate(admin(2), "remove", 2u32).unwrap();
+    assert!(matured(state(&home, sync(0), leave)));
+    for open in [removal, replacement] {
+        assert_eq!(cancelled(state(&home, sync(0), open)), Some(Cancel::Moot));
+    }
+
+    let leave = home.unevidenced(admin(1), "remove", 1u32).unwrap();
+    for name in ["veto", "cosign"] {
+        assert_eq!(
+            home.operate(admin(1), name, leave),
+            Err(PersonalError::Leaving)
+        );
+    }
+    home.pass(3 * MINUTE);
+    let signed = message(device(1).admin, home.method("remove"), &home.logged(leave));
+    home.call::<Recorded>(
+        sync(1),
+        "evidence",
+        evidence(leave, signed, Attached::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        cancelled(state(&home, sync(0), leave)),
+        Some(Cancel::Unevidenced)
+    );
+    assert_eq!(standing(&home, sync(0), 1), Standing::Active);
+}
+
+/// Two leaves opened side by side, each while the other device was live:
+/// the first to mature removes its device, and the last live device's is
+/// cancelled `Alone`, so the set keeps a device to commit it.
+#[test]
+fn of_two_leaves_side_by_side_the_last_is_cancelled() {
+    let mut home = seasoned(2);
+    let first = home.unevidenced(admin(0), "remove", 0u32).unwrap();
+    let second = home.unevidenced(admin(1), "remove", 1u32).unwrap();
+    for (index, n) in [(first, 0u8), (second, 1u8)] {
+        let signed = message(device(n).admin, home.method("remove"), &home.logged(index));
+        let _ = home.call::<Recorded>(
+            sync(n),
+            "evidence",
+            evidence(index, signed, Attached::default()),
+        );
+    }
+    assert!(matured(state(&home, sync(1), first)));
+    assert_eq!(
+        cancelled(state(&home, sync(1), second)),
+        Some(Cancel::Alone)
+    );
+    assert_eq!(standing(&home, sync(1), 1), Standing::Active);
+}

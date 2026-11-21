@@ -256,8 +256,9 @@ final class DevicesScreen extends Screen {
         "Leave this personal space",
         "This phone removes itself from your personal space now. Your other devices finish it:"
             + " the next one you open asks you to commit it. This phone keeps nothing of the"
-            + " space: its keys, its copy of your data and its recovery state are cleared. To come"
-            + " back, pair it again from another of your devices.",
+            + " space: its copy of your data, its keys to it and its recovery state are cleared,"
+            + " and its admin key signs nothing your agent takes. To come back, pair it again from"
+            + " another of your devices.",
         "Leave",
         () ->
             app.run(

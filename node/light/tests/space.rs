@@ -940,6 +940,44 @@ fn a_phone_leaves_and_the_other_commits_its_removal() {
     );
 }
 
+/// An active phone leaves while the other phone's removal of it is open,
+/// its evidence post dying on the way: the leave answers that it is not
+/// read through and the space stays held; the next passes post the
+/// evidence, read the leave through and forget the space. The removal of
+/// it ends with the leave, and the other phone's commit carries it.
+#[test]
+fn a_leave_cut_short_is_finished_by_a_pass() {
+    let world = world_of(Policy {
+        probation_ms: 3_000,
+        ..suite()
+    });
+    let home = world.home(HOME, 2, 1);
+    let staying = device(&world, 0x95);
+    staying.claim(&world, home);
+    let leaving = device(&world, 0x96);
+    let id = staying.pair(&leaving);
+    after(3_000);
+    // Read after the removal's call, at its batch time, past the probation.
+    staying.space.remove(&staying.phone, id).unwrap();
+    assert_eq!(staying.standing(id), Some(Standing::Active));
+    world.kill(0x96, Step::call(method::EVIDENCE), 1, Death::Before);
+    assert!(matches!(
+        leaving.space.leave(&leaving.phone),
+        Err(Error::Unreachable(_))
+    ));
+    assert!(leaving.space.grouped());
+    world.revive(0x96);
+    let mut passes = 0;
+    while leaving.space.grouped() {
+        passes += 1;
+        assert!(passes <= 2, "read through within two passes");
+        leaving.pass();
+    }
+    assert_eq!(leaving.space.status().unwrap().phase, Phase::None);
+    assert_eq!(staying.standing(id), Some(Standing::Removed));
+    assert_eq!(staying.space.update(&staying.phone).unwrap(), vec![id]);
+}
+
 /// A phone another device removed reads its removal through to `Out`
 /// once a commit carried it; out, it opens a restore with the kit as a
 /// fresh install would, what it kept left, rather than being refused as a

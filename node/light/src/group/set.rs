@@ -157,8 +157,13 @@ impl DeviceGroup {
                     && *matures >= at.saturating_add(delay);
                 (name, arguments, allowed)
             }
-            Act::Veto(op) => (method::VETO, op.encode(), matches!(by, Signer::Device(_))),
-            Act::Cosign(op) => (method::COSIGN, op.encode(), true),
+            // No one vetoes or cosigns a leave: the agent logs neither.
+            Act::Veto(op) => (
+                method::VETO,
+                op.encode(),
+                matches!(by, Signer::Device(_)) && !self.leave_at(*op),
+            ),
+            Act::Cosign(op) => (method::COSIGN, op.encode(), !self.leave_at(*op)),
             Act::Resolve { op, upheld } => (method::RESOLVE, (*op, *upheld).encode(), true),
         };
         let leaving = matches!(&act, Act::Op { op, .. } if leaves(by, op));
@@ -195,7 +200,10 @@ impl DeviceGroup {
             for target in &targets {
                 self.freeze(*target, at);
             }
-            call.rival = self.contest(&call, &targets);
+            // A leave is aimed at no one.
+            if !leaves(call.by, op) {
+                call.rival = self.contest(&call, &targets);
+            }
             if let Some(rival) = call.rival
                 && let Some(other) = self
                     .state
@@ -208,6 +216,13 @@ impl DeviceGroup {
             }
         }
         self.state.set.operations.push(call);
+    }
+
+    /// Whether the call at `index` is an open leave.
+    fn leave_at(&self, index: u64) -> bool {
+        self.state
+            .call_at(index)
+            .is_some_and(|call| matches!(&call.act, Act::Op { op, .. } if leaves(call.by, op)))
     }
 
     /// The open removal `call`, removing `targets`, makes one contest with,
@@ -384,8 +399,16 @@ impl DeviceGroup {
         }
     }
 
+    /// Whether the operation at `op` is `device`'s own leave.
+    fn left_by(&self, op: u64, device: DeviceId) -> bool {
+        self.state.call_at(op).is_some_and(|call| {
+            call.by == Signer::Device(device)
+                && matches!(&call.act, Act::Op { op, .. } if leaves(call.by, op))
+        })
+    }
+
     /// `device` has no voice from `at`: what the next commit carries, and
-    /// this device out if it is.
+    /// this device out if it is, [`Event::Left`] too when by its own leave.
     fn mature(
         &mut self,
         device: DeviceId,
@@ -408,6 +431,9 @@ impl DeviceGroup {
         }
         if self.state.id == Some(device) {
             self.out(events)?;
+            if self.leaving {
+                events.push(Event::Left);
+            }
         }
         Ok(())
     }
@@ -450,7 +476,12 @@ impl DeviceGroup {
             let vetoed = self.state.made.len();
             self.state.made.retain(|made| !made.vetoes(claim.op));
             match support {
-                Support::Held => self.take_effect(&claim, events)?,
+                Support::Held => {
+                    if self.state.id.is_some_and(|me| self.left_by(claim.op, me)) {
+                        self.leaving = true;
+                    }
+                    self.take_effect(&claim, events)?
+                }
                 _ if self.state.made.len() < vetoed => {}
                 _ => events.push(Event::Alarm(Alarm::Unsigned { index: claim.entry })),
             }
@@ -477,19 +508,26 @@ impl DeviceGroup {
         let Some((op, matures)) = call.op() else {
             return Support::Refused;
         };
+        // A leave matures in the agent's call that logs its evidence, and
+        // only before its deadline: its evidence logged and verified before
+        // the maturity, which is asserted at the entry's own time.
+        if leaves(call.by, op) {
+            let held = call.evidence == Check::Valid
+                && call.awaits.is_none()
+                && claim.at >= call.at
+                && claim.at == state.time
+                && claim.at < matures;
+            return if held {
+                Support::Held
+            } else {
+                Support::Refused
+            };
+        }
         match call.evidence {
             Check::Invalid => return Support::Refused,
             Check::Missing => return Support::Waiting,
             Check::Valid if call.awaits.is_some() => return Support::Waiting,
             Check::Valid => {}
-        }
-        // A leave waits on nothing but its own evidence.
-        if leaves(call.by, op) {
-            return if claim.at >= call.at {
-                Support::Held
-            } else {
-                Support::Refused
-            };
         }
         // A replacement's wait is its new key's probation, which no
         // resolution shortens (E29).

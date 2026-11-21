@@ -227,7 +227,8 @@ public final class Words {
       case Stage.APPROVING:
         return pairing(stage, true);
       case Stage.LEAVING:
-        return "Your devices took this phone's removal: clearing it from this phone…";
+        return "Your agent took this phone's removal: reading it through, then clearing this"
+            + " phone…";
       default:
         return "Working…";
     }

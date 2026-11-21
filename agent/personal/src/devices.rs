@@ -10,9 +10,10 @@
 //! operation's maturity, or one row of a removed device's silencing (an
 //! operation of its cancelled, a veto of its lifted) or of a replaced kit's
 //! (an operation of its cancelled), queued in the due index at the time it
-//! takes effect. So no step's work grows with what an adversary queued,
-//! and everything takes effect in time order, however late the call that
-//! settles it.
+//! takes effect; `evidence` makes one more, a leave's maturity (two
+//! cancels, a reopen and a candidate decided at most). So no step's work
+//! grows with what an adversary queued, and everything takes effect in
+//! time order, however late the call that settles it.
 
 use alloc::vec::Vec;
 
@@ -927,6 +928,14 @@ impl Personal {
         }
         if !self.applicable(&operation.op) {
             return self.cancel(index, Cancel::KeyTaken, now);
+        }
+        // Leaves opened side by side: the last live device's waits on no
+        // other's commit, so it is cancelled.
+        if let Op::Remove(target) = operation.op
+            && leaves(operation.by, &operation.op)
+            && !self.live.iter(None).any(|(id, ())| id != target)
+        {
+            return self.cancel(index, Cancel::Alone, now);
         }
         let rival = self.close(index, &operation, now);
         self.deposits.remove(&index);

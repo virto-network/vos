@@ -858,7 +858,9 @@ impl<H: Host> Personal<H> {
         if let Some(device) = group.id() {
             self.book(light, device);
         }
-        if let Err(error) = self.refresh_onions(&mut held, now) {
+        if left(&pass) {
+            self.forget(&mut held)?;
+        } else if let Err(error) = self.refresh_onions(&mut held, now) {
             failures.push(format!("the home's onions: {error}"));
         }
         Ok(Passed {
@@ -1002,17 +1004,22 @@ impl<H: Host> Personal<H> {
     /// One pass of the light node's job in the foreground: the log
     /// followed and every vote, evidence and `alive` posted, the scopes
     /// pushed and read. Whether it left the device with nothing a flow
-    /// waits for ([`crate::job::complete`]).
+    /// waits for ([`crate::job::complete`]). A pass that reads this
+    /// device's own leave through forgets the space ([`Personal::forget`]).
     fn follow(&self, held: &mut Held) -> Result<bool, Error> {
         let now = self.host.now();
-        self.with_link(held, Purpose::Personal, |link, held| {
+        let (complete, left) = self.with_link(held, Purpose::Personal, |link, held| {
             let Held { light, group, .. } = held;
             let group = group.as_mut().ok_or(Error::NoSpace)?;
             let instances = light.instances().map_err(store_failed)?;
             crate::job::run(light, group, link, &instances, now)
-                .map(|pass| crate::job::complete(group, &pass))
+                .map(|pass| (crate::job::complete(group, &pass), left(&pass)))
                 .map_err(|stopped| unreached(stopped.error))
-        })
+        })?;
+        if left {
+            self.forget(held)?;
+        }
+        Ok(complete)
     }
 
     /// Up to `follows` follows, until one leaves the device complete
@@ -1103,6 +1110,11 @@ impl<H: Host> Personal<H> {
             label: label.as_bytes().to_vec(),
         })
     }
+}
+
+/// Whether `pass` read this device's own leave through.
+fn left(pass: &crate::job::Pass) -> bool {
+    pass.events.contains(&crate::group::Event::Left)
 }
 
 /// Where a flow's request goes: the home whose handle it names, or the

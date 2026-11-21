@@ -453,6 +453,9 @@ pub enum Cancel {
     /// A key it brings was admitted by its maturity.
     #[codec(index = 7)]
     KeyTaken = 7,
+    /// A leave whose signer was the set's last live device by then.
+    #[codec(index = 8)]
+    Alone = 8,
 }
 
 /// Where an operation is.
@@ -1030,8 +1033,8 @@ pub enum PersonalError {
     /// again and sign the call at its head.
     #[codec(index = 46)]
     StaleHead,
-    /// A device's own removal, its leave: it matures with its evidence, and
-    /// no one vetoes, cosigns or resolves it.
+    /// A device's own removal, its leave: it matures with its evidence, no
+    /// one vetoes or cosigns it, and it is never contested.
     #[codec(index = 47)]
     Leaving,
     /// The set's last live device leaves nothing to commit its leave: a

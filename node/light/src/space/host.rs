@@ -185,7 +185,7 @@ pub enum Stage {
     HandingOver = 7,
     /// The new device's add waiting for the opener's admin key.
     Approving = 8,
-    /// This device's leave taken: the space being forgotten.
+    /// This device's leave taken by the agent: read through, the space forgotten.
     Leaving = 9,
 }
 

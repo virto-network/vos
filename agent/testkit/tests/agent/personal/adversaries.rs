@@ -6,8 +6,8 @@
 //!   devices: the owner, with one device and the kit or with two other
 //!   seasoned devices, always removes it, and every device it paired,
 //!   within the delay, and it never removes an owner device the owner
-//!   contests; its moves include each of its devices leaving, its own
-//!   removal, which matures at once and only lowers its power;
+//!   contests; a removal it signs may name its own device, a leave, which
+//!   matures at once and only lowers its power;
 //! - one holding only a sync key: the kit alone removes its device after
 //!   the kit's delay unvetoed, and the kit's restore matures the kit's
 //!   delay later, the removed device's `alive` ignored;

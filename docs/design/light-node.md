@@ -1443,8 +1443,11 @@ commits), **active**, or **removed** (with its frontier). A device is
     The leave matures as soon as its evidence is posted, with no delay,
     and no device vetoes, cosigns or resolves it; the other devices commit
     it as any matured removal (the commit re-seals the kit under a new
-    `R`). The set's last live device may not leave: no device would commit
-    it, and a restore with the kit replaces it instead.
+    `R`; a device on its probation commits once its probation ends, so
+    a phone left with only a newly paired one waits for it). The set's
+    last live device may not leave: no device would commit it, and a
+    restore with the kit replaces it instead; of two leaves open side by
+    side, the one maturing last is cancelled (`Alone`).
 
 *Why a leave waits on nothing.* A leave only lowers its signer's power:
 it gives up the one voice it had and gains none. The delay and the veto
@@ -1567,9 +1570,15 @@ where the rules above leave a choice, this is the one taken]:
   matured by the evidence call itself; its maturity cancels the removal
   and the replacement open against the device as `Moot`. A veto or a
   cosign of a leave is refused (`Leaving`), and so is the last live
-  device's leave (`Alone`). Each device checks it the same way
+  device's leave (`Alone`, when opened; cancelled `Alone` when it would
+  mature so). Each device checks it the same way
   (`node/light/src/group/set.rs`): its signer's key held on probation,
-  its maturity supported by its own evidence alone.
+  its maturity supported only by its own evidence logged before it, the
+  maturity asserted at that entry's own time and before the leave's
+  deadline; a logged veto or cosign of a leave is invalid. The agent
+  verifies no evidence's signature (no guest does, `core-model.md` §5): a
+  leaver posting a bad signature is removed by the agent while every
+  other device raises `Unsigned`, which needs the leaver's own keys.
 - **Vetoes** (`veto`, an active device's admin key, never the kit's):
   a device's operation becomes contested, the kit's is cancelled. A
   contest held only by vetoes lifts when the last vetoer's removal
@@ -4019,14 +4028,19 @@ device's crates faster); its size argument is small.
   Devices offers "Leave this personal space" on a phone with another
   live device in the set: one confirm that says what happens, one
   biometric, then progress in words ("Signing this phone's removal…",
-  "Reading it through…") and the removed screen, "This phone left your
+  then "Your agent took this phone's removal: reading it through, then
+  clearing this phone…") and the removed screen, "This phone left your
   personal space and keeps nothing of it", with "Pair again" and "Restore
   with your kit" (`Personal::leave`: the removal signed and posted, the
-  log read through to `Out`, the store made anew; the other phones' next
-  pass raises the matured removal's notice to commit it). The
-  Keystore's admin key is not deleted: s4 makes and signs with it and
-  deletes none; it signs nothing the agent admits from the leave's
-  maturity on, as after every other leave of the store. One test
+  log read through to `Out` and the store made anew by the follow that
+  read it, `Event::Left`; a leave cut short is read through and
+  forgotten by the next pass, and one killed between the two shows the
+  removed screen, whose pairing and restore forget first; the other
+  phones' next pass raises the matured removal's notice to commit it).
+  What stays: the secret source's key and the label, as at a fresh
+  install, and the Keystore's admin key, which s4 makes and signs with
+  and deletes none of; it signs nothing the agent admits from the
+  leave's maturity on, as after every other leave of the store. One test
   double for all of it: `vos_light::testing` (`Phone`, `World`,
   `Reach`) and `vos_testkit::personal::Agent`.
 - **Pairing after the set changed** [built, `node/light/android`]: the
