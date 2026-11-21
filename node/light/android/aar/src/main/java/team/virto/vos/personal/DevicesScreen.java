@@ -9,7 +9,7 @@ import android.widget.LinearLayout;
  * The device set: each device's standing and last call, a phone retired (removed, then its
  * memberships revoked), the changes open (veto, cosign, a contest resolved), the memberships a
  * pairing left, the recovery kit's rotation, this phone's admin key replaced, a regroup, a commit
- * now, and this phone leaving the space. Each change is the admin key's, behind its strong
+ * now. Each change is the admin key's, behind its strong
  * biometric. Read from the agent when shown and on each return to the app, never on a timer.
  */
 final class DevicesScreen extends Screen {
@@ -93,18 +93,6 @@ final class DevicesScreen extends Screen {
                   + ", last call at your agent "
                   + Words.ago(device.seen, now)));
       if (device.me) {
-        // Left alone, no other device would commit it: a move or a regroup is the way.
-        if (!device.removed && others() > 0) {
-          if (device.standing == 0) {
-            // On probation its admin key signs nothing, its own removal neither.
-            into.addView(
-                text(
-                    "This phone can leave once its probation ends; until then another of your"
-                        + " devices retires it."));
-          } else {
-            into.addView(button("Leave this personal space", v -> leave(device)));
-          }
-        }
         continue;
       }
       if (device.removed) {
@@ -247,37 +235,6 @@ final class DevicesScreen extends Screen {
                 "Removing " + device.label + "…",
                 (personal, prompts, refused) -> personal.remove(device.id, prompts, refused),
                 this::taken));
-  }
-
-  /** The other devices of the set not removed. */
-  private int others() {
-    int others = 0;
-    for (Device device : devices) {
-      others += !device.me && !device.removed ? 1 : 0;
-    }
-    return others;
-  }
-
-  /** This phone's own removal, signed by its own admin key: the other devices commit it. */
-  private void leave(Device device) {
-    app.ask(
-        "Leave this personal space",
-        "This phone signs its own removal. Your other devices finish it: once the removal's"
-            + " delay passes, one of them commits it (its notice asks), and from then on this"
-            + " phone gets none of the space's new keys and reads none of its changes; pairing it"
-            + " again or restoring clears what it kept. Until then"
-            + " another device can still veto it.",
-        "Leave",
-        () ->
-            app.run(
-                "Signing this phone's removal…",
-                (personal, prompts, refused) -> personal.remove(device.id, prompts, refused),
-                (Posted posted) -> {
-                  app.say(
-                      "Your removal is open: your other devices commit it once its delay"
-                          + " passes.");
-                  reload();
-                }));
   }
 
   private void revoke(Device device) {

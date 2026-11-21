@@ -3770,10 +3770,10 @@ device's crates faster); its size argument is small.
   a restore with the kit (which, from a device out of its group, leaves
   it first as a pairing does); "Commit now" from a matured removal's
   notice carries it and revokes the removed device in every space its
-  handles name in one flow (`commitRemovals`, one prompt a signature); a
-  phone past its probation leaves its personal space by signing its own removal with its
-  own admin key, which another device's commit carries, its pass then
-  reading it through to `Out`. One test
+  handles name in one flow (`commitRemovals`, one prompt a signature).
+  Leaving the personal space from the phone itself is not built: the
+  agent refuses a device's own removal (`Targeted`), so another device
+  retires it (`open.md`). One test
   double for all of it: `vos_light::testing` (`Phone`, `World`,
   `Reach`) and `vos_testkit::personal::Agent`.
 - **Pairing after the set changed** [built, `node/light/android`]: the
