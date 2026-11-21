@@ -361,29 +361,47 @@ mod tests {
     use super::*;
 
     /// A thread's alternate signal stack is unmapped when the thread exits,
-    /// so threads that ran native code leave no mapping behind.
+    /// so threads that ran native code leave no mapping behind. The stack
+    /// is marked before the thread exits: after, its address reads as
+    /// unmapped, or (another test thread's mapping landing on the freed
+    /// range) as memory that does not hold the mark.
     #[test]
     fn a_threads_alternate_stack_leaves_with_it() {
+        const MARK: [u8; 16] = *b"alternate-stack!";
         let stack = std::thread::spawn(|| {
             ensure_installed().unwrap();
             // SAFETY: sigaltstack writes the current stack into a valid struct.
             let mut current: libc::stack_t = unsafe { std::mem::zeroed() };
             assert_eq!(unsafe { libc::sigaltstack(null_mut(), &mut current) }, 0);
             assert_eq!(current.ss_flags & libc::SS_DISABLE, 0);
+            assert!(current.ss_size >= MARK.len());
+            // SAFETY: the alternate stack is this thread's, mapped and
+            // writable for `ss_size` bytes, and unused while no signal runs.
+            unsafe {
+                std::ptr::copy_nonoverlapping(MARK.as_ptr(), current.ss_sp as *mut u8, MARK.len())
+            };
             current.ss_sp as usize
         })
         .join()
         .unwrap();
         let mut pipe = [0; 2];
-        // SAFETY: pipe fills a valid array; write reads one byte at `stack`
-        // in the kernel, which reports an unmapped address as EFAULT.
+        let mut read = [0u8; 16];
+        // SAFETY: pipe fills a valid array; write reads the bytes at `stack`
+        // in the kernel, which reports an unmapped address as EFAULT; read
+        // fills `read`.
         let wrote = unsafe {
             assert_eq!(libc::pipe(pipe.as_mut_ptr()), 0);
-            let wrote = libc::write(pipe[1], stack as *const libc::c_void, 1);
+            let wrote = libc::write(pipe[1], stack as *const libc::c_void, MARK.len());
+            if wrote == MARK.len() as isize {
+                libc::read(pipe[0], read.as_mut_ptr() as *mut libc::c_void, MARK.len());
+            }
             libc::close(pipe[0]);
             libc::close(pipe[1]);
             wrote
         };
-        assert_eq!(wrote, -1, "the exited thread's stack is unmapped");
+        assert!(
+            wrote == -1 || read != MARK,
+            "the exited thread's stack is unmapped"
+        );
     }
 }
