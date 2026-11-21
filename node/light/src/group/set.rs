@@ -2,7 +2,7 @@
 //! §3.5): each admin call of the set checked against its signer and its
 //! evidence, and each maturity the log asserts honoured only once the
 //! evidence supports it: its delay passed unvetoed, or a second signature,
-//! or a resolution, each verified.
+//! or a resolution, each verified; a leave, by its evidence alone.
 
 use vos_abi::Encode;
 use vos_abi::ids::MethodId;
@@ -55,6 +55,12 @@ fn targets(op: &Op) -> &[DeviceId] {
     }
 }
 
+/// Whether `op`, signed by `by`, is a device's leave: its own removal,
+/// which matures with its evidence and which no one vetoes.
+pub(super) fn leaves(by: Signer, op: &Op) -> bool {
+    matches!((by, op), (Signer::Device(by), Op::Remove(target)) if by == *target)
+}
+
 fn signer(by: Signer) -> Option<DeviceId> {
     match by {
         Signer::Device(device) => Some(device),
@@ -81,8 +87,16 @@ impl DeviceGroup {
     /// replacement of the device whose asserted maturity waits on its
     /// evidence, which the call then waits on too.
     pub(super) fn holds(&self, by: Signer, origin: &[u8; 32], at: u64) -> Holds {
+        self.holds_as(by, origin, at, false)
+    }
+
+    /// [`DeviceGroup::holds`], a device with a voice holding its key on its
+    /// probation too when `leaving`: its own removal's signer.
+    fn holds_as(&self, by: Signer, origin: &[u8; 32], at: u64, leaving: bool) -> Holds {
         match by {
-            Signer::Device(device) if self.state.may_sign(device, at) => {
+            Signer::Device(device)
+                if self.state.may_sign(device, at) || leaving && self.state.voiced(device) =>
+            {
                 if self
                     .state
                     .known(device)
@@ -138,7 +152,8 @@ impl DeviceGroup {
                     Op::Replace { device: target, .. } => device
                         .is_none_or(|device| device != *target && self.state.seasoned(device, at)),
                     Op::Remove(_) | Op::Rotate(_) => true,
-                } && device.is_none_or(|device| !targets(op).contains(&device))
+                } && (leaves(by, op)
+                    || device.is_none_or(|device| !targets(op).contains(&device)))
                     && *matures >= at.saturating_add(delay);
                 (name, arguments, allowed)
             }
@@ -146,7 +161,8 @@ impl DeviceGroup {
             Act::Cosign(op) => (method::COSIGN, op.encode(), true),
             Act::Resolve { op, upheld } => (method::RESOLVE, (*op, *upheld).encode(), true),
         };
-        let holds = self.holds(by, &call.origin, at);
+        let leaving = matches!(&act, Act::Op { op, .. } if leaves(by, op));
+        let holds = self.holds_as(by, &call.origin, at, leaving);
         let evidence = if allowed
             && call.method == name.0
             && Place::split(&call.arguments).is_some_and(|(_, signed)| signed == arguments)
@@ -466,6 +482,14 @@ impl DeviceGroup {
             Check::Missing => return Support::Waiting,
             Check::Valid if call.awaits.is_some() => return Support::Waiting,
             Check::Valid => {}
+        }
+        // A leave waits on nothing but its own evidence.
+        if leaves(call.by, op) {
+            return if claim.at >= call.at {
+                Support::Held
+            } else {
+                Support::Refused
+            };
         }
         // A replacement's wait is its new key's probation, which no
         // resolution shortens (E29).

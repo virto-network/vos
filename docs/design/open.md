@@ -475,15 +475,6 @@ The scale results are in `core-model.md` §14, "The scale test".
 What `light-node.md` leaves for later; the dated risks and deferred flows
 are under "Identity and privacy" above.
 
-- **Leaving from the phone itself** [the owner, 2026-11-20, D4: "add Leave
-  now"; not built]: a device's own removal is refused by the agent
-  (`Targeted`, `agent/personal/src/devices.rs`, the rule that a device
-  signs nothing acting on itself), and a device on probation signs no
-  admin call at all. Leave needs the agent to take a removal signed by its
-  own target (its own admin key, past its probation, as an operation the
-  other devices commit), a change to the agent's rules; until then another
-  device retires the phone.
-
 - **The phone gates not yet recorded as passed** (`light-node.md` §2.4):
   PG1′ and PG2′ at format 47 on the Fairphone 6, twice a day apart; PG3′'s
   flows and PG6 as onion runs on two phones with the security key; PG5's

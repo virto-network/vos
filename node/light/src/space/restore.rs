@@ -51,7 +51,7 @@ impl<H: Host> Personal<H> {
         let home = kept.home.clone();
         let kit = entered_kit(prompts, old)?;
         if out == Some(true) {
-            self.leave(&mut held)?;
+            self.forget(&mut held)?;
         }
         let signing = kit.signing();
         let mut session = Signer::new(signing.verifying_key().to_bytes());

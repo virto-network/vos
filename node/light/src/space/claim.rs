@@ -586,7 +586,7 @@ impl<H: Host> Personal<H> {
 
     /// The personal space moved to another home, carrying nothing: once
     /// that home answers with an agent to give, this device leaves the
-    /// space it holds, with no call to its old home (`Personal::leave`),
+    /// space it holds, with no call to its old home (`Personal::forget`),
     /// and claims an agent there with a new kit, as a first claim does; the
     /// other devices leave and pair again from this one. Called again after
     /// a claim cut short, it finishes that claim.
@@ -627,7 +627,7 @@ impl<H: Host> Personal<H> {
             if holding.is_some() {
                 return Err(Error::HoldsAgentThere);
             }
-            self.leave(&mut held)?;
+            self.forget(&mut held)?;
             ready = Some(secret);
         }
         self.claiming(&mut held, prompts, request, ready)

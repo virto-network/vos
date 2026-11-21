@@ -226,6 +226,8 @@ public final class Words {
       case Stage.HANDING_OVER:
       case Stage.APPROVING:
         return pairing(stage, true);
+      case Stage.LEAVING:
+        return "Your devices took this phone's removal: clearing it from this phone…";
       default:
         return "Working…";
     }

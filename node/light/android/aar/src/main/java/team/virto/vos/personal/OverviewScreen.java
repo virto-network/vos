@@ -108,7 +108,11 @@ final class OverviewScreen extends Screen {
     long now = System.currentTimeMillis();
     switch (status.phase) {
       case Phase.NONE:
-        none(into);
+        if (app.hasLeft()) {
+          left(into);
+        } else {
+          none(into);
+        }
         return;
       case Phase.NEEDS_REPAIR:
         into.addView(warning(Words.phase(status.phase)));
@@ -191,6 +195,18 @@ final class OverviewScreen extends Screen {
         button(
             "Pair again after a move or a regroup (scan the code of a device there)",
             v -> app.open(new PairScreen(app, false))));
+  }
+
+  /** This phone left its personal space: the two ways back in. */
+  private void left(LinearLayout into) {
+    into.addView(warning("This phone left your personal space and keeps nothing of it."));
+    into.addView(
+        text(
+            "The next of your other devices you open asks you to commit its removal. To come back,"
+                + " pair this phone again from another of your devices, or, with none left,"
+                + " restore your personal space with your recovery kit."));
+    into.addView(button("Pair again", v -> app.open(new PairScreen(app, false))));
+    into.addView(button("Restore with your kit", v -> app.open(new RestoreScreen(app))));
   }
 
   private void none(LinearLayout into) {

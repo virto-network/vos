@@ -574,6 +574,11 @@ public final class VosNode {
     }
 
     @Override
+    public boolean leave(IVosPrompts prompts, Refused refused) {
+      return nativeLeave(prompts, refused);
+    }
+
+    @Override
     public int commitRemovals(IVosPrompts prompts, Refused refused) {
       return nativeCommitRemovals(prompts, refused);
     }
@@ -835,6 +840,8 @@ public final class VosNode {
       Refused refused);
 
   private static native boolean nativeUpdate(IVosPrompts prompts, Refused refused);
+
+  private static native boolean nativeLeave(IVosPrompts prompts, Refused refused);
 
   private static native int nativeCommitRemovals(IVosPrompts prompts, Refused refused);
 

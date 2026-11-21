@@ -435,6 +435,7 @@ impl From<space::Stage> for Stage {
             space::Stage::Checked => Self::Checked,
             space::Stage::HandingOver => Self::HandingOver,
             space::Stage::Approving => Self::Approving,
+            space::Stage::Leaving => Self::Leaving,
         }
     }
 }
@@ -1203,6 +1204,11 @@ impl Space {
 
     pub fn update(&self, prompts: Lent<'_>) -> Result<(), Refused> {
         self.personal.update(&Asked::new(prompts))?;
+        Ok(())
+    }
+
+    pub fn leave(&self, prompts: Lent<'_>) -> Result<(), Refused> {
+        self.personal.leave(&Asked::new(prompts))?;
         Ok(())
     }
 

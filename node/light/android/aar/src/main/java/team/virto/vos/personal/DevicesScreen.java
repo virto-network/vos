@@ -9,7 +9,7 @@ import android.widget.LinearLayout;
  * The device set: each device's standing and last call, a phone retired (removed, then its
  * memberships revoked), the changes open (veto, cosign, a contest resolved), the memberships a
  * pairing left, the recovery kit's rotation, this phone's admin key replaced, a regroup, a commit
- * now. Each change is the admin key's, behind its strong
+ * now, and this phone leaving the space. Each change is the admin key's, behind its strong
  * biometric. Read from the agent when shown and on each return to the app, never on a timer.
  */
 final class DevicesScreen extends Screen {
@@ -93,6 +93,10 @@ final class DevicesScreen extends Screen {
                   + ", last call at your agent "
                   + Words.ago(device.seen, now)));
       if (device.me) {
+        // Alone, no other device would commit it: a restore with the kit replaces it instead.
+        if (!device.removed && others() > 0) {
+          into.addView(button("Leave this personal space", v -> leave()));
+        }
         continue;
       }
       if (device.removed) {
@@ -235,6 +239,32 @@ final class DevicesScreen extends Screen {
                 "Removing " + device.label + "…",
                 (personal, prompts, refused) -> personal.remove(device.id, prompts, refused),
                 this::taken));
+  }
+
+  /** The other devices of the set not removed. */
+  private int others() {
+    int others = 0;
+    for (Device device : devices) {
+      others += !device.me && !device.removed ? 1 : 0;
+    }
+    return others;
+  }
+
+  /** This phone's own removal, signed by its admin key: the other devices commit it. */
+  private void leave() {
+    app.ask(
+        "Leave this personal space",
+        "This phone removes itself from your personal space now. Your other devices finish it:"
+            + " the next one you open asks you to commit it. This phone keeps nothing of the"
+            + " space: its keys, its copy of your data and its recovery state are cleared. To come"
+            + " back, pair it again from another of your devices.",
+        "Leave",
+        () ->
+            app.run(
+                "Signing this phone's removal…",
+                (personal, prompts, refused) ->
+                    personal.leave(prompts, refused) ? Boolean.TRUE : null,
+                done -> app.left())));
   }
 
   private void revoke(Device device) {

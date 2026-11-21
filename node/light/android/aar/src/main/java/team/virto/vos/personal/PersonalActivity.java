@@ -73,6 +73,8 @@ public final class PersonalActivity extends Activity {
   private boolean sitting;
   /** Whether the activity was started before: a start after it is a return to the app. */
   private boolean restarted;
+  /** Whether this phone left its personal space since the activity started. */
+  private boolean left;
 
   /** What {@code :vos} tells the screens: a stage of the flow under way, a pass ended. */
   private final IVosWatcher.Stub watcher =
@@ -364,6 +366,17 @@ public final class PersonalActivity extends Activity {
       shown.closed();
     }
     show(screen);
+  }
+
+  /** This phone left its personal space: the first screen shown anew, saying so. */
+  void left() {
+    left = true;
+    home();
+  }
+
+  /** Whether this phone left its personal space since the activity started. */
+  boolean hasLeft() {
+    return left;
   }
 
   /** Back to the first screen, shown anew. */

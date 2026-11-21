@@ -145,6 +145,12 @@ interface IVosPersonal {
     boolean update(IVosPrompts prompts, out Refused refused);
 
     /**
+     * Leave the personal space: this device's own removal, signed by its admin key, read through,
+     * then everything this phone kept of the space cleared; the other devices commit it.
+     */
+    boolean leave(IVosPrompts prompts, out Refused refused);
+
+    /**
      * The commit a matured removal's notice asks for, then each device it removed revoked in every
      * space its handles name (one admin or owner prompt a signature, as each call alone): how many
      * spaces it was revoked in. Refused as the first call that fails; a revoke refused leaves the

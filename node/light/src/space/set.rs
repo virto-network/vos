@@ -23,6 +23,10 @@ use crate::route::Purpose;
 /// past or for `Settling`: for the admin key, a prompt each.
 pub(super) const PLACINGS: usize = 3;
 
+/// The follows a leave makes after the one its call makes, until the log
+/// reads it out.
+const LEAVE_FOLLOWS: usize = 2;
+
 /// A device's new admin key, offered to another device of the set to sign
 /// its replacement: `device` (u32 big-endian) ‖ `key` ‖ a flags byte (1
 /// hardware, 2 verified boot) ‖ the offering device's sync key's signature
@@ -227,6 +231,52 @@ impl<H: Host> Personal<H> {
             device.encode(),
             None,
         )
+    }
+
+    /// This device leaves the personal space: its own removal, signed by
+    /// its admin key (on its probation too), which the agent matures once
+    /// its evidence is posted and no device vetoes; the log then read
+    /// through to `Out`, as a removed device reads its removal, and the
+    /// space forgotten at once ([`Personal::forget`]): the group's MLS
+    /// state, the key archive and `R`'s share, the kit's state, the home,
+    /// the agent, the admin key's public half, every flow's state and the
+    /// local actors' rows go with the store; the secret source's key and
+    /// the label stay, as at a fresh install. The other devices commit the
+    /// removal, as any matured one. Out already (a leave whose follow did
+    /// not get through, read out by a pass since), it forgets at once. The
+    /// leave posted but not read through, the space stays held and the
+    /// flow answers `Unreachable`: the next pass posts what is held and
+    /// reads it out, and the leave run again forgets.
+    pub fn leave(&self, prompts: &dyn Prompts) -> Result<(), Error> {
+        let mut held = self.held();
+        let out = |held: &Held| {
+            held.group
+                .as_ref()
+                .is_some_and(|group| group.course() == crate::group::Course::Out)
+        };
+        if !out(&held) {
+            let me = held
+                .group
+                .as_ref()
+                .and_then(crate::group::DeviceGroup::id)
+                .ok_or(Error::NoSpace)?;
+            self.operate(&mut held, prompts, method::REMOVE, me.encode(), None)?;
+            prompts.stage(super::Stage::Leaving);
+            for _ in 0..LEAVE_FOLLOWS {
+                if out(&held) {
+                    break;
+                }
+                self.follow(&mut held)?;
+            }
+            if !out(&held) {
+                return Err(Error::Unreachable(
+                    "the leave is posted, not yet read through: it finishes once this phone \
+                     reaches your agent again"
+                        .into(),
+                ));
+            }
+        }
+        self.forget(&mut held)
     }
 
     /// An operation open vetoed, by the admin key.

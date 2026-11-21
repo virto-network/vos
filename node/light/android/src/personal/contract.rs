@@ -96,6 +96,8 @@ byte_enum! {
         HandingOver = 7 as HANDING_OVER,
         /// The new device's add waiting for the opener's admin key.
         Approving = 8 as APPROVING,
+        /// This device's leave taken: the space being forgotten.
+        Leaving = 9 as LEAVING,
     }
 }
 
