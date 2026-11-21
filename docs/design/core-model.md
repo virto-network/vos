@@ -1073,9 +1073,10 @@ node-level log, keyed by (agent, index):
   the drain could have come in; each agent's order is kept, and synced
   rows stay invisible until their fsync (the store inserts a synced batch
   only after it). A leader's apply whose agent has no synced commit
-  before it in the drain so does not wait out another agent's fsync,
-  about two fifths of a batch's time at T1's load [measured,
-  `light-node.md` §3.3, "The cause"];
+  before it in the drain so does not wait out another agent's fsync: at
+  T1's load the apply was about two fifths of a batch's time, and this
+  took its mean from 37 to 22 ms and the batch's about 10% lower, the
+  commit's 8–11% higher [measured, `light-node.md` §3.3, "The cause"];
 - **a stalled writer hands over leadership** [decided]: a commit waiting
   past the stall bound (`Config::writer_stall`, by default the election
   timeout's upper end, 3 s at the defaults), its queueing behind other

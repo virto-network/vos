@@ -777,40 +777,81 @@ each other. What remains is `open.md`'s.
 **The cause** [measured, compumax (capped) + sigma, 2026-11-21; the
 rerun's layout and build with every executor job, batch, apply and
 writer flush timed exactly on the nodes; 3,000 calls a second for eight
-minutes]:
-- **The calls are not it.** 2,000 personal agents waking every 180 s,
-  the same calls a second as 10,000 every 900 s, left the transfers'
-  p99 at 590 ms against 610 ms without them; 10,000 agents eight minutes
-  after their creation moved nothing at the nodes either (a batch p50
-  75 ms in both). An idle agent writes nothing: the writer's changes a
-  second (appends, terms and commit indexes, applies, root builds) rose
-  3% with 10,000 agents, the wakes' own, and its bytes 2%.
-- **The node's time is the writer's.** A shard's batch took 75 ms at
-  p50: 6 ms to its proposal (refine and dry run, the executors 40–45%
-  busy, a wait for one 1.5–1.9 ms at p50), 35 ms to its commit (the
-  synced appends here and at a follower) and 32 ms to its apply, of
-  which 29 ms was the apply's commit: an apply needs no sync, but it
-  queued behind and then rode the writer's next synced flush, which took
-  18 ms at p50 and ran back to back (47 a second, 62 commits each, about
-  9 MB a second a node). Where shards' batches waited past 10 ms for an
-  executor, other shards' batches and root builds held them; a personal
-  agent's job, 1.4% of that time.
-- **Over the hour** (the rerun's 3,000 pair, exact means from the
-  histograms' sums): the batch +4%, +11% and +10% on the three nodes,
-  its commit +8–11%, the synced flush 21–22 to 23 ms (+3–8%), the apply
-  +3–9%, while the executors' waits moved both ways; every stage climbed
-  over the hour in both runs (the batch 78 to 103 ms without the agents),
-  the store growing under the load and, with them, the 255 MiB they
-  pushed [inferred]. The rise reads as the writer's flush growing a few
-  percent, which a batch meets in its commit and again in its apply, on
-  a writer with no slack [inferred]; at 5,000 the executors' waits rose
-  too (their means from 6–17 to 8–23 ms), which this does not explain.
+minutes]: where a batch's time goes is measured; what raises it with the
+agents is not identified.
+- **Eight minutes show no rise.** 2,000 personal agents waking every
+  180 s, the same calls a second as 10,000 every 900 s, left the
+  transfers' p99 at 590 ms against 610 ms without them; 10,000 agents
+  eight minutes after their creation moved nothing at the nodes (a batch
+  p50 75 ms in both), the writer's changes a second 3% higher (the wakes'
+  own; an idle agent's group writes nothing) and its bytes 2%. In the
+  hour-long runs below the first ten-minute block is as flat (594 against
+  578 ms) and the gap opens from the second (983 against 664 ms): these
+  runs sat inside that window.
+- **Where a batch's time goes.** A shard's batch took 75 ms at p50: 6 ms
+  to its proposal (refine and dry run, the executors 40–45% busy, a wait
+  for one 1.5–1.9 ms at p50), 35 ms to its commit (the synced appends
+  here and at a follower) and 32 ms to its apply, of which 29 ms was the
+  apply's commit: an apply needs no sync, but it queued behind and then
+  rode the writer's next synced flush, which took 18 ms at p50 and ran
+  back to back (47 a second, 62 commits each, about 9 MB a second a node).
+  Where shards' batches waited past 10 ms for an executor, other shards'
+  batches and root builds held them; a personal agent's job, 1.4% of that
+  time.
+- **Over the hour, at the nodes** (exact means from the histograms'
+  sums): the rerun's 3,000 pair had the batch +4%, +11% and +10% on the
+  three nodes, its commit +8–11%, the synced flush 21–22 to 23 ms
+  (+3–8%), the apply +3–9%; the executors' waits moved both ways. With
+  the agents the nodes also ran 10–14 million more steps' gas a second
+  (their pushes, even across the hour, as their wakes are) and the log
+  cache grew from about 130 to 335 MiB a node over the hour (50–67 MiB
+  without); batches a second, root builds, flushes and signature checks
+  did not grow with time. Every stage climbed over the hour in both runs
+  (the batch 78 to 103 ms without the agents). At 5,000 the executors'
+  waits rose too (their means from 6–17 to 8–23 ms).
 - **The fix:** a drain's unsynced commits go first, written and answered
   before its sync (`core-model.md` §9.5, the log writer), so an apply
   whose agent has no synced commit before it in the drain waits out the
   flush in progress, not another one after it; nothing durable changes.
   Executor lanes for long calls are not built: at 3,000 the data does
   not show them holding the batches.
+
+**The rerun with the fix** [measured, compumax (capped) + sigma,
+2026-11-21; the same layout, cap (each node on four threads), seed and
+load; the nodes and guests built at one revision, the driver's harness
+with its record written off the sending thread; the nodes' API bound
+raised to 4,096 requests in flight so the gate reads the nodes; 3,000
+calls a second, calibrated over 600 s (0 errors, the answered rate the
+offered, at most 843 in flight, the nodes' CPU 53–57%); four runs of an
+hour, (a) (b) (a′) (b′), 10,000 personal agents waking every 900 s in
+(b) and (b′); the clock check overridden, compumax's NTP source 140 ms
+off]:
+
+| run | transfer p50 / p99 / p99.9 (s) | 10-min block p99 (s) | in flight max | node CPU | RSS end (GiB) |
+|---|---|---|---|---|---|
+| (a) | 0.122 / 0.725 / 1.16 | 0.59 0.68 0.74 0.79 0.73 0.81 | 1,608 | 59–60% | 1.79–1.81 |
+| (b) | 0.131 / 0.840 / 1.36 | 0.64 1.00 0.83 0.75 0.79 0.95 | 2,467 | 58–64% | 2.75–2.78 |
+| (a′) | 0.119 / 0.651 / 0.99 | 0.58 0.66 0.65 0.66 0.63 0.74 | 1,498 | 57–63% | 1.71–1.74 |
+| (b′) | 0.129 / 0.852 / 1.50 | 0.59 0.98 0.96 0.81 0.74 0.94 | 2,401 | 58–65% | 2.71–2.77 |
+
+- **The gate reads: missed.** +15.8% in the first pair, **+30.9%** in the
+  second, +23% pooled (0.846 against 0.688 s), as before the fix. The
+  two runs with agents agree within 1.4%; the two without differ by 11%.
+  No errors in any run; the driver's sends at worst 2.3 ms late.
+- **At the nodes,** the fix took the apply's mean from 37–39 to 22–23 ms
+  and the batch's about 10% lower than the rerun's, the commit 8–11%
+  higher (its sync now behind the drain's buffered flush, about 41 a
+  second at 5 ms); with the agents the batch's mean still rose +2–13%
+  per node, the commit +2–9%, the synced flush +1–4%, the node leading
+  the most shards' batches the most.
+- **Memory:** +55.9–59.2 KiB a replica right after creation (**met**, as
+  before); at the load's end, against the run without them, +98–103 KiB
+  a replica in the first pair and +105–108 KiB in the second.
+- **Wakes:** 40,000 in each run with agents, none failed; a wake p50
+  0.20–0.21 s, p99 1.19–1.27 s.
+- **Creation through `claim`:** 10,001 agents, a creator's first made one
+  creator at a time (sixteen creators dialing together passed a node's
+  handshakes a client address may hold at once, and were refused).
 
 **Reaching the agent: every gateway lists every node.** A node that does
 not replicate an agent answers `Elsewhere { replicas }`
