@@ -676,6 +676,12 @@ natives! {
         Ok(true)
     }
 
+    personal fn nativeLeave(lent: JObject<'l>) -> jboolean, |env, node| {
+        let lent = prompts(env, &lent)?;
+        node.personal()?.leave(&*lent)?;
+        Ok(true)
+    }
+
     personal fn nativeCommitRemovals(lent: JObject<'l>) -> jint, |env, node| {
         let lent = prompts(env, &lent)?;
         let revoked = node.personal()?.commit_removals(&*lent)?;

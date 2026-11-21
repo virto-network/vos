@@ -1448,7 +1448,8 @@ commits), **active**, or **removed** (with its frontier). A device is
    the new device is in probation. Signed by a delayed admin, it waits
    72 h first.
 2. **Remove `d`:** signed by an active device, **pending** for 72 h, then
-   matures unless contested.
+   matures unless contested. Signed by `d` itself it is `d`'s **leave**
+   (rule 10).
 3. **Being targeted suspends no right:** a device with a removal pending
    against it keeps every right, its own veto included.
 4. **Veto:** any active device, the target included, may veto a pending
@@ -1467,13 +1468,40 @@ commits), **active**, or **removed** (with its frontier). A device is
    **liveness**: any device's signed `alive`, posted under its sync key by
    an ordinary sync (no prompt) while the restore is pending, cancels it,
    since a restore asserts that every device is lost.
-8. **Probation devices** cannot sign operations or veto. **A removal
+8. **Probation devices** cannot sign operations or veto, their own leave
+   aside (rule 10). **A removal
    pending or contested against a probation device freezes its
    probation** until the removal resolves, so an add cannot ripen into a
    second vote inside a removal's own window.
 9. **A device whose removal has matured has no voice:** its vetoes,
    `alive`, confirmations and nacks are ignored, whatever the agent
    stores.
+10. **Leave** [the owner, 2026-11-20, D4]: a device removes itself, signed
+    by its own admin key, active or on its probation (a frozen one too).
+    The leave matures as soon as its evidence is posted, with no delay,
+    and no device vetoes, cosigns or resolves it; the other devices commit
+    it as any matured removal (the commit re-seals the kit under a new
+    `R`; a device on its probation commits once its probation ends, so
+    a phone left with only a newly paired one waits for it). The set's
+    last live device may not leave: no device would commit it, and a
+    restore with the kit replaces it instead; of two leaves open side by
+    side, the one maturing last is cancelled (`Alone`).
+
+*Why a leave waits on nothing.* A leave only lowers its signer's power:
+it gives up the one voice it had and gains none. The delay and the veto
+exist so that a removal a device did not ask for can be answered by it
+and by the others; a leave's target is its signer, so its own act is the
+consent the delay waits for, and the others have nothing to protect by a
+veto: a device can always walk away by deleting its keys, and a veto
+could not make it stay, only keep a voice in the set that no one holds.
+A thief holding a stolen phone who signs its leave removes the phone the
+owner was about to retire (A25). A device that leaves during a contest
+that targets it concedes it: the removal of it ends `Moot` with the leave,
+its own removal of its rival is cancelled with its silencing, and the
+rival keeps its voice. The leave's evidence is what makes it mature, so a
+route that holds back the evidence holds back the leave (the device posts
+it again at its next pass) and one that drops it leaves it cancelled
+`Unevidenced` after the operation delay: neither gives anyone a voice.
 
 *What is conceded, and only this:* a thief who passes the owner's strong
 biometric holds an active device and can always contest. The owner wins
@@ -1573,7 +1601,22 @@ where the rules above leave a choice, this is the one taken]:
   replacement's wait, so the old key, while it signs, can veto a
   replacement it did not ask for. `seasoning_ms` (7 days) and the kit's
   daily allowance (`kit_operations_per_day`, 4) are the policy's too; a
-  test home sets each in minutes. No device removes itself.
+  test home sets each in minutes. A device's own removal is its leave
+  (rule 10): taken on its probation too, kept apart from the removal
+  open against it (one of each a target), its delay only the time its
+  evidence has (`operation_delay_ms`, then cancelled `Unevidenced`), and
+  matured by the evidence call itself; its maturity cancels the removal
+  and the replacement open against the device as `Moot`. A veto or a
+  cosign of a leave is refused (`Leaving`), and so is the last live
+  device's leave (`Alone`, when opened; cancelled `Alone` when it would
+  mature so). Each device checks it the same way
+  (`node/light/src/group/set.rs`): its signer's key held on probation,
+  its maturity supported only by its own evidence logged before it, the
+  maturity asserted at that entry's own time and before the leave's
+  deadline; a logged veto or cosign of a leave is invalid. The agent
+  verifies no evidence's signature (no guest does, `core-model.md` §5): a
+  leaver posting a bad signature is removed by the agent while every
+  other device raises `Unsigned`, which needs the leaver's own keys.
 - **Vetoes** (`veto`, an active device's admin key, never the kit's):
   a device's operation becomes contested, the kit's is cancelled. A
   contest held only by vetoes lifts when the last vetoer's removal
@@ -1871,7 +1914,10 @@ the one taken]:
   is the one the log named last (by `r_hash`); and no earlier group's
   naming secret or scope, which come from a device's own restore and
   from a pairing alone. An archive names no author at all. So a device, removed later,
-  leaves behind no author or key that outlives its removal (A7); unless one
+  leaves behind no author or key that outlives its removal (A7) (and a
+  device that leaves, its own removal, forgets the archive, `R`'s share
+  and every scope key with its store once its follow reads the removal
+  through, §3.5 rule 10); unless one
   there encodes as this device's whole archive (candidates are kept in
   order, so equal archives encode alike), it pushes its own, chunked,
   under the epoch's archive key. The committer's push and the push of any
@@ -4017,9 +4063,22 @@ device's crates faster); its size argument is small.
   it first as a pairing does); "Commit now" from a matured removal's
   notice carries it and revokes the removed device in every space its
   handles name in one flow (`commitRemovals`, one prompt a signature).
-  Leaving the personal space from the phone itself is not built: the
-  agent refuses a device's own removal (`Targeted`), so another device
-  retires it (`open.md`). One test
+  Devices offers "Leave this personal space" on a phone with another
+  live device in the set: one confirm that says what happens, one
+  biometric, then progress in words ("Signing this phone's removal…",
+  then "Your agent took this phone's removal: reading it through, then
+  clearing this phone…") and the removed screen, "This phone left your
+  personal space and keeps nothing of it", with "Pair again" and "Restore
+  with your kit" (`Personal::leave`: the removal signed and posted, the
+  log read through to `Out` and the store made anew by the follow that
+  read it, `Event::Left`; a leave cut short is read through and
+  forgotten by the next pass, and one killed between the two shows the
+  removed screen, whose pairing and restore forget first; the other
+  phones' next pass raises the matured removal's notice to commit it).
+  What stays: the secret source's key and the label, as at a fresh
+  install, and the Keystore's admin key, which s4 makes and signs with
+  and deletes none of; it signs nothing the agent admits from the
+  leave's maturity on, as after every other leave of the store. One test
   double for all of it: `vos_light::testing` (`Phone`, `World`,
   `Reach`) and `vos_testkit::personal::Agent`.
 - **Pairing after the set changed** [built, `node/light/android`]: the
@@ -4207,6 +4266,20 @@ re-pair from** (a buggy commit, a lost committer, a lockout). *Mitigation:*
 a regroup signed by its admin key: 72 h and a veto, or at once with two
 seasoned devices or the kit (§3.5); it keeps its regrouper alone, and
 the other devices pair again from it.
+
+**A25. A device leaves** (its owner retires it from itself; or a thief
+holding it, the biometric passed, signs the leave). *Mitigation:* a leave
+only lowers its signer's power (§3.5, rule 10): it matures with its
+evidence and gives no one a voice, so a thief's leave of a stolen phone
+is the retirement the owner wanted, at once. During a contest that
+targets the leaver, the leave concedes it: the removal of it ends `Moot`,
+the leaver's removal of its rival is cancelled with its silencing.
+*Known limit:* until the other devices commit it, the left device's leaf
+holds the epoch's keys, as after any matured removal (it forgot them at
+once if it was the owner's own leave; a thief who kept a copy reads until
+the commit, as A2's thief does before the owner's removal), and the
+commit re-seals `R`. The last live device cannot leave (`Alone`): no
+device would commit it; a restore with the kit replaces it.
 
 ### 8.2 The home space and its operators
 

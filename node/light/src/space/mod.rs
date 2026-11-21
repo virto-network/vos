@@ -24,13 +24,16 @@
 //!   device that holds another personal space, or a removed one, leaving it
 //!   first); the memberships a pairing leaves; the device set's
 //!   operations; a restore from the kit; a move home.
-//! - **Leaving** (`Personal::leave`): a device gives up the personal space
-//!   it holds with no call to its agent: its light node's store made anew,
-//!   as at a fresh install. A move home is a leave and a claim at the new
-//!   home, a device paired again after a move or a regroup a leave and a
-//!   pairing: nothing is carried, since the personal space holds the
-//!   credential book and the device book alone, which each device writes
-//!   again from what it holds ([`Artifacts`]).
+//! - **Forgetting** (`Personal::forget`): a device gives up the personal
+//!   space it holds with no call to its agent: its light node's store made
+//!   anew, as at a fresh install. A move home is a leave of this kind and a
+//!   claim at the new home, a device paired again after a move or a regroup
+//!   one and a pairing: nothing is carried, since the personal space holds
+//!   the credential book and the device book alone, which each device
+//!   writes again from what it holds ([`Artifacts`]).
+//! - **Leaving** ([`Personal::leave`]): the device's own removal, signed by
+//!   its admin key and read through to `Out`, then the space forgotten; the
+//!   other devices commit the removal.
 //! - **The prompts are the user's**: a kit shown or entered, a secret
 //!   source's output, a security key's `hmac-secret`, the admin key's
 //!   signature over bytes prepared here; none is asked outside a flow the
@@ -94,7 +97,7 @@ pub const DEVICE_BOOK: InstanceId = InstanceId(2);
 /// The light node's artifacts: the default agent's program, and the local
 /// actors' packages. The local actors are the credential book and the
 /// device book, which each device writes again from what it holds: so a
-/// leave, a move home among them, carries nothing (`Personal::leave`). A
+/// leave, a move home among them, carries nothing (`Personal::forget`). A
 /// local actor holding what no device writes again needs the move to carry
 /// its scope first.
 #[derive(Clone)]
@@ -530,7 +533,7 @@ pub struct Personal<H: Host> {
     /// When the home's onion set was last asked for, read or not.
     onions_tried: AtomicU64,
     /// The personal space's directory, and the artifacts a store made anew
-    /// installs (`Personal::leave`).
+    /// installs (`Personal::forget`).
     directory: PathBuf,
     artifacts: Artifacts,
 }
@@ -751,7 +754,7 @@ impl<H: Host> Personal<H> {
         self.held().group.is_some()
     }
 
-    /// Leave the personal space this device holds, for good, with no call
+    /// Forget the personal space this device holds, for good, with no call
     /// to its agent: a store made anew under the next generation's
     /// directory, its local actors installed there, then made the device's
     /// by its first batch, which keeps the source and the label and drops
@@ -760,7 +763,7 @@ impl<H: Host> Personal<H> {
     /// space, as at a fresh install: it claims, or pairs, with new sync and
     /// admin keys. Cut short before the new store is named, the old space
     /// stands; after, the old directory goes at the next open.
-    fn leave(&self, held: &mut Held) -> Result<(), Error> {
+    fn forget(&self, held: &mut Held) -> Result<(), Error> {
         let generation = held.generation + 1;
         let state = State {
             source: held.state.source.clone(),
@@ -855,7 +858,9 @@ impl<H: Host> Personal<H> {
         if let Some(device) = group.id() {
             self.book(light, device);
         }
-        if let Err(error) = self.refresh_onions(&mut held, now) {
+        if left(&pass) {
+            self.forget(&mut held)?;
+        } else if let Err(error) = self.refresh_onions(&mut held, now) {
             failures.push(format!("the home's onions: {error}"));
         }
         Ok(Passed {
@@ -999,17 +1004,22 @@ impl<H: Host> Personal<H> {
     /// One pass of the light node's job in the foreground: the log
     /// followed and every vote, evidence and `alive` posted, the scopes
     /// pushed and read. Whether it left the device with nothing a flow
-    /// waits for ([`crate::job::complete`]).
+    /// waits for ([`crate::job::complete`]). A pass that reads this
+    /// device's own leave through forgets the space (`Personal::forget`).
     fn follow(&self, held: &mut Held) -> Result<bool, Error> {
         let now = self.host.now();
-        self.with_link(held, Purpose::Personal, |link, held| {
+        let (complete, left) = self.with_link(held, Purpose::Personal, |link, held| {
             let Held { light, group, .. } = held;
             let group = group.as_mut().ok_or(Error::NoSpace)?;
             let instances = light.instances().map_err(store_failed)?;
             crate::job::run(light, group, link, &instances, now)
-                .map(|pass| crate::job::complete(group, &pass))
+                .map(|pass| (crate::job::complete(group, &pass), left(&pass)))
                 .map_err(|stopped| unreached(stopped.error))
-        })
+        })?;
+        if left {
+            self.forget(held)?;
+        }
+        Ok(complete)
     }
 
     /// Up to `follows` follows, until one leaves the device complete
@@ -1100,6 +1110,11 @@ impl<H: Host> Personal<H> {
             label: label.as_bytes().to_vec(),
         })
     }
+}
+
+/// Whether `pass` read this device's own leave through.
+fn left(pass: &crate::job::Pass) -> bool {
+    pass.events.contains(&crate::group::Event::Left)
 }
 
 /// Where a flow's request goes: the home whose handle it names, or the

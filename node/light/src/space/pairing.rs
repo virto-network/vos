@@ -329,7 +329,7 @@ impl<H: Host> Personal<H> {
     /// its group joined; the acknowledgement left. A device that holds
     /// another personal space, or this one's once out of it (its removal
     /// matured), leaves it once the opener's offer is read
-    /// (`Personal::leave`); one the set still holds live is refused. The
+    /// (`Personal::forget`); one the set still holds live is refused. The
     /// label is the caller's to check.
     pub fn pair_join(
         &self,
@@ -432,7 +432,7 @@ impl<H: Host> Personal<H> {
                             .map_err(failed)?
                             .is_some()
                     {
-                        self.leave(&mut held)?;
+                        self.forget(&mut held)?;
                     }
                     let source = self.source(prompts, &mut held)?;
                     let secret = secret(prompts, &source, &offer.home.handle)?;

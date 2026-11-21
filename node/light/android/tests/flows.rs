@@ -486,6 +486,60 @@ fn pair_sync_retire_and_the_removed_phone() {
     );
 }
 
+/// A phone leaving its personal space on its probation, timed: its own
+/// removal signed and read through, the space cleared; then the other
+/// phone's pass and its commit.
+#[test]
+fn leave_and_the_other_commits() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    world.delay(Delays::ONION);
+    let (staying, stays) = held(&world, 0x35);
+    staying
+        .node
+        .personal()
+        .unwrap()
+        .claim(&*stays, claim_at(&world, home, "staying"))
+        .unwrap();
+    let (leaving, leaves) = held(&world, 0x36);
+    let code = staying
+        .node
+        .personal()
+        .unwrap()
+        .pair_offer(&*stays)
+        .unwrap();
+    std::thread::scope(|scope| {
+        let opened = scope.spawn(|| staying.node.personal().unwrap().pair_await(&*stays));
+        leaving
+            .node
+            .personal()
+            .unwrap()
+            .pair_join(&*leaves, &code.code, "leaving")
+            .unwrap();
+        opened.join().unwrap().unwrap();
+    });
+    leaving.node.personal().unwrap().follow_behind().unwrap();
+
+    let meter = Meter::start(&world, &[&leaves]);
+    leaving.node.personal().unwrap().leave(&*leaves).unwrap();
+    meter.print(&world, "leave: from the tap to the space cleared");
+    let status = leaving.node.personal().unwrap().status().unwrap();
+    assert_eq!(status.phase, vos_facility::personal::Phase::None);
+
+    let meter = Meter::start(&world, &[&stays]);
+    let synced = staying.node.sync_personal().unwrap();
+    meter.print(
+        &world,
+        &format!(
+            "leave: the other phone's pass ({} notices)",
+            synced.notices.len()
+        ),
+    );
+    let meter = Meter::start(&world, &[&stays]);
+    staying.node.personal().unwrap().update(&*stays).unwrap();
+    meter.print(&world, "leave: the other phone's commit now");
+}
+
 /// A restore on a fresh phone, its screen's sitting open: the words
 /// mistyped first, then the restore opened, the kit's view read, and the
 /// restore finished after the kit's delay, the kit entered again only

@@ -10,9 +10,10 @@
 //! operation's maturity, or one row of a removed device's silencing (an
 //! operation of its cancelled, a veto of its lifted) or of a replaced kit's
 //! (an operation of its cancelled), queued in the due index at the time it
-//! takes effect. So no step's work grows with what an adversary queued,
-//! and everything takes effect in time order, however late the call that
-//! settles it.
+//! takes effect; `evidence` makes one more, a leave's maturity (two
+//! cancels, a reopen and a candidate decided at most). So no step's work
+//! grows with what an adversary queued, and everything takes effect in
+//! time order, however late the call that settles it.
 
 use alloc::vec::Vec;
 
@@ -37,8 +38,17 @@ pub const OPEN_OPERATIONS: usize = 2;
 /// The live devices a set holds.
 pub const DEVICES: usize = 8;
 
-/// The kind an operation is one open of, and its target.
-fn kind(op: &Op) -> Option<(Kind, DeviceId)> {
+/// Whether `op`, signed by `by`, is a device's leave: its own removal.
+pub(crate) fn leaves(by: Signer, op: &Op) -> bool {
+    matches!((by, op), (Signer::Device(by), Op::Remove(target)) if by == *target)
+}
+
+/// The kind an operation `by` signs is one open of, and its target: none
+/// for a leave, which takes no other removal's place.
+fn kind(by: Signer, op: &Op) -> Option<(Kind, DeviceId)> {
+    if leaves(by, op) {
+        return None;
+    }
     let (kind, target) = match op {
         Op::Remove(target) => (Kind::Remove, *target),
         Op::Replace { device, .. } => (Kind::Replace, *device),
@@ -194,14 +204,22 @@ impl Personal {
     }
 
     /// Who signs an admin call: an active device's admin key, or a kit
-    /// entry's signing key.
+    /// entry's signing key; `leaving`'s on its probation too, for its own
+    /// removal.
     pub(crate) fn signer(
         &self,
         caller: Principal,
         now: u64,
+        leaving: Option<DeviceId>,
     ) -> Result<([u8; 32], Signer), PersonalError> {
         match self.holder(caller) {
             Some((key, Holder::Kit(entry))) => Ok((key, Signer::Kit(entry))),
+            Some((key, Holder::Admin(device)))
+                if leaving == Some(device)
+                    && self.standing_of(device, now) == Some(Standing::Probation) =>
+            {
+                Ok((key, Signer::Device(device)))
+            }
             _ => self
                 .admin_caller(caller, now)
                 .map(|(key, device)| (key, Signer::Device(device))),
@@ -217,10 +235,22 @@ impl Personal {
         place: Place,
         message: &M,
     ) -> Result<(u64, AdminCall, Signer), PersonalError> {
+        self.admin_as(ctx, place, message, None)
+    }
+
+    /// [`Personal::admin`], `leaving`'s admin key taken on its probation
+    /// too: a removal of `leaving`, which it may sign itself.
+    pub(crate) fn admin_as<M: vos_sdk::context::Method>(
+        &mut self,
+        ctx: &Command<Self>,
+        place: Place,
+        message: &M,
+        leaving: Option<DeviceId>,
+    ) -> Result<(u64, AdminCall, Signer), PersonalError> {
         self.placed(place)?;
         let now = self.settle(ctx.now())?;
         self.assigned()?;
-        let (origin, by) = self.signer(ctx.caller(), now)?;
+        let (origin, by) = self.signer(ctx.caller(), now, leaving)?;
         let call = AdminCall {
             origin,
             method: M::ID,
@@ -261,7 +291,9 @@ impl Personal {
     /// Open `op`, signed by `by` in `call`, pending for its signer's delay:
     /// the kit's, a replacement's (its new key's probation), or a device's
     /// operation's. A removal aimed at a removal its target signed against
-    /// its signer makes one contest of the two.
+    /// its signer makes one contest of the two. A leave's delay is the time
+    /// its evidence has: it matures when that is posted
+    /// ([`Personal::evidenced_leave`]), and is cancelled without it.
     pub(crate) fn open_operation(
         &mut self,
         now: u64,
@@ -309,9 +341,10 @@ impl Personal {
             },
         );
         // A removal aimed at an open removal of its signer by one of its
-        // targets, a regroup's included, is one contest with it.
+        // targets, a regroup's included, is one contest with it; a leave
+        // is aimed at no one.
         let targets = removes(&op);
-        let rival = device.and_then(|signer| {
+        let rival = device.filter(|_| !leaves(by, &op)).and_then(|signer| {
             prefixed!(self.against, signer, u64::MAX)
                 .into_iter()
                 .map(|(rival, ())| rival)
@@ -329,7 +362,7 @@ impl Personal {
             self.freeze(target, now);
             self.against.insert(&(target, index), &());
         }
-        if let Some(key) = kind(&op) {
+        if let Some(key) = kind(by, &op) {
             self.kinds.insert(&key, &index);
         }
         self.signed.insert(&(By(by), index), &!removal);
@@ -361,10 +394,29 @@ impl Personal {
 
     /// Who may sign `op`, and whether the set allows it now.
     fn check_operation(&self, now: u64, by: Signer, op: &Op) -> Result<(), PersonalError> {
-        if kind(op).is_some_and(|key| self.kinds.contains(&key)) {
+        if kind(by, op).is_some_and(|key| self.kinds.contains(&key)) {
             return Err(PersonalError::Pending);
         }
         match op {
+            Op::Remove(target) if leaves(by, op) => {
+                // One leave open at once; and another live device to
+                // commit it.
+                let leaving =
+                    prefixed!(self.against, *target, u64::MAX)
+                        .into_iter()
+                        .any(|(index, ())| {
+                            self.operations
+                                .get(&index)
+                                .is_some_and(|open| leaves(open.by, &open.op))
+                        });
+                if leaving {
+                    return Err(PersonalError::Pending);
+                }
+                if !self.live.iter(None).any(|(id, ())| id != *target) {
+                    return Err(PersonalError::Alone);
+                }
+                self.live(*target, now)
+            }
             Op::Add(keys) => {
                 if matches!(by, Signer::Kit(_)) {
                     return Err(PersonalError::NotSigner);
@@ -374,12 +426,7 @@ impl Personal {
                 }
                 self.fresh(&[keys.sync, keys.admin])
             }
-            Op::Remove(target) => {
-                if by == Signer::Device(*target) {
-                    return Err(PersonalError::Targeted);
-                }
-                self.live(*target, now)
-            }
+            Op::Remove(target) => self.live(*target, now),
             Op::Replace { device, admin } => {
                 self.live(*device, now)?;
                 if let Signer::Device(signer) = by {
@@ -501,6 +548,9 @@ impl Personal {
         index: u64,
     ) -> Result<Recorded, PersonalError> {
         let operation = self.open_at(index)?;
+        if leaves(operation.by, &operation.op) {
+            return Err(PersonalError::Leaving);
+        }
         if self.vetoes.contains(&(index, device)) {
             return Err(PersonalError::Vetoed);
         }
@@ -538,6 +588,9 @@ impl Personal {
         index: u64,
     ) -> Result<Recorded, PersonalError> {
         let operation = self.open_at(index)?;
+        if leaves(operation.by, &operation.op) {
+            return Err(PersonalError::Leaving);
+        }
         let Signer::Device(signer) = operation.by else {
             return Err(PersonalError::NotSigner);
         };
@@ -658,6 +711,17 @@ impl Personal {
             return Err(PersonalError::Unevidenced);
         }
         Ok(())
+    }
+
+    /// The leave at `index`, if it is one still open, matured now its
+    /// evidence is posted: its signer's own removal waits on nothing else.
+    pub(crate) fn evidenced_leave(&mut self, index: u64, now: u64) {
+        if self
+            .open_at(index)
+            .is_ok_and(|operation| leaves(operation.by, &operation.op))
+        {
+            self.mature(index, now, now);
+        }
     }
 
     /// A device's `alive` cancels a pending restore, which asserts every
@@ -799,7 +863,7 @@ impl Personal {
         self.open.remove(&index);
         self.due.remove(&(operation.matures, Due::Op(index)));
         self.release(index, operation);
-        if let Some(key) = kind(&operation.op) {
+        if let Some(key) = kind(operation.by, &operation.op) {
             self.kinds.remove(&key);
         }
         for (device, ()) in prefixed!(self.vetoes, index, DeviceId::MAX) {
@@ -865,6 +929,14 @@ impl Personal {
         if !self.applicable(&operation.op) {
             return self.cancel(index, Cancel::KeyTaken, now);
         }
+        // Leaves opened side by side: the last live device's waits on no
+        // other's commit, so it is cancelled.
+        if let Op::Remove(target) = operation.op
+            && leaves(operation.by, &operation.op)
+            && !self.live.iter(None).any(|(id, ())| id != target)
+        {
+            return self.cancel(index, Cancel::Alone, now);
+        }
         let rival = self.close(index, &operation, now);
         self.deposits.remove(&index);
         operation.state = OpState::Matured { at };
@@ -883,7 +955,17 @@ impl Personal {
                     self.claimed.insert(&key, &index);
                 }
             }
-            Op::Remove(target) => self.remove_device(target, index, at, now),
+            Op::Remove(target) => {
+                if leaves(operation.by, &operation.op) {
+                    // What else acts on the device that left ends with it.
+                    for key in [(Kind::Remove, target), (Kind::Replace, target)] {
+                        if let Some(open) = self.kinds.get(&key) {
+                            self.cancel(open, Cancel::Moot, now);
+                        }
+                    }
+                }
+                self.remove_device(target, index, at, now)
+            }
             Op::Replace { device, admin } => {
                 if let Some(mut found) = self.devices.get(&device) {
                     self.admitted.remove(&found.keys.admin);

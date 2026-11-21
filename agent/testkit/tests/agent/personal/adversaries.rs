@@ -6,7 +6,8 @@
 //!   devices: the owner, with one device and the kit or with two other
 //!   seasoned devices, always removes it, and every device it paired,
 //!   within the delay, and it never removes an owner device the owner
-//!   contests;
+//!   contests; a removal it signs may name its own device, a leave, which
+//!   matures at once and only lowers its power;
 //! - one holding only a sync key: the kit alone removes its device after
 //!   the kit's delay unvetoed, and the kit's restore matures the kit's
 //!   delay later, the removed device's `alive` ignored;
@@ -416,8 +417,15 @@ impl Game {
                 continue;
             }
             assert_eq!(view.standing, Standing::Removed, "the thief's {}", view.id);
+            let removal = view.removal.unwrap();
+            // A thief's device that left by its own removal needed no
+            // move of the owner's.
+            let by = self.home.operation(self.reader(), removal.index).by;
+            if by == Signer::Device(view.id) {
+                continue;
+            }
             let noticed = self.noticed[&view.id];
-            let removed = view.removal.unwrap().at;
+            let removed = removal.at;
             assert!(
                 removed <= noticed + delay,
                 "device {} removed {} ms after the owner moved",

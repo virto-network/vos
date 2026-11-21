@@ -230,6 +230,9 @@ pub enum Event {
     /// This device is out of the group: its removal matured, or a
     /// confirmed commit removed it.
     Removed,
+    /// This device's own leave matured, after [`Event::Removed`]: it forgets
+    /// the space.
+    Left,
     Alarm(Alarm),
 }
 
@@ -461,6 +464,9 @@ pub struct DeviceGroup {
     chains: Vec<(u64, [u8; 32])>,
     /// The alarms raised and not yet written.
     raised: Vec<Alarm>,
+    /// This device's own leave held: the removal of it the log asserts
+    /// next is its leave.
+    leaving: bool,
 }
 
 /// The namespace `store`'s MLS state is in.
@@ -522,6 +528,7 @@ impl DeviceGroup {
             archive,
             processed: None,
             chains: Vec::new(),
+            leaving: false,
             raised: Vec::new(),
         })
     }
@@ -614,6 +621,7 @@ impl DeviceGroup {
             archive,
             processed: None,
             chains: Vec::new(),
+            leaving: false,
             raised: Vec::new(),
         })
     }
@@ -707,6 +715,7 @@ impl DeviceGroup {
             archive,
             processed: None,
             chains: Vec::new(),
+            leaving: false,
             raised: Vec::new(),
         })
     }
@@ -729,6 +738,7 @@ impl DeviceGroup {
             state,
             processed: None,
             chains: Vec::new(),
+            leaving: false,
             raised: Vec::new(),
         }))
     }
