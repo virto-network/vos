@@ -34,7 +34,8 @@
 //!
 //! Every request goes over Tor through one client ([`net`]): the credential
 //! tree read from its feed on the space's feed connection, apart from its
-//! proofs, on a jittered timer, never because a proof is about to be made;
+//! proofs, on a jittered timer, not because a proof is about to be made (a
+//! sign-in waiting for its leaf aside, `session`);
 //! the node's time read as a fetch of its own before an expiry is picked;
 //! each proof sent by the facility itself as a proven call, so no
 //! anonymous call ever takes the clearnet. A sync run ([`Facility::sync`],

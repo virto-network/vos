@@ -715,7 +715,8 @@ impl Client {
     /// half a query's life. The keeper's timer runs on this device's clock
     /// (`now_ms`, milliseconds). The changes applied; a page refused leaves
     /// the tree as the pages before it left it. The caller reads it when
-    /// [`TreeKeeper::due`] says, never because a proof is about to be made.
+    /// [`TreeKeeper::due`] says, but for a first sign-in waiting for its
+    /// leaf and a claim (`light-node.md` §6.2, §3.8).
     pub async fn read_tree(
         &self,
         space: SpaceId,

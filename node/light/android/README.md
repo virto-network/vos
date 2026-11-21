@@ -148,8 +148,8 @@ pairing's acknowledgement, the credential book's records). Leaving a personal
 space (a move, a pairing from another one) makes the light node's store anew
 under `light.<n>`, made the device's by its first batch, the old store deleted
 after. `tests/crashes.rs` kills it at each request of each flow. A phone of an
-earlier build (light `LAYOUT` 6 or before, enrollments as TOML files) clears the
-app's data and claims or pairs again, and enrolls again. A device paired in
+earlier build (light `LAYOUT` 9 or before, or enrollments as TOML files) clears
+the app's data and claims or pairs again, and enrolls again. A device paired in
 enrolls in each offered
 space with the key its handle there came from.
 
@@ -183,8 +183,9 @@ once the proof is made; the output is zeroized once copied.
 ## The tree and time
 
 Each enrollment's tree is read from its credential actor's feed on a jittered
-timer while a session is open, never because a proof is about to be made,
-and kept beside the enrollment (`<enrollment>.tree`), so a restart reads only
+timer while a session is open, not because a proof is about to be made (but a
+sign-in with no path yet reads it every 5 s for up to a minute, waiting for the
+operator's invitation), and kept beside the enrollment (`<enrollment>.tree`), so a restart reads only
 the changes since; a root the node no longer holds makes the feed due at a
 drawn delay. The node's time is read before an expiry is picked.
 

@@ -212,7 +212,9 @@ serve its requests:
   the member's, signed by a key drawn for it alone. The member's path is
   computed on the device, so no node or gateway learns which leaf is
   online. The feed is read on a jittered timer (30 s, between 15 s and
-  45 s), never because a proof is about to be made.
+  45 s), not because a proof is about to be made, but for a first sign-in
+  waiting for its leaf (every 5 s, up to a minute) and a personal agent's
+  claim (`light-node.md` §6.2, §3.8).
 - **A re-read after `RootUnknown`** precedes the proof that retries the
   call, at a time drawn below 10 s after the refusal, so that read's time
   links to that proof's. It happens only when the replica's ring does not
@@ -284,12 +286,16 @@ facility (`identity-and-authority.md` §7):
 
 - **No one in particular.** The port takes any public key as an identity
   for its connection alone (s4's anonymous policy): no session is parked
-  or resumed, and no remembered grant is selected. The client draws a key
+  or resumed, and no remembered grant is selected (on the client, s4
+  keeps a session's grant for a reconnect it makes by itself,
+  `light-node.md` §6.2; the server sees a new, granted session). The client draws a key
   for each connection, and another for each `vos-api` connection that
   reads the tree's feed or the node's time, so no two of them share a
   key. Keys are all that stops linking them: the gateway still sees their
   address and timing. The feed names no member, and the client reads it
-  on its own timer (`TreeKeeper`), not on the way to a proof.
+  on its own timer (`TreeKeeper`), not on the way to a proof, except a
+  first sign-in waiting for the operator's invitation, which reads it
+  every 5 s and proves seconds after the root that lists its leaf.
 - **The root a proof names.** A proof names the root of the tree the
   client built from the feed, each page checked against the root its last
   change names, so a gateway cannot hand one member a path to a root of
@@ -326,8 +332,11 @@ facility (`identity-and-authority.md` §7):
   The binding names the space, so a proof made for another space fails the
   node's `Binding` check whoever relays it.
 - **The enrollment's digests** are shown in the client's chrome, never in
-  the gateway's screen, which only asks the member to read them from there
-  to the operator; the operator invites them out of band. A gateway's
+  the gateway's screen, as a code a camera reads (`VOSENROLL1:`) and a
+  six-digit check; the operator scans or pastes the code into its tool,
+  which shows the same check, and invites them only once the two checks
+  match. The check catches a misread code or the wrong screen; it proves
+  nothing about who chose the digests. A gateway's
   screen therefore cannot have its own digests invited in the member's
   place, and the claim it relays names only digests an invitation holds.
 - **Time.** The calls' expiries are reckoned on the node's time, which the
@@ -442,7 +451,9 @@ admitted. What its operators are trusted with, and the limits that stay
   restore early (B7): every delay trusts the operators' clock, a known
   limit. They cannot forge an envelope (B5) or a device-set operation,
   each signed by a device's admin key or the kit and checked by every
-  device (B6).
+  device, nor log a signed call again on a forked log, each naming its
+  place (B6, `light-node.md` §3.5). They can withhold: a device that has
+  not yet read a veto can be shown the operation without it (B8).
 - **Collusion with a thief or a removed device** can drop vetoes, order
   the thief's operations first and serve a removed device data for up to
   six days; acting alone they can hold back a genuine commit until a
