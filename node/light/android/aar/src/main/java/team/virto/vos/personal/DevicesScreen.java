@@ -265,7 +265,7 @@ final class DevicesScreen extends Screen {
                 "Signing this phone's removal…",
                 (personal, prompts, refused) ->
                     personal.leave(prompts, refused) ? Boolean.TRUE : null,
-                done -> app.left())));
+                done -> app.left()));
   }
 
   private void revoke(Device device) {
