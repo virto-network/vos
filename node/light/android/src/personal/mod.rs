@@ -1436,11 +1436,15 @@ mod tests {
         sitting.open();
         sitting.lock().life_ms = Some(1_000);
         let opened = sitting.lock().opened;
-        let entry = Instant::now() - Duration::from_millis(1_000);
+        let entry = Instant::now()
+            .checked_sub(Duration::from_millis(1_000))
+            .unwrap();
         let words = Entered::Words(Zeroizing::new("zoo".into()));
         assert!(sitting.keep(words, opened, entry).is_none());
         assert!(sitting.lock().kit.is_none());
-        let entry = Instant::now() - Duration::from_millis(600);
+        let entry = Instant::now()
+            .checked_sub(Duration::from_millis(600))
+            .unwrap();
         let words = Entered::Words(Zeroizing::new("zoo".into()));
         let (_, left) = sitting.keep(words, opened, entry).unwrap();
         assert!(left <= Duration::from_millis(400));

@@ -458,8 +458,8 @@ What going over the onion changes for a device (`light-node.md` §6.7):
   two circuits by time: the feed's timer keeps its reads apart from
   proofs, no more, and a first sign-in that waited for its leaf follows a
   feed read on the feed's circuit by seconds, joining that proof to the
-  feed's connection and to the newest leaf, `light-node.md` §6.2); the `map_root` a proof names, which within a timer
-  period of a tree change sets apart the members who have not read it;
+  feed's connection and to the newest leaf, `light-node.md` §6.2); the
+  `map_root` a proof names, which within a timer period of a tree change sets apart the members who have not read it;
   small anonymity sets; a global observer correlating both ends of Tor;
   what a request carries itself (a member's signed call names its key,
   the personal agent's calls the device's sync key, an `alive` or a veto

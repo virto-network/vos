@@ -288,8 +288,8 @@ facility (`identity-and-authority.md` §7):
   for its connection alone (s4's anonymous policy): no session is parked
   or resumed, and no remembered grant is selected (on the client, s4
   keeps a session's grant for a reconnect it makes by itself,
-  `light-node.md` §6.2; the server sees a new, granted session). The client draws a key
-  for each connection, and another for each `vos-api` connection that
+  `light-node.md` §6.2; the server sees a new, granted session). The
+  client draws a key for each connection, and another for each `vos-api` connection that
   reads the tree's feed or the node's time, so no two of them share a
   key. Keys are all that stops linking them: the gateway still sees their
   address and timing. The feed names no member, and the client reads it

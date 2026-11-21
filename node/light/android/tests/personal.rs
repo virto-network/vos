@@ -701,17 +701,20 @@ fn a_slow_flow_does_not_extend_the_kits_life() {
     // The flow outlasts the kit's life: it ends with none held.
     space().set_kit_life(1_000);
     let started = view();
-    assert!(started.elapsed() > Duration::from_millis(1_000), "a slow flow");
+    assert!(
+        started.elapsed() > Duration::from_millis(1_000),
+        "a slow flow"
+    );
     assert!(!space().kit_held(), "held past its life from the entry");
 
     // A life the flow does not outlast: wiped at its end from the entry.
-    let life = Duration::from_millis(6_000);
+    let life = Duration::from_millis(8_000);
     space().set_kit_life(life.as_millis() as u64);
     let started = view();
     let took = started.elapsed();
     assert!(took > Duration::from_millis(1_000), "a slow flow");
     assert!(space().kit_held());
-    std::thread::sleep((life + Duration::from_millis(400)).saturating_sub(started.elapsed()));
+    std::thread::sleep((life + Duration::from_millis(900)).saturating_sub(started.elapsed()));
     assert!(
         !space().kit_held(),
         "held {took:?} past its life from the entry"

@@ -185,8 +185,8 @@ once the proof is made; the output is zeroized once copied.
 Each enrollment's tree is read from its credential actor's feed on a jittered
 timer while a session is open, not because a proof is about to be made (but a
 sign-in with no path yet reads it every 5 s for up to a minute, waiting for the
-operator's invitation), and kept beside the enrollment (`<enrollment>.tree`), so a restart reads only
-the changes since; a root the node no longer holds makes the feed due at a
+operator's invitation), and kept beside the enrollment (`<enrollment>.tree`),
+so a restart reads only the changes since; a root the node no longer holds makes the feed due at a
 drawn delay. The node's time is read before an expiry is picked.
 
 ## Building

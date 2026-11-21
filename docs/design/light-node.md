@@ -81,7 +81,7 @@ devices decrypt each other's messages".
 | E36 | One prompt per signature; "Commit now" from a matured removal's notice commits and revokes in one flow (2026-11-20). |
 | E37 | A first sign-in waits for the device's leaf (the feed read now and every 5 s, up to a minute, no drawn delay); the timing link this leaves is stated in §6.2 (2026-11-20). |
 | E38 | A debuggable build lets the personal-space screens be captured; a release build keeps them from capture (`FLAG_SECURE`) (2026-11-20). |
-| E39 | Every device-set call names its place, the log's head its signer read; the agent and every device take it only there (§3.5, "The place"), so a route cannot replay a vetoed removal (2026-11-20). |
+| E39 | Every device-set call names its place, the log's head its signer read; the agent and every device take it only if no admin call was logged between that place and the call (§3.5, "The place"), so a route cannot replay a vetoed removal (2026-11-20). |
 | E40 | `claim` is the one way a personal agent is assigned and its policy set: no `assign`, no `configure` (§3.3) (2026-11-20). |
 | E41 | A device is removed on the log it verifies, never on a refusal an agent answers (§3.6) (2026-11-20). |
 | E42 | A refusal of a pairing slot's read does not end the joiner's pairing: it reads the slot again until its expiry (§3.8) (2026-11-20). |
@@ -1305,8 +1305,8 @@ arm64-v8a build; the phones' timings below of 2026-11-06]:
   (`Policy::over`), and raises `Alarm::Policy` for one it lowers; an
   operation then asserted matured inside the kept delay is `Unsigned`.
   `Personal` takes its policy only with its claim (no later call
-  configures it), so an honest home logs no lowered delay. Lowering a delay would
-  need an operation of the device set's own, signed as §3.5's are; none
+  configures it), so an honest home logs no lowered delay. Lowering a
+  delay would need an operation of the device set's own, signed as §3.5's are; none
   is built. A raised delay is taken: the operators can lengthen any
   delay without bound, which stops removals and restores maturing, a
   withholding B8 concedes them already.
