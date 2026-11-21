@@ -238,21 +238,25 @@ impl State {
     /// The space and the purpose the next spare is built for, if one is
     /// wanted: none while dormant or in the background.
     fn wanted(&self) -> Option<(SpaceId, Purpose)> {
-        if self.dormant || !self.foreground {
-            return None;
-        }
         let space = self.spare_for?;
-        let now = Instant::now();
         self.spare_purposes
             .iter()
             .copied()
-            .find(|purpose| {
-                !self
-                    .spares
-                    .get(purpose)
-                    .is_some_and(|spare| spare.usable(now))
-            })
+            .find(|purpose| self.wants(space, *purpose))
             .map(|purpose| (space, purpose))
+    }
+
+    /// Whether a spare for `purpose` to `space` is wanted: kept for them,
+    /// awake and in the foreground, and none built and usable.
+    fn wants(&self, space: SpaceId, purpose: Purpose) -> bool {
+        !self.dormant
+            && self.foreground
+            && self.spare_for == Some(space)
+            && self.spare_purposes.contains(&purpose)
+            && !self
+                .spares
+                .get(&purpose)
+                .is_some_and(|spare| spare.usable(Instant::now()))
     }
 }
 
@@ -955,8 +959,9 @@ impl Client {
                 };
                 let mut state = client.state();
                 // Kept for whom it was opened for alone: not for a keeper
-                // that came since.
-                let wanted = state.wanted() == Some((space, purpose))
+                // that came since. Another purpose's spare taken meanwhile
+                // is built after this one, which stays.
+                let wanted = state.wants(space, purpose)
                     && state.spare_epoch == epoch
                     && Self::still(&state, space, version).is_ok();
                 if !wanted {
