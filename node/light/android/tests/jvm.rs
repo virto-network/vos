@@ -190,6 +190,9 @@ fn every_type_crosses_its_parcelable_unchanged() {
                         })
                         .collect(),
                     repair: "its row p/home does not decode".into(),
+                    kit: KitKind::SecurityKey,
+                    kit_known: true,
+                    failed: "the agent's log: unreachable".into(),
                 },
             );
         }
