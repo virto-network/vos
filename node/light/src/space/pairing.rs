@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 use super::link::Signer;
 use super::{
     Acked, CREDENTIAL_BOOK, Error, Held, Host, Kept, POLL, Paired, Personal, Prompts, answered,
-    failed, link, secret, store_failed, unreached,
+    failed, secret, store_failed, unreached,
 };
 use crate::group::{Course, DeviceGroup, Prepared};
 use crate::memberships;
@@ -377,7 +377,7 @@ impl<H: Host> Personal<H> {
         let agent = (code.agent, code.identity);
         let (mut joiner, put) = Joiner::scan(&code).map_err(failed)?;
         let slot_put = |signer: &mut Signer, arguments: Vec<u8>| -> Result<(), Error> {
-            let mut link = link(&self.host, &kept, Purpose::Personal, agent, &slot, signer);
+            let mut link = self.link(&kept, Purpose::Personal, agent, &slot, signer);
             answered(link.call::<u64>(method::PUT, arguments)).map(drop)
         };
         slot_put(&mut slot_signer, put.arguments())?;
@@ -394,14 +394,7 @@ impl<H: Host> Personal<H> {
                 return Err(Error::Cancelled);
             }
             let items: Vec<InboxItem> = {
-                let mut link = link(
-                    &self.host,
-                    &kept,
-                    Purpose::Personal,
-                    agent,
-                    &slot,
-                    &mut slot_signer,
-                );
+                let mut link = self.link(&kept, Purpose::Personal, agent, &slot, &mut slot_signer);
                 match link
                     .query(method::INBOX, Option::<(u64, [u8; 16])>::None)
                     .map_err(unreached)?
@@ -514,12 +507,21 @@ impl<H: Host> Personal<H> {
 
     /// The log followed until the opener's commit adding this device is
     /// confirmed (until then its sync key is not admitted, the group names
-    /// no device and a pass stops at its keys), then twice more.
+    /// no device and a pass stops at its keys) and a follow leaves this
+    /// device complete (its vote posted, the archive and recovery kept),
+    /// two more follows at most after the one that found it added; two
+    /// more left for after the pairing returns
+    /// ([`Personal::follow_behind`]).
     fn joined(&self, held: &mut Held) -> Result<(), Error> {
         let until = std::time::Instant::now() + self.wait();
         loop {
             let followed = self.follow(held);
-            if followed.is_ok() && held.group.as_ref().and_then(DeviceGroup::id).is_some() {
+            if held.group.as_ref().and_then(DeviceGroup::id).is_some() {
+                // Added: complete now, or within the follows it made
+                // before, each failure its own.
+                if !followed? {
+                    self.follow_until_complete(held, 2)?;
+                }
                 break;
             }
             if std::time::Instant::now() > until {
@@ -527,9 +529,7 @@ impl<H: Host> Personal<H> {
             }
             self.host.sleep(POLL);
         }
-        for _ in 0..2 {
-            self.follow(held)?;
-        }
+        self.leave_behind(held, 2);
         Ok(())
     }
 
@@ -551,14 +551,7 @@ impl<H: Host> Personal<H> {
             let kept = Kept::reached(acked.handle, acked.onions.clone());
             let slot = ed25519_dalek::SigningKey::from_bytes(&acked.slot);
             let mut signer = Signer::new(slot.verifying_key().to_bytes());
-            let mut link = link(
-                &self.host,
-                &kept,
-                Purpose::Personal,
-                acked.agent,
-                &slot,
-                &mut signer,
-            );
+            let mut link = self.link(&kept, Purpose::Personal, acked.agent, &slot, &mut signer);
             match link
                 .call::<u64>(method::PUT, acked.ack.clone())
                 .map_err(unreached)?

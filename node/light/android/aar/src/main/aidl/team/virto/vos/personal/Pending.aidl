@@ -35,4 +35,9 @@ enum Pending {
      * under a removed device's secret. "Commit now".
      */
     RESEAL = 12,
+    /**
+     * What a flow left to its last follows did not finish (the pairing, the commit or the restore
+     * is done): the next sync finishes it.
+     */
+    UNFINISHED = 13,
 }

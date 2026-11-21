@@ -37,6 +37,8 @@ const MEDIAN_RATE: u64 = 150_000;
 struct Stamped {
     phone: Arc<Phone>,
     prompts: Mutex<Vec<(Instant, String)>>,
+    /// How long the member takes to write a kit's words or card down.
+    writing: Mutex<Duration>,
 }
 
 impl Stamped {
@@ -44,6 +46,7 @@ impl Stamped {
         Arc::new(Self {
             phone: Arc::clone(phone),
             prompts: Mutex::new(Vec::new()),
+            writing: Mutex::new(Duration::ZERO),
         })
     }
 
@@ -55,6 +58,10 @@ impl Stamped {
 impl Prompts for Stamped {
     fn confirm(&self, form: Form) -> Answer {
         self.stamp(format!("form \"{}\"", form.title));
+        if form.title.starts_with("Your recovery") {
+            std::thread::sleep(*self.writing.lock().unwrap());
+            self.stamp("written down".into());
+        }
         Prompts::confirm(&*self.phone, form)
     }
 
@@ -104,6 +111,50 @@ fn named(step: world::Step) -> String {
         })
         .collect();
     format!("{kind} {}", names.join("|"))
+}
+
+/// How long the overview's status read waits right after a flow returned:
+/// behind the flow's follows still running, if they hold the space.
+fn status_after(node: &Node, flow: &str) {
+    let start = Instant::now();
+    node.status().unwrap();
+    println!(
+        "flow: {flow}: the status read after it {} ms",
+        start.elapsed().as_millis()
+    );
+}
+
+/// The follows a flow left for after it, waited for: when they ended
+/// after the flow returned, and the device's state the same before and
+/// after them.
+fn behind_done(node: &Node, flow: &str) {
+    let before = node.status().unwrap();
+    let start = Instant::now();
+    while node.space().unwrap().behind() {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "{flow}: follows left running"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let after = node.status().unwrap();
+    println!(
+        "flow: {flow}: the follows left for after it ended {} ms after it returned",
+        start.elapsed().as_millis()
+    );
+    assert_eq!(
+        (before.phase, before.device, before.agent, before.owed),
+        (after.phase, after.device, after.agent, after.owed),
+        "{flow}"
+    );
+    assert!(
+        after
+            .standing
+            .iter()
+            .all(|notice| notice.pending != vos_facility::Pending::Unfinished),
+        "{flow}: {:?}",
+        after.standing
+    );
 }
 
 /// One flow's measurement from its start: the world's log and the prompts
@@ -272,6 +323,39 @@ fn claim_a_personal_space() {
     assert_eq!(claimed.device, 0);
 }
 
+/// The claim, the member taking 20 s to write the phrase down: what is
+/// left after "I wrote them down".
+#[test]
+fn claim_while_the_member_writes() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    world.delay(Delays::ONION);
+    let (phone, stamped) = held(&world, 0x22);
+    *stamped.writing.lock().unwrap() = Duration::from_secs(20);
+    let meter = Meter::start(&world, &[&stamped]);
+    phone
+        .node
+        .personal()
+        .unwrap()
+        .claim(&*stamped, claim_at(&world, home, "writing"))
+        .unwrap();
+    let took = meter.print(&world, "claim, 20 s to write the phrase");
+    let written = stamped
+        .prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, what)| what == "written down")
+        .map(|(at, _)| *at)
+        .expect("the phrase written down");
+    println!(
+        "flow: claim: after \"I wrote them down\": {} ms",
+        (meter.start + took)
+            .saturating_duration_since(written)
+            .as_millis()
+    );
+}
+
 /// The same claim with the proofs' upload at the median rate.
 #[test]
 fn claim_over_slow_circuits() {
@@ -339,6 +423,8 @@ fn pair_sync_retire_and_the_removed_phone() {
         (opened.unwrap(), joined.unwrap())
     });
     meter.print(&world, "pair: from the scan to both done");
+    status_after(&joiner.node, "pair: the joiner");
+    behind_done(&joiner.node, "pair: the joiner");
     assert_eq!(opened.device, joined.device);
 
     for (phone, stamped, name) in [
@@ -386,6 +472,8 @@ fn pair_sync_retire_and_the_removed_phone() {
     let meter = Meter::start(&world, &[&opening]);
     opener.node.personal().unwrap().update(&*opening).unwrap();
     meter.print(&world, "retire: commit now");
+    status_after(&opener.node, "retire: commit now");
+    behind_done(&opener.node, "retire: commit now");
 
     let meter = Meter::start(&world, &[&joining]);
     let synced = joiner.node.sync_personal();
@@ -480,6 +568,8 @@ fn restore_from_the_kit_and_move() {
         fresh.hand.entered.lock().unwrap()
     );
     fresh.node.space().unwrap().forget_kit();
+    status_after(&fresh.node, "restore: finished");
+    behind_done(&fresh.node, "restore: finished");
 
     let meter = Meter::start(&world, &[&stamped]);
     fresh

@@ -165,6 +165,31 @@ impl Prompts for Lent {
             .map_err(|_| java::refusal(env))
         });
     }
+
+    fn progress(&self, text: &str) {
+        self.said(text);
+    }
+}
+
+impl Lent {
+    /// The progress `text` handed to `VosNode.progress`, beside these
+    /// prompts.
+    fn said(&self, text: &str) {
+        let Some(node) = VOS_NODE.get() else {
+            return;
+        };
+        let _ = attached(|env| {
+            let text = env.new_string(text).map_err(failed)?;
+            env.call_method(
+                &**node,
+                jni_str!("progress"),
+                jni_sig!("(Lteam/virto/s4/vos/IVosPrompts;Ljava/lang/String;)V"),
+                &[JValue::Object(&self.prompts), JValue::Object(&text)],
+            )
+            .map(drop)
+            .map_err(|_| java::refusal(env))
+        });
+    }
 }
 
 /// The device, as `VosNode` reads it in this process.

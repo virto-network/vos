@@ -77,11 +77,12 @@ impl Prompts for Phone {
                     .filter(|(label, _)| label.parse::<u8>().is_ok())
                     .map(|(_, word)| word.as_str())
                     .collect();
-                let shown = self.show_phrase(&words.join(" "), &card(&form));
+                let shown =
+                    self.show_phrase(&words.join(" "), &card(&form), form.notice.as_deref());
                 answered(shown, &form)
             }
             "Your recovery key's card" => {
-                let shown = self.show_card(&card(&form));
+                let shown = self.show_card(&card(&form), form.notice.as_deref());
                 answered(shown, &form)
             }
             crate::personal::CHECK_PHRASE => {
@@ -166,6 +167,10 @@ impl Prompts for Phone {
 
     fn stage(&self, stage: crate::personal::Stage) {
         self.stages.lock().unwrap().push(stage as u8);
+    }
+
+    fn progress(&self, text: &str) {
+        self.said.lock().unwrap().push(text.to_owned());
     }
 
     fn sign_key(&self, kind: Kind, key: &[u8], message: &[u8]) -> KeyAnswer {

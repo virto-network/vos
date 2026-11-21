@@ -224,6 +224,17 @@ public final class VosNode {
     }
   }
 
+  /**
+   * What an operation is doing while the user waits, in words, from the library (a sign-in waiting
+   * for its space to list the device): said to a sign-in's or payment's announcing prompts. No
+   * secret and no value in it.
+   */
+  void progress(IVosPrompts prompts, String text) {
+    if (prompts instanceof Announced) {
+      ((Announced) prompts).progress(text);
+    }
+  }
+
   /** Bootstrap Tor now: false when it refuses, {@code refused} naming why. */
   public boolean bootstrap(Refusal refused) {
     return nativeBootstrap(refused);
@@ -686,6 +697,11 @@ public final class VosNode {
      */
     void stage(byte stage) {
       stage(stage == team.virto.vos.personal.Stage.SENDING ? "sending" : "proving");
+    }
+
+    /** The facility's words while the operation waits, logged as a stage; s4's chrome shows none yet. */
+    void progress(String text) {
+      stage("waiting: " + text);
     }
 
     /** The end's time, for the done or refused line. */

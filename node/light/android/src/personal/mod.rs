@@ -73,6 +73,36 @@ impl Host for Reach {
             .block_on(self.facility.net().request(*space, purpose, request))
     }
 
+    fn requests(
+        &self,
+        space: &[u8; 32],
+        purpose: Purpose,
+        requests: &[Vec<u8>],
+    ) -> Vec<Result<Vec<u8>, String>> {
+        self.runtime
+            .block_on(self.facility.net().requests(*space, purpose, requests))
+    }
+
+    fn fetch_timed(
+        &self,
+        space: &[u8; 32],
+        query: &mut dyn FnMut(u64) -> Result<Vec<u8>, String>,
+    ) -> Result<Vec<u8>, String> {
+        self.runtime
+            .block_on(self.facility.net().client().fetch_timed(*space, |now| {
+                query(now).map_err(vos_light::tor::Error::Query)
+            }))
+            .map(|(_, body)| body)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prepare(&self, space: &[u8; 32], purpose: Purpose) {
+        let (client, space) = (self.facility.net().client().clone(), *space);
+        self.runtime.spawn(async move {
+            let _ = client.prepare(space, purpose).await;
+        });
+    }
+
     fn pin(&self, home: &[u8; 32], onions: &[Onion]) {
         self.facility.net().pin(
             *home,
@@ -412,12 +442,13 @@ impl space::Prompts for Asked<'_> {
         self.prompts.stage(stage.into());
     }
 
-    /// The phrase shown, then two of its words asked back before the flow
-    /// goes on; a wrong word shows the phrase again, saying so, and so does
-    /// a check declined.
-    fn show_phrase(&self, words: &str, card: &Card) -> bool {
+    /// The phrase shown (with why the one before is void, if one is),
+    /// then two of its words asked back before the flow goes on; a wrong
+    /// word shows the phrase again, saying so, and so does a check
+    /// declined.
+    fn show_phrase(&self, words: &str, card: &Card, void: Option<&str>) -> bool {
         let each: Vec<&str> = words.split(' ').collect();
-        let mut notice = None;
+        let mut notice = void.map(str::to_owned);
         loop {
             let rows = each
                 .iter()
@@ -453,7 +484,7 @@ impl space::Prompts for Asked<'_> {
         }
     }
 
-    fn show_card(&self, card: &Card) -> bool {
+    fn show_card(&self, card: &Card, void: Option<&str>) -> bool {
         self.shown(Form {
             title: "Your recovery key's card".into(),
             detail: "Write this card down and keep it with the security key: it names the home \
@@ -461,7 +492,7 @@ impl space::Prompts for Asked<'_> {
                 .into(),
             rows: card_rows(card),
             fields: Vec::new(),
-            notice: None,
+            notice: void.map(str::to_owned),
             choices: vec!["I wrote it down".into()],
         })
     }
@@ -909,6 +940,22 @@ impl Space {
         self.personal.grouped()
     }
 
+    /// Whether a flow returned with follows left for after it.
+    pub fn behind(&self) -> bool {
+        self.personal.behind()
+    }
+
+    /// The follows a flow left for after it returned.
+    pub fn follow_behind(&self) -> Result<(), Refused> {
+        Ok(self.personal.follow_behind()?)
+    }
+
+    /// The follows left for after a flow dropped: the next pass makes
+    /// them.
+    pub fn drop_behind(&self) {
+        self.personal.drop_behind();
+    }
+
     /// The personal space's state as the device holds it, the facility's
     /// parts (Tor, the notices standing) left for the node to fill.
     pub fn status(&self) -> Result<PersonalStatus, Refused> {
@@ -1300,7 +1347,7 @@ mod tests {
             handle: [1; 32],
             onions: Vec::new(),
         };
-        assert!(Asked::new(&user).show_phrase(&WORDS.join(" "), &card));
+        assert!(Asked::new(&user).show_phrase(&WORDS.join(" "), &card, None));
         let seen = user.seen.lock().unwrap();
         let titles: Vec<&str> = seen.iter().map(|form| form.title.as_str()).collect();
         assert_eq!(

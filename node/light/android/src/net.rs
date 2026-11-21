@@ -468,6 +468,26 @@ impl Net {
         self.request_for(space, purpose, request, None).await
     }
 
+    /// `requests` to `space` under `purpose`, as the client sends them: a
+    /// kept-open purpose's all in flight at once. No spare carries them.
+    pub async fn requests(
+        &self,
+        space: SpaceId,
+        purpose: Purpose,
+        requests: &[Vec<u8>],
+    ) -> Vec<Result<Vec<u8>, NetError>> {
+        self.client
+            .requests(space, purpose, requests)
+            .await
+            .into_iter()
+            .map(|answer| {
+                answer
+                    .map(|(_, body)| body)
+                    .map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+
     /// The same for the facility session `session`: the spares kept for it,
     /// and only those, may carry it.
     pub async fn request_for(

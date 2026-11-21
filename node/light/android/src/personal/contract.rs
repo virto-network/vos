@@ -54,6 +54,10 @@ byte_enum! {
         /// A commit is owed that re-seals the kit under a new `R`: the
         /// agent's verdict left it sealed under one a removed device holds.
         Reseal = 12 as RESEAL,
+        /// What a flow left to its last follows did not finish (the
+        /// pairing, the commit or the restore is done): the next pass
+        /// finishes it.
+        Unfinished = 13 as UNFINISHED,
     }
 }
 

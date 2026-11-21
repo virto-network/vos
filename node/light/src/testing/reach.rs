@@ -86,6 +86,44 @@ impl Host for Reach {
             .map_err(|error| error.to_string())
     }
 
+    fn requests(
+        &self,
+        space: &[u8; 32],
+        purpose: Purpose,
+        requests: &[Vec<u8>],
+    ) -> Vec<Result<Vec<u8>, String>> {
+        self.runtime
+            .block_on(self.client.requests(*space, purpose, requests))
+            .into_iter()
+            .map(|answer| {
+                answer
+                    .map(|(_, body)| body)
+                    .map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+
+    fn fetch_timed(
+        &self,
+        space: &[u8; 32],
+        query: &mut dyn FnMut(u64) -> Result<Vec<u8>, String>,
+    ) -> Result<Vec<u8>, String> {
+        self.runtime
+            .block_on(
+                self.client
+                    .fetch_timed(*space, |now| query(now).map_err(crate::tor::Error::Query)),
+            )
+            .map(|(_, body)| body)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prepare(&self, space: &[u8; 32], purpose: Purpose) {
+        let (client, space) = (self.client.clone(), *space);
+        self.runtime.spawn(async move {
+            let _ = client.prepare(space, purpose).await;
+        });
+    }
+
     fn pin(&self, home: &[u8; 32], onions: &[Onion]) {
         let _entered = self.runtime.enter();
         self.client

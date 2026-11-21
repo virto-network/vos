@@ -17,6 +17,10 @@ pub trait Chrome: Send + Sync {
     /// The operation reached `stage` (a proof made, its request sent):
     /// what the chrome says it is doing. Nothing is answered.
     fn stage(&self, _stage: crate::personal::Stage) {}
+
+    /// What the operation is doing while the user waits, in words: shown
+    /// beside it, never answered. Nothing where the client shows none.
+    fn progress(&self, _text: &str) {}
 }
 
 /// The first bytes of a digest in hex, as the chrome names it.

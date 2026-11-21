@@ -188,6 +188,8 @@ final class Notices {
         return R.string.vos_pending_commit;
       case Pending.RESEAL:
         return R.string.vos_pending_reseal;
+      case Pending.UNFINISHED:
+        return R.string.vos_pending_unfinished;
       default:
         return R.string.vos_pending_alarm;
     }

@@ -53,7 +53,7 @@ mod set;
 mod status;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -515,6 +515,13 @@ pub struct Personal<H: Host> {
     waiting: Waiting,
     /// How long a flow waits for the agent (ms): [`WAIT_MS`] unless set.
     wait: AtomicU64,
+    /// The follows a flow left for after it returned.
+    behind: AtomicUsize,
+    /// The node's time each kept-open purpose read last, which a flow's
+    /// links count on.
+    clocks: link::Clocks,
+    /// The state as [`Personal::status`] last read it.
+    last: Mutex<Option<Status>>,
     /// The light node's store and the source kept, as an enrollment asks
     /// them while a flow holds the rest.
     owed: (Mutex<crate::Store>, Mutex<Option<Vec<u8>>>),
@@ -579,6 +586,9 @@ impl<H: Host> Personal<H> {
             }),
             waiting: Waiting::default(),
             wait: AtomicU64::new(WAIT_MS),
+            behind: AtomicUsize::new(0),
+            clocks: link::Clocks::default(),
+            last: Mutex::new(None),
             owed,
             home,
             onions_tried: AtomicU64::new(0),
@@ -655,13 +665,23 @@ impl<H: Host> Personal<H> {
             return Ok(());
         }
         self.onions_tried.store(now, Ordering::Relaxed);
-        let onions: Vec<Onion> = self.home_query(
-            &kept.home,
-            Purpose::Fetch,
-            kept.home.credentials.0,
-            vos_wire::credentials::method::ONIONS,
-            Vec::new(),
-        )?;
+        // The node's time and the query on one fetch of their own.
+        let home = &kept.home;
+        let answer = self
+            .host
+            .fetch_timed(&To::Home(home.handle).routes(), &mut |now| {
+                wire::query_request(
+                    home.agent,
+                    &home.identity,
+                    home.credentials.0,
+                    vos_wire::credentials::method::ONIONS,
+                    Vec::new(),
+                    now + EXPIRY_MS,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .map_err(Error::Unreachable)?;
+        let onions: Vec<Onion> = wire::query_answer(&answer).map_err(failed)?;
         if !crate::route::usable_onions(&onions) {
             return Err(failed("the home's registrar served an unusable onion set"));
         }
@@ -818,7 +838,7 @@ impl<H: Host> Personal<H> {
             return Err(Error::NoSpace);
         };
         let key = light.sync_key().clone();
-        let mut link = link(&self.host, home, Purpose::Background, agent, &key, sync);
+        let mut link = self.link(home, Purpose::Background, agent, &key, sync);
         // The log is followed and `alive` posted even when the scopes
         // cannot be read.
         let instances = light.instances().unwrap_or_else(|error| {
@@ -915,9 +935,18 @@ impl<H: Host> Personal<H> {
             .map_err(Error::Unreachable)
     }
 
-    /// The node's time at `to`, under `purpose`.
+    /// The node's time at `to`, under `purpose`: a kept-open purpose's
+    /// reading counted on while young ([`link::Clocks`]), a one-shot
+    /// purpose's read on a connection of its own.
     fn time(&self, to: To, purpose: Purpose) -> Result<u64, Error> {
-        wire::time_answer(&self.ask(to, purpose, &wire::time_request())?).map_err(failed)
+        if let Some(now) = self.clocks.now(&to.routes(), purpose) {
+            return Ok(now);
+        }
+        let node =
+            wire::time_answer(&self.ask(to, purpose, &wire::time_request())?).map_err(failed)?;
+        self.clocks
+            .read(&to.routes(), purpose, node, std::time::Instant::now());
+        Ok(node)
     }
 
     /// A link to the agent the device's group is at.
@@ -935,25 +964,108 @@ impl<H: Host> Personal<H> {
         // of its own rather than a sequence this one uses.
         let mut sync =
             std::mem::replace(&mut held.sync, Signer::new(key.verifying_key().to_bytes()));
-        let mut link = link(&self.host, &kept, purpose, agent, &key, &mut sync);
+        let mut link = self.link(&kept, purpose, agent, &key, &mut sync);
         let done = f(&mut link, held);
         held.sync = sync;
         done
     }
 
+    /// A link of `purpose` to the agent `agent` at `home`, its sync key's
+    /// session `signer`, counting on the node's time the flow's links read
+    /// ([`link::Clocks`]).
+    fn link<'a>(
+        &'a self,
+        home: &Kept,
+        purpose: Purpose,
+        agent: (u32, [u8; 32]),
+        sync: &'a SigningKey,
+        signer: &'a mut Signer,
+    ) -> AgentLink<'a, H> {
+        AgentLink::new(
+            &self.host,
+            To::Home(home.home.handle).routes(),
+            purpose,
+            Agent {
+                agent: agent.0,
+                identity: agent.1,
+                instance: PERSONAL,
+            },
+            sync,
+            signer,
+        )
+        .with_clocks(&self.clocks)
+    }
+
     /// One pass of the light node's job in the foreground: the log
     /// followed and every vote, evidence and `alive` posted, the scopes
-    /// pushed and read.
-    fn follow(&self, held: &mut Held) -> Result<(), Error> {
+    /// pushed and read. Whether it left the device with nothing a flow
+    /// waits for ([`crate::job::complete`]).
+    fn follow(&self, held: &mut Held) -> Result<bool, Error> {
         let now = self.host.now();
         self.with_link(held, Purpose::Personal, |link, held| {
             let Held { light, group, .. } = held;
             let group = group.as_mut().ok_or(Error::NoSpace)?;
             let instances = light.instances().map_err(store_failed)?;
             crate::job::run(light, group, link, &instances, now)
-                .map(drop)
+                .map(|pass| crate::job::complete(group, &pass))
                 .map_err(|stopped| unreached(stopped.error))
         })
+    }
+
+    /// Up to `follows` follows, until one leaves the device complete
+    /// ([`crate::job::complete`]): the follows made.
+    fn follow_until_complete(&self, held: &mut Held, follows: usize) -> Result<usize, Error> {
+        for made in 1..=follows {
+            if self.follow(held)? {
+                return Ok(made);
+            }
+        }
+        Ok(follows)
+    }
+
+    /// `follows` left for after the flow holding `held` returns
+    /// ([`Personal::follow_behind`]), and the state it leaves kept for the
+    /// status read while they run.
+    fn leave_behind(&self, held: &Held, follows: usize) {
+        if let Ok(status) = status::read(held) {
+            *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
+        }
+        self.behind.store(follows, Ordering::SeqCst);
+    }
+
+    /// Whether a flow returned with follows left for after it.
+    pub fn behind(&self) -> bool {
+        self.behind.load(Ordering::SeqCst) > 0
+    }
+
+    /// The follows a flow left for after it returned, each holding the
+    /// space for itself alone, so a flow or a read the user starts
+    /// meanwhile waits for one follow at most. One that fails leaves the
+    /// rest to the next pass.
+    pub fn follow_behind(&self) -> Result<(), Error> {
+        while self.behind() {
+            let followed = self.follow(&mut self.held());
+            match followed {
+                Ok(_) => {
+                    let _ = self
+                        .behind
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                            Some(left.saturating_sub(1))
+                        });
+                }
+                Err(error) => {
+                    self.behind.store(0, Ordering::SeqCst);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The follows left for after a flow dropped: the next pass makes
+    /// them.
+    pub fn drop_behind(&self) {
+        self.behind.store(0, Ordering::SeqCst);
     }
 
     /// The device's keys at `home`: its sync key, its admin key (made now
@@ -1008,30 +1120,6 @@ impl To {
     }
 }
 
-/// A link of `purpose` to the agent `agent` at `home`, its sync key's
-/// session `signer`.
-fn link<'a, H: Host>(
-    host: &'a H,
-    home: &Kept,
-    purpose: Purpose,
-    agent: (u32, [u8; 32]),
-    sync: &'a SigningKey,
-    signer: &'a mut Signer,
-) -> AgentLink<'a, H> {
-    AgentLink::new(
-        host,
-        To::Home(home.home.handle).routes(),
-        purpose,
-        Agent {
-            agent: agent.0,
-            identity: agent.1,
-            instance: PERSONAL,
-        },
-        sync,
-        signer,
-    )
-}
-
 /// The secret for the space whose handle is `handle`, from `source` at its
 /// prompt.
 fn secret(
@@ -1060,13 +1148,18 @@ impl SecurityKey for Touched<'_> {
 
 /// A new kit of `kind` for the home `kept`: a phrase shown once beside
 /// its card, or a security key's, its discoverable credential made at its
-/// prompt, then its card.
-fn new_kit(prompts: &dyn Prompts, kind: KitKind, kept: &Kept) -> Result<KitSecret, Error> {
+/// prompt, then its card; `void`, why it replaces one shown before.
+fn new_kit(
+    prompts: &dyn Prompts,
+    kind: KitKind,
+    kept: &Kept,
+    void: Option<&str>,
+) -> Result<KitSecret, Error> {
     match kind {
         KitKind::Phrase => {
             let secret = KitSecret::phrase().ok_or_else(|| failed("no randomness"))?;
             let words = secret.words().ok_or_else(|| failed("a phrase has words"))?;
-            if !prompts.show_phrase(&words, &kept.card()) {
+            if !prompts.show_phrase(&words, &kept.card(), void) {
                 return Err(Error::Declined);
             }
             Ok(secret)
@@ -1074,7 +1167,7 @@ fn new_kit(prompts: &dyn Prompts, kind: KitKind, kept: &Kept) -> Result<KitSecre
         KitKind::SecurityKey => {
             let id = prompts.create_kit_key()?;
             let secret = KitSecret::security_key(&mut Touched { prompts, id })?;
-            if !prompts.show_card(&kept.card()) {
+            if !prompts.show_card(&kept.card(), void) {
                 return Err(Error::Declined);
             }
             Ok(secret)

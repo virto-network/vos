@@ -739,15 +739,18 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
     }
 }
 
-/// A sign-in before the claim, the tree read to its end and no leaf of
-/// the member's in it, is refused as unclaimed, not as a path still being
-/// read; once the member is claimed and the tree read again, it signs in.
+/// A sign-in before the claim says it waits for the space to list the
+/// device and reads the feed meanwhile; the tree read to its end with no
+/// leaf of the member's in it after the wait, it is refused as not invited
+/// yet, not as a path still being read. Invited while a sign-in waits, it
+/// goes on by itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_sign_in_before_the_claim_says_to_claim_first() {
+async fn a_sign_in_before_the_claim_waits_for_the_invitation() {
     let world = world();
     let directory = tempfile::tempdir().unwrap();
     let source = Arc::new(Phone::new(9));
-    let facility = facility(&world, directory.path(), source as Arc<dyn Source>);
+    let facility = facility(&world, directory.path(), source as Arc<dyn Source>)
+        .with_listed_wait(Duration::from_millis(1_500), Duration::from_millis(300));
     let session = facility.session(gateway());
     let chrome = Scripted::default();
     chrome.will(confirm(&[]));
@@ -767,11 +770,31 @@ async fn a_sign_in_before_the_claim_says_to_claim_first() {
     };
     assert_eq!(refused.code, Code::Unclaimed, "{refused:?}");
     assert!(
-        refused.message.contains("claim your invitation first"),
+        refused
+            .message
+            .contains("the operator has not invited it yet"),
         "{refused:?}"
     );
-    world.enroll(AGENT, &member);
-    let signed = sign_in_held(&session, &chrome).await.unwrap();
+    assert!(
+        chrome
+            .progress
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|text| text == vos_facility::WAITING_FOR_LIST),
+    );
+    assert!(!chrome.progress.lock().unwrap().is_empty());
+    // Invited while the sign-in waits: it signs in with no second tap.
+    let invite = {
+        let world = Arc::clone(&world);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            world.enroll(AGENT, &member);
+        })
+    };
+    chrome.will(confirm(&[]));
+    let signed = session.ask("sign_in", &login, &chrome).await.unwrap();
+    invite.await.unwrap();
     assert!(matches!(
         Response::decode_exact(&bytes(field(&signed, "answer"))),
         Some(Response::Ran { .. })
