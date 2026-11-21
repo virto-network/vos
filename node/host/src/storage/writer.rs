@@ -1,7 +1,7 @@
 //! The writer's loop: each group of commits checked, written as one batch,
 //! synced once when any change must be, and answered.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -209,9 +209,8 @@ impl Writer {
             return;
         }
         self.hooks.before_commit();
-        let started = Instant::now();
-        self.shared.flush_commits.record(group.len() as u64);
         {
+            let started = Instant::now();
             let pending = lock(&self.shared.pending);
             for commit in &group {
                 if let Some(queued) = pending.get(&commit.id) {
@@ -221,6 +220,26 @@ impl Writer {
                 }
             }
         }
+        let (unsynced, rest) = unsynced_first(group);
+        for group in [unsynced, rest] {
+            if !group.is_empty() {
+                self.flush(group);
+            }
+        }
+    }
+
+    /// Write `group` as one batch, synced when any change in it must be,
+    /// and answer its commits.
+    fn flush(&mut self, group: Vec<Commit>) {
+        if let Some(failure) = self.failed.clone() {
+            let refusal = format!("the store failed earlier: {failure}");
+            for commit in group {
+                self.answer(commit, Err(refusal.clone()));
+            }
+            return;
+        }
+        let started = Instant::now();
+        self.shared.flush_commits.record(group.len() as u64);
         let mut batch = self.store.batch();
         let mut staged = Staged::new();
         // Commits in order, each with its refusal if it has one; a refused
@@ -310,6 +329,30 @@ impl Writer {
         lock(&self.shared.pending).remove(&commit.id);
         let _ = commit.done.try_send(result);
     }
+}
+
+/// `group` split in two, each in its order: the commits that need no sync
+/// and touch no agent an earlier commit that needs one touches, then the
+/// rest. No commit of a group is answered before it is written, so its
+/// commits are concurrent and any order that keeps each agent's is one
+/// they could have come in: the first part is written and answered as a
+/// flush of its own, without waiting for the second's sync.
+fn unsynced_first(group: Vec<Commit>) -> (Vec<Commit>, Vec<Commit>) {
+    let mut synced_agents = HashSet::new();
+    let (mut unsynced, mut rest) = (Vec::new(), Vec::new());
+    for commit in group {
+        let synced = commit.changes.iter().any(Change::synced);
+        let agents = || commit.changes.iter().map(Change::agent);
+        if synced {
+            synced_agents.extend(agents().flatten());
+            rest.push(commit);
+        } else if agents().any(|agent| agent.is_none_or(|agent| synced_agents.contains(&agent))) {
+            rest.push(commit);
+        } else {
+            unsynced.push(commit);
+        }
+    }
+    (unsynced, rest)
 }
 
 /// What a group's changes leave for the writer once their batch is

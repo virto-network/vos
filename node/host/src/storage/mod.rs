@@ -163,6 +163,29 @@ impl Change {
         }
     }
 
+    /// The agent whose rows it changes; none for a barrier.
+    fn agent(&self) -> Option<AgentId> {
+        match self {
+            Self::Append { agent, .. }
+            | Self::Truncate { agent, .. }
+            | Self::Compact { agent, .. }
+            | Self::Hard { agent, .. }
+            | Self::Membership { agent, .. }
+            | Self::Apply { agent, .. }
+            | Self::Stage { agent, .. }
+            | Self::DropEpoch { agent, .. }
+            | Self::Switch { agent, .. }
+            | Self::Pin { agent, .. }
+            | Self::Unpin { agent, .. }
+            | Self::Placement { agent, .. }
+            | Self::Retire { agent, .. }
+            | Self::LastResult { agent, .. }
+            | Self::Tree { agent, .. } => Some(*agent),
+            Self::Agent(record) => Some(record.agent),
+            Self::Barrier => None,
+        }
+    }
+
     fn bytes(&self) -> usize {
         match self {
             Self::Append { entry, .. } => entry.body.len() + 64,

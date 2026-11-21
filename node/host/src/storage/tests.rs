@@ -276,3 +276,112 @@ fn a_held_writer_reports_a_stall_until_it_drains() {
     pending.join().unwrap().unwrap();
     assert!(!writer.stalled());
 }
+
+/// Holds the first group's commits until released, then each sync until
+/// released, saying when one starts.
+struct Syncs {
+    hold: AtomicBool,
+    syncing: Mutex<Option<mpsc::Sender<()>>>,
+    synced: Mutex<mpsc::Receiver<()>>,
+}
+
+impl Hooks for Syncs {
+    fn before_commit(&self) {
+        while self.hold.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn fail_sync(&self) -> bool {
+        if let Some(syncing) = &*self.syncing.lock().unwrap() {
+            let _ = syncing.send(());
+            let _ = self.synced.lock().unwrap().recv();
+        }
+        false
+    }
+}
+
+/// A writer whose first group waits for the hold's release, with the
+/// commits `queued` behind it in their order, all in its next group; the
+/// syncs held, each started told on the receiver given back.
+fn queued_behind_a_held_commit(
+    dir: &std::path::Path,
+    queued: Vec<Vec<Change>>,
+) -> (
+    Vec<mpsc::Receiver<Result<(), String>>>,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+) {
+    let (syncing, started) = mpsc::channel();
+    let (release, synced) = mpsc::channel();
+    let hooks = Arc::new(Syncs {
+        hold: AtomicBool::new(true),
+        syncing: Mutex::new(None),
+        synced: Mutex::new(synced),
+    });
+    let writer = Arc::new(StorageThread::spawn(
+        Fjall::open(dir).unwrap(),
+        Arc::clone(&hooks) as Arc<dyn Hooks>,
+    ));
+    let submit = |changes: Vec<Change>| {
+        let (done, answered) = mpsc::channel();
+        let before = lock(&writer.shared.pending).len();
+        let committing = Arc::clone(&writer);
+        std::thread::spawn(move || {
+            let _ = done.send(smol::block_on(committing.commit(changes)));
+        });
+        while lock(&writer.shared.pending).len() == before {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        answered
+    };
+    // The first group: a commit alone, held before it is written.
+    let first = submit(vec![hard(1, false)]);
+    let answers = queued.into_iter().map(submit).collect();
+    *hooks.syncing.lock().unwrap() = Some(syncing);
+    hooks.hold.store(false, Ordering::SeqCst);
+    first.recv().unwrap().unwrap();
+    (answers, started, release)
+}
+
+const B: AgentId = AgentId(2);
+
+/// An apply queued behind another agent's synced commit in one group is
+/// written and answered without waiting for that commit's sync.
+#[test]
+fn an_unsynced_commit_does_not_wait_for_another_agents_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = Change::Apply {
+        agent: B,
+        epoch: 0,
+        index: 1,
+        writes: Vec::new(),
+    };
+    let (answers, started, release) =
+        queued_behind_a_held_commit(dir.path(), vec![vec![hard(2, true)], vec![other]]);
+    started.recv().unwrap();
+    answers[1]
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the apply answered while the sync is held")
+        .unwrap();
+    assert!(answers[0].try_recv().is_err(), "the synced commit answered before its sync");
+    release.send(()).unwrap();
+    answers[0].recv().unwrap().unwrap();
+}
+
+/// An agent's unsynced commit behind its own synced one in a group waits
+/// for that sync: an agent's commits keep their order.
+#[test]
+fn an_agents_unsynced_commit_waits_for_its_earlier_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let (answers, started, release) =
+        queued_behind_a_held_commit(dir.path(), vec![vec![hard(2, true)], vec![apply(1)]]);
+    started.recv().unwrap();
+    assert!(
+        answers[1].recv_timeout(Duration::from_millis(200)).is_err(),
+        "the agent's apply answered before its earlier commit's sync"
+    );
+    release.send(()).unwrap();
+    answers[0].recv().unwrap().unwrap();
+    answers[1].recv().unwrap().unwrap();
+}
