@@ -18,7 +18,6 @@ use routes::Routes;
 use setup::{agents, methods};
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::rc::Rc;
@@ -39,7 +38,7 @@ use crate::drive::{LATE_US, Plan};
 use crate::load::{self, Kind, Readers, Users};
 use crate::nodes::target;
 use pool::{Pool, PoolStats};
-use session::{Agent, Body, Fate, Methods, Op, ShardCounts, Shared, fate};
+use session::{Agent, Body, Fate, Methods, Op, Sessions, ShardCounts, Shared, fate};
 use stats::{KindStats, REPORTED, Stats, cpu_seconds, mix_line, refusal, thread_seconds};
 
 /// How far ahead of its schedule an operation is signed.
@@ -88,7 +87,8 @@ struct Engine {
     pools: Vec<Pool>,
     routes: RefCell<Routes>,
     stats: RefCell<Stats>,
-    whole: RefCell<Stats>,
+    /// Each interval's counts, to the writing thread, until the load's end.
+    intervals: RefCell<Option<std::sync::mpsc::Sender<Interval>>>,
     pooled: RefCell<PoolStats>,
     /// Operations whose last request is unanswered, reads at a cut
     /// waiting for their window's close among them.
@@ -171,7 +171,7 @@ impl Engine {
             return;
         }
         let ready = {
-            let mut sessions = self.shared.sessions.lock().expect("sessions");
+            let mut sessions = self.shared.sessions.of(op.user);
             let session = sessions
                 .get_mut(&op.user)
                 .expect("a planned user's session");
@@ -272,7 +272,7 @@ impl Engine {
         // The session goes on before any read of a workflow: the user's
         // next call need not wait for it.
         let next = {
-            let mut sessions = self.shared.sessions.lock().expect("sessions");
+            let mut sessions = self.shared.sessions.of(op.user);
             let session = sessions
                 .get_mut(&op.user)
                 .expect("a sending user's session");
@@ -360,7 +360,7 @@ impl Engine {
         wait_ms: u64,
     ) -> Result<Response, String> {
         let (key, floor) = {
-            let sessions = self.shared.sessions.lock().expect("sessions");
+            let sessions = self.shared.sessions.of(op.user);
             let session = &sessions[&op.user];
             (session.key.clone(), session.floor)
         };
@@ -454,19 +454,57 @@ impl Engine {
         self.done(kind, closed, &last);
     }
 
-    /// The interval's lines: a line a kind, then one for the mix with the
-    /// driver's own counts.
-    fn flush(&self, file: &mut std::fs::File) {
+    /// The interval's counts, handed to the writing thread.
+    fn flush(&self) {
         let (since, cpu_then) = self.flushed.get();
         let seconds = since.elapsed().as_secs_f64();
         let cpu = cpu_seconds();
         self.flushed.set((Instant::now(), cpu));
-        let taken = std::mem::take(&mut *self.stats.borrow_mut());
         let mut pooled = PoolStats::default();
         for pool in &self.pools {
             pooled.absorb(&pool.take_stats());
         }
-        let t_ms = crate::now_ms();
+        self.pooled.borrow_mut().absorb(&pooled);
+        let interval = Interval {
+            t_ms: crate::now_ms(),
+            seconds,
+            cpu_s: cpu - cpu_then,
+            taken: std::mem::take(&mut *self.stats.borrow_mut()),
+            pooled,
+        };
+        if let Some(intervals) = &*self.intervals.borrow() {
+            let _ = intervals.send(interval);
+        }
+    }
+}
+
+/// An interval's counts, as the sending thread took them.
+struct Interval {
+    t_ms: u64,
+    seconds: f64,
+    cpu_s: f64,
+    taken: Stats,
+    pooled: PoolStats,
+}
+
+/// The writing thread: each interval's lines, a line a kind, then one for
+/// the mix with the driver's own counts, written to `file`, and the
+/// sessions left idle dropped, both off the sending thread. The whole
+/// load's counts once the sending thread is done.
+fn write_intervals(
+    intervals: std::sync::mpsc::Receiver<Interval>,
+    mut file: std::fs::File,
+    shared: &Shared,
+) -> (std::fs::File, Stats) {
+    let mut whole = Stats::default();
+    for interval in intervals {
+        let Interval {
+            t_ms,
+            seconds,
+            cpu_s,
+            taken,
+            pooled,
+        } = interval;
         for name in REPORTED {
             if let Some(stats) = taken.kinds.get(name) {
                 let _ = writeln!(file, "{}", stats.line(t_ms, seconds, name, false));
@@ -475,16 +513,15 @@ impl Engine {
         let mut line = taken.mix().line(t_ms, seconds, "all", false);
         // The mix's fine counts are its kinds' summed: not written twice.
         line["fine"]["counts"].take();
-        line["cpu_s"] = (cpu - cpu_then).into();
+        line["cpu_s"] = cpu_s.into();
         pool_fields(&mut line, &pooled);
         let _ = writeln!(file, "{line}");
-        self.pooled.borrow_mut().absorb(&pooled);
-        let mut whole = self.whole.borrow_mut();
         for (name, stats) in taken.kinds {
             whole.kind(name).absorb(&stats);
         }
-        self.shared.forget();
+        shared.sessions.forget();
     }
+    (file, whole)
 }
 
 /// A line's counts of the driver's connections.
@@ -532,7 +569,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
         instance: InstanceId(plan.shards[0].instance),
         methods,
         seed: plan.model.seed,
-        sessions: Mutex::new(HashMap::new()),
+        sessions: Sessions::default(),
         counts: Mutex::new(ShardCounts {
             users: vec![0; shards],
             sessions: vec![0; shards],
@@ -548,7 +585,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
         .iter()
         .map(|node| Pool::quic(&node.api, crate::keys::hex32(&node.key)?, client))
         .collect::<Result<Vec<_>, String>>()?;
-    let mut file =
+    let file =
         std::fs::File::create(out).map_err(|error| format!("{}: {error}", out.display()))?;
     let secs = plan.secs as f64;
     let (sender, receiver) = smol::channel::unbounded::<Op>();
@@ -600,6 +637,14 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
                 })
                 .expect("the planning thread")
         };
+        let (intervals, written) = std::sync::mpsc::channel::<Interval>();
+        let writer = {
+            let shared = Arc::clone(&shared);
+            std::thread::Builder::new()
+                .name("record".into())
+                .spawn_scoped(scope, move || write_intervals(written, file, &shared))
+                .expect("the writing thread")
+        };
         let ex: &'static LocalExecutor<'static> = Box::leak(Box::new(LocalExecutor::new()));
         let nodes = pools.len();
         let engine = Rc::new(Engine {
@@ -610,7 +655,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
                 down: vec![None; nodes],
             }),
             stats: RefCell::new(Stats::default()),
-            whole: RefCell::new(Stats::default()),
+            intervals: RefCell::new(Some(intervals)),
             pooled: RefCell::new(PoolStats::default()),
             inflight: Cell::new(0),
             ex,
@@ -644,11 +689,10 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
             engine.flushed.set((Instant::now(), cpu_before));
             let reporter = {
                 let engine = Rc::clone(&engine);
-                let file = &mut file;
                 async move {
                     loop {
                         Timer::after(every).await;
-                        engine.flush(file);
+                        engine.flush();
                     }
                 }
             };
@@ -671,8 +715,9 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
             smol::future::or(load, reporter).await;
         }));
         let _ = planner.join();
-        engine.flush(&mut file);
-        let whole = std::mem::take(&mut *engine.whole.borrow_mut());
+        engine.flush();
+        engine.intervals.borrow_mut().take();
+        let (mut file, whole) = writer.join().expect("the writing thread");
         let t_ms = crate::now_ms();
         let (from_ms, to_ms) = engine.sends.get().unwrap_or((t_ms, t_ms));
         let span = ((to_ms - from_ms) as f64 / 1e3).max(1.0);

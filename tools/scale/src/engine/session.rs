@@ -5,7 +5,7 @@
 //! starts another.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -187,6 +187,39 @@ pub enum Body {
     Query(Vec<u8>),
 }
 
+/// The users' sessions, in stripes by user: a thread holds one stripe at a
+/// time, so dropping the idle ones never holds the sending thread for the
+/// whole map.
+pub struct Sessions(Vec<Mutex<HashMap<u64, UserSession>>>);
+
+/// The stripes of [`Sessions`].
+const STRIPES: usize = 64;
+
+impl Default for Sessions {
+    fn default() -> Self {
+        Self((0..STRIPES).map(|_| Mutex::default()).collect())
+    }
+}
+
+impl Sessions {
+    /// The stripe holding `user`'s session.
+    pub fn of(&self, user: u64) -> MutexGuard<'_, HashMap<u64, UserSession>> {
+        self.0[(user % STRIPES as u64) as usize]
+            .lock()
+            .expect("sessions")
+    }
+
+    /// Drop the sessions unused for [`FORGET`] and idle: the users
+    /// inactive that long, a stripe at a time.
+    pub fn forget(&self) {
+        for stripe in &self.0 {
+            stripe.lock().expect("sessions").retain(|_, session| {
+                session.busy || session.unsent > 0 || session.used.elapsed() < FORGET
+            });
+        }
+    }
+}
+
 /// Each shard's distinct users and the sessions opened at it.
 #[derive(Default)]
 pub struct ShardCounts {
@@ -204,7 +237,7 @@ pub struct Shared {
     pub instance: InstanceId,
     pub methods: Methods,
     pub seed: u64,
-    pub sessions: Mutex<HashMap<u64, UserSession>>,
+    pub sessions: Sessions,
     pub counts: Mutex<ShardCounts>,
     /// How far the agents' time runs ahead of this host's clock, as a
     /// node last said.
@@ -251,11 +284,11 @@ impl Shared {
     /// `user`'s session at `agent`, opened if it has none: its key derived
     /// outside the lock.
     pub fn open(&self, user: u64, agent: usize) {
-        if self.sessions.lock().expect("sessions").contains_key(&user) {
+        if self.sessions.of(user).contains_key(&user) {
             return;
         }
         let session = UserSession::new(self.key(user), self.session_name(user, 0));
-        let opened = match self.sessions.lock().expect("sessions").entry(user) {
+        let opened = match self.sessions.of(user).entry(user) {
             std::collections::hash_map::Entry::Vacant(vacant) => {
                 vacant.insert(session);
                 true
@@ -271,17 +304,6 @@ impl Shared {
     pub fn fresh(&self, user: u64, agent: usize, generation: u32) -> ([u8; 16], u64) {
         self.opened(agent, false);
         (self.session_name(user, generation), self.agent_now())
-    }
-
-    /// Drop the sessions unused for [`FORGET`] and idle: the users
-    /// inactive that long.
-    pub fn forget(&self) {
-        self.sessions
-            .lock()
-            .expect("sessions")
-            .retain(|_, session| {
-                session.busy || session.unsent > 0 || session.used.elapsed() < FORGET
-            });
     }
 
     pub fn call_body(
@@ -357,7 +379,7 @@ impl Shared {
         let user = Self::signer(planned);
         let cross = planned.payee.is_some_and(|(_, cross)| cross);
         self.open(user, home);
-        let mut sessions = self.sessions.lock().expect("sessions");
+        let mut sessions = self.sessions.of(user);
         let session = sessions.get_mut(&user).expect("an open session");
         if planned.kind == Kind::Query {
             session.used = Instant::now();
