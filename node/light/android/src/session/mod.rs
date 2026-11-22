@@ -1503,7 +1503,8 @@ impl Session {
     /// A proved request sent over Tor as a proven call, the spare's if one
     /// is built: the node's answer. One that names the root unknown or
     /// stale makes the feed due; one that no longer admits this app's
-    /// device format is refused: the app needs updating.
+    /// device format or kernel release is refused, the window forgotten:
+    /// the app needs updating, or its next proof another release.
     async fn send(&self, enrollment: &Enrollment, request: &[u8]) -> Result<Vec<u8>, Refusal> {
         let answer = self
             .inner
@@ -1517,7 +1518,8 @@ impl Session {
             tree.unknown(&mut *tree.keeper.lock().await);
         }
         if let Err(refusal) = update_refused(&answer) {
-            // The window that admitted this format is the space's no more.
+            // The window that admitted this format or release is the
+            // space's no more.
             self.inner.forget_window(enrollment);
             return Err(refusal);
         }

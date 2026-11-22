@@ -131,8 +131,9 @@ pub fn answer<T: Decode, E: Decode>(outcome: &Outcome) -> Result<Result<T, E>, D
     }
 }
 
-/// Whether a proven call's `answer` refuses its proof's format: the space
-/// no longer admits this app's proofs, and the app is to be updated.
+/// Whether a proven call's `answer` refuses its proof's format, or the
+/// kernel release it was proved under, at apply: the space no longer
+/// admits this app's proofs, and the app is to be updated.
 pub fn format_refused(answer: &[u8]) -> bool {
     use vos_abi::abi::Refusal;
     use vos_wire::ingress::CredentialRefusal;
@@ -140,7 +141,7 @@ pub fn format_refused(answer: &[u8]) -> bool {
         Ok(Answer::Refused(CredentialRefusal::Format)) => true,
         Ok(Answer::Other(body)) => matches!(
             Response::decode_exact(&body),
-            Some(Response::Refused(Refusal::Format))
+            Some(Response::Refused(Refusal::Format | Refusal::Release))
         ),
         _ => false,
     }

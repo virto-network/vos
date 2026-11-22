@@ -744,9 +744,10 @@ async fn a_refused_root_is_proved_again_and_a_retired_format_asks_for_an_update(
     );
     assert_eq!(proofs(), sent + 2, "one retry");
 
-    // A device format the space no longer admits.
+    // A device format, or a kernel release, the space no longer admits.
     for retired in [
         Response::Refused(vos_abi::abi::Refusal::Format),
+        Response::Refused(vos_abi::abi::Refusal::Release),
         Response::Rejected(ingress::Rejection::Credential(
             ingress::CredentialRefusal::Format,
         )),

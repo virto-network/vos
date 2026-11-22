@@ -34,12 +34,16 @@ pub(super) fn node_refusal(body: &[u8]) -> Option<abi::Refusal> {
 }
 
 /// Refused, as an app to update, when the node refused a proof for its
-/// device format: one its ingress does not admit, or one the release or
-/// the agent's log retired by the batch's time.
+/// device format (one its ingress does not admit, or one the release or
+/// the agent's log retired by the batch's time) or for its kernel release,
+/// retired by the batch's time.
 pub(crate) fn update_refused(answer: &[u8]) -> Result<(), Refusal> {
     let format = match wire::credentialed_answer(answer) {
         Ok(wire::Answer::Refused(CredentialRefusal::Format)) => true,
-        Ok(wire::Answer::Other(body)) => node_refusal(&body) == Some(abi::Refusal::Format),
+        Ok(wire::Answer::Other(body)) => matches!(
+            node_refusal(&body),
+            Some(abi::Refusal::Format | abi::Refusal::Release)
+        ),
         _ => false,
     };
     match format {
