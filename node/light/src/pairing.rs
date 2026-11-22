@@ -71,9 +71,9 @@ use crate::home::Home;
 const PATTERN: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2b";
 
 /// The code's bytes in the QR: its version first.
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const PSK: &[u8] = b"vos/personal/pairing/psk";
-const PROLOGUE: &[u8] = b"vos/personal/pairing/v1";
+const PROLOGUE: &[u8] = b"vos/personal/pairing/v2";
 const ITEM: &[u8] = b"vos/personal/pairing/item";
 const RECEIVED: &[u8] = b"vos/personal/pairing/received";
 const CHECK: &[u8] = b"vos/personal/pairing/check";

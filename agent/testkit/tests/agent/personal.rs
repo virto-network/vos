@@ -564,9 +564,10 @@ impl<W: BorrowMut<World>> Home<W> {
     }
 
     /// `caller`'s operation `name`: its log index. A removal's, an add's,
-    /// a replacement's or a regroup's evidence is posted beside it, by the
-    /// device's sync key or the kit, as a device's flow posts it; a
-    /// rotation's and a restore's carry an `R2`, which the test deposits.
+    /// a replacement's, a regroup's, a second signature's or a resolution's
+    /// evidence is posted beside it, by the device's sync key or the kit,
+    /// as a device's flow posts it; a rotation's and a restore's carry an
+    /// `R2`, which the test deposits.
     pub fn operate(
         &mut self,
         caller: Principal,
@@ -577,7 +578,10 @@ impl<W: BorrowMut<World>> Home<W> {
         let index = self
             .call_encoded::<Recorded>(caller, name, &arguments)?
             .index;
-        if matches!(name, "remove" | "add" | "replace" | "regroup") {
+        if matches!(
+            name,
+            "remove" | "add" | "replace" | "regroup" | "cosign" | "resolve"
+        ) {
             let Principal::Client(key) = caller else {
                 return Ok(index);
             };

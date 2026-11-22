@@ -53,6 +53,8 @@
 mod alarm;
 pub mod archive;
 mod follow;
+#[cfg(test)]
+mod pins;
 mod set;
 mod state;
 
@@ -464,9 +466,6 @@ pub struct DeviceGroup {
     chains: Vec<(u64, [u8; 32])>,
     /// The alarms raised and not yet written.
     raised: Vec<Alarm>,
-    /// This device's own leave held: the removal of it the log asserts
-    /// next is its leave.
-    leaving: bool,
 }
 
 /// The namespace `store`'s MLS state is in.
@@ -518,6 +517,7 @@ impl DeviceGroup {
             views: Vec::new(),
             ahead: None,
             assigned: None,
+            leaving: false,
         };
         let mut mls = Mls::open(mls_namespace(store), &credential(&me), BTreeMap::new())?;
         mls.create(now / 1000, rows(&state, None))?;
@@ -528,7 +528,6 @@ impl DeviceGroup {
             archive,
             processed: None,
             chains: Vec::new(),
-            leaving: false,
             raised: Vec::new(),
         })
     }
@@ -609,6 +608,7 @@ impl DeviceGroup {
             views: Vec::new(),
             ahead: None,
             assigned,
+            leaving: false,
         };
         let mut mls = Mls::open(mls_namespace(store), &credential(&me), BTreeMap::new())?;
         let mut writes = rows(&state, Some(&archive));
@@ -621,7 +621,6 @@ impl DeviceGroup {
             archive,
             processed: None,
             chains: Vec::new(),
-            leaving: false,
             raised: Vec::new(),
         })
     }
@@ -705,6 +704,7 @@ impl DeviceGroup {
             views: Vec::new(),
             ahead: None,
             assigned: Some(0),
+            leaving: false,
         };
         let mut mls = Mls::open(mls_namespace(store), &credential(&me), BTreeMap::new())?;
         mls.create(read.time / 1000, rows(&state, Some(&archive)))?;
@@ -715,7 +715,6 @@ impl DeviceGroup {
             archive,
             processed: None,
             chains: Vec::new(),
-            leaving: false,
             raised: Vec::new(),
         })
     }
@@ -738,7 +737,6 @@ impl DeviceGroup {
             state,
             processed: None,
             chains: Vec::new(),
-            leaving: false,
             raised: Vec::new(),
         }))
     }
@@ -750,6 +748,21 @@ impl DeviceGroup {
 
     pub fn course(&self) -> Course {
         self.state.course
+    }
+
+    /// Whether the device is out of the group by its own leave: its store
+    /// is to be forgotten, by whichever pass finds it so.
+    pub fn left(&self) -> bool {
+        self.state.course == Course::Out && self.state.leaving
+    }
+
+    /// Whether the pending candidate adds a device: one whose add is
+    /// undecided, which is no other live device yet.
+    pub fn adding(&self) -> bool {
+        self.state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.effect.add.is_some())
     }
 
     /// The confirmed epoch: the one data is sealed under.

@@ -1038,7 +1038,12 @@ pub enum PersonalError {
     #[codec(index = 47)]
     Leaving,
     /// The set's last live device leaves nothing to commit its leave: a
-    /// restore with the kit replaces it instead.
+    /// restore with the kit replaces it instead. A device whose add the
+    /// pending candidate makes is not yet another live device.
     #[codec(index = 48)]
     Alone,
+    /// The device's add is the pending candidate's, not yet confirmed: it
+    /// signs nothing, its own leave included, until the verdict.
+    #[codec(index = 49)]
+    Undecided,
 }

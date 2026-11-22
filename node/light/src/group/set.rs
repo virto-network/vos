@@ -431,7 +431,7 @@ impl DeviceGroup {
         }
         if self.state.id == Some(device) {
             self.out(events)?;
-            if self.leaving {
+            if self.state.leaving {
                 events.push(Event::Left);
             }
         }
@@ -478,7 +478,7 @@ impl DeviceGroup {
             match support {
                 Support::Held => {
                     if self.state.id.is_some_and(|me| self.left_by(claim.op, me)) {
-                        self.leaving = true;
+                        self.state.leaving = true;
                     }
                     self.take_effect(&claim, events)?
                 }

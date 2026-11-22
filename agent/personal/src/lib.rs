@@ -171,6 +171,13 @@ pub struct Personal {
     closing: Table<(u64, Scope), (), Ordered>,
     /// The home's `Homes` that claimed the agent: its agent and instance.
     home: Cell<(u32, u32)>,
+    /// Each device's latest resolution of a contest, by the contest's
+    /// lower operation: its call's log index. It counts in `resolutions`
+    /// once its evidence is posted, and a later one replaces it.
+    resolving: Table<(u64, DeviceId), u64, Ordered>,
+    /// The second signatures of each open operation not yet evidenced, by
+    /// their signer: one at a time each.
+    cosigning: Table<(u64, By), (), Ordered>,
 }
 
 #[messages]
@@ -650,7 +657,7 @@ impl Personal {
             },
         );
         self.evidenced.insert(&index, &at);
-        self.evidenced_leave(index, now);
+        self.evidenced_call(index, now);
         Ok(Recorded { at: now, index: at })
     }
 

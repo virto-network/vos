@@ -190,6 +190,61 @@ fn an_open_claim_refused_behind_the_phrase_shows_new_words() {
     assert_eq!(first.space.status().unwrap().phase, Phase::Held);
 }
 
+/// A home that holds this device's nullifier spent (its device left or
+/// was removed there within the removal delay) is asked before a move
+/// leaves the space: the move is refused `Spent` with the space kept and
+/// no kit shown, and once the lapse passed it moves.
+#[test]
+fn a_move_to_a_home_that_holds_the_nullifier_spent_is_refused_first() {
+    let world = world();
+    let home = world.home(HOME, 2, 2);
+    let elsewhere = world.home([0x62; 32], 3, 1);
+    let phone = device(&world, 0x27);
+    let request = |at: u32| Claim {
+        home: world.home_of(at),
+        kit: KitKind::Phrase,
+        label: "phone".into(),
+    };
+    phone.space.claim(&phone.phone, request(home)).unwrap();
+    phone
+        .space
+        .move_home(&phone.phone, request(elsewhere))
+        .unwrap();
+    let spent = world.now() + 3_600_000;
+    {
+        let mut state = world.state.lock().unwrap();
+        let homes = state.spaces.get_mut(&home).unwrap().homes.as_mut().unwrap();
+        let (nullifier, _) = homes.nullifiers.drain().next().unwrap();
+        homes.spent.insert(nullifier, spent);
+    }
+    let shown = phone.phone.phrases.lock().unwrap().len();
+    assert_eq!(
+        phone
+            .space
+            .move_home(&phone.phone, request(home))
+            .unwrap_err(),
+        Error::HomeRefused(vos_wire::homes::HomesError::Spent)
+    );
+    assert_eq!(phone.space.status().unwrap().phase, Phase::Held);
+    assert_eq!(phone.phone.phrases.lock().unwrap().len(), shown, "no kit");
+    for lapse in world
+        .state
+        .lock()
+        .unwrap()
+        .spaces
+        .get_mut(&home)
+        .unwrap()
+        .homes
+        .as_mut()
+        .unwrap()
+        .spent
+        .values_mut()
+    {
+        *lapse = 0;
+    }
+    phone.space.move_home(&phone.phone, request(home)).unwrap();
+}
+
 /// A phone whose removal is pending its delay is in the set still: its
 /// own space's code scanned is refused, as for any live device.
 #[test]

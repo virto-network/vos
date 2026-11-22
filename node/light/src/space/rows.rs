@@ -30,6 +30,8 @@ const ACKED: &[u8] = b"p/acked";
 const KIT_CALLS: &[u8] = b"p/kit-calls";
 /// The home's onion set's last read from its registrar.
 const ONIONS: &[u8] = b"p/onions";
+/// Present while a claim's new kit is shown and no claim holds it.
+const KIT_SHOWN: &[u8] = b"p/kit-shown";
 /// Written in a store's first batch: the store is the device's from then
 /// on ([`super::Personal::open`] takes the newest store that holds it).
 const READY: &[u8] = b"p/ready";
@@ -59,6 +61,10 @@ impl State {
             acked: row::<Acked>(store, ACKED)?,
             kit_calls: row(store, KIT_CALLS)?.unwrap_or_default(),
             onions: row::<Refreshed>(store, ONIONS)?,
+            kit_shown: store
+                .group_row(KIT_SHOWN)
+                .map_err(super::store_failed)?
+                .is_some(),
         })
     }
 
@@ -85,6 +91,7 @@ impl State {
                 (!self.kit_calls.is_empty()).then(|| self.kit_calls.encode()),
             ),
             (ONIONS.to_vec(), some(&self.onions)),
+            (KIT_SHOWN.to_vec(), self.kit_shown.then(Vec::new)),
         ]
     }
 

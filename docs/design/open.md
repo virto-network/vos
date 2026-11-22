@@ -396,13 +396,23 @@ The scale results are in `core-model.md` §14, "The scale test".
   is refused at the window ("the app or the space must update") until the
   space moves; shipping the previous release's beside them needs a
   release process that keeps the previous one's ELF.
-- **A cosign or a resolution whose evidence never comes** [known limit,
-  dated 2026-11-18]: the operation it decides takes effect at the call,
-  while the devices take it only with the call's evidence; the device
-  that made it posts it until the log holds it (as every admin call's),
-  so only that device lost between the call and its evidence leaves the
-  devices without it, refusing the maturity (`Unsigned`) the agent
-  applied. Deciding at the evidence instead moves the agent's rules.
+- **A kit's resolution whose evidence never comes** [known limit, dated
+  2026-11-22]: a cosign or a resolution decides at its own evidence
+  (`light-node.md` §3.5), so one withheld leaves its operation where it
+  was for the agent and the devices alike. The kit's evidence is posted
+  only while the kit is held: a post that fails on the way leaves the
+  contest undecided until the user enters the 24 words again (the kit's
+  bytes are wiped ten minutes after entry), and the flow says only that
+  the agent was not reached.
+- **A withheld leave** [known limit, dated 2026-11-22]: a route that takes
+  the signed leave and answers nothing leaves it takeable until the next
+  admin call is logged (§3.5's stated cost); for a leave the operators may
+  log it whenever they choose, and the phone's next pass then posts its
+  evidence unasked and forgets its space, with no veto to answer. The
+  device knows when it signed: dropping a held leave whose flow ended in
+  failure, or posting no evidence for one logged long after the session
+  it was signed in, and showing "a leave is pending" while one is held,
+  is the fix.
 - **An operation without its evidence is not shown** [known limit, dated
   2026-11-18]: the chrome lists verified operations only, so one whose
   evidence has not come (its device lost after the call) shows nothing
@@ -440,11 +450,16 @@ The scale results are in `core-model.md` §14, "The scale test".
   and went with it; a lapsed agent's pushes are refused (`Lapsed`) with
   no notice of its own. The deferred re-proof flow brings both back.
 - **A left personal space's admin key** [known limit, dated 2026-11-17]:
-  a leave (a move, a pairing from another space) drops the light node's
-  store and keys but leaves the admin key in the UI's keystore, where it
-  could still sign at the old agent, at which the device stays listed
-  until its other devices remove it. Deleting it needs a prompts call of
-  its own.
+  a device that leaves a personal space drops the light node's store and
+  keys but leaves the admin key in the UI's keystore: no `IVosPrompts`
+  call deletes a key, so each leave, move or re-pair leaves one more
+  biometric-bound key there. What that key can still do differs. A move
+  and a pairing from another space make no call to the old agent, where
+  the device stays listed and the key could still sign until the other
+  devices remove it. A Leave (`light-node.md` §3.5, rule 10) is the
+  device's own removal: at its maturity the agent admits the device's
+  keys no more, so the key signs nothing there. Deleting it needs a
+  prompts call of its own.
 - **Scope checkpoints** [deferred, dated 2026-11-17;
   `light-node.md` §3.6, §8 C4; `node/light/SECURITY.md`]: a newly paired
   or restored device reads each scope from its start and has read no
