@@ -492,13 +492,15 @@ are under "Identity and privacy" above.
   The rerun with the log writer's fix (unsynced commits answered before
   the sync), below the knee at 3,000 with the API bound raised [measured,
   `light-node.md` §3.3, "The rerun with the fix"]: +16% and +31%, missed.
-  Where a batch's time goes is measured (the writer's flushes, met in its
-  commit and its apply); what raises it with the agents after the first
-  ten minutes is not identified: candidates the runs show are the log
-  cache growing with them (130 to 335 MiB a node over the hour), their
-  pushes' gas (10–14 million a second a node) and the busiest node
-  leading the most batches. Open: that cause, then the gate; and at
-  5,000 the executors' waits, which rose with the agents.
+  The cause, found [measured, `light-node.md` §3.3, "The cause: idle
+  leaders looking every five seconds"]: each agent holding a session had
+  its idle leader look at its due rows every 5 s, about a sixth of the
+  node's runtime thread once they had all woken; an idle leader now
+  sleeps until what it has due, and a clock step wakes it. Open: the
+  gate's rerun with that fix; at 5,000 the executors' waits, which rose
+  with the agents; a personal agent's log, kept whole in memory until
+  1,024 entries; the range scans of an agent's cut roots each batch
+  opens on that thread.
 - **An operation withheld from a device's log** (`light-node.md` §3.5,
   "The place"; B6): a device-set call names its place, so a route can no
   longer log a vetoed removal again and mature it; what is left is a

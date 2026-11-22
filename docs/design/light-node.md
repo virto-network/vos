@@ -853,6 +853,47 @@ off]:
   creator at a time (sixteen creators dialing together passed a node's
   handshakes a client address may hold at once, and were refused).
 
+**The cause: idle leaders looking every five seconds** [measured,
+compumax (capped) + sigma, 2026-11-22; the same layout, cap and load, the
+nodes built with frame pointers and sampled with `perf` on node 1's one
+runtime thread, which runs every group's driver, leader and apply loop,
+for 60 s at 7 and 21 minutes into a 26-minute load; one run with 10,000
+personal agents, one without]:
+- **What the agents add is idle leaders' looks.** A leader with no input
+  looks at what it may have due (a sweep of its due rows, a cut's marker,
+  reads to serve, reports, closes, proofs), about ten store reads and
+  scans on that thread. Without the agents those looks took 35 and 23 of
+  about 10,000 samples; with them 1,010 (9.6%) and 1,808 (16.6%). With
+  the looks taken out, the thread's samples were the same in both runs
+  (9,100 against 9,245 at 21 minutes).
+- **Why they grew.** An idle leader slept at most 5 s before looking at
+  its first due row again, and at most 2 s before its next boundary, so a
+  clock stepped forward would not leave it asleep past its time. A
+  personal agent's wake opens a session, a due row an hour ahead, so from
+  its first wake its leader looked every 5 s, about 3,300 leaders on a
+  node: their number grows as the agents wake for the first time, one in
+  900 s each, which is why the first ten-minute block is flat and the gap
+  opens from the second. The transfers' p99 was 0.85 s with the agents and
+  0.65 s without them (+30%).
+- **The fix:** an idle leader sleeps until its first due row or boundary.
+  A node task reads the node's clock against the monotonic clock every
+  second, and when the clock has gained more than a second (a step, a
+  slew adding up, the host's sleep) it wakes every idle leader to look
+  again, so a step is seen within two seconds, no later than before. The
+  space's representative first learned (for reports) and a blob arriving
+  (a proof to record) wake them too. With the fix and the agents, the
+  looks took 34 and 27 samples, as without them (8–15 idle looks a second
+  a node), and the transfers' p99 was 0.78 s in that one 26-minute run.
+  The `look` stage of a node's stats counts the idle looks that found
+  nothing due.
+- **Left as found:** a personal agent's group never compacts its log at
+  its rate (1,024 entries a compaction), so its entries stay in memory
+  and the store (the log cache 130 to 400 MiB a node over the hour,
+  about 7 KiB a wake a replica); and each batch's apply and its leader
+  open a range scan of the agent's cut roots, of which two are kept
+  (about 16% of the thread in both runs, the scans' setup most of it).
+  Neither differed between the runs on that thread.
+
 **Reaching the agent: every gateway lists every node.** A node that does
 not replicate an agent answers `Elsewhere { replicas }`
 (`node/host/src/node/mod.rs`), and a gateway retries toward any upstream
