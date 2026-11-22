@@ -3,7 +3,8 @@
 
 //! A phone over the world: its facility as `:vos` serves it, its user and
 //! its keys (the shared [`Phone`]), stopped and started again from its
-//! files ([`Held::restart`]).
+//! files ([`Held::restart`]), or killed at a request and started again from
+//! its files as they were then ([`Held::kill`], [`Held::reborn`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -56,7 +57,78 @@ pub fn phone(world: &Arc<World>, seed: u8) -> Held {
     }
 }
 
+/// What a process killed by [`Held::kill`] left: the phone's files as they
+/// were as it died.
+pub struct Corpse(Arc<Mutex<Option<tempfile::TempDir>>>);
+
+/// `from`'s files and directories copied under `into`.
+fn copy_tree(from: &std::path::Path, into: &std::path::Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let to = into.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir(&to).unwrap();
+            copy_tree(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).unwrap();
+        }
+    }
+}
+
 impl Held {
+    /// This phone's process dies at the `nth` request asking `step`, as
+    /// Android kills `:vos`: its files are kept as they are at that
+    /// moment, its user prompted for nothing it asks after, and nothing it
+    /// asks after reaches the world. What it writes after is lost with it:
+    /// [`Held::reborn`] starts the next process from the files kept.
+    pub fn kill(
+        &self,
+        world: &World,
+        step: world::Step,
+        nth: usize,
+        death: world::Death,
+    ) -> Corpse {
+        let kept = Arc::new(Mutex::new(None));
+        let (from, into, hand) = (
+            self._directory.path().to_owned(),
+            Arc::clone(&kept),
+            Arc::clone(&self.hand),
+        );
+        world.kill(self.tag, step, nth, death);
+        world.on_death(
+            self.tag,
+            Box::new(move || {
+                hand.die();
+                let copy = tempfile::tempdir().unwrap();
+                copy_tree(&from, copy.path());
+                *into.lock().unwrap() = Some(copy);
+            }),
+        );
+        Corpse(kept)
+    }
+
+    /// The process after `corpse`'s, started from the files kept as it
+    /// died, its keys and its user the same.
+    pub fn reborn(self, world: &Arc<World>, corpse: Corpse) -> Self {
+        let Held {
+            node: dead,
+            hand,
+            tag,
+            _directory,
+        } = self;
+        drop(dead);
+        drop(_directory);
+        let directory = corpse.0.lock().unwrap().take().expect("the process died");
+        world.revive(tag);
+        hand.live();
+        Held {
+            node: node_as(world, directory.path(), tag, &hand),
+            hand,
+            tag,
+            _directory: directory,
+        }
+    }
+
     /// The same phone's facility stopped and opened again from its files,
     /// its keys and its user the same: a process Android killed, started
     /// anew.

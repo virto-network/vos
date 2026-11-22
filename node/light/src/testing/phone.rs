@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ed25519_dalek::{Signer as _, SigningKey};
 use hmac::{Hmac, Mac as _};
@@ -74,6 +75,9 @@ pub struct Phone {
     /// The admin keys made from now on are software keys, as a keystore
     /// with no Ed25519 in its TEE makes them.
     pub software: Mutex<bool>,
+    /// The process asking is dead ([`Phone::die`]): nothing is shown, made
+    /// or signed for it.
+    dead: AtomicBool,
 }
 
 impl Phone {
@@ -104,7 +108,24 @@ impl Phone {
             decline_check: Mutex::new(false),
             comparing: Mutex::new(std::time::Duration::ZERO),
             software: Mutex::new(false),
+            dead: AtomicBool::new(false),
         }
+    }
+
+    /// The process asking died: every prompt it makes from now on is
+    /// declined unseen, every key it asks made or used refused, until
+    /// [`Phone::live`] (the next process's).
+    pub fn die(&self) {
+        self.dead.store(true, Ordering::SeqCst);
+    }
+
+    /// The next process asks.
+    pub fn live(&self) {
+        self.dead.store(false, Ordering::SeqCst);
+    }
+
+    fn dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
     }
 
     /// The last phrase shown.
@@ -158,8 +179,11 @@ impl Phone {
         self.signed.lock().unwrap().expect("an admin signature")
     }
 
-    /// Whether this prompt is declined.
+    /// Whether this prompt is declined: every one a dead process asks.
     fn declines(&self) -> bool {
+        if self.dead() {
+            return true;
+        }
         let mut left = self.declines.lock().unwrap();
         let declined = *left > 0;
         *left = left.saturating_sub(1);
@@ -216,6 +240,9 @@ impl Prompts for Phone {
     }
 
     fn show_phrase(&self, words: &str, card: &Card, void: Option<&str>) -> bool {
+        if self.dead() {
+            return false;
+        }
         if let Some(void) = void {
             self.voids.lock().unwrap().push(void.to_owned());
         }
@@ -226,6 +253,9 @@ impl Prompts for Phone {
     }
 
     fn show_card(&self, card: &Card, void: Option<&str>) -> bool {
+        if self.dead() {
+            return false;
+        }
         if let Some(void) = void {
             self.voids.lock().unwrap().push(void.to_owned());
         }
@@ -234,6 +264,9 @@ impl Prompts for Phone {
     }
 
     fn enter_phrase(&self) -> Option<Zeroizing<String>> {
+        if self.dead() {
+            return None;
+        }
         *self.entered.lock().unwrap() += 1;
         if self.declines() {
             return None;
@@ -243,22 +276,34 @@ impl Prompts for Phone {
     }
 
     fn approve_admin(&self, approval: &Approval) -> bool {
+        if self.dead() {
+            return false;
+        }
         self.approvals.lock().unwrap().push(approval.clone());
         !self.declines()
     }
 
     fn confirm_pairing(&self, check: &str) -> bool {
+        if self.dead() {
+            return false;
+        }
         self.checks.lock().unwrap().push(check.to_owned());
         std::thread::sleep(*self.comparing.lock().unwrap());
         !std::mem::take(&mut *self.decline_check.lock().unwrap())
     }
 
     fn show_pairing(&self, check: &str) -> bool {
+        if self.dead() {
+            return false;
+        }
         self.checks.lock().unwrap().push(check.to_owned());
         true
     }
 
     fn create_source(&self) -> Result<Vec<u8>, Error> {
+        if self.dead() {
+            return Err(Error::Declined);
+        }
         Ok(self.new_alias())
     }
 
@@ -276,14 +321,23 @@ impl Prompts for Phone {
     }
 
     fn create_kit_key(&self) -> Result<Vec<u8>, Error> {
+        if self.dead() {
+            return Err(Error::Declined);
+        }
         Ok(vec![self.next(); 16])
     }
 
     fn kit_secret(&self, _id: &[u8], salt: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, Error> {
+        if self.dead() {
+            return Err(Error::Declined);
+        }
         Ok(Zeroizing::new(hmac(&self.security_key, salt)))
     }
 
     fn create_admin(&self) -> Result<AdminKey, Error> {
+        if self.dead() {
+            return Err(Error::Declined);
+        }
         let key = SigningKey::from_bytes(&[self.next(); 32]);
         let public = key.verifying_key().to_bytes();
         self.admins.lock().unwrap().insert(public, key);

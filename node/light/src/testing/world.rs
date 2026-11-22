@@ -134,7 +134,9 @@ pub struct Logged {
 /// Where a phone's process dies, as Android kills `:vos`: at the `nth`
 /// request (from 1) asking `step`, before the world takes it, or after the
 /// world took it and before its answer leaves. From then on the phone's
-/// every connection is cut, until [`World::revive`].
+/// every connection is cut, until [`World::revive`]; a death with a hook
+/// ([`World::on_death`]) is the process's own, whose connections stay cut
+/// for good.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Death {
     Before,
@@ -149,6 +151,10 @@ struct Kill {
     seen: usize,
     fired: bool,
 }
+
+/// What a process death does as it comes, before the world takes the
+/// request or answers it: the phone's files kept as they are then.
+pub type Hook = Box<dyn FnOnce() + Send>;
 
 /// What the world does with a phone's request.
 enum Fate {
@@ -277,6 +283,9 @@ pub struct Homes {
     pub kits: HashMap<[u8; 32], u32>,
     /// The agent each claiming device's nullifier holds.
     pub nullifiers: HashMap<[u8; 32], u32>,
+    /// Each spent nullifier's lapse, as a test sets it: its claims are
+    /// `Spent` before then.
+    pub spent: HashMap<[u8; 32], u64>,
 }
 
 /// A space's agent: its identity, its credential actor and its tree, its
@@ -321,6 +330,12 @@ pub struct State {
     /// phone's tag and its connection's index: the flows' timings.
     pub log: Vec<Logged>,
     kills: HashMap<u8, Kill>,
+    /// What each phone's death does as it comes ([`World::on_death`]).
+    hooks: HashMap<u8, Hook>,
+    /// Each phone's process: the dials made for it count its processes.
+    processes: HashMap<u8, u32>,
+    /// The phones' processes that died, which reach nothing again.
+    dead: std::collections::HashSet<(u8, u32)>,
     /// The next call each phone asks of a step, answered as taken and never
     /// applied ([`World::forge`]).
     forging: HashMap<u8, Step>,
@@ -630,6 +645,7 @@ impl World {
             pool: agents,
             kits: HashMap::new(),
             nullifiers: HashMap::new(),
+            spent: HashMap::new(),
         });
         agent
     }
@@ -679,7 +695,7 @@ impl World {
                     host: "127.0.0.1".into(),
                     port,
                 };
-                let connection = world.connection(&target, Circuit::new(), 0);
+                let connection = world.connection(&target, Circuit::new(), 0, 0);
                 ssh::serve(&world.host_key, connection, stream);
             }
         });
@@ -699,7 +715,8 @@ impl World {
     /// The dial of the phone tagged `tag` (not 0): its requests traced,
     /// and cut where [`World::kill`] says.
     pub fn dial_as(self: &Arc<Self>, tag: u8) -> Arc<dyn Dial> {
-        Arc::new(Gateway(Arc::clone(self), tag))
+        let process = *self.state.lock().unwrap().processes.entry(tag).or_default();
+        Arc::new(Gateway(Arc::clone(self), tag, process))
     }
 
     /// The phone tagged `tag` dies at the `nth` request asking `step`.
@@ -714,6 +731,15 @@ impl World {
                 fired: false,
             },
         );
+    }
+
+    /// As the phone tagged `tag` dies ([`World::kill`]), `hook` runs, before
+    /// the world takes the request or answers it: its files kept as they
+    /// are then, its user gone. The death is then its process's: what that
+    /// process asks after reaches nothing, and the process
+    /// [`World::revive`] starts is another, dialing anew.
+    pub fn on_death(&self, tag: u8, hook: Hook) {
+        self.state.lock().unwrap().hooks.insert(tag, hook);
     }
 
     /// The next call of `step` the phone tagged `tag` makes is answered as
@@ -791,9 +817,13 @@ impl World {
             .is_some_and(|kill| kill.fired)
     }
 
-    /// The phone tagged `tag` reached again, as its next process is.
+    /// The phone tagged `tag` reached again, as its next process is: the
+    /// dials made from now on are that process's.
     pub fn revive(&self, tag: u8) {
-        self.state.lock().unwrap().kills.remove(&tag);
+        let mut state = self.state.lock().unwrap();
+        state.kills.remove(&tag);
+        state.hooks.remove(&tag);
+        *state.processes.entry(tag).or_default() += 1;
     }
 
     /// The requests the phone tagged `tag` asked, from the last
@@ -812,11 +842,15 @@ impl World {
         self.state.lock().unwrap().traces.remove(&tag);
     }
 
-    /// What becomes of a request asking `step` from the phone `tag`.
-    fn fate(&self, tag: u8, step: Step) -> Fate {
+    /// What becomes of a request asking `step` from the phone `tag`'s
+    /// `process`.
+    fn fate(&self, tag: u8, process: u32, step: Step) -> Fate {
         let mut state = self.state.lock().unwrap();
         if tag == 0 {
             return Fate::Answer;
+        }
+        if state.dead.contains(&(tag, process)) {
+            return Fate::Drop;
         }
         if let Some((at, ms)) = state.passing.get(&tag).copied()
             && at == step
@@ -843,7 +877,12 @@ impl World {
                 kill.seen += 1;
                 if kill.seen == kill.nth {
                     kill.fired = true;
-                    return match kill.death {
+                    let death = kill.death;
+                    if let Some(hook) = state.hooks.remove(&tag) {
+                        state.dead.insert((tag, process));
+                        hook();
+                    }
+                    return match death {
                         Death::Before => Fate::Drop,
                         Death::After => Fate::TakeAndDrop,
                     };
@@ -1155,6 +1194,10 @@ impl State {
             let nullifier = <[u8; 32]>::decode_exact(&query.arguments).unwrap();
             return done(homes.nullifiers.get(&nullifier).copied());
         }
+        if named(vos_wire::homes::method::SPENT) {
+            let nullifier = <[u8; 32]>::decode_exact(&query.arguments).unwrap();
+            return done(homes.spent.get(&nullifier).copied());
+        }
         panic!("no such query")
     }
 
@@ -1223,6 +1266,16 @@ impl State {
             let (device, kit, chosen) =
                 <(NewDevice, Kit, u32)>::decode_exact(&request.arguments).unwrap();
             let homes = space.homes.as_mut().unwrap();
+            if homes
+                .spent
+                .get(&device.nullifier)
+                .is_some_and(|lapse| *lapse > now)
+            {
+                return Outcome::Failed {
+                    code: vos_abi::abi::Failure::Handler,
+                    detail: vos_wire::homes::HomesError::Spent.encode(),
+                };
+            }
             let Some(at) = homes.pool.iter().position(|agent| *agent == chosen) else {
                 return Outcome::Failed {
                     code: vos_abi::abi::Failure::Handler,
@@ -1255,14 +1308,14 @@ impl State {
 }
 
 /// The gateway's dial: each stream an SSH server of its own; the phone's
-/// tag on each.
-struct Gateway(Arc<World>, u8);
+/// tag on each, and its process's number.
+struct Gateway(Arc<World>, u8, u32);
 
 impl Dial for Gateway {
     fn dial(&self, target: &Target, circuit: Circuit) -> Dialing {
-        let (world, target, tag) = (Arc::clone(&self.0), target.clone(), self.1);
+        let (world, target, tag, process) = (Arc::clone(&self.0), target.clone(), self.1, self.2);
         Box::pin(async move {
-            if world.died(tag) {
+            if world.died(tag) || world.state.lock().unwrap().dead.contains(&(tag, process)) {
                 return Err(std::io::Error::other("the phone's process is gone"));
             }
             if let Some(left) = world.state.lock().unwrap().unpublished.get_mut(&tag)
@@ -1275,7 +1328,10 @@ impl Dial for Gateway {
             }
             let delays = world.state.lock().unwrap().delays;
             tokio::time::sleep(delays.connect).await;
-            let ours = ssh::dialed(&world.host_key, world.connection(&target, circuit, tag));
+            let ours = ssh::dialed(
+                &world.host_key,
+                world.connection(&target, circuit, tag, process),
+            );
             if delays.none() {
                 return Ok(Box::new(Held::new(ours)) as Stream);
             }
@@ -1351,8 +1407,15 @@ impl Dial for Loopback {
 }
 
 impl World {
-    /// A connection of the phone tagged `tag` to `target`, recorded.
-    fn connection(self: &Arc<Self>, target: &Target, circuit: Circuit, tag: u8) -> Connection {
+    /// A connection of the phone tagged `tag`'s `process` to `target`,
+    /// recorded.
+    fn connection(
+        self: &Arc<Self>,
+        target: &Target,
+        circuit: Circuit,
+        tag: u8,
+        process: u32,
+    ) -> Connection {
         let mut state = self.state.lock().unwrap();
         state.seen.push(Seen::new(target, circuit));
         let index = state.seen.len() - 1;
@@ -1366,15 +1429,17 @@ impl World {
             world: Arc::clone(self),
             index,
             tag,
+            process,
         }
     }
 }
 
-/// One connection of the gateway's, the phone's tag on it.
+/// One connection of the gateway's, the phone's tag and process on it.
 struct Connection {
     world: Arc<World>,
     index: usize,
     tag: u8,
+    process: u32,
 }
 
 impl ssh::Connection for Connection {
@@ -1386,7 +1451,7 @@ impl ssh::Connection for Connection {
     /// phone's process dying before the world takes it or after.
     fn answer(&self, kind: u16, body: &[u8]) -> Answer {
         let step = Step::of(kind, body);
-        let fate = self.world.fate(self.tag, step);
+        let fate = self.world.fate(self.tag, self.process, step);
         if matches!(fate, Fate::Drop) {
             return Answer::Cut;
         }
