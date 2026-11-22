@@ -5139,7 +5139,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s4-credential-contract"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=345d4e49a4a90d3b8a4a56b51bde9be888806348#345d4e49a4a90d3b8a4a56b51bde9be888806348"
+source = "git+https://codeberg.org/Virto/s4?rev=c865afafc085abcfc202bc60a06d2fb27d9b1231#c865afafc085abcfc202bc60a06d2fb27d9b1231"
 dependencies = [
  "hex",
  "jni",
@@ -5151,7 +5151,7 @@ dependencies = [
 [[package]]
 name = "s4-protocol"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=345d4e49a4a90d3b8a4a56b51bde9be888806348#345d4e49a4a90d3b8a4a56b51bde9be888806348"
+source = "git+https://codeberg.org/Virto/s4?rev=c865afafc085abcfc202bc60a06d2fb27d9b1231#c865afafc085abcfc202bc60a06d2fb27d9b1231"
 dependencies = [
  "base64",
  "ciborium",
@@ -5163,7 +5163,7 @@ dependencies = [
 [[package]]
 name = "s4-rui"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=345d4e49a4a90d3b8a4a56b51bde9be888806348#345d4e49a4a90d3b8a4a56b51bde9be888806348"
+source = "git+https://codeberg.org/Virto/s4?rev=c865afafc085abcfc202bc60a06d2fb27d9b1231#c865afafc085abcfc202bc60a06d2fb27d9b1231"
 dependencies = [
  "base64",
  "libc",
@@ -5181,7 +5181,7 @@ dependencies = [
 [[package]]
 name = "s4-server"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=345d4e49a4a90d3b8a4a56b51bde9be888806348#345d4e49a4a90d3b8a4a56b51bde9be888806348"
+source = "git+https://codeberg.org/Virto/s4?rev=c865afafc085abcfc202bc60a06d2fb27d9b1231#c865afafc085abcfc202bc60a06d2fb27d9b1231"
 dependencies = [
  "rand 0.10.3",
  "russh",
@@ -5194,7 +5194,7 @@ dependencies = [
 [[package]]
 name = "s4-widgets"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=345d4e49a4a90d3b8a4a56b51bde9be888806348#345d4e49a4a90d3b8a4a56b51bde9be888806348"
+source = "git+https://codeberg.org/Virto/s4?rev=c865afafc085abcfc202bc60a06d2fb27d9b1231#c865afafc085abcfc202bc60a06d2fb27d9b1231"
 dependencies = [
  "s4-protocol",
  "serde",
