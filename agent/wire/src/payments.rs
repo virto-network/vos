@@ -67,4 +67,20 @@ pub enum PaymentError {
     /// A transfer or a mint of nothing.
     #[codec(index = 12)]
     NoAmount,
+    /// A transfer under a key this payer paid under already: the payment
+    /// that key names was made, and is not made again.
+    #[codec(index = 13)]
+    Paid,
+}
+
+/// The key a payer names one payment by: drawn by its device per
+/// confirmed form, and the same in every proof made for that form, so the
+/// ledger pays it once.
+pub type PaymentKey = [u8; 32];
+
+/// The external id the ledger records a transfer under `key` of `owner`'s
+/// by: cipher-clerk's `client_external_id`, BLAKE2b-256 under its domain.
+/// A device reads `paid` by it, so the read names no owner.
+pub fn external_id(owner: &Owner, key: &PaymentKey) -> [u8; 32] {
+    vos_pvm_precompiles::blake2b_hash::<32>(b"cipher-clerk/external-id/client", &[owner, key])
 }

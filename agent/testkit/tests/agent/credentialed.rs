@@ -321,13 +321,15 @@ fn owner_proofs_pay_from_the_accounts_they_hold() {
     agent.account(time, "alice", alice, 100);
     agent.account(time, "bob", bob, 0);
 
+    let keys = std::cell::Cell::new(0u8);
     let pay = |agent: &mut Agent, by: Digest, to: &str, amount: u64| {
         let to = to.as_bytes().to_vec();
+        keys.set(keys.get() + 1);
         let call = agent.call(
             Principal::Owner(by),
             PAYMENTS,
             "transfer",
-            (to, amount),
+            (to, amount, [keys.get(); 32]),
             time + 60_000,
             None,
         );
@@ -456,12 +458,14 @@ fn the_ledger_refuses_what_its_rules_refuse_and_conserves() {
         PaymentError::NoAmount
     );
 
+    let keys = std::cell::Cell::new(0u8);
     let pay = |agent: &mut Agent, to: &str, amount: u64| {
+        keys.set(keys.get() + 1);
         let call = agent.call(
             Principal::Owner(alice),
             PAYMENTS,
             "transfer",
-            (to.as_bytes().to_vec(), amount),
+            (to.as_bytes().to_vec(), amount, [keys.get(); 32]),
             time + 60_000,
             None,
         );
@@ -496,6 +500,68 @@ fn the_ledger_refuses_what_its_rules_refuse_and_conserves() {
     );
 }
 
+/// A payer's key pays once: a second transfer under it, in a proof made
+/// after the first's expiry and for another amount, is refused `Paid` and
+/// moves nothing; another key pays; `paid` answers by the transfer's
+/// external id, naming no owner, and a failed transfer spends no key.
+#[test]
+fn a_payment_key_pays_once() {
+    let mut agent = Agent::new();
+    let time = START + 10;
+    let (alice, bob) = (owner(1), owner(2));
+    agent.account(time, "alice", alice, 100);
+    agent.account(time, "bob", bob, 0);
+    let pay = |agent: &mut Agent, at: u64, amount: u64, key: [u8; 32]| {
+        let call = agent.call(
+            Principal::Owner(alice),
+            PAYMENTS,
+            "transfer",
+            (b"bob".to_vec(), amount, key),
+            at + 60_000,
+            None,
+        );
+        agent.step(at, &call)
+    };
+    let paid = |agent: &Agent, key: [u8; 32]| -> bool {
+        agent.query(
+            PAYMENTS,
+            "paid",
+            vos_wire::payments::external_id(&alice, &key),
+        )
+    };
+    let (key, other) = ([7; 32], [8; 32]);
+    assert!(!paid(&agent, key));
+    let short = pay(&mut agent, time, 101, key);
+    assert_eq!(payment_error(&short), PaymentError::Insufficient);
+    assert!(!paid(&agent, key), "a failed transfer spends no key");
+    assert!(matches!(
+        ran(&pay(&mut agent, time, 30, key)).outcome,
+        Outcome::Done(_)
+    ));
+    assert!(paid(&agent, key));
+    let later = time + 3_600_000;
+    let again = pay(&mut agent, later, 30, key);
+    assert_eq!(payment_error(&again), PaymentError::Paid);
+    let changed = pay(&mut agent, later, 5, key);
+    assert_eq!(payment_error(&changed), PaymentError::Paid);
+    assert_eq!(
+        (agent.balance("alice"), agent.balance("bob")),
+        (Some(70), Some(30))
+    );
+    // The same key is another payer's own.
+    let bobs: bool = agent.query(
+        PAYMENTS,
+        "paid",
+        vos_wire::payments::external_id(&bob, &key),
+    );
+    assert!(!bobs);
+    assert!(matches!(
+        ran(&pay(&mut agent, later, 5, other)).outcome,
+        Outcome::Done(_)
+    ));
+    assert_eq!(agent.balance("bob"), Some(35));
+}
+
 /// An origin is admitted by its guard alone: an owner proof's to a method
 /// with no guard, or an auth proof's to an owner guard, is `Forbidden`, as
 /// is a client calling a guarded method; and no role is granted to one.
@@ -520,12 +586,18 @@ fn an_origin_is_admitted_by_its_guard_alone() {
         anonymous,
         PAYMENTS,
         "transfer",
-        (b"alice".to_vec(), 1u64),
+        (b"alice".to_vec(), 1u64, [1u8; 32]),
         time + 1_000,
         None,
     );
     assert_eq!(failed(&agent.step(time, &other)), Failure::Forbidden);
-    let client = agent.request(BOB, PAYMENTS, "transfer", (b"alice".to_vec(), 1u64), time);
+    let client = agent.request(
+        BOB,
+        PAYMENTS,
+        "transfer",
+        (b"alice".to_vec(), 1u64, [1u8; 32]),
+        time,
+    );
     let result = agent.node.batch(time, vec![client]);
     assert_eq!(failed(&result.steps[0]), Failure::Forbidden);
     let grant = Input::Admin(Admin::SetRole(Grant {
@@ -551,12 +623,12 @@ fn apply_refuses_by_the_batchs_time_and_records_each_binding() {
     let time = START + 10;
     agent.account(time, "alice", owner(1), 10);
     agent.account(time, "bob", owner(2), 0);
-    let transfer = (b"bob".to_vec(), 1u64);
+    let transfer = |key: u8| (b"bob".to_vec(), 1u64, [key; 32]);
     let expired = agent.call(
         Principal::Owner(owner(1)),
         PAYMENTS,
         "transfer",
-        transfer.clone(),
+        transfer(1),
         time - 1,
         None,
     );
@@ -572,7 +644,7 @@ fn apply_refuses_by_the_batchs_time_and_records_each_binding() {
         Principal::Owner(owner(1)),
         PAYMENTS,
         "transfer",
-        transfer.clone(),
+        transfer(2),
         time,
         None,
     );
@@ -597,7 +669,7 @@ fn apply_refuses_by_the_batchs_time_and_records_each_binding() {
         Principal::Owner(owner(1)),
         PAYMENTS,
         "transfer",
-        transfer,
+        transfer(3),
         time,
         None,
     );
@@ -912,8 +984,8 @@ fn a_batch_runs_at_most_its_credentialed_calls() {
     agent.account(time, "alice", owner(1), 100);
     agent.account(time, "bob", owner(2), 0);
     let calls: Vec<CredentialedInput> = (0..=defaults::BATCH_CREDENTIALED)
-        .map(|_| {
-            let transfer = (b"bob".to_vec(), 1u64);
+        .map(|key| {
+            let transfer = (b"bob".to_vec(), 1u64, [key as u8; 32]);
             agent.call(
                 Principal::Owner(owner(1)),
                 PAYMENTS,

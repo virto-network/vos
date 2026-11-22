@@ -217,7 +217,7 @@ impl Reached {
 
     fn made(&self, count: usize, expires_ms: u64) -> Vec<(AgentId, Credentialed)> {
         let transfer = method(&program("vos-payments"), "transfer");
-        let arguments = vos_light::transfer_arguments("payee", 1);
+        let arguments = vos_light::transfer_arguments("payee", 1, &[1; 32]);
         let elf = std::fs::read(vos_checker::programs::program_elf("vos-credentials")).unwrap();
         let owner = vos_light::release::device(&elf, "owner").expect("the stock owner kernel");
         let program = DeviceProgram::from_release(&owner).expect("its program");

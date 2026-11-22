@@ -1196,7 +1196,7 @@ fn the_device_librarys_proofs_are_admitted() {
         founded.write(PAYMENTS, "open", (name.clone(), digest));
         founded.write(PAYMENTS, "mint", (name, 50u64));
     }
-    let arguments = vos_light::transfer_arguments("shop", 20);
+    let arguments = vos_light::transfer_arguments("shop", 20, &[20; 32]);
     let pay = vos_light::Call::new(
         space,
         agent.0,

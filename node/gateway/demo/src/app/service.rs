@@ -114,6 +114,7 @@ pub(super) fn payment_error(detail: &[u8]) -> String {
         PaymentError::Refused(_) => "the ledger refused",
         PaymentError::BadOwner => "not an owner digest",
         PaymentError::SamePayee => "a payment to your own account",
+        PaymentError::Paid => "this payment was made already",
         PaymentError::NoAmount => "an amount of nothing",
     }
     .into()

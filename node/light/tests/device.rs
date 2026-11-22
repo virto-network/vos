@@ -232,7 +232,7 @@ fn a_method_id_and_a_transfer_s_arguments_are_the_node_s() {
         vos_light::method_id("transfer"),
         derive_id("vos/method/", "transfer")
     );
-    let arguments = vos_light::transfer_arguments("bob", 7);
+    let arguments = vos_light::transfer_arguments("bob", 7, &[7; 32]);
     assert_eq!(
         arguments,
         [&3u32.to_le_bytes()[..], b"bob", &7u64.to_le_bytes()].concat()

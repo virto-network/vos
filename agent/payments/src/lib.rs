@@ -4,7 +4,7 @@
 //! account has a name, its handle for a payee, kept in its row's
 //! `user_data`; `transfer` runs under `#[msg(credential = Owner)]` and
 //! pays from the account of the digest the caller proved, unless it is
-//! frozen. Accounts come by an operator's invitation naming the name and
+//! frozen, once per payment key the payer names. Accounts come by an operator's invitation naming the name and
 //! the digest, opened by any caller before it expires; the operator mints
 //! from the space's issuance, moves an account to a new owner (lifting a
 //! freeze) and freezes one. Pseudonymous and custodial by design: payers,
@@ -17,7 +17,7 @@
 extern crate alloc;
 
 use cipher_clerk::codec;
-use cipher_clerk::conventions::{AccountKind, BankCode, Holder};
+use cipher_clerk::conventions::{AccountKind, BankCode, Holder, client_external_id};
 use cipher_clerk::ids::ExternalId;
 use cipher_clerk::kernel::TransferBuilder;
 use cipher_clerk::{
@@ -26,7 +26,7 @@ use cipher_clerk::{
 };
 use vos_sdk::prelude::*;
 
-pub use vos_wire::payments::{Holding, MAX_NAME, Name, Owner, PaymentError};
+pub use vos_wire::payments::{Holding, MAX_NAME, Name, Owner, PaymentError, PaymentKey};
 
 /// The space's one journal and currency.
 const JOURNAL: JournalId = JournalId([1; 16]);
@@ -62,6 +62,8 @@ pub struct Payments {
     names: Table<Name, [u8; 16]>,
     owners: Table<Owner, Held>,
     invites: Table<Name, Invitation>,
+    /// The external ids of the transfers made under a payer's key.
+    keyed: Table<[u8; 32], ()>,
     /// The accounts and transfers made, each id the count before it.
     opened: Cell<u64>,
     paid: Cell<u64>,
@@ -87,12 +89,14 @@ fn refused(status: EventStatus) -> PaymentError {
     match status {
         EventStatus::BalanceMustNotBeNegative => PaymentError::Insufficient,
         EventStatus::OverflowsBalance => PaymentError::Overflow,
+        EventStatus::ExternalIdAlreadyUsed => PaymentError::Paid,
         other => PaymentError::Refused(other.code()),
     }
 }
 
-/// The kernel's view of the tables. Payments submits no transfer with an
-/// external id, a void or a reservation, so those sets stay empty.
+/// The kernel's view of the tables. Payments submits no void or
+/// reservation, so those sets stay empty; a transfer's external id is its
+/// payer's key's.
 impl LedgerState for Payments {
     type Value = Value;
 
@@ -120,12 +124,12 @@ impl LedgerState for Payments {
         (*id == JOURNAL).then(|| Journal::new(JOURNAL, REGISTRAR, 0))
     }
 
-    fn external_id_seen(&self, _id: &ExternalId) -> bool {
-        false
+    fn external_id_seen(&self, id: &ExternalId) -> bool {
+        self.keyed.get(&id.0).is_some()
     }
 
-    fn mark_external_id(&mut self, _id: &ExternalId) {
-        unreachable!("no transfer names an external id")
+    fn mark_external_id(&mut self, id: &ExternalId) {
+        self.keyed.insert(&id.0, &());
     }
 
     fn transfer_voided(&self, _id: &TransferId) -> bool {
@@ -156,23 +160,27 @@ impl Payments {
         }
     }
 
-    /// Move `amount` from `from` to `to` under `authority`, in one transfer.
+    /// Move `amount` from `from` to `to` under `authority`, in one
+    /// transfer, under the external id `external` if one is named.
     fn post(
         &mut self,
         now: u64,
         authority: Authority,
-        from: &Account<Value>,
-        to: &Account<Value>,
+        (from, to): (&Account<Value>, &Account<Value>),
         amount: u64,
+        external: Option<ExternalId>,
     ) -> Result<(), PaymentError> {
         if amount == 0 {
             return Err(PaymentError::NoAmount);
         }
         let paid = self.paid.get_or_default();
-        let transfer = TransferBuilder::new(TransferId(id(paid)), JOURNAL)
+        let mut transfer = TransferBuilder::new(TransferId(id(paid)), JOURNAL)
             .debit(from, Layer::Settled, Value(amount))
-            .credit(to, Layer::Settled, Value(amount))
-            .build();
+            .credit(to, Layer::Settled, Value(amount));
+        if let Some(external) = external {
+            transfer = transfer.external_id(external);
+        }
+        let transfer = transfer.build();
         let event = Authorized::new(transfer, authority);
         let result = cipher_clerk::apply_batch(self, &[event], now);
         match result[0].status {
@@ -304,21 +312,23 @@ impl Payments {
         self.post(
             ctx.now(),
             Authority::of([ISSUER]),
-            &issuance,
-            &account,
+            (&issuance, &account),
             amount,
+            None,
         )?;
         Ok(balance(&self.get_account(&id).expect("the account")))
     }
 
     /// Pay `amount` to the account `to` from the account of the digest the
-    /// caller proved, unless it is frozen.
+    /// caller proved, unless it is frozen, once under the payer's `key`: a
+    /// second transfer under it is refused `Paid`, whatever it names.
     #[msg(credential = Owner)]
     pub async fn transfer(
         &mut self,
         ctx: &mut Command<Self>,
         to: Name,
         amount: u64,
+        key: PaymentKey,
     ) -> Result<(), PaymentError> {
         let owner = ctx.owner().ok_or(PaymentError::NotOwner)?;
         let held = self.owners.get(&owner).ok_or(PaymentError::NotOwner)?;
@@ -332,7 +342,23 @@ impl Payments {
         let payer = self
             .get_account(&AccountId(held.account))
             .expect("a held account");
-        self.post(ctx.now(), Authority::of([owner]), &payer, &to, amount)
+        let external = client_external_id(&owner, &key);
+        self.post(
+            ctx.now(),
+            Authority::of([owner]),
+            (&payer, &to),
+            amount,
+            Some(external),
+        )
+    }
+
+    /// Whether a transfer was made under the external id `external`
+    /// (`vos_wire::payments::external_id` of its payer and key): what a
+    /// device whose payment's answer was lost reads before it says "paid"
+    /// or "not paid", naming no owner.
+    #[msg]
+    pub async fn paid(&self, external: [u8; 32]) -> bool {
+        self.keyed.get(&external).is_some()
     }
 
     /// The account `name`, if there is one.
