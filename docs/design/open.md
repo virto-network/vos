@@ -492,15 +492,19 @@ are under "Identity and privacy" above.
   The rerun with the log writer's fix (unsynced commits answered before
   the sync), below the knee at 3,000 with the API bound raised [measured,
   `light-node.md` §3.3, "The rerun with the fix"]: +16% and +31%, missed.
-  The cause, found [measured, `light-node.md` §3.3, "The cause: idle
-  leaders looking every five seconds"]: each agent holding a session had
-  its idle leader look at its due rows every 5 s, about a sixth of the
-  node's runtime thread once they had all woken; an idle leader now
-  sleeps until what it has due, and a clock step wakes it. Open: the
-  gate's rerun with that fix; at 5,000 the executors' waits, which rose
-  with the agents; a personal agent's log, kept whole in memory until
-  1,024 entries; the range scans of an agent's cut roots each batch
-  opens on that thread.
+  With the agents, each idle leader holding a session looked at its due
+  rows every 5 s, about a sixth of a node's runtime thread [measured,
+  `light-node.md` §3.3, "What the agents added on the node thread"]; an
+  idle leader now sleeps until what it has due, and a clock step wakes
+  it. The rerun with that [measured, `light-node.md` §3.3, "The rerun
+  with the looks' fix"]: −23% (its base run an outlier) and +33%,
+  missed; the p99 with agents did not move, so the looks were not the
+  rise. Open: the rise's cause (the nodes' stage means rise +2–11%
+  against +33% at the driver's p99: the tail, or a part the node's
+  stages do not time); at 5,000 the executors' waits, which rose with
+  the agents; a personal agent's log, kept whole in memory until 1,024
+  entries; the range scans of an agent's cut roots each batch opens on
+  that thread.
 - **An operation withheld from a device's log** (`light-node.md` §3.5,
   "The place"; B6): a device-set call names its place, so a route can no
   longer log a vetoed removal again and mature it; what is left is a

@@ -870,7 +870,7 @@ off]:
   creator at a time (sixteen creators dialing together passed a node's
   handshakes a client address may hold at once, and were refused).
 
-**The cause: idle leaders looking every five seconds** [measured,
+**What the agents added on the node thread: idle leaders' looks** [measured,
 compumax (capped) + sigma, 2026-11-22; the same layout, cap and load, the
 nodes built with frame pointers and sampled with `perf` on node 1's one
 runtime thread, which runs every group's driver, leader and apply loop,
@@ -910,6 +910,39 @@ personal agents, one without]:
   open a range scan of the agent's cut roots, of which two are kept
   (about 16% of the thread in both runs, the scans' setup most of it).
   Neither differed between the runs on that thread.
+
+**The rerun with the looks' fix** [measured, compumax (capped) + sigma,
+2026-11-22; as "The rerun with the fix": the same layout, cap, seed,
+load and API bound, the nodes and guests built at one revision with the
+idle leaders' sleep; calibrated at 3,000 calls a second over 600 s (0
+errors, the answered rate the offered, at most 1,634 in flight, the
+nodes' CPU 56–60%); four runs of an hour, (a) (b) (a′) (b′); the clock
+check passed, compumax and sigma on one NTP source, 1.6 ms apart]:
+
+| run | transfer p50 / p99 / p99.9 (s) | 10-min block p99 (s) | in flight max | node CPU | RSS end (GiB) |
+|---|---|---|---|---|---|
+| (a) | 0.134 / 1.073 / 2.52 | 0.57 0.72 0.69 1.03 1.19 1.97 | 3,635 | 56–62% | 1.87–1.89 |
+| (b) | 0.133 / 0.827 / 1.50 | 0.64 0.95 0.79 0.79 0.86 0.92 | 2,830 | 55–64% | 2.76–2.83 |
+| (a′) | 0.118 / 0.664 / 0.98 | 0.56 0.66 0.72 0.64 0.68 0.70 | 1,531 | 59–62% | 1.78–1.82 |
+| (b′) | 0.123 / 0.885 / 1.43 | 0.61 0.87 0.99 0.93 0.82 0.96 | 2,349 | 58–62% | 2.86–2.88 |
+
+- **The gate reads: missed.** −23% in the first pair, whose run without
+  agents is the outlier (its blocks climbing to 1.97 s, 26 calls
+  refused `Behind`, its p99 62% over (a′)'s); **+33%** in the second.
+  The runs with agents agree within 7% and match the previous rerun's
+  (0.840 and 0.852 s); (a′) matches its (a′) (0.651 s). The sleep did
+  not move the p99 with agents: the looks were a cost on the node's
+  thread, not the rise.
+- **At the nodes,** in the second pair, with the agents the batch's
+  mean rose +5–6% per node, the commit +2–8%, the synced flush +3%, the
+  wait in the shards' queues +9–11%; the idle looks 8–15 a second a
+  node at 0.12–0.14 ms each. The rise at the driver's p99 (+33%) is
+  several times the rise in any stage's mean at the nodes.
+- **Memory:** +54–58.5 KiB a replica right after creation (**met**); at
+  the load's end +254–268 KiB a replica against the node before
+  creation.
+- **Wakes:** 39,890 in each run with agents' window, none failed; a wake
+  p99 1.15 and 1.25 s.
 
 **Reaching the agent: every gateway lists every node.** A node that does
 not replicate an agent answers `Elsewhere { replicas }`
