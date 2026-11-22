@@ -3,7 +3,7 @@
 # check-blobs` checks it (the justfile's `_blob-hashes` says which blobs).
 bf5d23e443567cefd61b8f378bbbfd409a218cb26f13492be06dff79e651d98b  target/riscv64em-vos/release/final-verify.elf
 f37969a9fdb612449b1af7e36d9fd6bcc179ab25378bd5da1d59f4e27bafbd04  target/riscv64em-vos/release/statement-service.elf
-e352eb9bf04c13a38c6a9891f81acfd040f739ff5fcf78d6471f06a644ddc58a  agent/programs/target/riscv64em-vos/release/vos-agent.elf
+1704308b5597ddd3d0523f3b0afa5879145631d6d1ae83561ea4107b2a0111c2  agent/programs/target/riscv64em-vos/release/vos-agent.elf
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 ce85389deb6cd305845aa9cf31c8e4b5ebf4ce3a20e412308d8d2202b7022fff  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
 878a39351352a2f961c8006156278b7a4437a7112df1cddc208df065b650495d  agent/programs/target/riscv64em-vos/release/vos-personal.elf
