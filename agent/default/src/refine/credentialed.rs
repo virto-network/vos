@@ -175,8 +175,10 @@ fn guard(
 /// Whether the release `call`'s proof was verified against is in its
 /// kernel's window at the batch's time: the kernel's actor's
 /// ([`CredentialGuard::kernel`]), the credential actor's for a stock
-/// guard. A method with no guard names no kernel, and nothing is refused
-/// here; one whose kernel's actor is gone admits no release.
+/// guard. A method with no guard names no kernel, and a call of another
+/// kernel than its guard names is the guard's to refuse: nothing is
+/// refused here for either; a kernel whose actor is gone admits no
+/// release.
 fn released(
     base: &Base,
     guard: Option<&CredentialGuard>,
@@ -197,11 +199,18 @@ fn released(
             InstanceId::decode_exact(&bytes).ok_or(Failure::Trapped)?
         }
     };
-    Ok(base.installed(actor)?.is_some_and(|installed| {
-        installed
-            .window(call.kernel, base.time)
-            .contains(&call.release)
-    }))
+    let Some(installed) = base.installed(actor)? else {
+        return Ok(false);
+    };
+    let named = core::str::from_utf8(guard.kernel().0)
+        .ok()
+        .and_then(|name| installed.schema.method_id(name));
+    if named != Some(call.kernel) {
+        return Ok(true);
+    }
+    Ok(installed
+        .window(call.kernel, base.time)
+        .contains(&call.release))
 }
 
 /// Whether device format `format` is admitted at the batch's time: one the
