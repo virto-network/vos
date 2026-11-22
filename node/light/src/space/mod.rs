@@ -213,6 +213,9 @@ struct State {
     kit_calls: Vec<KitCall>,
     /// The home's onion set's last read from its registrar.
     onions: Option<Refreshed>,
+    /// A claim's new kit is being shown, and no claim holds it yet: a
+    /// claim started while it is so says the words shown are void.
+    kit_shown: bool,
 }
 
 /// The home's onion set as last read from its registrar (the current set
@@ -858,7 +861,7 @@ impl<H: Host> Personal<H> {
         if let Some(device) = group.id() {
             self.book(light, device);
         }
-        if left(&pass) {
+        if left(&pass) || group.left() {
             self.forget(&mut held)?;
         } else if let Err(error) = self.refresh_onions(&mut held, now) {
             failures.push(format!("the home's onions: {error}"));
@@ -1013,7 +1016,10 @@ impl<H: Host> Personal<H> {
             let group = group.as_mut().ok_or(Error::NoSpace)?;
             let instances = light.instances().map_err(store_failed)?;
             crate::job::run(light, group, link, &instances, now)
-                .map(|pass| (crate::job::complete(group, &pass), left(&pass)))
+                .map(|pass| {
+                    let left = left(&pass) || group.left();
+                    (crate::job::complete(group, &pass), left)
+                })
                 .map_err(|stopped| unreached(stopped.error))
         })?;
         if left {

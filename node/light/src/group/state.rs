@@ -371,6 +371,9 @@ pub(crate) struct State {
     /// ([`Alarm::Policy`](super::Alarm::Policy)). A paired device's is its
     /// pairing device's; a restored device starts past it.
     pub(crate) assigned: Option<u64>,
+    /// This device's own leave held: the removal of it the log asserts
+    /// next is its leave, and the device out by it forgets its store.
+    pub(crate) leaving: bool,
 }
 
 impl State {

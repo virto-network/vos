@@ -117,7 +117,12 @@ searched for the secret by its `tests/leaks.rs`.
   device with a voice, no rival removal and, for a restore, no `alive`
   since (unsigned, the agent's word), or a verified second signature, or
   verified resolutions naming it (the kit's, or the latest of each of two
-  seasoned devices with strong admins). A maturity asserted at a time
+  seasoned devices with strong admins). A **leave** (a device's own
+  removal, which no one vetoes or cosigns) is honoured on its own
+  evidence alone, verified and logged before the maturity, which must be
+  asserted at that entry's own time and before the leave's delay ends;
+  its signer's key is held as its own on its probation too, but not while
+  the commit adding it is undecided. A maturity asserted at a time
   past its entry's is refused, and an entry whose batch time goes back
   stops the reading; a removal freezes its target's probation as the
   agent does. Evidence

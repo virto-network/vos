@@ -246,7 +246,9 @@ impl<H: Host> Personal<H> {
     /// the space stays held and the flow answers `Unreachable`: the next
     /// pass posts what is held, reads the leave through and forgets. Out
     /// already, by a leave read through with the forgetting cut short, it
-    /// forgets at once.
+    /// forgets at once. Refused while a candidate adding a device is
+    /// undecided ([`Error::AwaitsVotes`]): that device is no other live
+    /// one until its add is confirmed, and void it leaves the set.
     pub fn leave(&self, prompts: &dyn Prompts) -> Result<(), Error> {
         let mut held = self.held();
         let out = |held: &Held| {
@@ -262,7 +264,24 @@ impl<H: Host> Personal<H> {
             .as_ref()
             .and_then(crate::group::DeviceGroup::id)
             .ok_or(Error::NoSpace)?;
-        self.operate(&mut held, prompts, method::REMOVE, me.encode(), None)?;
+        let adding = self.with_link(&mut held, Purpose::Personal, |link, held| {
+            let group = held.group.as_mut().ok_or(Error::NoSpace)?;
+            read_to_head(link, group)?;
+            Ok(group.adding())
+        });
+        if out(&held) {
+            return self.forget(&mut held);
+        }
+        if adding? {
+            return Err(Error::AwaitsVotes);
+        }
+        if let Err(error) = self.operate(&mut held, prompts, method::REMOVE, me.encode(), None) {
+            // Read out by its own leave, maybe in an earlier sitting.
+            if out(&held) {
+                return self.forget(&mut held);
+            }
+            return Err(error);
+        }
         prompts.stage(super::Stage::Leaving);
         for _ in 0..LEAVE_FOLLOWS {
             if held.group.is_none() {

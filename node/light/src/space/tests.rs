@@ -85,6 +85,7 @@ fn every_field() -> State {
             }],
             until: 44,
         }),
+        kit_shown: true,
     }
 }
 
@@ -155,6 +156,7 @@ const PINNED: &[(&str, &str)] = &[
             "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2c00000000000000",
         ),
     ),
+    ("p/kit-shown", ""),
 ];
 
 fn hexed(rows: &[crate::store::Change]) -> Vec<(String, String)> {
