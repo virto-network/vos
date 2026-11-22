@@ -457,7 +457,12 @@ fn no_carrier_holds_a_members_device_secret_or_its_place() {
         founded.write(PAYMENTS, "open", (name.clone(), digest));
         founded.write(PAYMENTS, "mint", (name, 50u64));
     }
-    let pay = founded.call(at, PAYMENTS, "transfer", (b"shop".to_vec(), 20u64));
+    let pay = founded.call(
+        at,
+        PAYMENTS,
+        "transfer",
+        (b"shop".to_vec(), 20u64, [20u8; 32]),
+    );
     let paid = prover.prove_owner(&secret, &pay, &owner_program).unwrap();
     answers.push(ran(send(&pay, &paid)));
 

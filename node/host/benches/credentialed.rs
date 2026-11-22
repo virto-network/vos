@@ -217,7 +217,6 @@ impl Reached {
 
     fn made(&self, count: usize, expires_ms: u64) -> Vec<(AgentId, Credentialed)> {
         let transfer = method(&program("vos-payments"), "transfer");
-        let arguments = vos_light::transfer_arguments("payee", 1, &[1; 32]);
         let elf = std::fs::read(vos_checker::programs::program_elf("vos-credentials")).unwrap();
         let owner = vos_light::release::device(&elf, "owner").expect("the stock owner kernel");
         let program = DeviceProgram::from_release(&owner).expect("its program");
@@ -237,6 +236,10 @@ impl Reached {
                     let mut nonce = [0u8; 16];
                     nonce[..8].copy_from_slice(&(index as u64).to_le_bytes());
                     nonce[8..].copy_from_slice(&expires_ms.to_le_bytes());
+                    // A payment key of its own, so each transfer pays.
+                    let mut key = [0u8; 32];
+                    key[..16].copy_from_slice(&nonce);
+                    let arguments = vos_light::transfer_arguments("payee", 1, &key);
                     let call = Call {
                         space: self.space.0,
                         agent: agent.0,
