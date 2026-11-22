@@ -358,12 +358,12 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **The onion's proven calls under many circuits** [known limit, dated
   2026-11-22, `light-node.md` §6.6]: a proven call's header takes its
   circuit's places first and one call a circuit waits for the onion's,
-  and a body has 5 s plus its length at 40 KiB/s, at most 30 s. Behind
+  and a body has 5 s plus its length at 32 KiB/s, at most 30 s. Behind
   C attacker circuits a member waits about C × 5 / 16 s against headers
-  alone (60 s at about 190 circuits), C × 6.6 / 16 s against the
-  smallest large bodies kept at their pace (about 145 circuits, 38 KiB/s
-  of upload), and C × 30 / 16 s against bodies of 1 MiB or more uploaded
-  at the slowest pace: about 32 circuits, for about 0.45 MiB/s of upload.
+  alone (60 s at about 190 circuits), C × 7 / 16 s against the
+  smallest large bodies kept at their pace (about 137 circuits, 42 KiB/s
+  of upload), and C × 30 / 16 s against bodies of 800 KiB or more uploaded
+  at the slowest pace: about 32 circuits, for about 0.35 MiB/s of upload.
   A place is held as long as a real proof's upload may take, so only the
   attacker's bandwidth separates that case from a member's. Past these
   the bound is the introduction points' rate and arti's service-side

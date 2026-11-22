@@ -916,15 +916,15 @@ personal agents, one without]:
   A node task reads the node's clock against the monotonic clock every
   second, and when the clock has gained more than a second (a step, a
   slew adding up, the host's sleep) it wakes every idle leader to look
-  again, so a step is seen within two seconds, no later than before. The
-  space's representative first learned (for reports) and a blob arriving
-  (a proof to record) wake them too, 256 at a time and 50 ms apart
-  (`steps::look_again`): a look took about 150–275 µs of the thread in
-  these runs, so a slice holds it at most about 70 ms, and a step at the
-  33,000 idle leaders a node of `open.md`'s 100,066 groups is seen by all
-  within about 15 s rather than as one burst of several seconds the Raft
-  drivers sharing the thread (3 s election timeout) would wait behind
-  (`a_wake_comes_in_slices`). With the fix and the agents, the
+  again, 256 at a time and 50 ms apart (`steps::look_again`): a look
+  took about 150–275 µs of the thread in these runs, so a slice holds it
+  at most about 70 ms, and a step is seen within two seconds by the
+  first slice and, at the 33,000 idle leaders a node of `open.md`'s
+  100,066 groups, by all within about 15 s, rather than as one burst of
+  several seconds the Raft drivers sharing the thread (3 s election
+  timeout) would wait behind (`a_wake_comes_in_slices`). The space's
+  representative first learned (for reports) wakes them the same way, and
+  a blob arriving (a proof to record) wakes its leader. With the fix and the agents, the
   looks took 34 and 27 samples, as without them (8–15 idle looks a second
   a node), and the transfers' p99 was 0.78 s in that one 26-minute run.
   The `look` stage of a node's stats counts the idle looks that found
@@ -3011,8 +3011,9 @@ format, the chips, the sizes and the root.
     every replica agrees and a restart keeps it; one call for each agent
     that takes proven calls). The log never retires the release's newest
     format (`Forbidden`): its date is never moved later, so the agent
-    would admit no proven call until a release with a newer one; a node's
-    own configuration still retires it at that node's ingress. With one
+    would admit no proven call until a release with a newer one. A node's
+    own configuration still retires it at that node's ingress, but nothing
+    stops it space-wide before a release brings a newer format. With one
     format in the release (47) the log's retirement is reachable only
     once a release brings a second. A proof of a retired
     format is refused `Format` at ingress before anything is decoded, and
@@ -3845,20 +3846,20 @@ connection's and circuit's first (past either the channel is closed),
 then the onion's, for which one call a circuit waits (another is closed
 at once), so no circuit queues headers ahead of the others; the header
 takes its circuit's request token, and the body must then keep its pace:
-its time is 5 s plus its length at 40 KiB/s (a 1 MiB upload's slowest
-measured, through a bridge, §6.3), at most 30 s, and by 5 s plus its
+its time is 5 s plus its length at 32 KiB/s (below a 1 MiB upload's
+slowest measured, 26 s through a bridge, §6.3), at most 30 s, and by 5 s plus its
 share of that time as much of it as that share, the whole within it, so
 a header whose body never comes, or comes a byte at a time, gives its
 places back after about 5 s, and the smallest large body (64 KiB) kept
-at its pace after about 6.6 s (`ssh::Pace`); an agent's calls
+at its pace after about 7 s (`ssh::Pace`); an agent's calls
 and proven calls from one circuit rated. *Known limit:* at the defaults,
 the members' wait still grows with the circuits an attacker
 holds, one waiter each before a member, 16 places [derived, 2026-11-22]:
 with headers alone a member waits about C × 5 / 16 s, inside the
 gateway's 60 s for up to about 190 circuits; with the smallest large
-bodies kept at their pace (about 2.4 KiB/s a place, 38 KiB/s for all 16)
-C × 6.6 / 16 s, about 145 circuits; and an attacker who uploads bodies
-of 1 MiB or more at the slowest pace (about 28 KiB/s a place, 0.45 MiB/s
+bodies kept at their pace (about 2.6 KiB/s a place, 42 KiB/s for all 16)
+C × 7 / 16 s, about 137 circuits; and an attacker who uploads bodies
+of 800 KiB or more at the slowest pace (about 22 KiB/s a place, 0.35 MiB/s
 for all 16) holds each place the whole 30 s, a member waiting
 C × 30 / 16 s, past 60 s at about 32 circuits. The device's own deadline
 for a proven call, 90 s (`tor::Config::proven`), covers the gateway's

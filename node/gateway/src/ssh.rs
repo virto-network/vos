@@ -55,11 +55,11 @@ pub const LARGE_DEADLINE: Duration = Duration::from_secs(30);
 /// its places: a Tor circuit delivers its cells seconds apart at worst.
 pub const PROGRESS: Duration = Duration::from_secs(5);
 /// The slowest rate, in bytes a second, a large body's pace allows past
-/// [`PROGRESS`]: a 1 MiB upload's slowest measured, 26 s through a bridge
-/// (`light-node.md` §6.3), about 40 KiB/s. A body has [`PROGRESS`] plus its
-/// length at this rate, at most [`LARGE_DEADLINE`], so a small one holds
-/// its places only as long as its length needs.
-pub const SLOWEST_RATE: u64 = 40 << 10;
+/// [`PROGRESS`]: below a 1 MiB upload's slowest measured, 26 s through a
+/// bridge (`light-node.md` §6.3), about 39 KiB/s. A body has [`PROGRESS`]
+/// plus its length at this rate, at most [`LARGE_DEADLINE`], so a small one
+/// holds its places only as long as its length needs.
+pub const SLOWEST_RATE: u64 = 32 << 10;
 
 /// A large body's pace from when it took its places: of its `length`
 /// bytes, `read` so far, each due by [`PROGRESS`] plus its share of the

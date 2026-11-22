@@ -876,7 +876,7 @@ async fn starved(held: Held) {
         Some(Response::Rejected(Rejection::Malformed)),
         "the member's proven call reached the node"
     );
-    assert!(took < Duration::from_secs(20), "the member waited {took:?}");
+    assert!(took < Duration::from_secs(22), "the member waited {took:?}");
     assert!(caps.refused().waiting > 0, "{:?}", caps.refused());
     for holder in holders {
         holder.abort();

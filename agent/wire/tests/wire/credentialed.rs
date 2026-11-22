@@ -134,8 +134,7 @@ fn the_request_and_its_refusals_encode_as_pinned() {
 
 /// The log's input at `Input`'s index 10, its claim, its kernel, its
 /// device format and the kernel's release beside the origin, without the
-/// proof or the nonce; its
-/// step's reference at `InputRef`'s index 9.
+/// proof or the nonce; its step's reference at `InputRef`'s index 9.
 #[test]
 fn the_logged_input_carries_the_origin_and_the_claim() {
     let input = CredentialedInput {

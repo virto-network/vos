@@ -45,7 +45,8 @@ pub(crate) async fn look_again(looks: &event_listener::Event) {
 /// Read the node's clock every [`EVERY`] on its runtime: each time it has
 /// gained more than [`STEP_MS`] on the monotonic clock over its least lead
 /// since the leaders last woke, every listener of `inner.looks` wakes
-/// ([`look_again`]), the next read after the wake has run. A
+/// ([`look_again`]), and a further gain during the wake wakes them again.
+/// A
 /// slow gain, or the host's sleep, which the monotonic clock does not
 /// count, wakes them as a step does. A step back wakes no one: a leader's
 /// timer then fires before its time by the clock, and the leader, finding
@@ -60,7 +61,7 @@ pub(crate) async fn watch(inner: Arc<Inner>) {
         let now = lead();
         if now - floor > STEP_MS {
             look_again(&inner.looks).await;
-            floor = lead();
+            floor = now;
         } else {
             floor = floor.min(now);
         }

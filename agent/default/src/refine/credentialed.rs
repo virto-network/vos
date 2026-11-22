@@ -3,8 +3,8 @@
 //! binding digest is recorded, when its proof's device format is retired,
 //! by the release or the agent's log, whatever the node that verified it
 //! admits, when the kernel's release it was verified against has left the
-//! kernel's window by the batch's time, when a stock auth claim's root is not fresh at
-//! [`credentials::judged_at`] (the earlier of the batch's time and the
+//! kernel's window by the batch's time, when a stock auth claim's root is
+//! not fresh at [`credentials::judged_at`] (the earlier of the batch's time and the
 //! expiry less the horizon, no later than any admitting ingress's clock,
 //! so apply refuses no root ingress admitted), or when a `once` guard
 //! admitted its nullifier; else its binding digest is recorded, whatever

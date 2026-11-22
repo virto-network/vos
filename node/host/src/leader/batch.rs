@@ -419,8 +419,8 @@ impl Leader {
     }
 
     /// A batch's time: the node's clock, or while it reads no later than
-    /// the agent's time, `floor`, a millisecond past it. Leadership stays: every
-    /// replica would trail an agent a fast clock once led. A trailing
+    /// the agent's time, `floor`, a millisecond past it. Leadership stays:
+    /// every replica would trail an agent a fast clock once led. A trailing
     /// leader's batches each take a time of their own, so the credential
     /// actor's ring, which replaces a root written at its own time
     /// (`Ring::record`), keeps the roots devices read at earlier batches
