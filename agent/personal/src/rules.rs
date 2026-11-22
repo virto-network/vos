@@ -221,14 +221,17 @@ impl Personal {
     }
 
     /// The admin key that calls and its device, which must be active: a
-    /// sync key, a device in probation, and one whose removal matured, sign
-    /// no admin call.
+    /// sync key, a device in probation or whose add is undecided, and one
+    /// whose removal matured, sign no admin call.
     pub(crate) fn admin_caller(
         &self,
         caller: Principal,
         now: u64,
     ) -> Result<([u8; 32], DeviceId), PersonalError> {
         match self.holder(caller) {
+            Some((_, Holder::Admin(device))) if self.undecided() == Some(device) => {
+                Err(PersonalError::Undecided)
+            }
             Some((key, Holder::Admin(device))) => match self.standing_of(device, now) {
                 Some(Standing::Active) => Ok((key, device)),
                 Some(Standing::Probation) => Err(PersonalError::Probation),

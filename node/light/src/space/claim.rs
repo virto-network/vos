@@ -76,6 +76,10 @@ struct Ahead {
     clock: Option<Reading>,
 }
 
+/// What the kit shown after a claim stopped while its kit was shown says.
+const STOPPED: &str = "This phone stopped while the backup was shown, before it was kept: \
+    the words shown then are void; write these new ones.";
+
 /// What the kit shown before a new one says: the home refused the backup
 /// for `why`, so its words are void.
 fn voided(why: &str) -> String {
@@ -383,6 +387,25 @@ impl<H: Host> Personal<H> {
         Ok((agent, self.identity(home, agent)?))
     }
 
+    /// Refused `Spent` while `nullifier`'s device left or was removed at
+    /// `home` within its removal delay: asked before a kit is shown or a
+    /// space left for a claim the home would refuse.
+    fn unspent(&self, home: &Home, nullifier: &[u8; 32]) -> Result<(), Error> {
+        let lapse: Option<u64> = self.home_query(
+            home,
+            Purpose::Personal,
+            home.homes.0,
+            homes::method::SPENT,
+            nullifier.encode(),
+        )?;
+        match lapse {
+            Some(lapse) if lapse > self.time(To::Home(home.handle), Purpose::Personal)? => {
+                Err(Error::HomeRefused(HomesError::Spent))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// A personal agent at a home-only space, with a kit of the kind asked.
     /// The device's open claim first (its own work, a session of its own),
     /// then the claim of the agent `Homes` names, sealed to its identity,
@@ -430,7 +453,7 @@ impl<H: Host> Personal<H> {
         let mut derived = Some(secret);
         // Why the kit shown last is void: the home refused the backup after
         // it was shown.
-        let mut void: Option<String> = None;
+        let mut void: Option<String> = held.state.kit_shown.then(|| STOPPED.to_owned());
         let mut kits = 0;
         prompts.stage(super::Stage::Reaching);
         let (agent, claim) = loop {
@@ -540,33 +563,68 @@ impl<H: Host> Personal<H> {
         let home = &kept.home;
         let terms = self.opening(home)?;
         let agent = self.pooled(home)?;
+        self.unspent(home, &home.nullifier(secret))?;
         let device = self.device(held, prompts, home, secret, &request.label)?;
+        // Kept before the words are shown, so a claim after a kill while
+        // they were says they are void.
+        held.state.kit_shown = true;
+        self.keep(&held.light, &held.state)?;
         let (written, cancelled) = (AtomicBool::new(false), AtomicBool::new(false));
-        let (kit, ahead) = std::thread::scope(|scope| {
+        let (kit, claim, ahead) = std::thread::scope(|scope| {
             let behind =
                 scope.spawn(|| self.behind_the_kit(home, member, &terms, &written, &cancelled));
             let kit = new_kit(prompts, request.kit, kept, void);
+            // The claim held the moment the words are written down, before
+            // the work and the reads behind them end: a kill after leaves
+            // the claim with the kit the user holds.
+            let claim = kit.as_ref().ok().map(|kit| {
+                let mut next = held.state.clone();
+                next.home = Some(kept.clone());
+                next.agent = Some(agent);
+                next.label = request.label.clone();
+                next.kit_shown = false;
+                let claim = Claiming::prepare(
+                    held.light.store(),
+                    device.clone(),
+                    vec![kit.key()],
+                    agent.0,
+                    agent.1,
+                    next.rows(),
+                );
+                (claim, next)
+            });
             cancelled.store(kit.is_err(), Ordering::SeqCst);
             written.store(true, Ordering::SeqCst);
-            (kit, behind.join())
+            (kit, claim, behind.join())
         });
-        let ahead = ahead.map_err(|_| failed("the claim's reads stopped"))?;
-        let kit = kit?;
-        // The home and agent are the device's in the claim's batch.
-        let mut next = held.state.clone();
-        next.home = Some(kept.clone());
-        next.agent = Some(agent);
-        next.label = request.label.clone();
-        let claim = Claiming::prepare(
-            held.light.store(),
-            device,
-            vec![kit.key()],
-            agent.0,
-            agent.1,
-            next.rows(),
-        )
-        .map_err(failed)?;
-        self.adopt(held, next);
+        let error = match (kit, claim) {
+            (Ok(_), Some((Ok(claim), next))) => {
+                // Adopted before anything else can fail: the store holds it.
+                self.adopt(held, next);
+                let ahead = ahead.map_err(|_| failed("the claim's reads stopped"))?;
+                return self.claim_held(held, kept, claim, ahead);
+            }
+            (Err(error), _) => error,
+            (Ok(_), Some((Err(error), _))) => failed(error),
+            (Ok(_), None) => unreachable!("a kit written down is held"),
+        };
+        // No claim holds the kit: the mark cleared, the flow's own error
+        // answered even when clearing it fails.
+        held.state.kit_shown = false;
+        let _ = self.keep(&held.light, &held.state);
+        Err(error)
+    }
+
+    /// The claim `kit_and_open` held, its open claim as `ahead` made it:
+    /// refused once the kit was shown, the claim abandoned and its words
+    /// void.
+    fn claim_held(
+        &self,
+        held: &mut Held,
+        kept: &Kept,
+        claim: Claiming,
+        ahead: Ahead,
+    ) -> Result<(Claiming, Ahead), Error> {
         let mut ahead = ahead;
         match std::mem::replace(&mut ahead.open, Ok(())) {
             Ok(()) => Ok((claim, ahead)),
@@ -627,6 +685,7 @@ impl<H: Host> Personal<H> {
             if holding.is_some() {
                 return Err(Error::HoldsAgentThere);
             }
+            self.unspent(home, &home.nullifier(&secret))?;
             self.forget(&mut held)?;
             ready = Some(secret);
         }

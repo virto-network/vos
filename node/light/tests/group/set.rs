@@ -114,9 +114,9 @@ fn relayed(home: &Home, reader: &Phone, phone: &mut Phone) -> Vec<Event> {
 
 /// A thief's device removes an owner's, whose removal of it in return makes
 /// one contest; two other seasoned devices resolve it for the owner, the
-/// second's resolution maturing the owner's removal and dropping the
-/// thief's. The devices hold off until the second resolution's evidence
-/// verifies, then the owner's commit carries the removal and the thief is
+/// second's resolution's evidence maturing the owner's removal and
+/// dropping the thief's: nothing is decided before it, at the agent or at
+/// a device. Then the owner's commit carries the removal and the thief is
 /// out.
 #[test]
 fn a_contested_removal_resolved_by_two_devices_is_carried() {
@@ -160,6 +160,14 @@ fn a_contested_removal_resolved_by_two_devices_is_carried() {
         "resolve",
         (ours, true).encode(),
     );
+    assert_eq!(
+        state(&home, &owners[0], ours),
+        OpState::Contested,
+        "a resolution decides nothing before its evidence"
+    );
+    signed(&settle(&mut home, &mut all(owners)));
+    assert!(owed(&home, &mut owners[0]).is_empty());
+    post(&mut home, &owners[2].sync, index, message, signature, None);
     assert!(matches!(
         state(&home, &owners[0], ours),
         OpState::Matured { .. }
@@ -168,12 +176,6 @@ fn a_contested_removal_resolved_by_two_devices_is_carried() {
         state(&home, &owners[0], theirs),
         OpState::Cancelled { .. }
     ));
-    signed(&settle(&mut home, &mut all(owners)));
-    assert!(
-        owed(&home, &mut owners[0]).is_empty(),
-        "no device honours a resolution before its evidence"
-    );
-    post(&mut home, &owners[2].sync, index, message, signature, None);
     signed(&settle(&mut home, &mut all(owners)));
     assert_eq!(owed(&home, &mut owners[0]), vec![3]);
 
@@ -193,9 +195,8 @@ fn a_contested_removal_resolved_by_two_devices_is_carried() {
 }
 
 /// A removal made immediate by a second seasoned device's signature: it
-/// matures in the cosign's call, before the cosign's evidence is posted;
-/// the devices honour it once that evidence verifies, and the next
-/// commit carries it.
+/// matures at the cosign's evidence, not its call, and the devices honour
+/// it behind that evidence; the next commit carries it.
 #[test]
 fn a_cosigned_removal_is_carried_once_its_cosign_verifies() {
     let (mut home, mut phones) = seasoned(3);
@@ -209,14 +210,15 @@ fn a_cosigned_removal_is_carried_once_its_cosign_verifies() {
     );
     let (index, message, signature) =
         unevidenced(&mut home, &phones[1].admin, "cosign", removal.encode());
-    assert!(matches!(
-        state(&home, &phones[0], removal),
-        OpState::Matured { .. }
-    ));
+    assert_eq!(state(&home, &phones[0], removal), OpState::Pending);
     let (owners, _) = phones.split_at_mut(2);
     signed(&settle(&mut home, &mut all(owners)));
     assert!(owed(&home, &mut owners[0]).is_empty());
     post(&mut home, &owners[1].sync, index, message, signature, None);
+    assert!(matches!(
+        state(&home, &owners[0], removal),
+        OpState::Matured { .. }
+    ));
     signed(&settle(&mut home, &mut all(owners)));
     assert_eq!(owed(&home, &mut owners[1]), vec![2]);
 

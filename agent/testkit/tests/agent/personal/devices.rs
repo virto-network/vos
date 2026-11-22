@@ -199,6 +199,53 @@ fn two_seasoned_devices_remove_at_once() {
     assert_eq!(standing(&home, sync(0), 2), Standing::Removed);
 }
 
+/// A second signature or a resolution decides at its evidence, never at
+/// its call: one whose signer withholds the evidence decides nothing, the
+/// signer may sign it again, and another device's evidenced signature
+/// decides; the withheld one's evidence posted late changes nothing. A device's later resolution replaces its earlier one,
+/// evidenced or not.
+#[test]
+fn a_second_signature_or_a_resolution_decides_at_its_evidence() {
+    let posted = |home: &mut Home, n: u8, name: &str, index: u64| {
+        let signed = message(device(n).admin, home.method(name), &home.logged(index));
+        home.call::<Recorded>(
+            sync(n),
+            "evidence",
+            evidence(index, signed, Attached::default()),
+        )
+        .unwrap();
+    };
+    let mut home = seasoned(4);
+    let removal = home.operate(admin(0), "remove", 3u32).unwrap();
+    let withheld = home.unevidenced(admin(1), "cosign", removal).unwrap();
+    assert_eq!(state(&home, sync(0), removal), OpState::Pending);
+    home.unevidenced(admin(1), "cosign", removal).unwrap();
+    assert_eq!(state(&home, sync(0), removal), OpState::Pending);
+    home.operate(admin(2), "cosign", removal).unwrap();
+    assert!(matured(state(&home, sync(0), removal)));
+    posted(&mut home, 1, "cosign", withheld);
+    assert!(matured(state(&home, sync(0), removal)));
+
+    let mut home = seasoned(4);
+    let removal = home.operate(admin(0), "remove", 3u32).unwrap();
+    home.operate(admin(3), "veto", removal).unwrap();
+    let first = home
+        .unevidenced(admin(1), "resolve", (removal, true))
+        .unwrap();
+    home.operate(admin(2), "resolve", (removal, true)).unwrap();
+    assert_eq!(state(&home, sync(0), removal), OpState::Contested);
+    home.operate(admin(1), "resolve", (removal, false)).unwrap();
+    posted(&mut home, 1, "resolve", first);
+    assert_eq!(
+        state(&home, sync(0), removal),
+        OpState::Contested,
+        "a resolution replaced counts no more"
+    );
+    home.operate(admin(1), "resolve", (removal, true)).unwrap();
+    assert!(matured(state(&home, sync(0), removal)));
+    assert_eq!(standing(&home, sync(0), 3), Standing::Removed);
+}
+
 /// An operation the devices hold no evidence of matures for none of them:
 /// a removal due without its call's evidence is cancelled `Unevidenced`,
 /// its target keeping its voice; a cosign before the evidence is refused,
@@ -1074,10 +1121,10 @@ fn a_devices_rotation_takes_the_kits_place_and_the_kit_has_an_allowance() {
     );
 }
 
-/// A device dropped with its void candidate is silenced as a removed one
-/// is: its operations cancelled.
+/// A device whose add a candidate makes signs nothing before the verdict
+/// (`Undecided`), so a void candidate drops it with nothing of its open.
 #[test]
-fn a_dropped_devices_operations_are_cancelled() {
+fn an_undecided_device_signs_nothing_and_is_dropped_with_its_candidate() {
     let policy = Policy {
         confirm_window_ms: 10 * MINUTE,
         ..minutes()
@@ -1093,13 +1140,14 @@ fn a_dropped_devices_operations_are_cancelled() {
         .call(admin(0), "commit", commit(2, effect, vec![2; 600]))
         .unwrap();
     home.pass(3 * MINUTE);
-    let add = home.operate(admin(2), "add", device(6)).unwrap();
+    assert_eq!(
+        home.operate(admin(2), "add", device(6)),
+        Err(PersonalError::Undecided)
+    );
     home.call::<Voted>(sync(0), "nack", (2u64, [0u8; 64]))
         .unwrap();
     assert!(candidacy.set.contains(&0));
     assert_eq!(standing(&home, sync(0), 2), Standing::Dropped);
-    home.wake(sync(0)).unwrap();
-    assert_eq!(cancelled(state(&home, sync(0), add)), Some(Cancel::Signer));
 }
 
 /// The previous `R2` stays released until the restore's device has
@@ -1407,6 +1455,66 @@ fn a_leave_on_a_frozen_probation_ends_what_acts_on_it() {
         Some(Cancel::Unevidenced)
     );
     assert_eq!(standing(&home, sync(0), 1), Standing::Active);
+}
+
+/// A leave beside an add the pending candidate makes: that device is not
+/// another live device, so the set's one confirmed device may not leave
+/// (were the candidate void, no device would be left), and a leave opened
+/// before, evidenced once the only other live device is that one, is
+/// cancelled `Alone`. The device being added signs nothing until the
+/// verdict, its own leave included; confirmed, it leaves.
+#[test]
+fn a_leave_counts_only_the_confirmed_group() {
+    let mut home = seasoned(1);
+    let epoch = home.overview().confirmed + 1;
+    let effect = Effect {
+        add: Some(device(1)),
+        ..Effect::default()
+    };
+    let candidacy: Candidacy = home
+        .call(
+            admin(0),
+            "commit",
+            commit(epoch, effect, vec![epoch as u8; 700]),
+        )
+        .unwrap();
+    assert_eq!(
+        home.operate(admin(0), "remove", 0u32),
+        Err(PersonalError::Alone),
+        "the device being added is no other live device"
+    );
+    assert_eq!(
+        home.unevidenced(admin(1), "remove", 1u32),
+        Err(PersonalError::Undecided),
+        "the device being added signs no leave"
+    );
+    home.confirm_all(epoch, &candidacy.set);
+    home.operate(admin(1), "remove", 1u32).unwrap();
+    assert_eq!(standing(&home, sync(0), 1), Standing::Removed);
+
+    let mut home = seasoned(2);
+    let leave = home.unevidenced(admin(0), "remove", 0u32).unwrap();
+    let epoch = home.overview().confirmed + 1;
+    let effect = Effect {
+        add: Some(device(2)),
+        ..Effect::default()
+    };
+    home.call::<Candidacy>(
+        admin(1),
+        "commit",
+        commit(epoch, effect, vec![epoch as u8; 700]),
+    )
+    .unwrap();
+    home.operate(admin(1), "remove", 1u32).unwrap();
+    let signed = message(device(0).admin, home.method("remove"), &home.logged(leave));
+    home.call::<Recorded>(
+        sync(0),
+        "evidence",
+        evidence(leave, signed, Attached::default()),
+    )
+    .unwrap();
+    assert_eq!(cancelled(state(&home, sync(0), leave)), Some(Cancel::Alone));
+    assert_eq!(standing(&home, sync(0), 0), Standing::Active);
 }
 
 /// Two leaves opened side by side, each while the other device was live:

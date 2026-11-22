@@ -36,7 +36,7 @@ use crate::group::Archive;
 /// personal space's rows encode (`crate::space`). A store written in
 /// another is refused at open. Numbered apart from the node's store's
 /// layouts.
-pub const LAYOUT: u32 = 10;
+pub const LAYOUT: u32 = 11;
 
 /// The block cache the store keeps by default: a phone's.
 pub const CACHE_BYTES: u64 = 16 << 20;

@@ -25,6 +25,6 @@ pub use held::Held;
 pub use phone::{Phone, hmac};
 pub use reach::Reach;
 pub use world::{
-    Death, Delays, Kernels, Loopback, Seen, Step, World, address, artifacts, onion_of,
+    Death, Delays, Hook, Kernels, Loopback, Seen, Step, World, address, artifacts, onion_of,
     personal_package, policy, program, wall,
 };
