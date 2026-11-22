@@ -519,12 +519,6 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
     );
     let address = ssh_port(served.node.id().0, standing.socket.clone(), port, 3).await;
     // Junk in shape: a credentialed call whose proof is 900 KB of noise.
-    // The smallest large body for `Held::Paced`, a device proof's size
-    // otherwise.
-    let proof = match held {
-        Held::Paced => Kind::Call.limit() as usize + 4_096,
-        _ => 300_000,
-    };
     let junk = |at: u64| {
         let call = vos_wire::ingress::Credentialed {
             instance: COUNTER,
