@@ -1474,8 +1474,12 @@ numbers are the phone session's, `tools/phone/scripts/group.sh`]:
   the device's own report, as the UI's keystore answered it (`KeyInfo`'s
   security level), not an attestation another device verified: a key that
   is not hardware-backed registers `AdminClass::Delayed`, claimed, paired
-  or as a replacement; the verified-boot flag is recorded as reported.
-  Verifying the attestation chain, and the PIN-authenticated fallback of a
+  or as a replacement. No verified-boot state is read: s4's bridge reports
+  the key's security level alone, so every device records
+  `verified_boot: false` and no screen shows a boot state (the devices
+  screen shows "admin key strong/weak"); E24's boot half is not built.
+  Verifying the attestation chain (whose root of trust carries the boot
+  state), and the PIN-authenticated fallback of a
   phone without a Class 3 biometric, are later work (`open.md`). A
   delayed admin opens no pairing (`Error::DelayedAdmin`, below): a strong
   admin's device pairs it.
@@ -1943,9 +1947,21 @@ restore's times [World]: §6.3]:
   lost phone, resolving a contest, opening and finishing the restore), and
   zeroized when the screen closes, when the app goes to the background
   (the UI's stop, and `:vos`'s own background signal), when the UI's
-  process dies, at most ten minutes after the entry (a flow still running
-  then ends holding none), and when a flow finds
-  it not a kit or not this space's. So the kit's secret lives minutes in
+  process dies, at most ten minutes after the entry, and when a flow finds
+  it not a kit or not this space's. A restore screen's flow in flight is
+  held to the same deadlines: once its sitting closes (the screen, the
+  background) or the ten minutes from its kit's entry pass (a kit it
+  entered or took from the sitting), every further prompt of that flow is
+  declined, so it ends and drops the kit it holds; the UI's stop declines
+  the form such a flow waits on. A kit flow outside the restore screen (a
+  claim, a rotation, a regroup, a move) has no sitting and no such
+  deadline: it holds its kit until it ends, each of its forms waiting ten
+  minutes. A form shown before the ten minutes passed may
+  still be answered after (each form waits ten minutes), and the flow then
+  ends at its next prompt. The words in the forms' rows and in the
+  answers are zeroized in `:vos` once handed over or read; the Java
+  copies (the Binder parcels, the form's text in the UI) are the
+  collector's to reclaim, not zeroized. So the kit's secret lives minutes in
   `:vos` instead of one call; a flow outside the restore screen (a
   rotation, an admin key's replacement) still asks for it each time. The
   kind of kit a restore was opened with is kept in the facility's
@@ -3127,7 +3143,28 @@ journal's registrar, is a non-canonical digest no proof states);
 `rekey` moves an account to a new digest and lifts a `freeze`; a
 payment to oneself or of nothing is refused; a device reads its own
 account by its digest (`held`), and an account's digest and balance are
-readable by the agent's callers, as the log's readers see them. The
+readable by the agent's callers, as the log's readers see them.
+**Once per confirmed form** [built]: `transfer(to, amount, key)` pays
+under cipher-clerk's external id of the payer's digest and the key
+(`client_external_id`), so a second transfer under one key is refused
+`Paid`, whatever it names, and moves nothing; `paid(external_id)` answers
+whether one was made, naming no owner. The facility draws a fresh key
+for each confirmed form and keeps it, with the values and the proof's
+expiry, in its database before the first proof leaves (a local synced
+write, no round trip); every proof made for that form names that key. The
+same form confirmed again while it is pending is the same payment: its
+last proof sent again while it may still run, else a new proof under the
+same key, and an answer that says the proof will not run again
+(`Replayed`, an expiry) is proved again under that key at once. A lost
+answer says so ("pay the same again to learn whether it was paid; it is
+paid once"). Before a payment's form, each pending payment of the
+account is asked of the ledger by `paid`, a linearizable read on a fetch
+of its own (ten seconds at most each), in the payment's session alone
+(which names the account already): paid, or not paid once its proof can
+no longer run by the device's own clock (its expiry plus the node's
+clock's 300 s bound), and the form says which; otherwise it stays
+pending. "Not paid" is the answering node's word (`open.md`). Tested: `a_payment_key_pays_once` (the ledger)
+and the facility's lost answer, restart and expiry, each paying once. The
 facility proves with the stock kernels' release artifacts it
 embeds, never a kernel a server sends (G2), so the s4 demo signs in by
 the stock `auth` kernel alone.
@@ -3396,9 +3433,11 @@ nodes may ask the onion's mark of its proven calls, or of every request
   2026-11-18). The user grants `vos.credential` once a session, in s4's
   chrome; every reconnect s4 makes by itself (the one after an
   enrollment, a retry after a dropped connection) keeps the grant of the
-  session it replaces, for the same host, port and application, in s4's
-  memory alone, and a session the user starts asks as ever (E35;
-  built). The new session is the facility's new session all
+  session it replaces, for the same host, port, verified host key and
+  application, in s4's memory alone, across at most eight such reconnects
+  and an hour by the wall clock from the user's grant (past either the
+  next session asks),
+  and a session the user starts asks as ever (E35; built). The new session is the facility's new session all
   the same: it starts knowing nothing (`Learned::Nothing`), never
   inherits what the old one was shown, so a session that showed the
   digests or paid still signs in nothing, and the next one signs in. A
@@ -3458,6 +3497,16 @@ nodes may ask the onion's mark of its proven calls, or of every request
     session, which names the device's account, and a sign-in's session,
     which must not be joined to it, share no connection, opened ahead or
     not.
+  - **The feed's connection:** every session open at once shares the
+    space's feed connection, which carries the window and the tree's
+    reads, nothing of the member's. Its reads start at the first
+    session's grant and stop when the last one open closes; that last
+    close also closes the connection (`Client::close_kept`), so the next
+    session's reads go on a new one, under its own key and circuit, one
+    rendezvous more. The gateway can tie the connection's open to the
+    first session and its close to the last, so sessions open at the same
+    time are joined through it; sessions that follow one another are not
+    (tested: `the_feed_connection_closes_with_the_last_session`).
   - **The expiry:** a call's expiry is the node's time plus 60 s, in the
     clear in the request, and the gateway answers that time. A gateway
     can mark each connection's answer (seconds apart, within
@@ -3479,7 +3528,11 @@ nodes may ask the onion's mark of its proven calls, or of every request
     after the first root holding a new leaf points at that newest member:
     a sign-in with no path waits for the space to list the device,
     reading the feed now and every 5 s for up to a minute (built
-    2026-11-20, E37: no drawn delay), so a device's
+    2026-11-20, E37: no drawn delay), refused before any read on a
+    session that named the device, and entered at most once in ten
+    minutes past the last wait's end however often a server asks (a
+    sign-in asked sooner answers at once why there is no path), so a
+    device's
     first sign-in after its invitation follows the leaf's root by a few
     seconds; a member tapping again shows the same, less tightly; the drawn delays spread the
     open times of several devices' spares into each other, and against a
@@ -3784,7 +3837,11 @@ phone; the Fairphone 6 (Snapdragon 7s Gen 3, Android 15) and the Pixel 1
   list, as many campus and corporate networks do. Pluggable transports
   (obfs4 through lyrebird, Snowflake, WebTunnel), which defeat deep packet
   inspection but each bring a Go binary run as a managed subprocess on
-  Android, are later work (`open.md`).
+  Android, are later work (`open.md`). Bridges kept that do not read at
+  the next start hold Tor back: no dial and no bootstrap until the user
+  sets bridges again (an empty list choosing the public relays), so the
+  app never reaches the public relays where bridges were wanted
+  (`Arti::hold`; tested: `held_tor_dials_and_bootstraps_nothing`).
 - **What a user behind a network that blocks Tor by inspection sees:**
   key-signed calls fall back to the clearnet where the space
   allows it and the user opted out for it; anonymous calls and the
@@ -4057,7 +4114,7 @@ against a no-flood baseline:
   circuit of the device's and a read before each proof would join the
   proofs through it (two exceptions, each once a device's life at a
   space: a sign-in waiting for its leaf, which reads the feed every 5 s
-  until it is listed, and the claim of a personal agent, which reads its
+  until it is listed, at most once in ten minutes, and the claim of a personal agent, which reads its
   home's tree while the kit is written down); a page that says more is due at once; `RootUnknown`
   or `RootStale` makes the feed due at once and halves the period.
 - **The root in the log:** the claim keeps the root, which the apply

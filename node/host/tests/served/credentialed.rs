@@ -268,9 +268,12 @@ impl Founded {
         request(&call, proof)
     }
 
-    /// An owner call of the ledger's `transfer`, by `secret`.
+    /// An owner call of the ledger's `transfer`, by `secret`, under a
+    /// payment key of its own.
     fn pay(&self, at: NodeNumber, secret: &Secret, to: &str, amount: u64) -> Credentialed {
-        let arguments = (to.as_bytes().to_vec(), amount);
+        static KEYS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        let key = [KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); 32];
+        let arguments = (to.as_bytes().to_vec(), amount, key);
         self.owned(at, secret, PAYMENTS, "transfer", arguments)
     }
 
@@ -1224,7 +1227,7 @@ fn the_device_librarys_proofs_are_admitted() {
         founded.write(PAYMENTS, "open", (name.clone(), digest));
         founded.write(PAYMENTS, "mint", (name, 50u64));
     }
-    let arguments = vos_light::transfer_arguments("shop", 20);
+    let arguments = vos_light::transfer_arguments("shop", 20, &[20; 32]);
     let pay = vos_light::Call::new(
         space,
         agent.0,

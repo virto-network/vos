@@ -136,6 +136,7 @@ fn every_type_crosses_its_parcelable_unchanged() {
                 seen: 1_700_000_000_000,
                 removed: false,
                 me: true,
+                adding: true,
             },
         );
         round_trip(
@@ -149,6 +150,7 @@ fn every_type_crosses_its_parcelable_unchanged() {
                     seen: 1_700_000_000_000,
                     removed: false,
                     me: false,
+                    adding: false,
                 }],
                 operations: vec![Notice {
                     pending: Pending::Remove,

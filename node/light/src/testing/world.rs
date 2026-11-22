@@ -316,6 +316,10 @@ pub struct State {
     /// space's tree enrolls as it answers, if any: a root superseded.
     pub refusing: std::collections::VecDeque<(Response, Option<[u8; 32]>)>,
     pub feed_reads: usize,
+    /// The ledger's transfers made, by their external id (the payer's
+    /// digest and key, `vos_wire::payments::external_id`): a second under
+    /// one id is refused `Paid`, as `Payments` refuses it.
+    pub paid: std::collections::HashMap<[u8; 32], (Vec<u8>, u64)>,
     /// The policy each personal agent is configured with at its claim,
     /// [`policy`] unless set.
     pub policy: Option<Policy>,
@@ -1149,6 +1153,10 @@ impl State {
             &query.signature,
         );
         let named = |id: MethodId| query.method == id;
+        if query.instance.0 != space.credentials && query.method.0 == crate::method_id("paid") {
+            let external = <[u8; 32]>::decode_exact(&query.arguments).unwrap();
+            return done(self.paid.contains_key(&external));
+        }
         if query.instance.0 == space.credentials {
             if named(credentials::FEED) {
                 self.feed_reads += 1;
@@ -1292,6 +1300,22 @@ impl State {
             host.claim(now, device, kit, policy)
                 .expect("the claim taken");
             return done(chosen);
+        }
+        if request.method.0 == crate::method_id("transfer") {
+            let (to, amount, key) =
+                <(Vec<u8>, u64, [u8; 32])>::decode_exact(&request.arguments).unwrap();
+            let owner = vos_wire::credentials::OwnerClaim::decode_exact(&request.claim)
+                .unwrap()
+                .owner;
+            let external = vos_wire::payments::external_id(&owner, &key);
+            if self.paid.contains_key(&external) {
+                return Outcome::Failed {
+                    code: vos_abi::abi::Failure::Handler,
+                    detail: vos_wire::payments::PaymentError::Paid.encode(),
+                };
+            }
+            self.paid.insert(external, (to, amount));
+            return done(());
         }
         if named(credentials::ENROLL_DEVICE) {
             let (member, _owner) =

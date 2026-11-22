@@ -105,9 +105,10 @@ pub fn method_id(name: &str) -> u32 {
     derive_id("vos/method/", name)
 }
 
-/// The arguments of the ledger's owner-guarded `transfer(to, amount)`,
-/// which pays from the account of the digest the proof states: the
-/// payee's name as the codec writes bytes, then the amount.
-pub fn transfer_arguments(to: &str, amount: u64) -> Vec<u8> {
-    (to.as_bytes().to_vec(), amount).encode()
+/// The arguments of the ledger's owner-guarded `transfer(to, amount,
+/// key)`, which pays from the account of the digest the proof states, once
+/// under `key`: the payee's name as the codec writes bytes, the amount,
+/// then the key.
+pub fn transfer_arguments(to: &str, amount: u64, key: &[u8; 32]) -> Vec<u8> {
+    (to.as_bytes().to_vec(), amount, *key).encode()
 }

@@ -759,10 +759,15 @@ impl DeviceGroup {
     /// Whether the pending candidate adds a device: one whose add is
     /// undecided, which is no other live device yet.
     pub fn adding(&self) -> bool {
+        self.added().is_some()
+    }
+
+    /// The device the pending candidate adds, while its add is undecided.
+    pub fn added(&self) -> Option<&vos_wire::personal::NewDevice> {
         self.state
             .pending
             .as_ref()
-            .is_some_and(|pending| pending.effect.add.is_some())
+            .and_then(|pending| pending.effect.add.as_ref())
     }
 
     /// The confirmed epoch: the one data is sealed under.

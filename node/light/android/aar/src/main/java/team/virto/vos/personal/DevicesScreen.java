@@ -245,7 +245,8 @@ final class DevicesScreen extends Screen {
   private int others() {
     int others = 0;
     for (Device device : devices) {
-      others += !device.me && !device.removed ? 1 : 0;
+      // A device whose add is undecided is no other live one: void, it leaves the set.
+      others += !device.me && !device.removed && !device.adding ? 1 : 0;
     }
     return others;
   }
@@ -257,8 +258,9 @@ final class DevicesScreen extends Screen {
         "This phone removes itself from your personal space now. Your other devices finish it:"
             + " the next one you open asks you to commit it. This phone keeps nothing of the"
             + " space: its copy of your data, its keys to it and its recovery state are cleared,"
-            + " and its admin key signs nothing your agent takes. To come back, pair it again from"
-            + " another of your devices.",
+            + " and its admin key signs nothing your agent takes. Committing it also ends this"
+            + " phone's memberships in every other space: its sign-ins there stop working. To come"
+            + " back, pair it again from another of your devices.",
         "Leave",
         () ->
             app.run(

@@ -371,9 +371,11 @@ The scale results are in `core-model.md` §14, "The scale test".
   declared ready).
 - **The admin key's attestation** [known limit, dated 2026-11-18,
   `light-node.md` §3.5]: a device's admin class and its hardware and
-  verified-boot flags are its own report (the keystore's `KeyInfo`), not
-  an attestation chain another device verified: a modified client can
-  claim a strong admin. Generating the key under an attestation challenge
+  hardware flag are its own report (the keystore's `KeyInfo`), not an
+  attestation chain another device verified: a modified client can claim
+  a strong admin. The verified-boot flag is not read at all (s4's bridge
+  reports the security level alone, so it is `false` on every device) and
+  no screen shows it: E24's boot half is not built. Generating the key under an attestation challenge
   bound to the agent and the device, and each device checking the chain
   (its security level, the authentication it requires, the root of trust's
   verified-boot state), is later work; so is the PIN-authenticated delayed
@@ -583,6 +585,31 @@ are under "Identity and privacy" above.
 - **Proof bytes over Tor:** the upload dominates a proven call's latency
   over an onion circuit (`light-node.md` §6.3); smaller device proofs and
   an upload split over several circuits are the levers.
+- **A `once` sign-in's guard is the enrolling server's word** [known
+  limit, dated 2026-11-22, `light-node.md` §6.2]: the facility reads a
+  method's `once` from what the enrollment pinned, as the enrolling
+  server declared it; the proof does not bind it and the node spends by
+  its own schema. A server that pinned a once-guarded method as `once:
+  false` gets the member's one admission spent with no "Spend your one …?"
+  on the form. And a `once` call whose answer is lost after the proof
+  left has spent the admission with nothing kept to send again: the next
+  try is refused `Once`. Reading each method's guard from the node's
+  schema before the form (a node read) and keeping a once call's request
+  to send again until its expiry are later work.
+- **"Not paid" is the answering node's word** [known limit, dated
+  2026-11-22, `light-node.md` §5.2]: a pending payment past its expiry is
+  said not paid, and forgotten, on a linearizable `paid` read, so a
+  replica that is behind does not answer for the space; but an operator
+  that answers it can say "no" for a transfer that ran, and a user who
+  then pays again pays twice. A read answered by a signed state root
+  (node-signed answers, above) would close it.
+- **The ledger's payment keys grow with its payments** [known limit,
+  dated 2026-11-22, `light-node.md` §5.2]: `Payments` keeps each
+  transfer's external id (32 bytes) for good, beside the transfer's own
+  row, which it keeps for good too, so a retry under a key years later is
+  still refused `Paid`. Bounding both (pruning by age with a stated
+  window past which a key may pay again) waits for the ledger's history
+  horizon.
 
 ## Private payments (P2)
 

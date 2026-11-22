@@ -71,9 +71,18 @@ fn key_answer(
 }
 
 impl Prompts for Lent {
-    fn confirm(&self, form: Form) -> Answer {
+    fn confirm(&self, mut form: Form) -> Answer {
         attached(|env| {
-            let form = form.to_java(env)?;
+            let java = form.to_java(env);
+            // The rows and fields (a kit's words shown, say) zeroized once
+            // the Java form holds them; that copy is the collector's.
+            for (_, value) in &mut form.rows {
+                zeroize::Zeroize::zeroize(value);
+            }
+            for field in &mut form.fields {
+                zeroize::Zeroize::zeroize(&mut field.value);
+            }
+            let form = java?;
             let answer = env
                 .call_method(
                     &self.prompts,

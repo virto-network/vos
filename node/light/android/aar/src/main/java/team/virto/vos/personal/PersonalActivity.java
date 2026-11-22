@@ -202,7 +202,11 @@ public final class PersonalActivity extends Activity {
   @Override
   protected void onStop() {
     // The app in the background: the kit a restore holds is wiped, entered again on return, and
-    // `:vos` keeps no watcher of a screen not shown.
+    // `:vos` keeps no watcher of a screen not shown. A form a flow of the sitting waits on is
+    // declined, so the flow ends and drops the kit it holds too.
+    if (sitting) {
+      forms.dismissAll();
+    }
     forgetKit();
     background(personal -> personal.watch(null));
     VosClient.get(this).stopped();
@@ -560,25 +564,32 @@ public final class PersonalActivity extends Activity {
     if (refused.why == Why.DECLINED || refused.why == Why.CANCELLED) {
       return;
     }
-    new AlertDialog.Builder(this)
-        .setTitle("Not done")
-        .setMessage(Words.why(refused))
-        .setPositiveButton("OK", null)
-        .show();
+    shown(
+        new AlertDialog.Builder(this)
+            .setTitle("Not done")
+            .setMessage(Words.why(refused))
+            .setPositiveButton("OK", null));
   }
 
   void say(String message) {
-    new AlertDialog.Builder(this).setMessage(message).setPositiveButton("OK", null).show();
+    shown(new AlertDialog.Builder(this).setMessage(message).setPositiveButton("OK", null));
   }
 
   /** Ask before {@code then}. */
   void ask(String title, String message, String yes, Runnable then) {
-    new AlertDialog.Builder(this)
-        .setTitle(title)
-        .setMessage(message)
-        .setPositiveButton(yes, (dialog, which) -> then.run())
-        .setNegativeButton("Cancel", null)
-        .show();
+    shown(
+        new AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setPositiveButton(yes, (dialog, which) -> then.run())
+            .setNegativeButton("Cancel", null));
+  }
+
+  /** A plain dialog shown, kept from screenshots as the screens are. */
+  private void shown(AlertDialog.Builder builder) {
+    AlertDialog dialog = builder.create();
+    secure(this, dialog.getWindow());
+    dialog.show();
   }
 
   int dp(int value) {

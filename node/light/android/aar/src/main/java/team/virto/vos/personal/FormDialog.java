@@ -123,6 +123,7 @@ final class FormDialog implements VosPrompts.Forms {
               | (check ? 0 : InputType.TYPE_TEXT_FLAG_MULTI_LINE)
               | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
       field.setImeOptions(EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
+      Screen.noAutofill(field);
       body.addView(text(row.label, false));
       body.addView(field);
       fields.add(field);

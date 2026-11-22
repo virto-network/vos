@@ -198,7 +198,13 @@ searched for the secret by its `tests/leaks.rs`.
   UI's stop, and `foreground(false)`), when the UI's process dies (its
   token's death), ten minutes after its entry at most (a timer, not a
   check at the next use), and when a flow finds it not a kit or not the
-  space's. The other kit flows ask for it at each call. The form that
+  space's. A restore screen's flow in flight that holds a kit is ended at
+  the same deadlines: its next prompt is declined, and the UI's stop
+  declines the form it waits on; a kit flow outside that screen holds its
+  kit until it ends. "Zeroized" is the `:vos` side's: the words a form
+  shows or an answer carries are zeroized there once handed over or read,
+  while their Java copies (the Binder parcels, the form's text in the UI)
+  are left to the collector. The other kit flows ask for it at each call. The form that
   takes the words gives the keyboard no suggestion and nothing to learn
   (`IME_FLAG_NO_PERSONALIZED_LEARNING`, a visible-password field), and the
   words it checks as they are typed never leave the form.
@@ -343,8 +349,10 @@ searched for the secret by its `tests/leaks.rs`.
 - **The feed is read on a jittered timer of its own** (30 s, between
   15 s and 45 s), not because a proof is about to be made, with two
   exceptions, each about once a device's life at a space: a first sign-in
-  waiting for its leaf reads it every 5 s for up to a minute and proves on
-  the read that lists it, and a personal agent's claim reads its home's
+  waiting for its leaf reads it at once and then every 5 s for up to a
+  minute and proves on the read that lists it (refused before any
+  read on a session that named the device, and entered at most once in
+  ten minutes past the last wait's end, however often a server asks), and a personal agent's claim reads its home's
   tree while the kit is written down (`light-node.md` §6.2, §3.8). The
   feed's connection is one circuit for as long as it is open, and a read
   just before each proof would join the proofs through it. A `RootUnknown` or

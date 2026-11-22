@@ -198,6 +198,9 @@ pub struct Arti {
     dormant: std::sync::atomic::AtomicBool,
     /// What its last bootstrap found, and why it failed.
     state: Mutex<(crate::personal::Tor, String)>,
+    /// Why Tor is held back, if it is: no dial and no bootstrap until the
+    /// user sets bridges (none among them: the public relays).
+    held: Mutex<Option<String>>,
 }
 
 impl Arti {
@@ -210,6 +213,7 @@ impl Arti {
             tor: RwLock::new(None),
             dormant: Default::default(),
             state: Mutex::default(),
+            held: Mutex::default(),
         });
         arti.rebuild(bridges)?;
         Ok(arti)
@@ -236,6 +240,7 @@ impl Arti {
         let candidate = self.build(bridges)?;
         self.found(candidate.bootstrap().await)?;
         *self.tor.write().unwrap_or_else(|e| e.into_inner()) = Some(candidate);
+        *crate::lock(&self.held) = None;
         Ok(())
     }
 
@@ -246,6 +251,9 @@ impl Arti {
     /// Bootstrap the arti built last: its failure named (a wrong clock, a
     /// bridge that does not answer, a network that blocks Tor).
     pub async fn bootstrap(&self) -> Result<(), BootstrapError> {
+        if let Some(why) = self.held() {
+            return Err(BootstrapError::Tor(why));
+        }
         let bootstrapped = match self.current() {
             Some(tor) => tor.bootstrap().await,
             None => Err(BootstrapError::Tor("not built".into())),
@@ -263,9 +271,18 @@ impl Arti {
         bootstrapped
     }
 
-    /// Tor held back for `why`: no bootstrap is tried until the user asks.
+    /// Tor held back for `why`: no dial and no bootstrap until the user
+    /// sets bridges, so arti never reaches the public relays where bridges
+    /// were wanted.
     pub fn hold(&self, why: String) {
+        let why = format!("{why}: set the bridges again");
+        *crate::lock(&self.held) = Some(why.clone());
         *crate::lock(&self.state) = (crate::personal::Tor::Blocked, why);
+    }
+
+    /// Why Tor is held back, if it is.
+    fn held(&self) -> Option<String> {
+        crate::lock(&self.held).clone()
     }
 
     /// Tor's state as its last bootstrap found it, and why it is blocked.
@@ -276,6 +293,9 @@ impl Arti {
 
 impl Dial for Arti {
     fn dial(&self, target: &Target, circuit: Circuit) -> Dialing {
+        if let Some(why) = self.held() {
+            return Box::pin(async move { Err(io::Error::other(format!("Tor is held: {why}"))) });
+        }
         match self.current() {
             Some(tor) => tor.dial(target, circuit),
             None => Box::pin(async { Err(io::Error::other("Tor is not built")) }),
@@ -289,6 +309,9 @@ impl Dial for Arti {
         }
     }
 }
+
+/// How long a first contact's onion stream may take to open.
+const ONION_STREAM_WITHIN: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The facility's client of its spaces, and what it keeps of their routes.
 pub struct Net {
@@ -374,7 +397,9 @@ impl Net {
     }
 
     /// A stream to the onion service at `address`, `port`, on a circuit of
-    /// its own: the s4 session's, to a gateway's onion.
+    /// its own: the s4 session's, to a gateway's onion; refused past
+    /// [`ONION_STREAM_WITHIN`], so a rendezvous that hangs holds no Binder
+    /// call for good.
     pub async fn onion_stream(
         &self,
         address: &str,
@@ -387,7 +412,9 @@ impl Net {
             address: address.to_ascii_lowercase(),
             port,
         };
-        self.dial.dial(&target, Circuit::new()).await
+        tokio::time::timeout(ONION_STREAM_WITHIN, self.dial.dial(&target, Circuit::new()))
+            .await
+            .map_err(|_| io::Error::other("the onion service did not answer in time"))?
     }
 
     /// The client, for the requests the light node's flows make.
@@ -512,11 +539,16 @@ impl Net {
     }
 
     /// Opt `space`'s key-signed calls out of Tor, the chrome having shown
-    /// [`OPT_OUT_WARNING`]; or back on Tor. Kept.
-    pub fn opt_out(&self, space: SpaceId, out: bool) -> Result<(), Refused> {
-        let mut routes = self.client.routes(&space).ok_or(Refused::UnknownSpace)?;
+    /// [`OPT_OUT_WARNING`]; or back on Tor. Kept: a write that fails is
+    /// refused, so a kept opt-out never returns at the next start unsaid.
+    pub fn opt_out(&self, space: SpaceId, out: bool) -> Result<(), String> {
+        let mut routes = self
+            .client
+            .routes(&space)
+            .ok_or(Refused::UnknownSpace)
+            .map_err(|refusal| refusal.to_string())?;
         if out {
-            routes.opt_out()?;
+            routes.opt_out().map_err(|refusal| refusal.to_string())?;
         } else {
             routes.opt_in();
         }
@@ -524,8 +556,7 @@ impl Net {
         self.client.set_space(space, routes);
         let mut state = self.state();
         state.spaces.entry(space).or_default().opted_out = opted_out;
-        let _ = self.keep(&state, &space);
-        Ok(())
+        self.keep(&state, &space)
     }
 
     /// Whether the user opted `space` out of Tor.
@@ -645,5 +676,32 @@ impl Net {
             Some(arti) => arti.bootstrap().await.map_err(|error| error.to_string()),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Held back (bridges kept that do not read), arti dials nothing and
+    /// bootstraps nothing, so it never reaches the public relays where
+    /// bridges were wanted; bridges set lift the hold.
+    #[tokio::test]
+    async fn held_tor_dials_and_bootstraps_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let arti = Arti::new(directory.path().join("tor"), &[]).unwrap();
+        arti.hold("the bridges kept do not read".into());
+        let target = Target::Onion {
+            address: vos_light::tor::onion_address(&[7; 32]),
+            port: 22,
+        };
+        let dialed = arti.dial(&target, Circuit::new()).await;
+        let Err(error) = dialed else {
+            panic!("a held Tor dialed")
+        };
+        assert!(error.to_string().contains("held"));
+        let bootstrapped = arti.bootstrap().await.unwrap_err();
+        assert!(bootstrapped.to_string().contains("set the bridges"));
+        assert_eq!(arti.state().0, crate::personal::Tor::Blocked);
     }
 }

@@ -359,7 +359,11 @@ fn no_carrier_through_the_onion_holds_a_members_device_secret_or_its_place() {
     let shop = tree::digest(&tree::compress(&Tag::Owner.block(), &other(1)));
     space.open_account("device", owner, 50).unwrap();
     space.open_account("shop", shop, 0).unwrap();
-    let pay = call_of(PAYMENTS, "transfer", (b"shop".to_vec(), 20u64).encode());
+    let pay = call_of(
+        PAYMENTS,
+        "transfer",
+        (b"shop".to_vec(), 20u64, [20u8; 32]).encode(),
+    );
     let paid = prover.prove_owner(&secret, &pay, &owner_program).unwrap();
     let answer = proven(&pay, &paid);
     ran(&answer);

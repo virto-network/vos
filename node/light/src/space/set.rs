@@ -120,6 +120,9 @@ pub struct Device {
     pub seen: u64,
     pub removed: bool,
     pub me: bool,
+    /// Its add waits for the pending candidate's votes: no other live
+    /// device of the set yet.
+    pub adding: bool,
 }
 
 impl<H: Host> Personal<H> {
@@ -144,6 +147,11 @@ impl<H: Host> Personal<H> {
         }
         let views = self.views(&mut held)?;
         self.adopt_admin(&mut held, &views)?;
+        let added = held
+            .group
+            .as_ref()
+            .and_then(crate::group::DeviceGroup::added)
+            .cloned();
         Ok(views
             .into_iter()
             .map(|view| Device {
@@ -158,6 +166,7 @@ impl<H: Host> Personal<H> {
                     view.removal.is_some() || view.standing == Standing::Removed
                 },
                 me: Some(view.id) == me,
+                adding: added.as_ref() == Some(&view.device.keys),
             })
             .collect())
     }
