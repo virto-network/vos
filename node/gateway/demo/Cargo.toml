@@ -18,7 +18,7 @@ path = "src/main.rs"
 [dependencies]
 vos-gateway = { path = "..", features = ["tor"] }
 # The screens' app on the SSH port.
-s4-server = { git = "https://codeberg.org/Virto/s4", rev = "345d4e49a4a90d3b8a4a56b51bde9be888806348" }
+s4-server = { git = "https://codeberg.org/Virto/s4", rev = "da9f9c72a640ba89bc3a500719edee9ec0decdbc" }
 vos-node = { path = "../../host" }
 vos-testkit = { path = "../../../agent/testkit" }
 # The test homes' pools of personal agents.
@@ -43,9 +43,9 @@ qrcode = { version = "0.15", default-features = false, features = ["std"] }
 [dev-dependencies]
 # The headless client: s4's protocol, and this tree's `vos.credential`
 # facility.
-s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "345d4e49a4a90d3b8a4a56b51bde9be888806348" }
+s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "da9f9c72a640ba89bc3a500719edee9ec0decdbc" }
 vos-facility = { path = "../../light/android", features = ["testing"] }
-s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "345d4e49a4a90d3b8a4a56b51bde9be888806348" }
+s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "da9f9c72a640ba89bc3a500719edee9ec0decdbc" }
 # The carrier audit's search over what the onion carried, and the tests'
 # waits.
 vos-checker = { path = "../../checker" }

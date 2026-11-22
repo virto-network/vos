@@ -48,8 +48,8 @@ testing = ["vos-light/testing"]
 [dependencies]
 # The facility's protocol and its Binder contract: s4's, by git revision,
 # as the gateway names s4-server.
-s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "345d4e49a4a90d3b8a4a56b51bde9be888806348" }
-s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "345d4e49a4a90d3b8a4a56b51bde9be888806348" }
+s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "da9f9c72a640ba89bc3a500719edee9ec0decdbc" }
+s4-credential-contract = { git = "https://codeberg.org/Virto/s4", rev = "da9f9c72a640ba89bc3a500719edee9ec0decdbc" }
 # The light node, with its device library: the secret's derivation, the
 # proofs, the node-API requests and the path kept apart from proofs.
 vos-light = { path = "..", features = ["tor"] }
@@ -81,7 +81,7 @@ vos-testkit = { path = "../../../agent/testkit" }
 # program over the interpreter, its work applied as accumulate applies it.
 vos-exec = { path = "../../exec" }
 vos-pvm = { path = "../../../pvm/runtime" }
-s4-server = { git = "https://codeberg.org/Virto/s4", rev = "345d4e49a4a90d3b8a4a56b51bde9be888806348" }
+s4-server = { git = "https://codeberg.org/Virto/s4", rev = "da9f9c72a640ba89bc3a500719edee9ec0decdbc" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
 tempfile = "3"
 hmac = "0.12"
