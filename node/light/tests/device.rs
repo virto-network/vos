@@ -235,11 +235,17 @@ fn a_method_id_and_a_transfer_s_arguments_are_the_node_s() {
     let arguments = vos_light::transfer_arguments("bob", 7, &[7; 32]);
     assert_eq!(
         arguments,
-        [&3u32.to_le_bytes()[..], b"bob", &7u64.to_le_bytes()].concat()
+        [
+            &3u32.to_le_bytes()[..],
+            b"bob",
+            &7u64.to_le_bytes(),
+            &[7; 32]
+        ]
+        .concat()
     );
     assert_eq!(
-        <(Vec<u8>, u64)>::decode(&arguments).unwrap(),
-        ((b"bob".to_vec(), 7), arguments.len())
+        <(Vec<u8>, u64, [u8; 32])>::decode(&arguments).unwrap(),
+        ((b"bob".to_vec(), 7, [7; 32]), arguments.len())
     );
 }
 
