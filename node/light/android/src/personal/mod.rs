@@ -20,7 +20,7 @@ use vos_light::route::{Purpose, Route};
 use vos_light::space::{self, AdminKey, Approval, Card, Enrolled, Error, Host, Proof};
 
 use vos_wire::credentials::Onion;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::job::{Passed, Personal};
 use crate::kept::Kept;
@@ -307,6 +307,8 @@ pub struct Asked<'a> {
     /// The kit this flow entered and when, for the sitting to hold once it
     /// is done, for what is left of its life from the entry.
     entered: Mutex<Option<(Entered, Instant)>>,
+    /// The sitting's count of opens and closes when the flow began.
+    opened: u64,
 }
 
 impl<'a> Asked<'a> {
@@ -315,14 +317,59 @@ impl<'a> Asked<'a> {
             prompts,
             sitting: None,
             entered: Mutex::new(None),
+            opened: 0,
         }
     }
 
     fn within(prompts: &'a dyn Prompts, sitting: &'a Sitting) -> Self {
         Self {
             sitting: Some(sitting),
+            opened: sitting.lock().opened,
             ..Self::new(prompts)
         }
+    }
+
+    /// Whether the flow's sitting ended under it (closed, or the app in the
+    /// background), or the kit it entered outlived its life: every further
+    /// prompt is declined then, so the flow ends and drops the kit it holds
+    /// at the sitting's own deadlines.
+    fn ended(&self) -> bool {
+        let Some(sitting) = self.sitting else {
+            return false;
+        };
+        let (opened, life_ms) = {
+            let holding = sitting.lock();
+            (holding.opened, holding.life_ms.unwrap_or(KIT_LIFE_MS))
+        };
+        let outlived = crate::lock(&self.entered)
+            .as_ref()
+            .is_some_and(|(_, entry)| entry.elapsed() >= Duration::from_millis(life_ms));
+        opened != self.opened || outlived
+    }
+
+    /// `form` asked of the chrome, unless the flow's sitting ended.
+    fn confirm(&self, form: Form) -> Answer {
+        if self.ended() {
+            return Answer::Declined;
+        }
+        self.prompts.confirm(form)
+    }
+
+    /// A key's prompt, unless the flow's sitting ended.
+    fn key(&self, ask: impl FnOnce(&dyn Prompts) -> KeyAnswer) -> KeyAnswer {
+        if self.ended() {
+            return KeyAnswer::Declined;
+        }
+        ask(self.prompts)
+    }
+}
+
+/// The user's answer's values zeroized: the words a kit is entered or
+/// checked with. The Binder parcel and the UI's text they came from are
+/// Java objects, the collector's to reclaim.
+fn wipe(mut values: Vec<String>) {
+    for value in &mut values {
+        value.zeroize();
     }
 }
 
@@ -389,14 +436,14 @@ fn thirty_two(answer: KeyAnswer, what: &str) -> Result<Zeroizing<[u8; 32]>, Erro
 
 impl Asked<'_> {
     fn shown(&self, form: Form) -> bool {
-        matches!(self.prompts.confirm(form), Answer::Confirmed { .. })
+        matches!(self.confirm(form), Answer::Confirmed { .. })
     }
 
     /// Two of the phrase's words asked back, from what the user wrote:
     /// whether both are right; `None` when the user declined.
     fn checked(&self, words: &[&str]) -> Option<bool> {
         let (first, second) = two_of(words.len());
-        let answer = self.prompts.confirm(Form {
+        let answer = self.confirm(Form {
             title: CHECK_PHRASE.into(),
             detail: format!(
                 "From what you wrote down, words {} and {}: so a word written wrong is found \
@@ -420,6 +467,7 @@ impl Asked<'_> {
             return None;
         };
         let given: Vec<Zeroizing<String>> = values.iter().map(|value| normalized(value)).collect();
+        wipe(values);
         Some(
             given.len() == 2
                 && given[0].as_str() == words[first]
@@ -510,7 +558,7 @@ impl space::Prompts for Asked<'_> {
         if let Some(words) = self.sitting.and_then(Sitting::words) {
             return Some(words);
         }
-        let answer = self.prompts.confirm(Form {
+        let answer = self.confirm(Form {
             title: ENTER_PHRASE.into(),
             detail: "The 24 words you wrote down, in order, separated by spaces.".into(),
             rows: Vec::new(),
@@ -526,6 +574,7 @@ impl space::Prompts for Asked<'_> {
             return None;
         };
         let words = normalized(&Zeroizing::new(values.join(" ")));
+        wipe(values);
         if self.sitting.is_some() {
             *crate::lock(&self.entered) = Some((Entered::Words(words.clone()), Instant::now()));
         }
@@ -589,7 +638,7 @@ impl space::Prompts for Asked<'_> {
     }
 
     fn create_source(&self) -> Result<Vec<u8>, Error> {
-        let key = key_answer(self.prompts.create_key(Kind::Keystore))?;
+        let key = key_answer(self.key(|prompts| prompts.create_key(Kind::Keystore)))?;
         Reference::from_bytes(&[&[Kind::Keystore as u8], &key[..]].concat())
             .map(|reference| reference.to_bytes())
             .ok_or_else(|| Error::Source("the source's key handle".into()))
@@ -604,14 +653,13 @@ impl space::Prompts for Asked<'_> {
             .ok_or_else(|| Error::Source("the source's key handle".into()))?;
         let bytes = reference.to_bytes();
         thirty_two(
-            self.prompts
-                .evaluate_key(reference.kind(), &bytes[1..], input),
+            self.key(|prompts| prompts.evaluate_key(reference.kind(), &bytes[1..], input)),
             "the source's output",
         )
     }
 
     fn create_kit_key(&self) -> Result<Vec<u8>, Error> {
-        key_answer(self.prompts.create_key(Kind::Kit)).map(|id| id.to_vec())
+        key_answer(self.key(|prompts| prompts.create_key(Kind::Kit))).map(|id| id.to_vec())
     }
 
     /// The kit's security key's output; for its discoverable credential
@@ -622,7 +670,7 @@ impl space::Prompts for Asked<'_> {
             return Ok(secret);
         }
         let secret = thirty_two(
-            self.prompts.evaluate_key(Kind::Kit, id, salt),
+            self.key(|prompts| prompts.evaluate_key(Kind::Kit, id, salt)),
             "the security key's output",
         )?;
         if entered {
@@ -636,7 +684,7 @@ impl space::Prompts for Asked<'_> {
     }
 
     fn create_admin(&self) -> Result<AdminKey, Error> {
-        let bytes = key_answer(self.prompts.create_key(Kind::Admin))?;
+        let bytes = key_answer(self.key(|prompts| prompts.create_key(Kind::Admin)))?;
         let (key, flags) = bytes
             .split_first_chunk::<32>()
             .ok_or_else(|| Error::Source("the admin key's answer is short".into()))?;
@@ -649,7 +697,7 @@ impl space::Prompts for Asked<'_> {
     }
 
     fn sign_admin(&self, key: &[u8; 32], message: &[u8]) -> Result<[u8; 64], Error> {
-        let bytes = key_answer(self.prompts.sign_key(Kind::Admin, key, message))?;
+        let bytes = key_answer(self.key(|prompts| prompts.sign_key(Kind::Admin, key, message)))?;
         <[u8; 64]>::try_from(bytes.as_slice())
             .map_err(|_| Error::Source("a signature is 64 bytes".into()))
     }

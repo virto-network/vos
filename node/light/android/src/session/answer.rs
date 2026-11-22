@@ -26,7 +26,7 @@ pub(super) fn root_refused(answer: &[u8]) -> Option<bool> {
 }
 
 /// The node's refusal an answer's body carries, if it is one.
-fn node_refusal(body: &[u8]) -> Option<abi::Refusal> {
+pub(super) fn node_refusal(body: &[u8]) -> Option<abi::Refusal> {
     match <Response as vos_abi::Decode>::decode_exact(body) {
         Some(Response::Refused(refusal)) => Some(refusal),
         _ => None,

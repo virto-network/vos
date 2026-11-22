@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -271,8 +270,6 @@ struct Inner {
     dial: Arc<dyn Dial>,
     config: Config,
     state: Mutex<State>,
-    /// Where the next connection's onion is taken from in a pinned set.
-    next: AtomicU64,
     /// What it opened, each hour.
     tally: Mutex<Tally>,
 }
@@ -300,7 +297,6 @@ impl Client {
                 dial,
                 config,
                 state: Mutex::new(State::default()),
-                next: AtomicU64::new(rand_u64()),
                 tally: Mutex::new(Tally::default()),
             }),
         };
@@ -580,6 +576,27 @@ impl Client {
         .await;
         connection.close();
         asked
+    }
+
+    /// The kept-open connection of `purpose` to `space` closed, at once or,
+    /// while a request holds it, once that request is done: the next
+    /// request of that purpose opens another, under its own key and circuit.
+    pub fn close_kept(&self, space: SpaceId, purpose: Purpose) {
+        let Some(slot) = self.state().groups.get(&(purpose, space)).cloned() else {
+            return;
+        };
+        let close = |kept: &mut Kept| {
+            if let Some(held) = kept.held.take() {
+                held.connection.close();
+            }
+        };
+        if let Ok(mut kept) = slot.try_lock() {
+            close(&mut kept);
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { close(&mut *slot.lock().await) });
+        }
     }
 
     /// A kept-open group's connection, open under the space's current
@@ -1038,7 +1055,9 @@ impl Client {
         let mut last = String::from("no attempt");
         let mut unpublished = true;
         let attempts = config.attempts.max(1) as u64;
-        let turn = self.inner.next.fetch_add(attempts + 1, Ordering::Relaxed);
+        // The first onion drawn for each connection, so no onion of a set of
+        // two or four carries every connection of the device.
+        let turn = rand_u64();
         for attempt in 0..=attempts {
             if attempt == attempts {
                 // Every attempt found the service unpublished: once more,
@@ -1051,7 +1070,7 @@ impl Client {
                     return Err(Error::Dormant);
                 }
             }
-            let (target, host_key) = Self::target(routes, route, turn + attempt)?;
+            let (target, host_key) = Self::target(routes, route, turn.wrapping_add(attempt))?;
             let circuit = Circuit::new();
             let opened = async {
                 let stream =
@@ -1103,7 +1122,9 @@ impl Client {
         let mut last = io::Error::other("no attempt");
         let mut unpublished = true;
         let attempts = config.attempts.max(1) as u64;
-        let turn = self.inner.next.fetch_add(attempts + 1, Ordering::Relaxed);
+        // The first onion drawn for each connection, so no onion of a set of
+        // two or four carries every connection of the device.
+        let turn = rand_u64();
         for attempt in 0..=attempts {
             if attempt == attempts {
                 if !unpublished {
@@ -1114,7 +1135,7 @@ impl Client {
             if self.is_dormant() {
                 return Err(Error::Dormant);
             }
-            let (target, host_key) = Self::target(routes, route, turn + attempt)?;
+            let (target, host_key) = Self::target(routes, route, turn.wrapping_add(attempt))?;
             let dialed = tokio::time::timeout(
                 config.connect,
                 self.inner.dial.dial(&target, Circuit::new()),

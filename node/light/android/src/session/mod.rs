@@ -21,23 +21,23 @@ use vos_light::{
 };
 use vos_wire::ingress::DeviceWindow;
 
-use crate::chrome::{Answer, Chrome, Field, Form, short};
+use crate::chrome::{Answer, Chrome, Form, short};
 use crate::enrollment::{Agent, Enrollment, Guard, Method, Origin, Store, write_private};
 use crate::job::now_ms;
 use crate::net::{Net, Pinned};
 use crate::source::{Kind, Reference, Source, SourceError};
 use crate::warm::{self, Programs, Warming};
 use crate::{
-    Code, Enroll, Enrolled, EnrolledSpace, Gateway, Operation, Outcome, Paid, Pay, Refusal, SignIn,
-    SignedIn, StreamTarget, Synced, refused,
+    Code, Enroll, Enrolled, EnrolledSpace, Gateway, Operation, Outcome, Refusal, SignIn, SignedIn,
+    StreamTarget, Synced, refused,
 };
-use s4_credential_contract::{TRANSFER, account};
 
 /// How far past the node's time a proof's expiry is set: within VOS's
 /// `CREDENTIAL_HORIZON_MS`, which ingress allows, room for the proof and
 /// the trip.
 mod answer;
 mod clock;
+mod pay;
 
 use answer::root_refused;
 pub(crate) use answer::update_refused;
@@ -88,11 +88,16 @@ const REFRESH_EVERY: Duration = Duration::from_secs(30);
 /// meanwhile.
 const LISTED_WAIT: Duration = Duration::from_secs(60);
 const LISTED_EVERY: Duration = Duration::from_secs(5);
+/// The least time between the end of one such wait at a space and the
+/// start of the next.
+const LISTED_AGAIN: Duration = Duration::from_secs(10 * 60);
 /// What a sign-in says while it waits for the space to list the device.
 pub const WAITING_FOR_LIST: &str =
     "Waiting for the space to list your device (the operator's invitation)…";
 /// Why a sign-in found no leaf of the member's after its wait.
-const NOT_INVITED: &str = "Your device is enrolled; the operator has not invited it yet.";
+const NOT_INVITED: &str = "Your device is enrolled, and the space does not list it: the operator \
+                           has not invited it yet, or your other devices ended its membership \
+                           (a phone that left your personal space).";
 const REFRESH_SPREAD: Duration = Duration::from_secs(5);
 
 /// The release artifacts of VOS's stock kernels, each an encoded
@@ -148,8 +153,9 @@ pub(crate) struct Inner {
     device_proof: Mutex<()>,
     tick: Duration,
     /// How long a sign-in with no path waits for the space to list the
-    /// member, and how often it reads the feed meanwhile.
-    listed: (Duration, Duration),
+    /// member, how often it reads the feed meanwhile, and the least time
+    /// from one such wait's end to the next one's start.
+    listed: (Duration, Duration, Duration),
     /// The one client every request to a space goes through.
     pub(crate) net: Arc<Net>,
     /// Each enrollment's tree and its refresher, by origin, for the
@@ -190,26 +196,21 @@ struct Tree {
     /// When a `refresh` request makes the feed due, at a drawn delay.
     unknown_at: Mutex<Option<Instant>>,
     last_refresh: Mutex<Option<Instant>>,
-    /// The last payment made: its confirmed values and its request, sent
-    /// again as it is for the same values while it may still run.
-    payment: Mutex<Option<Payment>>,
+    /// The last payment proved, sent again as it is for the same form
+    /// while it may still run.
+    payment: Mutex<Option<pay::Payment>>,
     refresher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The sessions holding it: its refresher stops with the last.
     sessions: AtomicUsize,
     /// The feed's reads made: a sign-in whose root was refused waits for
     /// the next.
     reads: AtomicUsize,
+    /// When a sign-in last began to wait for the member's leaf.
+    listed: Mutex<Option<Instant>>,
     /// The member's path at the newest root the keeper holds, as its last
     /// read left it: a sign-in takes it without waiting for a read in
     /// flight.
     witness: Mutex<Option<AuthWitness>>,
-}
-
-#[derive(Clone)]
-struct Payment {
-    values: (String, u64),
-    expires_ms: u64,
-    request: Vec<u8>,
 }
 
 impl Tree {
@@ -247,7 +248,7 @@ pub(crate) fn pinned(enrollment: &Enrollment) -> Pinned {
         // the system's resolver.
         clearnet: enrollment
             .host_key
-            .filter(|_| !enrollment.host.to_ascii_lowercase().ends_with(".onion"))
+            .filter(|_| !host(&enrollment.host).ends_with(".onion"))
             .map(|key| Clearnet {
                 host: enrollment.host.clone(),
                 port: enrollment.port,
@@ -284,7 +285,7 @@ impl Facility {
                 programs: Programs::default(),
                 device_proof: Mutex::new(()),
                 tick: TICK,
-                listed: (LISTED_WAIT, LISTED_EVERY),
+                listed: (LISTED_WAIT, LISTED_EVERY, LISTED_AGAIN),
                 net,
                 trees: Mutex::new(HashMap::new()),
                 personal: Mutex::new(None),
@@ -319,7 +320,15 @@ impl Facility {
     /// The same, a sign-in with no path waiting `wait` for its leaf and
     /// reading the feed `every` meanwhile (tests).
     pub fn with_listed_wait(mut self, wait: Duration, every: Duration) -> Self {
-        self.inner_mut().listed = (wait, every);
+        let again = self.inner.listed.2;
+        self.inner_mut().listed = (wait, every, again);
+        self
+    }
+
+    /// The same, a sign-in waiting for its leaf again no sooner than
+    /// `again` after the last wait's end (tests).
+    pub fn with_listed_again(mut self, again: Duration) -> Self {
+        self.inner_mut().listed.2 = again;
         self
     }
 
@@ -748,6 +757,7 @@ impl Inner {
                 refresher: Mutex::new(None),
                 sessions: AtomicUsize::new(0),
                 reads: AtomicUsize::new(0),
+                listed: Mutex::new(None),
                 witness,
             })
         })))
@@ -809,7 +819,9 @@ enum Learned {
 
 impl Drop for Session {
     /// Its clock's task stops and its spares close; the last session
-    /// holding a tree stops its refresher.
+    /// holding a tree stops its refresher and closes the space's feed
+    /// connection, so the next session's reads go on another and the feed
+    /// does not join the sessions that follow one another.
     fn drop(&mut self) {
         self.clock.stop();
         let Some(tree) = self.held.lock().expect("held poisoned").take() else {
@@ -818,6 +830,7 @@ impl Drop for Session {
         self.inner.net.drop_spare(tree.space, self.id);
         if tree.sessions.fetch_sub(1, Ordering::SeqCst) == 1 {
             tree.stop();
+            self.inner.net.client().close_kept(tree.space, Purpose::Feed);
         }
     }
 }
@@ -958,13 +971,24 @@ impl Session {
     /// racing on one session cannot both pass.
     fn apart(&self, to: Learned) -> Result<(), Refusal> {
         let mut learned = self.learned.lock().expect("learned poisoned");
+        Self::joins(*learned, to)?;
+        *learned = to;
+        Ok(())
+    }
+
+    /// Refused as [`Session::apart`] refuses, the session left as it is:
+    /// a check made before anything is read for a call.
+    fn would_join(&self, to: Learned) -> Result<(), Refusal> {
+        Self::joins(*self.learned.lock().expect("learned poisoned"), to)
+    }
+
+    fn joins(learned: Learned, to: Learned) -> Result<(), Refusal> {
         let joined = match to {
-            Learned::SignedIn => *learned == Learned::Named,
-            Learned::Named => *learned == Learned::SignedIn,
+            Learned::SignedIn => learned == Learned::Named,
+            Learned::Named => learned == Learned::SignedIn,
             Learned::Nothing => false,
         };
         if !joined {
-            *learned = to;
             return Ok(());
         }
         Err(refused(
@@ -1237,8 +1261,10 @@ impl Session {
     /// The member's path once the space lists it: a sign-in with none
     /// yet (its invitation not claimed when the tree was read, or the
     /// tree not read to its end) says it waits and reads the feed now and
-    /// every [`LISTED_EVERY`] for up to [`LISTED_WAIT`] (a read that has
-    /// a path makes none), so the user need not tap again. Past the wait,
+    /// every [`LISTED_EVERY`] for up to [`LISTED_WAIT`]
+    /// (a read that has a path makes none), so the user need not tap
+    /// again; at most once in [`LISTED_AGAIN`] at a space, and never for a
+    /// session that named the device (refused before). Past the wait,
     /// why there is none: the tree read to the feed's end holds no leaf of
     /// the member's, or is not read to its end yet. The gateway can join a
     /// sign-in made seconds after the first root holding a new leaf to the
@@ -1252,21 +1278,38 @@ impl Session {
         if let Some(witness) = self.witness() {
             return Ok(witness);
         }
-        chrome.stage(WAITING_FOR_LIST);
-        let (wait, every) = self.inner.listed;
-        let until = Instant::now() + wait;
-        if let Some(tree) = self.inner.tree_of(enrollment) {
-            loop {
-                // The read fails or is due again at the next turn alike.
-                let _ = read_now(&self.inner.net, &tree, enrollment).await;
-                if let Some(witness) = self.witness() {
-                    return Ok(witness);
-                }
-                if Instant::now() + every > until {
-                    break;
-                }
-                tokio::time::sleep(every).await;
+        let Some(tree) = self.inner.tree_of(enrollment) else {
+            return Err(self.pathless().await);
+        };
+        // Entered once in [`LISTED_AGAIN`] after the last wait's end: a
+        // server that asks again, or brings the witness back to none, does
+        // not time this member's reads by asking.
+        let (wait, every, again) = self.inner.listed;
+        let due = {
+            let mut last = tree.listed.lock().expect("listed poisoned");
+            let due = last.is_none_or(|last| last.elapsed() >= wait + again);
+            if due {
+                *last = Some(Instant::now());
             }
+            due
+        };
+        if !due {
+            return Err(self.pathless().await);
+        }
+        chrome.stage(WAITING_FOR_LIST);
+        let until = Instant::now() + wait;
+        loop {
+            // The read fails, is cut at the wait's end, or is due again at
+            // the next turn alike.
+            let left = until.saturating_duration_since(Instant::now());
+            let _ = tokio::time::timeout(left, read_now(&self.inner.net, &tree, enrollment)).await;
+            if let Some(witness) = self.witness() {
+                return Ok(witness);
+            }
+            if Instant::now() + every > until {
+                break;
+            }
+            tokio::time::sleep(every).await;
         }
         Err(self.pathless().await)
     }
@@ -1315,6 +1358,7 @@ impl Session {
                 "a once-guarded call is proved with no arguments the chrome cannot show",
             ));
         }
+        self.would_join(Learned::SignedIn)?;
         self.inner.admits(&enrollment, Kernel::Auth).await?;
         let witness = self.listed(&enrollment, chrome).await?;
         self.apart(Learned::SignedIn)?;
@@ -1475,120 +1519,6 @@ impl Session {
             return Err(refusal);
         }
         Ok(answer)
-    }
-
-    /// `pay`: a transfer from this device's account, as the user confirmed
-    /// it, proved.
-    pub async fn pay(&self, request: Pay, chrome: &dyn Chrome) -> Result<Paid, Refusal> {
-        let enrollment = self.enrolled()?;
-        let method = Self::pinned(
-            &enrollment,
-            request.agent,
-            request.instance,
-            &request.method,
-            |method| method.guard == Guard::Owner && method.name == TRANSFER,
-        )?;
-        self.carried(&enrollment)?;
-        self.inner.admits(&enrollment, Kernel::Owner).await?;
-        self.apart(Learned::Named)?;
-        self.read_clock_meanwhile(&enrollment);
-        let (mut payee, mut amount) = (request.payee.clone(), request.amount.to_string());
-        let mut notice = None;
-        let (payee, amount) = loop {
-            let form = Form {
-                title: "Confirm the payment".into(),
-                detail: format!(
-                    "{} this device to pay from its account. What you confirm here is \
-                     what is paid.",
-                    self.origin_line()
-                ),
-                rows: vec![
-                    ("Space handle".into(), short(&enrollment.handle)),
-                    ("Method".into(), describe(method).1),
-                    ("From".into(), "this device's account".into()),
-                ],
-                fields: vec![
-                    Field {
-                        label: "To account".into(),
-                        value: payee.clone(),
-                    },
-                    Field {
-                        label: "Amount".into(),
-                        value: amount.clone(),
-                    },
-                ],
-                notice: notice.take(),
-                choices: vec!["Pay".into()],
-                code: None,
-            };
-            let Answer::Confirmed { values, .. } = chrome.confirm(form).await else {
-                return Err(declined());
-            };
-            let [to, how_much] = values.as_slice() else {
-                return Err(refused(Code::Arguments, "the form answered other fields"));
-            };
-            (payee, amount) = (to.trim().to_owned(), how_much.trim().to_owned());
-            match (account(&payee), amount.parse::<u64>()) {
-                (Ok(to), Ok(how_much)) if how_much > 0 => break (to, how_much),
-                (Err(_), _) => {
-                    notice = Some(
-                        "An account's name is 1 to 32 ASCII letters, digits, `.`, `_` or `-`."
-                            .into(),
-                    )
-                }
-                _ => notice = Some("The amount is a whole number above zero.".into()),
-            }
-        };
-        let values = (payee.clone(), amount);
-        let answer = |answer: Vec<u8>, proving_ms: u64| Paid {
-            answer,
-            proving_ms,
-            payee: values.0.clone(),
-            amount: values.1,
-        };
-        // The same payment asked again while its last proof may still run
-        // (a relay that withheld it, then asked anew) is that proof again:
-        // its binding runs once.
-        let now = self.node_now(&enrollment).await?;
-        let tree = self.tree();
-        let again = tree.as_ref().and_then(|tree| {
-            tree.payment
-                .lock()
-                .expect("payment poisoned")
-                .clone()
-                .filter(|last| last.values == values && now + 5_000 < last.expires_ms)
-        });
-        if let Some(again) = again {
-            chrome.stage(SENDING);
-            return Ok(answer(self.send(&enrollment, &again.request).await?, 0));
-        }
-        let arguments = vos_light::transfer_arguments(&values.0, amount);
-        let call = self.call_at(&enrollment, method, arguments, now)?;
-        let secret = self.secret(&enrollment).await?;
-        chrome.stage(PROVING);
-        let started = Instant::now();
-        let expires_ms = call.expires_ms;
-        let bytes = Inner::prove(
-            &self.inner,
-            Kernel::Owner,
-            call,
-            move |prover, program, call| {
-                let proof = prover.prove_owner(&secret, call, program);
-                drop(secret);
-                proof
-            },
-        )
-        .await?;
-        let proving_ms = started.elapsed().as_millis() as u64;
-        if let Some(tree) = tree {
-            *tree.payment.lock().expect("payment poisoned") = Some(Payment {
-                values: values.clone(),
-                expires_ms,
-                request: bytes.clone(),
-            });
-        }
-        chrome.stage(SENDING);
-        Ok(answer(self.send(&enrollment, &bytes).await?, proving_ms))
     }
 
     /// A call of `method` with `arguments`, its expiry from the node's time

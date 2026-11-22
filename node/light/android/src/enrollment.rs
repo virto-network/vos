@@ -175,6 +175,22 @@ pub struct Store {
 
 /// The enrollments' rows' prefix, then the origin's digest.
 const ENROLLMENT: &[u8] = b"enrollment/";
+const PAYMENT: &[u8] = b"payment/";
+
+/// A payment the user confirmed whose ledger answer the device has not
+/// read: kept before its first proof leaves, so a lost answer, a restart
+/// or an expiry is settled by the ledger's word (`Payments.paid`) and
+/// never paid twice. Every proof made for it names its `key`.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Pending {
+    /// The owner digest it pays from.
+    pub owner: [u8; 32],
+    pub key: [u8; 32],
+    pub payee: String,
+    pub amount: u64,
+    /// Its last proof's expiry, by the node's clock.
+    pub expires_ms: u64,
+}
 
 /// Where a server is: its verified SSH host key and the application that
 /// asked.
@@ -227,6 +243,32 @@ impl Store {
     /// Pin `enrollment` for `origin`.
     pub fn put(&self, origin: &Origin, enrollment: &Enrollment) -> Result<(), String> {
         self.kept()?.put(&Self::key(origin), enrollment)
+    }
+
+    fn payments(origin: &Origin) -> Vec<u8> {
+        [PAYMENT, &origin.digest()].concat()
+    }
+
+    /// The payments `origin`'s enrollment holds pending, oldest key first.
+    pub fn pending(&self, origin: &Origin) -> Result<Vec<Pending>, String> {
+        Ok(self
+            .kept()?
+            .under::<Pending>(&Self::payments(origin))?
+            .into_iter()
+            .map(|(_, pending)| pending)
+            .collect())
+    }
+
+    /// Keep `pending` for `origin`, synced.
+    pub fn keep_pending(&self, origin: &Origin, pending: &Pending) -> Result<(), String> {
+        self.kept()?
+            .put(&[Self::payments(origin), pending.key.to_vec()].concat(), pending)
+    }
+
+    /// The pending payment `key` of `origin`'s settled: forgotten.
+    pub fn settled(&self, origin: &Origin, key: &[u8; 32]) -> Result<(), String> {
+        self.kept()?
+            .remove(&[Self::payments(origin), key.to_vec()].concat())
     }
 
     /// Whether any enrollment is kept: its source's key already exists.

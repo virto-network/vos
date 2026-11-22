@@ -539,7 +539,7 @@ impl Node {
         self.facility
             .net()
             .opt_out(vos_light::route::space(&handle), out)
-            .map_err(|refusal| refused(Code::Refused, refusal.to_string()))
+            .map_err(|refusal| refused(Code::Refused, refusal))
     }
 
     /// The background job's runs kept, the latest last.

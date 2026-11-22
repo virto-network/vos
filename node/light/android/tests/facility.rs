@@ -238,9 +238,11 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
             .any(|(label, value)| label == "From" && value == "this device's account")
     );
     let (agent, request) = world.last_credentialed();
+    let (to, amount, key) =
+        <(Vec<u8>, u64, [u8; 32])>::decode_exact(&request.arguments).unwrap();
     assert_eq!(
-        request.arguments,
-        (b"shop".to_vec(), 20u64).encode(),
+        (to, amount),
+        (b"shop".to_vec(), 20u64),
         "what the chrome confirmed, not what the server asked"
     );
     assert_eq!(request.method.0, vos_light::method_id("transfer"));
@@ -248,14 +250,13 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
     assert_eq!(field(&paid, "payee"), &Value::from("shop"));
     assert_eq!(field(&paid, "amount"), &Value::from(20u64));
 
-    // The same payment asked again while its proof may still run is that
-    // proof again, so it runs once; another amount is a new proof.
+    // A payment answered is done: the same form confirmed again is a new
+    // payment, under a key of its own.
     chrome.will(confirm(&["shop", "20"]));
     session.ask("pay", &pay, &chrome).await.unwrap();
-    assert_eq!(world.last_credentialed().1, request, "sent again as it was");
-    chrome.will(confirm(&["shop", "21"]));
-    session.ask("pay", &pay, &chrome).await.unwrap();
-    assert_ne!(world.last_credentialed().1, request);
+    let again = world.last_credentialed().1;
+    let (_, _, other) = <(Vec<u8>, u64, [u8; 32])>::decode_exact(&again.arguments).unwrap();
+    assert_ne!(other, key, "a key a confirmed form's own");
 
     // A once-guarded call with arguments the chrome cannot read is refused.
     let ballot = object(&[
@@ -774,7 +775,8 @@ async fn a_sign_in_before_the_claim_waits_for_the_invitation() {
     let directory = tempfile::tempdir().unwrap();
     let source = Arc::new(Phone::new(9));
     let facility = facility(&world, directory.path(), source as Arc<dyn Source>)
-        .with_listed_wait(Duration::from_millis(1_500), Duration::from_millis(300));
+        .with_listed_wait(Duration::from_millis(1_500), Duration::from_millis(300))
+        .with_listed_again(Duration::from_secs(2));
     let session = facility.session(gateway());
     let chrome = Scripted::default();
     chrome.will(confirm(&[]));
@@ -814,6 +816,26 @@ async fn a_sign_in_before_the_claim_waits_for_the_invitation() {
             .all(|stage| stage == vos_facility::WAITING_FOR_LIST),
         "{stages:?}"
     );
+    // Asked again at once, it does not wait again, nor read the feed
+    // for it: a server cannot time this member's reads by asking.
+    chrome.stages.lock().unwrap().clear();
+    let feeds = world.feed_reads();
+    let again = session.ask("sign_in", &login, &chrome).await.unwrap_err();
+    assert_eq!(again.code, Code::Unclaimed, "{again:?}");
+    assert!(chrome.stages.lock().unwrap().is_empty());
+    assert!(world.feed_reads() <= feeds + 1, "the refresher's own read at most");
+    // A session that named the device waits for nothing and reads
+    // nothing: it is refused before.
+    let named = facility.session(gateway());
+    named.granted();
+    chrome.will(confirm(&[]));
+    named.ask("enroll", &enrollment(), &chrome).await.unwrap();
+    let joined = named.ask("sign_in", &login, &chrome).await.unwrap_err();
+    assert_eq!(joined.code, Code::Refused, "{joined:?}");
+    assert!(chrome.stages.lock().unwrap().is_empty());
+    // Past the last wait's end and the gap after it, a sign-in waits again.
+    tokio::time::sleep(Duration::from_millis(3_600)).await;
+
     // Invited while the sign-in waits: it signs in with no second tap.
     let invite = {
         let world = Arc::clone(&world);
@@ -1021,4 +1043,70 @@ async fn a_proofs_expiry_carries_its_own_sessions_reading_alone() {
         );
     }
     assert!(b >= opened_b && a < opened_b, "B's reading is B's own");
+}
+
+/// The space's feed connection closes with the last session holding it:
+/// the next session's reads go on a new connection, so the feed does not
+/// join sessions that follow one another (`light-node.md` §6.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_feed_connection_closes_with_the_last_session() {
+    let world = world();
+    let directory = tempfile::tempdir().unwrap();
+    let source = Arc::new(Phone::new(9));
+    let facility = facility(
+        &world,
+        directory.path(),
+        Arc::clone(&source) as Arc<dyn Source>,
+    );
+    let chrome = Scripted::default();
+    let feeds = |world: &World| -> Vec<(usize, bool)> {
+        let state = world.state.lock().unwrap();
+        state
+            .seen
+            .iter()
+            .enumerate()
+            .filter(|(_, seen)| {
+                seen.requests
+                    .iter()
+                    .any(|(kind, _)| *kind == ApiKind::Query as u16)
+            })
+            .map(|(index, seen)| (index, seen.ended))
+            .collect()
+    };
+    let read = |world: Arc<World>| async move {
+        let reads = world.feed_reads();
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        while world.feed_reads() == reads {
+            assert!(std::time::Instant::now() < until, "no feed read");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    // Session A enrolls, which holds the tree: its refresher reads.
+    let first = facility.session(gateway());
+    chrome.will(confirm(&[]));
+    chrome.will(confirm(&[]));
+    first.ask("enroll", &enrollment(), &chrome).await.unwrap();
+    read(Arc::clone(&world)).await;
+    let before = feeds(&world);
+    assert!(!before.is_empty());
+    drop(first);
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while feeds(&world).iter().any(|(_, ended)| !ended) {
+        assert!(std::time::Instant::now() < until, "the feed stayed open");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Session B, opened after A closed, reads on a connection of its own
+    // (a `refresh` makes the feed due within seconds).
+    let second = facility.session(gateway());
+    second.granted();
+    second.ask("refresh", &Value::Null, &chrome).await.unwrap();
+    read(Arc::clone(&world)).await;
+    let after: Vec<usize> = feeds(&world)
+        .into_iter()
+        .map(|(index, _)| index)
+        .filter(|index| before.iter().all(|(earlier, _)| earlier != index))
+        .collect();
+    assert!(!after.is_empty(), "B's reads went on A's feed connection");
 }
