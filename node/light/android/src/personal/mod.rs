@@ -855,6 +855,7 @@ impl From<space::Device> for Device {
             seen: device.seen,
             removed: device.removed,
             me: device.me,
+            adding: device.adding,
         }
     }
 }

@@ -245,7 +245,8 @@ final class DevicesScreen extends Screen {
   private int others() {
     int others = 0;
     for (Device device : devices) {
-      others += !device.me && !device.removed ? 1 : 0;
+      // A device whose add is undecided is no other live one: void, it leaves the set.
+      others += !device.me && !device.removed && !device.adding ? 1 : 0;
     }
     return others;
   }

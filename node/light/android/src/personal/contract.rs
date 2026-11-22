@@ -494,6 +494,7 @@ parcel! {
         pub seen: u64 => long,
         pub removed: bool => boolean,
         pub me: bool => boolean,
+        pub adding: bool => boolean,
     }
 
     /// The device set as the kit reads it at its home: each device, and

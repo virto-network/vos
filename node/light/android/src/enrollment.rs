@@ -261,8 +261,10 @@ impl Store {
 
     /// Keep `pending` for `origin`, synced.
     pub fn keep_pending(&self, origin: &Origin, pending: &Pending) -> Result<(), String> {
-        self.kept()?
-            .put(&[Self::payments(origin), pending.key.to_vec()].concat(), pending)
+        self.kept()?.put(
+            &[Self::payments(origin), pending.key.to_vec()].concat(),
+            pending,
+        )
     }
 
     /// The pending payment `key` of `origin`'s settled: forgotten.

@@ -369,5 +369,7 @@ fn device(view: DeviceView) -> Device {
         seen: view.seen,
         removed: view.removal.is_some() || view.standing == Standing::Removed,
         me: false,
+        // The kit reads no device group.
+        adding: false,
     }
 }

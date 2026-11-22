@@ -830,7 +830,10 @@ impl Drop for Session {
         self.inner.net.drop_spare(tree.space, self.id);
         if tree.sessions.fetch_sub(1, Ordering::SeqCst) == 1 {
             tree.stop();
-            self.inner.net.client().close_kept(tree.space, Purpose::Feed);
+            self.inner
+                .net
+                .client()
+                .close_kept(tree.space, Purpose::Feed);
         }
     }
 }

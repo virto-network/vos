@@ -238,8 +238,7 @@ async fn enroll_sign_in_and_pay_as_the_chrome_confirmed() {
             .any(|(label, value)| label == "From" && value == "this device's account")
     );
     let (agent, request) = world.last_credentialed();
-    let (to, amount, key) =
-        <(Vec<u8>, u64, [u8; 32])>::decode_exact(&request.arguments).unwrap();
+    let (to, amount, key) = <(Vec<u8>, u64, [u8; 32])>::decode_exact(&request.arguments).unwrap();
     assert_eq!(
         (to, amount),
         (b"shop".to_vec(), 20u64),
@@ -823,7 +822,10 @@ async fn a_sign_in_before_the_claim_waits_for_the_invitation() {
     let again = session.ask("sign_in", &login, &chrome).await.unwrap_err();
     assert_eq!(again.code, Code::Unclaimed, "{again:?}");
     assert!(chrome.stages.lock().unwrap().is_empty());
-    assert!(world.feed_reads() <= feeds + 1, "the refresher's own read at most");
+    assert!(
+        world.feed_reads() <= feeds + 1,
+        "the refresher's own read at most"
+    );
     // A session that named the device waits for nothing and reads
     // nothing: it is refused before.
     let named = facility.session(gateway());

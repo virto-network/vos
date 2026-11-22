@@ -19,9 +19,9 @@ use super::{Inner, Kernel, Learned, PROVING, SENDING, Session, declined, describ
 use crate::chrome::{Answer, Chrome, Field, Form, short};
 use crate::enrollment::{Enrollment, Guard, Method, Pending};
 use crate::job::now_ms;
-use vos_light::route::Purpose;
 use crate::{Code, Paid, Pay, Refusal, refused};
 use s4_credential_contract::{TRANSFER, account};
+use vos_light::route::Purpose;
 
 /// The most payments a device holds pending at a space: past it, a new one
 /// waits for the ledger to settle the last.
@@ -68,8 +68,12 @@ fn settles(answer: &[u8]) -> Settles {
 /// A fresh key for one confirmed form.
 fn draw_key() -> Result<[u8; 32], Refusal> {
     let mut key = [0; 32];
-    getrandom::getrandom(&mut key)
-        .map_err(|_| refused(Code::Prove, "the system gave no randomness for a payment's key"))?;
+    getrandom::getrandom(&mut key).map_err(|_| {
+        refused(
+            Code::Prove,
+            "the system gave no randomness for a payment's key",
+        )
+    })?;
     Ok(key)
 }
 
@@ -162,7 +166,9 @@ impl Session {
             });
             if let Some(again) = again {
                 chrome.stage(SENDING);
-                let answer = self.send_payment(&enrollment, &held.key, &again.request).await?;
+                let answer = self
+                    .send_payment(&enrollment, &held.key, &again.request)
+                    .await?;
                 if !matches!(settles(&answer), Settles::ProveAgain) {
                     return Ok(paid(answer, 0));
                 }
