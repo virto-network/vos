@@ -135,6 +135,7 @@ impl Node {
             settings,
             hooks: config.hooks,
             clock: config.clock,
+            looks: event_listener::Event::new(),
             node_id,
             node_key: SigningKey::from_bytes(&secret),
             venue: config.venue,
@@ -185,6 +186,7 @@ impl Node {
         let liveness = arrivals.map(|arrivals| start_liveness(&inner, arrivals));
         inner.spawn(super::directory::resend_records(Arc::clone(&inner)));
         inner.spawn(crate::stats::probe(Arc::clone(&inner)));
+        inner.spawn(crate::steps::watch(Arc::clone(&inner)));
         let collector = Some(start_collector(&inner));
         let prover = config
             .prover

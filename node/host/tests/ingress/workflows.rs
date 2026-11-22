@@ -348,3 +348,41 @@ fn a_collected_workflow_reads_unknown() {
         )
     });
 }
+
+/// A due row written while the leader sleeps towards a later one is kept
+/// to: with an hour's session held, a tour's nap of three seconds ends at
+/// its time, the node's clock running true, with no step to wake the
+/// leader.
+#[test]
+fn a_nap_ends_at_its_time_while_the_leader_holds_a_later_due_row() {
+    let served = Served::plain();
+    let tours = served.tours();
+    let mut client = served.client(1);
+    assert_eq!(done(served.call(&mut client, 1)), 1);
+    std::thread::sleep(Duration::from_secs(1));
+    let running = Arc::new(AtomicBool::new(true));
+    let ticker = {
+        let (clock, running) = (Arc::clone(&served.clock), Arc::clone(&running));
+        std::thread::spawn(move || {
+            let mut last = Instant::now();
+            while running.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(50));
+                let now = Instant::now();
+                clock.fetch_add((now - last).as_millis() as u64, Ordering::SeqCst);
+                last = now;
+            }
+        })
+    };
+    let tour = Tour::light(tours.other, vec![7], 3_000);
+    let started = Instant::now();
+    let workflow = served.start_tour(&mut client, &tours, &tour);
+    let answer = client.workflow(served.agent, workflow, Duration::from_secs(20));
+    let took = started.elapsed();
+    running.store(false, Ordering::SeqCst);
+    ticker.join().unwrap();
+    assert_eq!(
+        status(answer.unwrap()),
+        WorkflowStatus::Ended(Outcome::Done(tour.result(0)))
+    );
+    assert!(took < Duration::from_secs(8), "ended at its time: {took:?}");
+}

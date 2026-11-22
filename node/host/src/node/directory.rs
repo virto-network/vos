@@ -173,7 +173,13 @@ impl Inner {
     /// Learn where an agent runs, and act on it.
     pub(crate) fn learn(self: &Arc<Self>, record: CreationRecord, placement: Placement) {
         let agent = record.agent;
-        lock(&self.directory.known).insert(agent, Arc::new(Known { record, placement }));
+        let first = lock(&self.directory.known)
+            .insert(agent, Arc::new(Known { record, placement }))
+            .is_none();
+        // Reports go to the representative once it is known.
+        if first && self.representative() == Some(agent) {
+            self.looks.notify(usize::MAX);
+        }
         self.reconsider(agent);
     }
 

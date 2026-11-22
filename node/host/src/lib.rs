@@ -33,6 +33,7 @@ mod runs;
 mod signature;
 mod space;
 mod stats;
+mod steps;
 pub mod storage;
 pub mod store;
 pub mod tls;

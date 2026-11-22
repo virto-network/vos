@@ -94,6 +94,10 @@ pub(crate) struct Stats {
     /// run there: the builds share the executors with the batches.
     pub(crate) root_build_queue: Histogram,
     pub(crate) root_build: Histogram,
+    /// An idle leader's look at what it may have due (a sweep, a cut's
+    /// marker, reads to serve, reports, proofs, an anchor to offer) that
+    /// found none.
+    pub(crate) look: Histogram,
     /// How late a probe on the runtime wakes once due: a proxy for every
     /// task's wait to be polled there, the driver's and the applier's too
     /// (to the timers' millisecond or so).
@@ -159,6 +163,7 @@ impl Stats {
             stage("credential", &self.credential),
             stage("root_build_queue", &self.root_build_queue),
             stage("root_build", &self.root_build),
+            stage("look", &self.look),
             stage("late", &self.late),
         ];
         stages.extend(more);

@@ -14,8 +14,8 @@ use super::Leader;
 use crate::fault::{Fault, read};
 use crate::store::Snapshot;
 
-/// How often an idle leader looks again at its first due row: a clock
-/// stepped forward does not move a timer.
+/// How long an idle leader waits to look again at a due index it failed
+/// to read.
 const SWEEP_RECHECK: Duration = Duration::from_secs(5);
 /// How long a leader adds no sweep once one left its first due row in
 /// place.
@@ -146,7 +146,9 @@ impl Leader {
             }
             _ => Duration::from_millis(first.0.saturating_sub(now)),
         };
-        Some(wait.clamp(Duration::from_millis(1), SWEEP_RECHECK))
+        // Until then the leader looks again only as something wakes it:
+        // its clock stepping forward among them ([`crate::steps`]).
+        Some(wait.max(Duration::from_millis(1)))
     }
 
     /// Whether a batch timed `time` sweeps, the first row of the due index

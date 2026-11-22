@@ -20,8 +20,8 @@ use crate::fault::{Fault, read};
 use crate::random;
 use crate::store::Snapshot;
 
-/// How often an idle leader looks again at the next boundary: a clock
-/// stepped forward does not move a timer.
+/// How long an idle leader waits to look again at its next boundary once
+/// it failed to read it.
 const CUT_RECHECK: Duration = Duration::from_secs(2);
 
 /// The clock of `snapshot`'s agent's space, if it belongs to one.
@@ -76,12 +76,9 @@ impl Leader {
             Err(_) => return Some(CUT_RECHECK),
         };
         let now = (self.inner.clock)();
-        let wait = Duration::from_millis(boundary.saturating_sub(now));
-        Some(if wait.is_zero() {
-            wait
-        } else {
-            wait.clamp(Duration::from_millis(1), CUT_RECHECK)
-        })
+        // Until then the leader looks again only as something wakes it:
+        // its clock stepping forward among them ([`crate::steps`]).
+        Some(Duration::from_millis(boundary.saturating_sub(now)))
     }
 
     /// Append a marker, if one is still due on the applied state: an empty

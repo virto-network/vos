@@ -166,7 +166,8 @@ enum Woke {
     Lost,
     /// A window is due to go again.
     Round,
-    /// It looks again at its due index, or tells more senders.
+    /// It looks again at what it has due, its time come or the node
+    /// asking, or tells more senders.
     Recheck,
     /// Its replica's root builder finished a window's cut: a report, a
     /// close or a read may be due.
@@ -383,6 +384,10 @@ impl Leader {
                 }
             }
             // Idle: a sweep due runs alone, after the node's other tasks.
+            // Listening first, a look the node asks for meanwhile is not
+            // missed.
+            let looks = self.inner.looks.listen();
+            let looked = Instant::now();
             let sweep = self.sweep_wait();
             if sweep == Some(Duration::ZERO) {
                 smol::future::yield_now().await;
@@ -405,6 +410,7 @@ impl Leader {
                 smol::future::yield_now().await;
                 return Some(Taken::Anchor);
             }
+            self.inner.stats.look.took(looked.elapsed());
             // A receiver found this agent behind it: windows go again.
             if behind {
                 return Some(Taken::Rounds);
@@ -440,6 +446,10 @@ impl Leader {
                 shared.wait(|state| state.cuts_built != built).await;
                 Woke::Built
             };
+            let asked = async {
+                looks.await;
+                Woke::Recheck
+            };
             // Senders still to tell: told at a `Behind`'s pace.
             let told = self.told;
             let tell = async {
@@ -457,6 +467,7 @@ impl Leader {
                 .or(recheck)
                 .or(tell)
                 .or(finished)
+                .or(asked)
                 .await
             {
                 Woke::Queue => waited = true,

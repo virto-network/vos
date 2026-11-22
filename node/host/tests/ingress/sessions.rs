@@ -264,3 +264,43 @@ fn a_call_whose_answer_was_lost_is_answered_once_or_lost() {
     assert!(matches!(again(old), Err(ClientError::Lost)));
     assert_eq!(served.value(&client), 5);
 }
+
+/// An idle leader holding a session sleeps until its session is due to be
+/// collected: it looks at nothing meanwhile, and looks again at once when
+/// its clock steps past the expiry, collecting the session.
+#[test]
+fn an_idle_leader_sleeps_until_its_session_is_due() {
+    let served = Served::plain();
+    let mut client = served.client(1);
+    assert_eq!(done(served.call(&mut client, 1)), 1);
+    let session = client.session(served.agent);
+    let looks = || {
+        served
+            .node
+            .stats()
+            .stages
+            .iter()
+            .find(|stage| stage.name == "look")
+            .map(|stage| stage.counts.iter().sum::<u64>())
+            .expect("the idle leaders' looks")
+    };
+    // Past the call's batch and its apply, the leader is idle.
+    std::thread::sleep(Duration::from_secs(1));
+    let idle = looks();
+    std::thread::sleep(Duration::from_secs(11));
+    assert_eq!(looks(), idle, "no look while nothing is due");
+    assert!(served.holds(&session));
+    served.clock.fetch_add(
+        defaults::SESSION_EXPIRY_MS + 2 * defaults::SESSION_BUCKET_MS,
+        Ordering::SeqCst,
+    );
+    let stepped = Instant::now();
+    wait_until("the idle leader collects the session", || {
+        !served.holds(&session)
+    });
+    assert!(
+        stepped.elapsed() < Duration::from_secs(4),
+        "looked again within a step's bound: {:?}",
+        stepped.elapsed()
+    );
+}

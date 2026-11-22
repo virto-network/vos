@@ -104,6 +104,11 @@ pub(crate) struct Inner {
     pub(crate) settings: Settings,
     pub(crate) hooks: Arc<dyn Hooks>,
     pub(crate) clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// What makes every idle leader look again at what it has due: its
+    /// timers wait for times by `clock`, which a step forward passes
+    /// unseen ([`crate::steps`]), and its reports wait for the space's
+    /// representative to be known here.
+    pub(crate) looks: event_listener::Event,
     pub(crate) node_id: NodeId,
     /// The node key, whose public half is its id: the only key the
     /// anchors of the space's representative, led here, are signed with.
@@ -449,6 +454,8 @@ impl Inner {
         for id in waiting {
             if let Some(run) = self.run(id) {
                 run.inbox.send(GroupInput::Blobs);
+                // A statement's proof it waited for: its leader records it.
+                run.agent.wake();
             }
         }
     }
