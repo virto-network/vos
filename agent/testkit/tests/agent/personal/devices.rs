@@ -201,9 +201,8 @@ fn two_seasoned_devices_remove_at_once() {
 
 /// A second signature or a resolution decides at its evidence, never at
 /// its call: one whose signer withholds the evidence decides nothing, the
-/// signer cosigning that operation once only meanwhile, and another
-/// device's evidenced signature decides; its evidence posted late changes
-/// nothing. A device's later resolution replaces its earlier one,
+/// signer may sign it again, and another device's evidenced signature
+/// decides; the withheld one's evidence posted late changes nothing. A device's later resolution replaces its earlier one,
 /// evidenced or not.
 #[test]
 fn a_second_signature_or_a_resolution_decides_at_its_evidence() {
@@ -220,10 +219,8 @@ fn a_second_signature_or_a_resolution_decides_at_its_evidence() {
     let removal = home.operate(admin(0), "remove", 3u32).unwrap();
     let withheld = home.unevidenced(admin(1), "cosign", removal).unwrap();
     assert_eq!(state(&home, sync(0), removal), OpState::Pending);
-    assert_eq!(
-        home.unevidenced(admin(1), "cosign", removal),
-        Err(PersonalError::Cosigned)
-    );
+    home.unevidenced(admin(1), "cosign", removal).unwrap();
+    assert_eq!(state(&home, sync(0), removal), OpState::Pending);
     home.operate(admin(2), "cosign", removal).unwrap();
     assert!(matured(state(&home, sync(0), removal)));
     posted(&mut home, 1, "cosign", withheld);

@@ -605,8 +605,8 @@ impl Personal {
     /// a removal, a kit rotation or a regroup, signed by two seasoned
     /// devices with strong admins other than its targets, or a regroup by
     /// its device and the kit. It matures, contested or not, once the
-    /// second signature's evidence is posted ([`Personal::evidenced_call`]);
-    /// a signer holds one such signature of an operation at a time.
+    /// second signature's evidence is posted ([`Personal::evidenced_call`]),
+    /// any of the signer's if it signed more than one.
     pub(crate) fn cosign_operation(
         &mut self,
         now: u64,
@@ -645,9 +645,6 @@ impl Personal {
             Signer::Kit(_) => return Err(PersonalError::NotSigner),
         }
         self.evidenced_op(index, &operation.op)?;
-        if self.cosigning.contains(&(index, By(by))) {
-            return Err(PersonalError::Cosigned);
-        }
         let at = self.append(
             now,
             Body::Cosign {

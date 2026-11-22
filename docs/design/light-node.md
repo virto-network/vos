@@ -535,8 +535,8 @@ operator makes ahead of time**:
   nullifier already holding an agent, and one whose device's removal or
   leave matured within the removal delay (`Spent`, E43), takes the pooled
   agent the device named (`Taken` when another claim took it), indexes it
-  under the
-  nullifier and under `H(each recovery public key)` (§3.5), and sends it
+  under the nullifier and under `H(each recovery public key)` (§3.5), and
+  sends it
   `claim(device, kit, policy, homes)`; `Command::send` is one-way
   (`agent/sdk/src/context.rs`), so `Personal` answers `assigned` or
   `refused`, and `Homes` releases a refused one. The chrome refuses a
@@ -602,8 +602,8 @@ this is the one taken]:
 - **The claim** (`claim(device, kit, agent)` under `Auth("home")`, 0.69M
   gas): the device's `nullifier` must be the proof's (`Nullifier`); a
   nullifier holding an agent is `Claimed`, one spent `Spent` (below), a
-  kit entry's index holding one `KitTaken`, more than four entries or one key twice among the device's
-  and the kit's `Malformed` (what `Personal` would refuse, so a refusal
+  kit entry's index holding one `KitTaken`, more than four entries or one
+  key twice among the device's and the kit's `Malformed` (what `Personal` would refuse, so a refusal
   cannot be repeated against a pooled agent), an empty pool `PoolEmpty`,
   an `agent` not pooled `Taken`, each writing nothing. A kit may be empty
   (no recovery). **The device names the agent** [built]: a kit's
@@ -652,8 +652,8 @@ this is the one taken]:
   device's new nullifier vouched for by its admin key and relayed by
   `Personal`) waits for the re-founding runbook.
 - **Spent nullifiers** [E43, built]: a leave matures at its own evidence
-  and a cosigned removal at its second signature, so without a hold one
-  member's leaf could claim, add a made-up device, leave and claim again
+  and a cosigned removal at its second signature's evidence, so without
+  a hold one member's leaf could claim, add a made-up device, leave and claim again
   with no wait, a pool agent a loop. Every `forget` (a leave, a removal by
   others, a regroup's, a restore's) holds the nullifier spent until the
   delay from then; a claim under it is `Spent` until that time, and the
@@ -1791,8 +1791,7 @@ where the rules above leave a choice, this is the one taken]:
   nothing immediate and resolves nothing (every operation it signs
   waits); its veto counts. The second signature is `cosign(op)`, which
   matures a removal, a kit rotation or a regroup at its own evidence,
-  contested or not (a signer holds one unevidenced cosign of an operation
-  at a time, `Cosigned`); the kit cosigns only a regroup.
+  contested or not; the kit cosigns only a regroup.
   `resolve(op, upheld)` names the operation that matures, its rival in a
   pair dropped (or, not upheld, the reverse): the kit's acts at its
   evidence, a device's at the evidence that makes two agree, each

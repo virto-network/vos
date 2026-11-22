@@ -61,16 +61,25 @@ pub fn phone(world: &Arc<World>, seed: u8) -> Held {
 /// were as it died.
 pub struct Corpse(Arc<Mutex<Option<tempfile::TempDir>>>);
 
-/// `from`'s files and directories copied under `into`.
+/// `from`'s files and directories copied under `into`. A file the dying
+/// process's other threads delete meanwhile (a compaction's) is left out,
+/// as a kill would find it gone.
 fn copy_tree(from: &std::path::Path, into: &std::path::Path) {
+    let gone = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
         let to = into.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            std::fs::create_dir(&to).unwrap();
-            copy_tree(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => {
+                std::fs::create_dir(&to).unwrap();
+                copy_tree(&entry.path(), &to);
+            }
+            Ok(_) => match std::fs::copy(entry.path(), &to) {
+                Err(error) if !gone(&error) => panic!("copying {:?}: {error}", entry.path()),
+                _ => {}
+            },
+            Err(error) if gone(&error) => {}
+            Err(error) => panic!("reading {:?}: {error}", entry.path()),
         }
     }
 }

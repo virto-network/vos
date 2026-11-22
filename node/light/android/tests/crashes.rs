@@ -15,6 +15,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::phone::*;
 use common::world::{Death, Step};
@@ -462,10 +463,13 @@ fn a_move_killed_at_any_step_ends_at_one_agent_with_one_kit() {
     });
 }
 
-/// A leave killed anywhere: left again (the space cleared already, it is
-/// done) and the background job run, the phone holds no personal space,
-/// and the other phone's pass reads the leaver removed and commits its
-/// removal.
+/// A leave killed anywhere: the next process's background pass finishes
+/// a leave the agent took (its evidence posted, its removal read through,
+/// in that process or the one before, and the space forgotten); one never
+/// taken is left again. The phone then holds no personal space, and the
+/// other phone's pass reads the leaver removed and commits its removal.
+/// Most deaths are reached, and some leaves are finished by the pass
+/// alone.
 #[test]
 fn a_leave_killed_at_any_step_ends_left() {
     let paired = |world: &Arc<World>| {
@@ -489,7 +493,9 @@ fn a_leave_killed_at_any_step_ends_left() {
             .unwrap();
         world.trace(2)
     };
-    each(&deaths(&trace), |step, nth, death| {
+    let deaths = deaths(&trace);
+    let (died, by_pass) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    each(&deaths, |step, nth, death| {
         let at = format!("{step:?} #{nth} {death:?}");
         let world = world();
         let (staying, leaving) = paired(&world);
@@ -499,18 +505,24 @@ fn a_leave_killed_at_any_step_ends_left() {
         // A follow's later reads are as many as the log's pages then: a
         // step the trace saw may not come again.
         let leaving = if world.died(2) {
+            died.fetch_add(1, Ordering::SeqCst);
             leaving.reborn(&world, corpse)
         } else {
             cut.unwrap_or_else(|refusal| panic!("{at}: not reached: {refusal:?}"));
             world.revive(2);
             leaving
         };
-        match leaving.node.personal().unwrap().leave(&*leaving.hand) {
-            Ok(()) => {}
-            Err(refusal) if refusal.why == Why::NoSpace => {}
-            Err(refusal) => panic!("{at}: the leave again: {refusal:?}"),
-        }
+        let phase = || leaving.node.personal().unwrap().status().unwrap().phase;
         let _ = leaving.node.sync_personal();
+        if phase() == vos_facility::personal::Phase::None {
+            by_pass.fetch_add(1, Ordering::SeqCst);
+        } else {
+            match leaving.node.personal().unwrap().leave(&*leaving.hand) {
+                Ok(()) => {}
+                Err(refusal) if refusal.why == Why::NoSpace => {}
+                Err(refusal) => panic!("{at}: the leave again: {refusal:?}"),
+            }
+        }
         let status = leaving.node.personal().unwrap().status().unwrap();
         assert_eq!(
             status.phase,
@@ -531,4 +543,14 @@ fn a_leave_killed_at_any_step_ends_left() {
             "{at}: {devices:?}"
         );
     });
+    let died = died.load(Ordering::SeqCst);
+    assert!(
+        2 * died >= deaths.len(),
+        "{died} of {} deaths reached",
+        deaths.len()
+    );
+    assert!(
+        by_pass.load(Ordering::SeqCst) > 0,
+        "no leave finished by a pass"
+    );
 }

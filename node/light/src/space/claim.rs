@@ -597,15 +597,34 @@ impl<H: Host> Personal<H> {
             written.store(true, Ordering::SeqCst);
             (kit, claim, behind.join())
         });
-        let ahead = ahead.map_err(|_| failed("the claim's reads stopped"))?;
-        if let Err(error) = kit {
-            held.state.kit_shown = false;
-            self.keep(&held.light, &held.state)?;
-            return Err(error);
-        }
-        let (claim, next) = claim.expect("a claim for the kit shown");
-        let claim = claim.map_err(failed)?;
-        self.adopt(held, next);
+        let error = match (kit, claim) {
+            (Ok(_), Some((Ok(claim), next))) => {
+                // Adopted before anything else can fail: the store holds it.
+                self.adopt(held, next);
+                let ahead = ahead.map_err(|_| failed("the claim's reads stopped"))?;
+                return self.claim_held(held, kept, claim, ahead);
+            }
+            (Err(error), _) => error,
+            (Ok(_), Some((Err(error), _))) => failed(error),
+            (Ok(_), None) => unreachable!("a kit written down is held"),
+        };
+        // No claim holds the kit: the mark cleared, the flow's own error
+        // answered even when clearing it fails.
+        held.state.kit_shown = false;
+        let _ = self.keep(&held.light, &held.state);
+        Err(error)
+    }
+
+    /// The claim `kit_and_open` held, its open claim as `ahead` made it:
+    /// refused once the kit was shown, the claim abandoned and its words
+    /// void.
+    fn claim_held(
+        &self,
+        held: &mut Held,
+        kept: &Kept,
+        claim: Claiming,
+        ahead: Ahead,
+    ) -> Result<(Claiming, Ahead), Error> {
         let mut ahead = ahead;
         match std::mem::replace(&mut ahead.open, Ok(())) {
             Ok(()) => Ok((claim, ahead)),

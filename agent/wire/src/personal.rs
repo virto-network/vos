@@ -1046,8 +1046,4 @@ pub enum PersonalError {
     /// signs nothing, its own leave included, until the verdict.
     #[codec(index = 49)]
     Undecided,
-    /// The signer's second signature of the operation waits for its
-    /// evidence: it signs another once that is posted, or never.
-    #[codec(index = 50)]
-    Cosigned,
 }
