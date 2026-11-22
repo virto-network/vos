@@ -115,9 +115,10 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
 }
 
 /// An idle agent no read waits on is given no marker: its clocks pass
-/// `B_0` and `B_1`, its leader appends nothing, and no replica records a
-/// cut. Once one reads in window 2, the next boundary cuts that window
-/// alone.
+/// `B_0` and `B_1`, its leader appends no empty result (the clock past
+/// `B_1` sweeps the writes' expired sessions, a result with steps), and no
+/// replica records a cut. Once one reads in window 2, the next boundary
+/// cuts that window alone.
 #[test]
 fn an_idle_agent_appends_no_marker() {
     let clock = clock();
@@ -127,13 +128,17 @@ fn an_idle_agent_appends_no_marker() {
     let leader = cluster.leader(agent);
     let node = cluster.node(leader);
     let applied = stored_applied(node, agent);
+    let markers = || {
+        results(node, agent, applied)
+            .into_iter()
+            .filter(|(_, result)| result.steps.is_empty())
+            .count()
+    };
     for window in 0..2 {
         cluster.set_clocks(clock.boundary(window).unwrap() + 1_000);
-        stays("no marker", Duration::from_secs(2), || {
-            results(node, agent, applied).is_empty()
-        });
+        stays("no marker", Duration::from_secs(2), || markers() == 0);
     }
-    assert!(results(node, agent, applied).is_empty(), "no marker");
+    assert_eq!(markers(), 0, "no marker");
     for number in 1..=3 {
         assert!(cuts(cluster.node(number), agent).is_empty(), "no cut");
     }
