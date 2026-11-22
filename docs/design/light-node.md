@@ -85,6 +85,7 @@ devices decrypt each other's messages".
 | E40 | `claim` is the one way a personal agent is assigned and its policy set: no `assign`, no `configure` (§3.3) (2026-11-20). |
 | E41 | A device is removed on the log it verifies, never on a refusal an agent answers (§3.6) (2026-11-20). |
 | E42 | A refusal of a pairing slot's read does not end the joiner's pairing: it reads the slot again until its expiry (§3.8) (2026-11-20). |
+| E43 | A nullifier whose device left or was removed stays spent at `Homes` for the removal delay (72 h), then may claim again: one agent per nullifier per delay, so a leave loop cannot drain the pool (§3.3) (2026-11-22). |
 
 **The flows left out** [the owner, 2026-11-17]: four flows that had no
 caller in the product, or carried most of the device side's complexity,
@@ -531,8 +532,10 @@ operator makes ahead of time**:
 - **The claim:** `homes.claim(device, kit, agent)` under
   `#[msg(credential = Auth("home"))]`. The pseudonym is the claiming
   device's nullifier in scope "home" [decided, E5]. `Homes` refuses a
-  nullifier already holding an agent, takes the pooled agent the device
-  named (`Taken` when another claim took it), indexes it under the
+  nullifier already holding an agent, and one whose device's removal or
+  leave matured within the removal delay (`Spent`, E43), takes the pooled
+  agent the device named (`Taken` when another claim took it), indexes it
+  under the
   nullifier and under `H(each recovery public key)` (§3.5), and sends it
   `claim(device, kit, policy, homes)`; `Command::send` is one-way
   (`agent/sdk/src/context.rs`), so `Personal` answers `assigned` or
@@ -598,8 +601,8 @@ this is the one taken]:
   dropped and the agent retired.
 - **The claim** (`claim(device, kit, agent)` under `Auth("home")`, 0.69M
   gas): the device's `nullifier` must be the proof's (`Nullifier`); a
-  nullifier holding an agent is `Claimed`, a kit entry's index holding one
-  `KitTaken`, more than four entries or one key twice among the device's
+  nullifier holding an agent is `Claimed`, one spent `Spent` (below), a
+  kit entry's index holding one `KitTaken`, more than four entries or one key twice among the device's
   and the kit's `Malformed` (what `Personal` would refuse, so a refusal
   cannot be repeated against a pooled agent), an empty pool `PoolEmpty`,
   an `agent` not pooled `Taken`, each writing nothing. A kit may be empty
@@ -626,7 +629,9 @@ this is the one taken]:
   device's at its maturity (`record`, refused for a nullifier another agent
   holds), each removed device's as its removal matures (`forget`, so a
   stolen phone renews nothing and the index stays at the device set's
-  size), and the kit's signing keys whenever a rotation or a restore
+  size; the nullifier is then **spent** for the home's removal delay,
+  `operation_delay_ms`, 72 h by default, and its next claim after that is
+  a first claim [E43, built]), and the kit's signing keys whenever a rotation or a restore
   replaces it (`rekey`, the agent re-indexed under the new keys alone, a
   key indexing another agent left out, and that kit then finding no agent:
   a squatted kit key is the next rotation's to replace). A device's
@@ -646,7 +651,22 @@ this is the one taken]:
   agents lapse into their grace unless a device re-records; the path (a
   device's new nullifier vouched for by its admin key and relayed by
   `Personal`) waits for the re-founding runbook.
-- **Reads:** the agent of a nullifier (`agent`), of a kit entry's index
+- **Spent nullifiers** [E43, built]: a leave matures at its own evidence
+  and a cosigned removal at its second signature, so without a hold one
+  member's leaf could claim, add a made-up device, leave and claim again
+  with no wait, a pool agent a loop. Every `forget` (a leave, a removal by
+  others, a regroup's, a restore's) holds the nullifier spent until the
+  delay from then; a claim under it is `Spent` until that time, and the
+  first claim after takes the row away. So one nullifier takes at most one
+  agent a delay, and only a leaf of the home proves under one: an open
+  claim's, under the registrar's period cap (B11), or an enrollment's at a
+  home that is the user's own space (B13). The rows are pruned
+  as they lapse, two at each `forget` and claim, by an index of their
+  times. A device asks `spent(nullifier)` (the time it lapses) before a
+  claim shows its kit and before a move leaves its space, so neither ends
+  at a refusal it could have read first.
+- **Reads:** the agent of a nullifier (`agent`), a spent nullifier's lapse
+  (`spent`), of a kit entry's index
   (`find`, a restore's lookup), an agent's standing (`standing_of`), the
   counts (`tally`), and the stocked agents a page at a time (`agents`,
   which the keeper's upgrade walks).
@@ -1617,7 +1637,12 @@ commits), **active**, or **removed** (with its frontier). A device is
     a phone left with only a newly paired one waits for it). The set's
     last live device may not leave: no device would commit it, and a
     restore with the kit replaces it instead; of two leaves open side by
-    side, the one maturing last is cancelled (`Alone`).
+    side, the one maturing last is cancelled (`Alone`). Only the confirmed
+    group counts: the device a pending candidate adds is not another live
+    device (were the candidate void, it would be dropped and the set left
+    with none), and it signs nothing, its own leave included, until the
+    verdict (`Undecided`); a device whose own candidate adds one leaves
+    once it is confirmed (`AwaitsVotes` on the device).
 
 *Why a leave waits on nothing.* A leave only lowers its signer's power:
 it gives up the one voice it had and gains none. The delay and the veto
@@ -1765,10 +1790,18 @@ where the rules above leave a choice, this is the one taken]:
   admins other than the targets: a delayed admin's signature makes
   nothing immediate and resolves nothing (every operation it signs
   waits); its veto counts. The second signature is `cosign(op)`, which
-  matures a removal, a kit rotation or a regroup at once, contested or
-  not; the kit cosigns only a regroup. `resolve(op, upheld)` names the
-  operation that matures, its rival in a pair dropped (or, not upheld,
-  the reverse): the kit's acts at once, a device's when a second agrees.
+  matures a removal, a kit rotation or a regroup at its own evidence,
+  contested or not (a signer holds one unevidenced cosign of an operation
+  at a time, `Cosigned`); the kit cosigns only a regroup.
+  `resolve(op, upheld)` names the operation that matures, its rival in a
+  pair dropped (or, not upheld, the reverse): the kit's acts at its
+  evidence, a device's at the evidence that makes two agree, each
+  device's latest resolution counting and replacing its earlier one. So
+  a call that makes an operation immediate decides nothing until its
+  evidence is in the log, as a leave: a signer who withholds it (a lost
+  phone, or a thief holding a seasoned device) leaves the operation where
+  it was for the agent and for every device alike, never a maturity the
+  devices refuse.
   A replacement upheld still waits out its new key's probation [E29]: it
   matures at its own time, and a device takes no maturity of one
   asserted before it.
@@ -2254,7 +2287,7 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   entry that logged its removal (`Matured`) and on while the entries are
   within the confirming window after its maturity (`Personal::log`, the
   table `gone`), where any evidence the maturity rests on is (a cosign's
-  or a resolution's, posted after the call that matured it); the device
+  or a resolution's, logged before the maturity it decides); the device
   follows it as any device does, verifying each operation's and
   confirmation's signature against the keys its own log gave it (B6), and
   is out (`Course::Out`) once that evidence supports its removal, which
@@ -2273,7 +2306,7 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   candidates, `alive`), which before it read none of: a stolen phone
   removed and then replaced learns the new phone's nullifier. A device
   whose removal's maturity the log asserted but whose evidence never
-  supported it (a cosign's evidence never posted) stays in the set by its
+  supported it (a log the operators wrote) stays in the set by its
   rules, and pairs again from a code of its own space
   (`DeviceGroup::removal_unsupported`); a removal pending its delay lets
   no device in the set pair again. The Devices screen's own row says
@@ -2316,7 +2349,12 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   one the agent answers alike when sent again. The test kills a pass
   before and after each of its requests (a push that had something to
   do, a scope to read), restarts the phone from its store and runs the
-  next pass: the phones converge and the agent holds each node once.
+  next pass: the phones converge and the agent holds each node once. The
+  flows' suite (the facility's `crashes.rs`: claim, pairing, restore,
+  move and leave) kills the process as Android does: the phone's files
+  are kept as they are at the request (`Held::kill`, `World::on_death`),
+  nothing the dying process writes, shows or sends after counts, and the
+  next process starts from those files.
 - **s4's jobs**: WorkManager's periodic jobs (15 minutes, a network up)
   in `:vos` alone (`setDefaultProcessName`, every WorkManager component
   declared in `:vos`, its start-up initializer dropped from the UI
@@ -2515,7 +2553,14 @@ one taken; times [World]: §6.3]:
   kit was shown voids that kit: the claim is abandoned and new words are
   shown with the reason ("the words shown before are void"), at most
   three kits; one unreached keeps the claim and its kit, as a retry
-  sends it. The claim (the device, the kit with `R2`, `R`, the
+  sends it. Before the words are shown the claim asks `spent` of its
+  nullifier (E43), and writes that a kit is being shown (`p/kit-shown`);
+  the claim is held the moment the words are written down, in the batch
+  that clears that row, while the open claim's work and reads still run
+  behind them, so a process killed after the tap leaves the claim with
+  the kit the user holds, and one killed while the words were shown
+  leaves the row: the next claim shows new words saying the earlier
+  ones are void. The claim (the device, the kit with `R2`, `R`, the
   agent) is held in the store from before its call until the device's
   group starts from the agent's log (`Claim::claimed`, the `R` the kit's
   from the `Assigned` entry), so a retry after a lost answer sends the
@@ -4237,8 +4282,10 @@ device's crates faster); its size argument is small.
   with your kit" (`Personal::leave`: the removal signed and posted, the
   log read through to `Out` and the store made anew by the follow that
   read it, `Event::Left`; a leave cut short is read through and
-  forgotten by the next pass, and one killed between the two shows the
-  removed screen, whose pairing and restore forget first; the other
+  forgotten by the next pass; the group keeps that its own leave was
+  held (`State.leaving`), so a leave read in two sittings, or a forget
+  cut short, is finished by the next pass that finds the group out by
+  it, in any process; the other
   phones' next pass raises the matured removal's notice to commit it).
   What stays: the secret source's key and the label, as at a fresh
   install, and the Keystore's admin key, which s4 makes and signs with
@@ -4444,7 +4491,15 @@ holds the epoch's keys, as after any matured removal (it forgot them at
 once if it was the owner's own leave; a thief who kept a copy reads until
 the commit, as A2's thief does before the owner's removal), and the
 commit re-seals `R`. The last live device cannot leave (`Alone`): no
-device would commit it; a restore with the kit replaces it.
+device would commit it; a restore with the kit replaces it. Nor can a
+device whose only other live device is one its pending candidate adds
+(the candidate void, none would be left), and that device signs no leave
+before its verdict. *Known limit:* with a third device that is lost but
+still confirmed (in the confirming window), a leave beside a pending add
+is allowed by the agent; the leaver's own flow refuses it while its
+candidate adding a device is undecided (`AwaitsVotes`), but a leave
+signed elsewhere, after the pairing device showed "Paired", leaves the
+set to the lost device if the add then times out.
 
 ### 8.2 The home space and its operators
 
@@ -4515,7 +4570,10 @@ disk and every device at once.
 **B11. The pool runs out,** or the open claims' daily cap is reached.
 *Mitigation:* `Homes` answers `PoolEmpty`, the designed symptom (the cap
 is kept below the keeper's refill rate so the disk never fills first); the
-keeper tops up, the device stays local and retries.
+keeper tops up, the device stays local and retries. The cap counts open
+claims, and each open claim's leaf takes at most one agent a removal
+delay, however often its device leaves or is removed (E43): a forgotten
+nullifier is spent for that delay.
 
 **B12. `Homes` assigns one agent twice, or one nullifier twice.**
 *Mitigation:* unique Linear indexes in `Homes`; `assigned`/`refused`
