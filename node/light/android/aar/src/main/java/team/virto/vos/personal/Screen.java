@@ -4,6 +4,7 @@
 package team.virto.vos.personal;
 
 import android.graphics.Typeface;
+import android.os.Build;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
@@ -168,7 +169,15 @@ abstract class Screen {
       field.setSingleLine(true);
     }
     field.setInputType(type);
+    noAutofill(field);
     return field;
+  }
+
+  /** A field no autofill service reads or fills: a kit's words, a check word, a pairing code. */
+  static void noAutofill(EditText field) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      field.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+    }
   }
 
   interface KeepKind {

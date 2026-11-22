@@ -129,6 +129,30 @@ final class RestoreScreen extends Screen {
       return;
     }
     into.addView(heading("2. Opened ✓"));
+    into.addView(
+        text(
+            "Keep your old kit until this phone shows \"Restored\": the new one restores nothing "
+                + "before then, nor if the restore is cancelled."));
+    into.addView(
+        text(
+            "If opening it was cut short, or a device of yours answered that it is alive, open it "
+                + "again: the kit resumes it, or opens a new one."));
+    into.addView(
+        buttons(
+            button(
+                "Open the restore again",
+                v -> {
+                  Home at = home != null ? home : homeField == null ? null : homeField.home();
+                  if (at != null) {
+                    open(at);
+                  }
+                }),
+            button(
+                "Remove a lost phone first",
+                v -> {
+                  lost = true;
+                  redraw();
+                })));
     long now = System.currentTimeMillis();
     boolean matured = status.matures > 0 && status.matures <= now;
     into.addView(heading("3. Wait for the kit's delay" + (matured ? " ✓" : "")));
@@ -327,7 +351,10 @@ final class RestoreScreen extends Screen {
         },
         null,
         true,
-        refused -> refused(home, refused));
+        refused -> {
+          refused(home, refused);
+          shown();
+        });
   }
 
   private void finish() {
@@ -342,6 +369,9 @@ final class RestoreScreen extends Screen {
         },
         null,
         true,
-        refused -> refused(home, refused));
+        refused -> {
+          refused(home, refused);
+          shown();
+        });
   }
 }
