@@ -5,8 +5,9 @@
 
 use vos_abi::abi::Refusal;
 use vos_abi::credentials::Tag;
-use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal};
+use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash};
 use vos_abi::keys::{self, Due};
+use vos_abi::records::DeviceRelease;
 use vos_abi::result::InputRef;
 use vos_abi::{Decode, Encode, SpaceId, defaults};
 use vos_wire::batch::{CredentialedInput, Input};
@@ -131,8 +132,9 @@ fn the_request_and_its_refusals_encode_as_pinned() {
     );
 }
 
-/// The log's input at `Input`'s index 10, its claim, its kernel and its
-/// device format beside the origin, without the proof or the nonce; its
+/// The log's input at `Input`'s index 10, its claim, its kernel, its
+/// device format and the kernel's release beside the origin, without the
+/// proof or the nonce; its
 /// step's reference at `InputRef`'s index 9.
 #[test]
 fn the_logged_input_carries_the_origin_and_the_claim() {
@@ -146,6 +148,11 @@ fn the_logged_input_carries_the_origin_and_the_claim() {
         claim: vec![7; 3],
         kernel: MethodId(8),
         format: 47,
+        release: DeviceRelease {
+            kernel: ProgramHash([9; 32]),
+            reference: ProgramHash([10; 32]),
+            headroom: 11,
+        },
     };
     let fields = [
         &Principal::Owner([1; 32]).encode()[..],
@@ -159,6 +166,9 @@ fn the_logged_input_carries_the_origin_and_the_claim() {
         &[7; 3],
         &8u32.to_le_bytes(),
         &47u32.to_le_bytes(),
+        &[9; 32],
+        &[10; 32],
+        &[11],
     ]
     .concat();
     assert_eq!(

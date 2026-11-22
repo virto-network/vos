@@ -195,8 +195,10 @@ pub fn status(answer: &Answer) -> u16 {
         Answer::Refused(Refusal::SessionsFull) => 503,
         Answer::Refused(Refusal::KeySessionsFull) => 429,
         // A credentialed call too late, on a root too old, or of a retired
-        // device format: a new proof.
-        Answer::Refused(Refusal::CredentialExpired | Refusal::StaleRoot | Refusal::Format) => 403,
+        // device format or kernel release: a new proof.
+        Answer::Refused(
+            Refusal::CredentialExpired | Refusal::StaleRoot | Refusal::Format | Refusal::Release,
+        ) => 403,
         Answer::Refused(_) => 409,
         Answer::Rejected(rejection) => match rejection {
             Rejection::TooOld | Rejection::StaleSession { .. } => 410,

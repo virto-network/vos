@@ -496,7 +496,7 @@ impl Inner {
         let admitted = programs
             .into_iter()
             .filter(|(release, _)| window.contains(release))
-            .filter_map(|(_, program)| program)
+            .filter_map(|(release, program)| Some((release, program?)))
             .collect::<Vec<_>>();
         if admitted.is_empty() {
             return Err(CredentialRefusal::Kind.into());
@@ -513,9 +513,9 @@ impl Inner {
         };
         let claimed = *credentials::claim_binding(&call.claim).ok_or(CredentialRefusal::Kind)?;
         // The binding names the program: one of the window's.
-        let (binding, program) = admitted
+        let (binding, release, program) = admitted
             .into_iter()
-            .map(|program| {
+            .map(|(release, program)| {
                 let binding = Bound {
                     space: &space,
                     agent,
@@ -527,9 +527,9 @@ impl Inner {
                     expires_ms: call.expires_ms,
                 }
                 .digest();
-                (binding, program)
+                (binding, release, program)
             })
-            .find(|(binding, _)| credentials::binding(binding) == claimed)
+            .find(|(binding, ..)| credentials::binding(binding) == claimed)
             .ok_or(CredentialRefusal::Binding)?;
         if snapshot.get(agent, &keys::binding(&binding))?.is_some() {
             return Err(CredentialRefusal::Replayed.into());
@@ -574,6 +574,7 @@ impl Inner {
                 claim: call.claim,
                 kernel,
                 format: call.format,
+                release,
             },
         })
     }

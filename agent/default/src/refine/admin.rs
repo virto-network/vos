@@ -141,6 +141,12 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
             else {
                 return failed(Outcome::failed(Failure::Unknown));
             };
+            // The release's newest format is the one its devices prove in:
+            // retired, the agent would admit no proven call until a release
+            // with a newer one, as the date is never moved later.
+            if format == defaults::DEVICE_FORMATS[0].0 {
+                return failed(Outcome::failed(Failure::Forbidden));
+            }
             let logged = match base.decoded::<u64>(&keys::format_retired(format)) {
                 Ok(logged) => logged,
                 Err(_) => return failed(Outcome::failed(Failure::Trapped)),

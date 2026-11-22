@@ -152,6 +152,11 @@ codes! {
         /// (`vos_wire::defaults::DEVICE_FORMATS`,
         /// [`crate::keys::format_retired`]).
         Format = 11,
+        /// A credentialed call whose proof is of a device-kernel release
+        /// its guard's kernel no longer admits by the batch's time
+        /// ([`crate::records::Installed::window`]): replaced past its
+        /// previous release's date, or retired through the agent's log.
+        Release = 12,
     }
 }
 

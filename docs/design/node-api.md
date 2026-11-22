@@ -240,7 +240,10 @@ budget, past which it is answered `Busy`.
   agent's log (`Admin::Retire`, its outcome the date kept); `Format {
   format, at_ms }` sets device format `format`'s the same way
   (`Admin::RetireFormat`), its outcome the date kept, `Unknown` for a
-  format the release does not admit. Neither ever moves a date later.
+  format the release does not admit, `Forbidden` for its newest, which its
+  devices prove in. Neither ever moves a date later; apply refuses a proof
+  of a retired release `Refusal::Release` and of a retired format
+  `Refusal::Format`, on every replica.
 - **The credential actor's `feed(from)`, `path(member)` and `root()`** are `Query`s
   like any other, signed by a key the device library draws for each
   (`identity-and-authority.md` §6); no kind of their own.

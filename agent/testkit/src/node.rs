@@ -11,7 +11,7 @@ use vos_abi::abi::surface::LOST;
 use vos_abi::abi::{Failure, Refusal, cap, code};
 use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, SessionId};
 use vos_abi::jam::{AccumulateInput, Operand, RefineArgs};
-use vos_abi::records::{Installed, SessionMark, unstored};
+use vos_abi::records::{DeviceRelease, Installed, SessionMark, unstored};
 use vos_abi::result::{Outcome, Run, Step, WorkResult};
 use vos_abi::{Decode, Encode, keys};
 use vos_pvm::accumulate_host::AccumulateContext;
@@ -462,6 +462,19 @@ impl Node {
     pub fn value<T: Decode>(&self, key: &[u8]) -> Option<T> {
         self.get(key)
             .map(|bytes| crate::model::decode(&bytes).expect("decodes"))
+    }
+
+    /// The release of `instance`'s device kernel `kernel` an install put
+    /// there, which ingress verifies a proof against; zeros for an
+    /// instance not installed or a method that is no device kernel.
+    pub fn release(&self, instance: InstanceId, kernel: MethodId) -> DeviceRelease {
+        self.value::<Installed>(&keys::installed(instance))
+            .and_then(|installed| installed.derivation.device(kernel))
+            .unwrap_or(DeviceRelease {
+                kernel: ProgramHash([0; 32]),
+                reference: ProgramHash([0; 32]),
+                headroom: 0,
+            })
     }
 
     /// A session's id and mark, as accumulate keeps them.

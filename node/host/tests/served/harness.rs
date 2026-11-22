@@ -74,6 +74,9 @@ pub struct Slot {
     pub installed: AtomicU64,
     pub trip: Arc<Trip>,
     pub offset: Arc<AtomicI64>,
+    /// While not zero, the reading its clock is held at, whatever the
+    /// offsets.
+    pub held: Arc<AtomicU64>,
     /// The device formats its next start admits, where a test sets them
     /// (`Config::device_formats`); the release's otherwise.
     pub device_formats: Mutex<Option<DeviceFormats>>,
@@ -136,6 +139,7 @@ impl Cluster {
                 installed: AtomicU64::new(0),
                 trip: Arc::new(Trip::default()),
                 offset: Arc::new(AtomicI64::new(0)),
+                held: Arc::new(AtomicU64::new(0)),
                 device_formats: Mutex::new(None),
                 dir,
             })
@@ -215,10 +219,12 @@ impl Cluster {
         config.compact_tail = 16;
         config.snapshot_chunk = 4096;
         let (offset, everyone) = (Arc::clone(&slot.offset), Arc::clone(&self.offset));
-        config.clock = Arc::new(move || {
-            vos_node::wall_clock().saturating_add_signed(
+        let held = Arc::clone(&slot.held);
+        config.clock = Arc::new(move || match held.load(Ordering::SeqCst) {
+            0 => vos_node::wall_clock().saturating_add_signed(
                 everyone.load(Ordering::SeqCst) + offset.load(Ordering::SeqCst),
-            )
+            ),
+            held => held,
         });
         if let Some(formats) = slot.device_formats.lock().unwrap().clone() {
             config.device_formats = formats;

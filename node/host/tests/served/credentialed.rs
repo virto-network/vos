@@ -832,6 +832,34 @@ fn a_verified_call_holds_no_large_place_while_it_waits_to_apply() {
     }
 }
 
+/// Two tree-changing batches while the leader's clock reads the agent's
+/// time: the second is timed a millisecond past the first, so its root
+/// does not replace the one the first wrote (`Ring::record`), which a
+/// device that read it still proves against.
+#[test]
+fn a_batch_at_the_agents_time_is_timed_past_it() {
+    let founded = Founded::new();
+    let leader = founded.cluster.leader(founded.agent).unwrap();
+    let held = vos_node::wall_clock()
+        .saturating_add_signed(founded.cluster.offset.load(Ordering::SeqCst))
+        + 2_000;
+    let first = Secret::new(4);
+    let path = {
+        let slot = founded.cluster.slot(leader);
+        slot.held.store(held, Ordering::SeqCst);
+        founded.write(CREDENTIALS, "enroll", first.member());
+        let path = founded.path(&first);
+        founded.write(CREDENTIALS, "enroll", Secret::new(5).member());
+        slot.held.store(0, Ordering::SeqCst);
+        path
+    };
+    let newest = founded.root();
+    assert!(newest.since > held, "a batch time past the agent's");
+    assert_ne!(newest.root, path.root);
+    let call = founded.auth(leader, &first, &path, ("login", "login"), ());
+    assert!(done(&founded.send(leader, &call)).len() > 1);
+}
+
 /// A root this replica has not applied is `RootUnknown` there, and
 /// admitted at a replica that has; a root written while the leader's clock
 /// trails the agent's time stays admitted after the next batch's write,
@@ -1433,8 +1461,8 @@ fn window(founded: &Founded, at: NodeNumber, instance: InstanceId) -> DeviceWind
 /// old app refuses before proving, saying which side must update, and its
 /// proof made before is refused at ingress. A rollback keeps release two's
 /// program until its date, 60 days on: then it leaves the window, by the
-/// clock alone. A device format retired now empties the window's formats,
-/// and a proof is refused `Format`.
+/// clock alone. The release's one device format cannot be retired in the
+/// agent's log (`Forbidden`): its window keeps it, and a proof runs.
 #[test]
 fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     use vos_light::wire::{self, Answer};
@@ -1634,8 +1662,8 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     let (call, proof) = login(0);
     assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
 
-    // A device format retired now in the agent's log: no device proof is
-    // admitted, at any replica.
+    // The release's one device format cannot be retired in the agent's
+    // log: no proven call would run until a release with a newer one.
     let now = time();
     let retire = |format| {
         smol::block_on(
@@ -1648,7 +1676,10 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
     };
     assert!(matches!(
         retire(DEVICE_FORMAT),
-        vos_node::Reply::Ran(Outcome::Done(ref kept)) if Option::<u64>::decode_exact(kept) == Some(Some(now))
+        vos_node::Reply::Ran(Outcome::Failed {
+            code: Failure::Forbidden,
+            ..
+        })
     ));
     assert!(
         matches!(
@@ -1660,15 +1691,16 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
         ),
         "a format the release never admitted"
     );
-    let (call, proof) = login(1);
-    vos_checker::spaces::wait_in_process("the retirement applied", || {
-        window(&founded, at, CREDENTIALS).formats.is_empty()
-    });
-    assert!(matches!(sign_in(&old_app), Err(DeviceError::Window)));
+    let formats = window(&founded, at, CREDENTIALS).formats;
     assert_eq!(
-        send(&call, &proof),
-        Answer::Refused(CredentialRefusal::Format)
+        formats
+            .iter()
+            .map(|window| window.format)
+            .collect::<Vec<_>>(),
+        [DEVICE_FORMAT]
     );
+    let (call, proof) = login(1);
+    assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
 }
 
 /// The device formats' window (`light-node.md` §4.4) at one node: by
@@ -1679,7 +1711,8 @@ fn an_app_one_release_behind_signs_in_until_its_window_closes() {
 /// proof is run as its member's pseudonym. Restarted with 48 retired now: a
 /// 48 proof made before is refused `Format` at the node's ingress and the
 /// app chooses 47. Restarted admitting 48 alone, retired, the node's window
-/// is empty.
+/// is empty. The agent's log retires neither 48, which the release does not
+/// admit, nor 47, its newest: 47 proofs still run.
 #[test]
 fn the_previous_device_format_is_admitted_until_it_is_retired() {
     use vos_light::wire::{self, Answer};
@@ -1824,8 +1857,8 @@ fn the_previous_device_format_is_admitted_until_it_is_retired() {
     assert!(window(&founded, at, CREDENTIALS).formats.is_empty());
     assert!(matches!(sign_in(3, &both), Err(DeviceError::Window)));
 
-    // The agent's log retires only a format the release admits; its
-    // retirement of 47 outlives a restart that admits 47 again.
+    // The agent's log retires only a format the release admits, and not
+    // its newest: 47 stays admitted, through a restart too.
     let retire = |format| {
         smol::block_on(founded.cluster.leading(founded.agent).retire_format(
             founded.agent,
@@ -1834,24 +1867,23 @@ fn the_previous_device_format_is_admitted_until_it_is_retired() {
         ))
         .unwrap()
     };
-    assert!(matches!(
-        retire(previous),
-        vos_node::Reply::Ran(Outcome::Failed {
-            code: Failure::Unknown,
-            ..
-        })
-    ));
+    for (format, code) in [
+        (previous, Failure::Unknown),
+        (DEVICE_FORMAT, Failure::Forbidden),
+    ] {
+        assert!(
+            matches!(
+                retire(format),
+                vos_node::Reply::Ran(Outcome::Failed { code: failed, .. }) if failed == code
+            ),
+            "format {format}"
+        );
+    }
     restart(vec![(DEVICE_FORMAT, None)]);
-    assert!(matches!(
-        retire(DEVICE_FORMAT),
-        vos_node::Reply::Ran(Outcome::Done(ref kept)) if Option::<u64>::decode_exact(kept) == Some(Some(now))
-    ));
-    vos_checker::spaces::wait_in_process("the retirement applied", || {
-        window(&founded, at, CREDENTIALS).formats.is_empty()
-    });
-    restart(vec![(DEVICE_FORMAT, None)]);
-    assert!(window(&founded, at, CREDENTIALS).formats.is_empty());
-    assert!(matches!(sign_in(3, &both), Err(DeviceError::Window)));
+    assert_eq!(formats(&window(&founded, at, CREDENTIALS)), [DEVICE_FORMAT]);
+    let (format, call, proof) = sign_in(3, &both).unwrap();
+    assert_eq!(format, DEVICE_FORMAT);
+    assert!(matches!(send(&call, &proof), Answer::Ran { .. }));
 }
 
 /// A device format the release does not admit binds every replica, whatever
@@ -1906,6 +1938,71 @@ fn a_format_the_release_does_not_admit_is_refused_at_apply() {
         founded.send(at, &request(&call, proof)),
         Response::Refused(Refusal::Format)
     );
+    let after: u64 = founded.read(POLL, "logins", ());
+    assert_eq!(after, logins, "run nowhere");
+}
+
+/// A replica that has not applied the operator's retirement of release one
+/// still admits release one's proof at ingress, its window as it applied
+/// it, and forwards it; the leader's apply refuses it `Release`, and it
+/// runs nowhere.
+#[test]
+fn a_retired_release_is_refused_at_apply_behind_a_lagging_replica() {
+    let founded = Founded::new();
+    let agent = founded.agent;
+    let auth = founded.method(CREDENTIALS, "auth");
+    let elf = |path: std::path::PathBuf| std::fs::read(path).unwrap();
+    let one = stock(&elf(program_elf("vos-credentials")), "auth");
+    let at = founded.follower();
+    let secret = Secret::new(0x62);
+    founded.write(CREDENTIALS, "enroll", secret.member());
+    let path = founded.path(&secret);
+    founded.install(
+        CREDENTIALS,
+        &elf(actor_elf("credentials-next")),
+        "registrar",
+    );
+    let leading = founded.cluster.leading(agent).applied(agent);
+    vos_checker::spaces::wait_in_process("the install applied", || {
+        founded
+            .cluster
+            .node(at)
+            .is_some_and(|node| node.applied(agent) >= leading)
+    });
+    let admits_one = || {
+        window(&founded, at, CREDENTIALS)
+            .kernels
+            .iter()
+            .any(|kernel| kernel.programs.iter().any(|program| program.id == one.id))
+    };
+    assert!(admits_one(), "release one in the window after the upgrade");
+    let logins: u64 = founded.read(POLL, "logins", ());
+    let call = founded.call(at, POLL, "login", ());
+    let proof = founded
+        .prover
+        .prove_auth(
+            &secret.0,
+            &witness(&path),
+            b"login",
+            &call,
+            &DeviceProgram::from_release(&one).unwrap(),
+        )
+        .unwrap();
+    let answer = {
+        let _held = founded.cluster.slot(at).trip.commits.close();
+        let now = client::time(founded.cluster.target(at)).unwrap();
+        let retired = smol::block_on(founded.cluster.leading(agent).retire(
+            agent,
+            CREDENTIALS,
+            auth,
+            now,
+        ))
+        .unwrap();
+        assert!(matches!(retired, vos_node::Reply::Ran(Outcome::Done(_))));
+        assert!(admits_one(), "the lagging replica has not applied it");
+        founded.send(at, &request(&call, proof))
+    };
+    assert_eq!(answer, Response::Refused(Refusal::Release));
     let after: u64 = founded.read(POLL, "logins", ());
     assert_eq!(after, logins, "run nowhere");
 }

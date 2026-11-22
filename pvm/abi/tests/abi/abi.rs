@@ -610,6 +610,7 @@ fn codes_keep_their_values() {
         (Refusal::StaleRoot, 9),
         (Refusal::Once, 10),
         (Refusal::Format, 11),
+        (Refusal::Release, 12),
     ];
     for (refusal, code) in refusals {
         assert_eq!(refusal.code(), code);
@@ -657,7 +658,7 @@ fn codes_keep_their_values() {
         .concat()
     );
     assert_eq!(gas.failure(), Failure::Cap);
-    for outside in [0u32, 12, u32::MAX] {
+    for outside in [0u32, 13, u32::MAX] {
         assert!(Refusal::decode(&outside.to_le_bytes()).is_err());
     }
     let failed = Outcome::Failed {

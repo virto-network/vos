@@ -7,7 +7,7 @@ use crate::ingress::Grant;
 use vos_abi::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, RequestId, Session};
 use vos_abi::keys::Due;
 use vos_abi::message::{Await, Body};
-use vos_abi::records::Derivation;
+use vos_abi::records::{Derivation, DeviceRelease};
 
 /// A refine's work item payload: a batch through the log, a query on
 /// applied state, a batch on JAM, or a merge on a device.
@@ -204,15 +204,16 @@ pub enum Input {
     },
     /// A proven call, its device proof verified at ingress: no session, its
     /// origin the one the proof proved (`identity-and-authority.md` §5).
-    /// The log carries its claim, but neither the proof, nor its nonce, nor
-    /// its format.
+    /// The log carries its claim, its format and the kernel's release it
+    /// was verified against, but neither the proof nor its nonce.
     /// Boxed, so every input does not carry its size.
     #[codec(index = 10)]
     Credentialed(alloc::boxed::Box<CredentialedInput>),
 }
 
 /// A proven call as the log carries it. Refine refuses it if `expires_ms`
-/// is before the batch's time, if `binding` is recorded, if a stock auth
+/// is before the batch's time, if `binding` is recorded, if its `format`
+/// or `release` is retired by the batch's time, if a stock auth
 /// claim's root is not fresh by the batch's time, or if a `once` guard's
 /// nullifier is recorded; else it records `binding` until `expires_ms`
 /// plus [`crate::defaults::BINDING_KEPT_MS`] and runs the method, its
@@ -241,6 +242,10 @@ pub struct CredentialedInput {
     /// The device format the proof is in, which ingress verified it under:
     /// apply refuses one the release or the agent's log retired.
     pub format: u32,
+    /// The kernel's release the proof was verified against: apply refuses
+    /// one no longer in `kernel`'s window by the batch's time, whatever the
+    /// node that verified it held.
+    pub release: DeviceRelease,
 }
 
 /// A client request, in its session's sequence for this agent.
@@ -333,7 +338,10 @@ pub enum Admin {
     /// time, if that is earlier than its date (`light-node.md` §4.4): from
     /// then apply refuses a proof of it on every replica, and each
     /// replica's ingress refuses it at once. A format the release does not
-    /// admit fails `Unknown`; its outcome is the date kept, encoded.
+    /// admit fails `Unknown`, and its newest, the one its devices prove in,
+    /// `Forbidden`: the date is never moved later, so it would admit no
+    /// proven call until a release with a newer one. Its outcome is the
+    /// date kept, encoded.
     #[codec(index = 4)]
     RetireFormat { format: u32, at_ms: u64 },
 }

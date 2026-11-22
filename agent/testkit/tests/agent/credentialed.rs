@@ -210,6 +210,7 @@ impl Agent {
             Principal::Owner(_) => "owner",
             _ => "auth",
         };
+        let kernel = method(&self.credentials, kernel);
         CredentialedInput {
             origin,
             instance,
@@ -218,8 +219,9 @@ impl Agent {
             binding,
             expires_ms,
             claim,
-            kernel: method(&self.credentials, kernel),
+            kernel,
             format: defaults::DEVICE_FORMATS[0].0,
+            release: self.node.release(CREDENTIALS, kernel),
         }
     }
 
@@ -844,6 +846,7 @@ fn a_kernel_guards_handler_takes_the_claim_first() {
         .concat()
     };
     let auth = method(&actor("device"), "auth");
+    let release = node.release(device, auth);
     let call = |origin, claim: Vec<u8>, binding| CredentialedInput {
         origin,
         instance: device,
@@ -854,6 +857,7 @@ fn a_kernel_guards_handler_takes_the_claim_first() {
         claim,
         kernel: auth,
         format: defaults::DEVICE_FORMATS[0].0,
+        release,
     };
     let program = [0x70; 32];
     let kernel = Principal::Kernel { program };
@@ -1481,12 +1485,33 @@ fn an_owner_digest_another_person_named_is_held_a_day_at_most() {
     assert_eq!(detail(&acting), CredentialError::NoPerson as u8);
 }
 
+/// Apply holds every proven call to its kernel's window, whatever the node
+/// that verified it admits: a proof of a release the credential actor's
+/// window does not hold is refused `Release`, writing nothing, and one of
+/// the release it holds runs.
+#[test]
+fn apply_refuses_a_release_the_kernels_window_does_not_hold() {
+    let mut agent = Agent::new();
+    let time = START + 10;
+    let root = agent.root().root;
+    let origin = agent.anonymous("login", 1);
+    let mut call = agent.call(origin, POLL, "login", (), time + 60_000, Some(root));
+    let current = call.release;
+    call.release.kernel = vos_abi::ids::ProgramHash([0x5e; 32]);
+    let step = agent.step(time, &call);
+    assert_eq!(refused(&step), Refusal::Release);
+    assert!(!agent.node.state.contains_key(&keys::binding(&call.binding)));
+    call.release = current;
+    assert!(done(&agent.step(time, &call)));
+}
+
 /// Apply holds every proven call to the release's device formats and the
 /// agent's log, whatever the node that verified it admits: a proof of a
 /// format the release does not admit is refused `Format`, writing
-/// nothing; the operator retires 47 through the log, its outcome the date
-/// kept, and from that batch time a 47 proof is refused too. Retiring a
-/// format the release does not admit fails `Unknown`.
+/// nothing; a date in the log retires a format from that batch time, so a
+/// 47 proof is refused too. Retiring a format the release does not admit
+/// fails `Unknown`, and its newest, 47, `Forbidden`: no proven call would
+/// run until a release with a newer one.
 #[test]
 fn apply_refuses_a_device_format_the_release_or_the_log_retired() {
     let mut agent = Agent::new();
@@ -1512,18 +1537,15 @@ fn apply_refuses_a_device_format_the_release_or_the_log_retired() {
         agent.node.batch(time, vec![input]).steps.remove(0)
     };
     assert_eq!(failed(&retire(&mut agent, 44, time)), Failure::Unknown);
-    let kept = retire(&mut agent, 47, time + 5);
-    assert!(matches!(
-        &ran(&kept).outcome,
-        Outcome::Done(bytes) if Option::<u64>::decode_exact(bytes) == Some(Some(time + 5))
-    ));
-    let later = retire(&mut agent, 47, time + 50);
-    assert!(
-        matches!(
-            &ran(&later).outcome,
-            Outcome::Done(bytes) if Option::<u64>::decode_exact(bytes) == Some(Some(time + 5))
-        ),
-        "a date never moves later"
+    assert_eq!(
+        failed(&retire(&mut agent, 47, time + 5)),
+        Failure::Forbidden
+    );
+    assert!(!agent.node.state.contains_key(&keys::format_retired(47)));
+    // The row a release with a newer format lets the log write for 47.
+    agent.node.state.insert(
+        keys::format_retired(47),
+        vos_abi::records::stored(&(time + 5).encode()),
     );
     let call = login(&mut agent, 47, 3);
     assert!(done(&agent.step(time + 4, &call)));

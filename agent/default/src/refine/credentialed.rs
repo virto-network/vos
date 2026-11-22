@@ -2,7 +2,8 @@
 //! the batch's time): refused, writing nothing, when it expired, when its
 //! binding digest is recorded, when its proof's device format is retired,
 //! by the release or the agent's log, whatever the node that verified it
-//! admits, when a stock auth claim's root is not fresh at
+//! admits, when the kernel's release it was verified against has left the
+//! kernel's window by the batch's time, when a stock auth claim's root is not fresh at
 //! [`credentials::judged_at`] (the earlier of the batch's time and the
 //! expiry less the horizon, no later than any admitting ingress's clock,
 //! so apply refuses no root ingress admitted), or when a `once` guard
@@ -59,6 +60,11 @@ pub(crate) fn credentialed(base: &Base, index: u32, call: CredentialedInput) -> 
         Err(Corrupt) => return Stepped::ran(consumed(input, Outcome::failed(Failure::Trapped))),
     }
     let (guard, kernel) = guard(base, call.instance, call.method);
+    match released(base, guard.as_ref(), &call) {
+        Ok(true) => {}
+        Ok(false) => return refused(Refusal::Release),
+        Err(code) => return Stepped::ran(consumed(input, Outcome::failed(code))),
+    }
     // A stock auth claim's root, its first digest: ingress checked the
     // claim's shape, and one that is not an auth claim runs nothing.
     if let Some(CredentialGuard::Auth { .. }) = &guard {
@@ -164,6 +170,38 @@ fn guard(
         _ => None,
     };
     (guard, kernel)
+}
+
+/// Whether the release `call`'s proof was verified against is in its
+/// kernel's window at the batch's time: the kernel's actor's
+/// ([`CredentialGuard::kernel`]), the credential actor's for a stock
+/// guard. A method with no guard names no kernel, and nothing is refused
+/// here; one whose kernel's actor is gone admits no release.
+fn released(
+    base: &Base,
+    guard: Option<&CredentialGuard>,
+    call: &CredentialedInput,
+) -> Result<bool, Failure> {
+    let Some(guard) = guard else {
+        return Ok(true);
+    };
+    let actor = match guard.kernel().1 {
+        false => call.instance,
+        true => {
+            let Some(bytes) = base
+                .read(&keys::credentials())
+                .map_err(|_: Corrupt| Failure::Trapped)?
+            else {
+                return Ok(false);
+            };
+            InstanceId::decode_exact(&bytes).ok_or(Failure::Trapped)?
+        }
+    };
+    Ok(base.installed(actor)?.is_some_and(|installed| {
+        installed
+            .window(call.kernel, base.time)
+            .contains(&call.release)
+    }))
 }
 
 /// Whether device format `format` is admitted at the batch's time: one the

@@ -384,6 +384,7 @@ proves and the kernel's claim.
       pub claim: Vec<u8>,              // the kernel's public arguments
       pub kernel: MethodId,            // the kernel the proof is of
       pub format: u32,                 // the device format verified under
+      pub release: DeviceRelease,      // the kernel's release verified against
   }
   ```
 - **At apply** (refine, in the batch's order, at the batch's time `t`):
@@ -394,7 +395,13 @@ proves and the kernel's claim.
      past its release's date or the date the agent's log retired it at
      (`Admin::RetireFormat`, the operator's `Retire::Format` for an
      agent, one call for each agent that takes proven calls): refused,
-     `Refusal::Format` (11). A node's configuration
+     `Refusal::Format` (11); then the release one the kernel's window
+     (`Installed::window`, the kernel's actor's, the credential actor's
+     for a stock guard) no longer holds at `t`, past its date or retired
+     through the agent's log (`Admin::Retire`): refused,
+     `Refusal::Release` (12), so a replica that has not applied a
+     retirement admits the release's proofs at its ingress for nothing.
+     A node's configuration
      narrows what its own ingress admits and never what the space
      runs: a replica admitting a retired format verifies its proofs for
      nothing [decided];

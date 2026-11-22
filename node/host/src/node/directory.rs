@@ -178,7 +178,8 @@ impl Inner {
             .is_none();
         // Reports go to the representative once it is known.
         if first && self.representative() == Some(agent) {
-            self.looks.notify(usize::MAX);
+            let inner = Arc::clone(self);
+            self.spawn(async move { crate::steps::look_again(&inner.looks).await });
         }
         self.reconsider(agent);
     }

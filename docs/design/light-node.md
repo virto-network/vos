@@ -898,7 +898,13 @@ personal agents, one without]:
   slew adding up, the host's sleep) it wakes every idle leader to look
   again, so a step is seen within two seconds, no later than before. The
   space's representative first learned (for reports) and a blob arriving
-  (a proof to record) wake them too. With the fix and the agents, the
+  (a proof to record) wake them too, 256 at a time and 50 ms apart
+  (`steps::look_again`): a look took about 150–275 µs of the thread in
+  these runs, so a slice holds it at most about 70 ms, and a step at the
+  33,000 idle leaders a node of `open.md`'s 100,066 groups is seen by all
+  within about 15 s rather than as one burst of several seconds the Raft
+  drivers sharing the thread (3 s election timeout) would wait behind
+  (`a_wake_comes_in_slices`). With the fix and the agents, the
   looks took 34 and 27 samples, as without them (8–15 idle looks a second
   a node), and the transfers' p99 was 0.78 s in that one 26-minute run.
   The `look` stage of a node's stats counts the idle looks that found
@@ -2947,14 +2953,24 @@ format, the chips, the sizes and the root.
     install or retirement deletes its entry. The operator may set any
     earlier date, **now** included, when a version is found unsound
     (`Kind::Retire`, `Admin::Retire`, through the agent's log, so every
-    replica agrees; `vos agent retire`); a date is never moved later.
+    replica agrees; `vos agent retire`); a date is never moved later. The
+    proven input carries the release its proof was verified against, and
+    apply refuses one its kernel's window no longer holds by the batch's
+    time (`Refusal::Release`), so a replica behind the retirement, whose
+    ingress still admits the release, runs nothing of it
+    (`a_retired_release_is_refused_at_apply_behind_a_lagging_replica`).
   - **The formats' window** is the release's, held at apply: the device
     formats its binary verifies, at most two, the previous one retiring at
     the date its release set (60 days after the release that brought the
     next), or any earlier date the operator sets in an agent's log
     (`Kind::Retire`'s `Format` for that agent, `Admin::RetireFormat`, so
     every replica agrees and a restart keeps it; one call for each agent
-    that takes proven calls). A proof of a retired
+    that takes proven calls). The log never retires the release's newest
+    format (`Forbidden`): its date is never moved later, so the agent
+    would admit no proven call until a release with a newer one; a node's
+    own configuration still retires it at that node's ingress. With one
+    format in the release (47) the log's retirement is reachable only
+    once a release brings a second. A proof of a retired
     format is refused `Format` at ingress before anything is decoded, and
     the proven input carries its format, so apply refuses it on every
     replica too (`Refusal::Format`): a node whose configuration admits
@@ -3785,16 +3801,26 @@ connection's and circuit's first (past either the channel is closed),
 then the onion's, for which one call a circuit waits (another is closed
 at once), so no circuit queues headers ahead of the others; the header
 takes its circuit's request token, and the body must then keep its pace:
-by 5 s plus its share of 30 s, as much of it as that share, the whole
-within 30 s, so a header whose body never comes, or comes a byte at a
-time, gives its places back after about 5 s; an agent's calls
+its time is 5 s plus its length at 40 KiB/s (a 1 MiB upload's slowest
+measured, through a bridge, §6.3), at most 30 s, and by 5 s plus its
+share of that time as much of it as that share, the whole within it, so
+a header whose body never comes, or comes a byte at a time, gives its
+places back after about 5 s, and the smallest large body (64 KiB) kept
+at its pace after about 6.6 s (`ssh::Pace`); an agent's calls
 and proven calls from one circuit rated. *Known limit:* at the defaults,
 the members' wait still grows with the circuits an attacker
-holds: with one waiter each and 16 places freed every 5 s, a member waits
-about C × 5 / 16 s behind C attacker circuits, inside the 60 s a call
-waits for up to about 190 circuits (the 1,024-circuit cap would mean
-about 320 s); past that the defence is the introduction points' rate and
-arti's proof of work (`open.md`). Past a
+holds, one waiter each before a member, 16 places [derived, 2026-11-22]:
+with headers alone a member waits about C × 5 / 16 s, inside the
+gateway's 60 s for up to about 190 circuits; with the smallest large
+bodies kept at their pace (about 2.4 KiB/s a place, 38 KiB/s for all 16)
+C × 6.6 / 16 s, about 145 circuits; and an attacker who uploads bodies
+of 1 MiB or more at the slowest pace (about 28 KiB/s a place, 0.45 MiB/s
+for all 16) holds each place the whole 30 s, a member waiting
+C × 30 / 16 s, past 60 s at about 32 circuits. The device's own deadline
+for a proven call, 90 s (`tor::Config::proven`), covers the gateway's
+60 s wait and the body's 30 s, so it lowers none of these. Past them the
+defence is the introduction points' rate and arti's proof of work
+(`open.md`). Past a
 cap on a request already read the gateway answers `Busy` and asks no
 node. A flood of junk proven calls the size of a device proof, from eight
 connections through a port capped this way, held at most the port's

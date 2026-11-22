@@ -447,6 +447,10 @@ impl On<'_> {
             claim: claim.encode(),
             kernel: self.method(credentials, "auth"),
             format: DEVICE_FORMATS[0].0,
+            release: self
+                .this()
+                .node
+                .release(credentials, self.method(credentials, "auth")),
         }
     }
 
@@ -475,6 +479,10 @@ impl On<'_> {
             claim: OwnerClaim { owner, binding }.encode(),
             kernel: self.method(credentials, "owner"),
             format: DEVICE_FORMATS[0].0,
+            release: self
+                .this()
+                .node
+                .release(credentials, self.method(credentials, "owner")),
         }
     }
 
