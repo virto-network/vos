@@ -16,10 +16,12 @@
 //! nothing while it waits for the port's and closed past the others; on
 //! an uncapped one a place among the port's proven bodies
 //! ([`crate::caps::PROVEN_BODIES`]). Its header takes its address's rate
-//! token. The body must then arrive within [`LARGE_DEADLINE`], at a pace
-//! ([`Pace`]): after a first [`PROGRESS`], as much of it as that share of
-//! the deadline, so a header whose body never comes, or comes a byte at a
-//! time, holds its places about [`PROGRESS`]. Each call and proven call
+//! token. The body must then arrive within [`PROGRESS`] plus its length at
+//! [`SLOWEST_RATE`], at most [`LARGE_DEADLINE`], at a pace ([`Pace`]):
+//! after a first [`PROGRESS`], as much of it as that share of its time, so
+//! a header whose body never comes, or comes a byte at a time, holds its
+//! places about [`PROGRESS`], and a small body kept at its pace little
+//! longer. Each call and proven call
 //! passes its port's caps, or is answered `Busy` with no node asked.
 
 use std::net::SocketAddr;
@@ -45,17 +47,23 @@ pub const APPLICATION: &str = "vos.gateway";
 pub const IN_FLIGHT: usize = 16;
 /// How long a frame may take to arrive from its first byte.
 pub const DEADLINE: Duration = Duration::from_secs(60);
-/// How long a proven call's large body may take to arrive once it holds
+/// The most a proven call's large body may take to arrive once it holds
 /// its places: a device proof over an onion circuit at its slowest
 /// measured rate (`light-node.md` §6.3), with room.
 pub const LARGE_DEADLINE: Duration = Duration::from_secs(30);
 /// The slack a proven call's large body has over its pace once it holds
 /// its places: a Tor circuit delivers its cells seconds apart at worst.
 pub const PROGRESS: Duration = Duration::from_secs(5);
+/// The slowest rate, in bytes a second, a large body's pace allows past
+/// [`PROGRESS`]: a 1 MiB upload's slowest measured, 26 s through a bridge
+/// (`light-node.md` §6.3), about 40 KiB/s. A body has [`PROGRESS`] plus its
+/// length at this rate, at most [`LARGE_DEADLINE`], so a small one holds
+/// its places only as long as its length needs.
+pub const SLOWEST_RATE: u64 = 40 << 10;
 
 /// A large body's pace from when it took its places: of its `length`
-/// bytes, `read` so far, each due by [`PROGRESS`] plus its share of
-/// [`LARGE_DEADLINE`], the whole by [`LARGE_DEADLINE`].
+/// bytes, `read` so far, each due by [`PROGRESS`] plus its share of the
+/// whole body's time ([`Pace::whole`]), the whole by then.
 struct Pace {
     from: Instant,
     length: u64,
@@ -63,12 +71,21 @@ struct Pace {
 }
 
 impl Pace {
+    /// The whole body's time: [`PROGRESS`] and its length at
+    /// [`SLOWEST_RATE`], at most [`LARGE_DEADLINE`].
+    fn whole(&self) -> Duration {
+        (PROGRESS + Duration::from_secs_f64(self.length as f64 / SLOWEST_RATE as f64))
+            .min(LARGE_DEADLINE)
+    }
+
     /// When its next byte is due.
     fn due(&self) -> Instant {
-        let share = LARGE_DEADLINE.mul_f64(self.read as f64 / self.length.max(1) as f64);
-        (self.from + PROGRESS + share).min(self.from + LARGE_DEADLINE)
+        let whole = self.whole();
+        let share = whole.mul_f64(self.read as f64 / self.length.max(1) as f64);
+        (self.from + PROGRESS + share).min(self.from + whole)
     }
 }
+
 /// How long the onion's SSH connections may take to authenticate: the
 /// light node's own handshake deadline over Tor.
 pub const ONION_HANDSHAKE: Duration = Duration::from_secs(30);

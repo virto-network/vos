@@ -47,7 +47,10 @@ impl Held {
     }
 }
 
-/// The enrollments held at most.
+/// The enrollments held at most, the oldest let go past it. Any screen
+/// session holds one, anonymous ones too, so 32 holds from anyone push an
+/// earlier enrollment out before the operator invites it: the demo serves
+/// its testers on a port of theirs, never an exposed one.
 const HELD: usize = 32;
 
 fn failed(message: impl Into<String>) -> HostServiceError {

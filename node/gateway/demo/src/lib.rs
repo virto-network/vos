@@ -6,7 +6,9 @@
 //! gateway's library) over the node's socket.
 //! A phone runs it through `adb reverse`; the end-to-end test
 //! drives it with a headless client. Beside it, on the same node, test
-//! homes ([`home`]): home-only spaces of personal agents.
+//! homes ([`home`]): home-only spaces of personal agents. Its screens trust
+//! whoever reaches them (an enrollment held for the operator's invitation
+//! can be pushed out by any session), so its port is never exposed.
 
 pub mod app;
 pub mod home;

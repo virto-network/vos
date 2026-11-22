@@ -519,6 +519,12 @@ async fn a_flood_of_junk_proofs_is_held_to_the_caps_and_members_are_served() {
     );
     let address = ssh_port(served.node.id().0, standing.socket.clone(), port, 3).await;
     // Junk in shape: a credentialed call whose proof is 900 KB of noise.
+    // The smallest large body for `Held::Paced`, a device proof's size
+    // otherwise.
+    let proof = match held {
+        Held::Paced => Kind::Call.limit() as usize + 4_096,
+        _ => 300_000,
+    };
     let junk = |at: u64| {
         let call = vos_wire::ingress::Credentialed {
             instance: COUNTER,
@@ -725,17 +731,33 @@ async fn a_port_takes_the_ssh_connections_its_file_names() {
 /// a circuit of its own, reaches the node within one turn of the queue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn headers_alone_hold_no_members_proven_call_back() {
-    starved(false).await;
+    starved(Held::Header).await;
 }
 
 /// The same with each body trickled a byte a second: kept coming, but
 /// behind its pace.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn trickled_bodies_hold_no_members_proven_call_back() {
-    starved(true).await;
+    starved(Held::Trickled).await;
 }
 
-async fn starved(trickle: bool) {
+/// The same with each body the smallest large one, sent evenly over the
+/// most a large body may take: a pace that allowed any body that long
+/// would hold every place that long. Its length at the slowest rate is
+/// its time, so it falls behind within a few seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn small_bodies_at_the_longest_pace_hold_no_members_proven_call_back() {
+    starved(Held::Paced).await;
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Held {
+    Header,
+    Trickled,
+    Paced,
+}
+
+async fn starved(held: Held) {
     use vos_gateway::caps::{Caps, PerPort};
     let served = served();
     let (agent, _, value) = served.counter().await;
@@ -764,6 +786,12 @@ async fn starved(trickle: bool) {
         Arc::clone(&caps),
     );
     let address = ssh_port(served.node.id().0, standing.socket.clone(), port, 5).await;
+    // The smallest large body for `Held::Paced`, a device proof's size
+    // otherwise.
+    let proof = match held {
+        Held::Paced => Kind::Call.limit() as usize + 4_096,
+        _ => 300_000,
+    };
     let junk = |at: u64| {
         let call = vos_wire::ingress::Credentialed {
             instance: COUNTER,
@@ -773,7 +801,7 @@ async fn starved(trickle: bool) {
             expires_ms: served.clock.load(Ordering::SeqCst) + 60_000,
             format: 0,
             claim: vec![5; 64],
-            proof: vec![at as u8; 300_000],
+            proof: vec![at as u8; proof],
         };
         frame(
             Framing::Stream,
@@ -805,12 +833,27 @@ async fn starved(trickle: bool) {
                     if channel.data(&bytes[..header]).await.is_err() {
                         continue;
                     }
-                    if trickle {
+                    match held {
+                        Held::Header => {}
                         // Past the whole body's deadline either way.
-                        for byte in bytes[header..].iter().take(60) {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            if channel.data(&[*byte][..]).await.is_err() {
-                                break;
+                        Held::Trickled => {
+                            for byte in bytes[header..].iter().take(60) {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                if channel.data(&[*byte][..]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        // A thirtieth of the body a second, from a first
+                        // part at once: within `LARGE_DEADLINE`'s pace.
+                        Held::Paced => {
+                            let body = &bytes[header..];
+                            let part = body.len().div_ceil(30);
+                            for chunk in body.chunks(part) {
+                                if channel.data(chunk).await.is_err() {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_secs(1)).await;
                             }
                         }
                     }
