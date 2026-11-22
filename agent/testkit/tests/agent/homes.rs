@@ -659,6 +659,62 @@ fn a_lapsed_agent_serves_reads_a_restore_and_a_removal_and_refuses_pushes() {
         .unwrap();
 }
 
+/// A nullifier whose device left, or was removed, is spent for the
+/// removal delay: a claim under it is `Spent` until then, so a leaf that
+/// claims, adds a device and leaves takes no second agent at once; once the
+/// delay passed it claims one agent, the row gone with the claim.
+#[test]
+fn a_forgotten_nullifier_is_spent_for_the_removal_delay() {
+    let policy = minutes();
+    let mut space = Space::new(policy);
+    space.make(3);
+    let claimer = device(0).nullifier;
+    let agent = space.claim_with(claimer, device(0), kit()).unwrap();
+    space.agent(agent).pair(0, 1);
+    space.agent(agent).pair(0, 2);
+    space.flush(agent);
+    // A removal by another device, matured after its delay.
+    let mut home = space.agent(agent);
+    home.operate(admin(0), "remove", 2u32).unwrap();
+    home.pass(policy.operation_delay_ms);
+    home.commit_removing(0, vec![2]);
+    space.flush(agent);
+    let delay = policy.operation_delay_ms;
+    // Each call moves the world's time on a millisecond.
+    let lately = |lapse: u64, now: u64| lapse <= now + delay && lapse + 16 > now + delay;
+    let removed: u64 = space
+        .query::<Option<u64>>(HOMES, "spent", device(2).nullifier)
+        .expect("spent");
+    assert!(lately(removed, space.world.now));
+    // The claimer's leave, matured at its evidence.
+    space
+        .agent(agent)
+        .operate(admin(0), "remove", 0u32)
+        .unwrap();
+    space.flush(agent);
+    assert_eq!(space.found(claimer), None);
+    let lapse: u64 = space
+        .query::<Option<u64>>(HOMES, "spent", claimer)
+        .expect("spent");
+    assert!(lately(lapse, space.world.now));
+    let again = |space: &mut Space| {
+        let device = NewDevice {
+            nullifier: claimer,
+            ..claimant(7)
+        };
+        space.claim_with(claimer, device, kit_of(7))
+    };
+    assert_eq!(again(&mut space), Err(HomesError::Spent));
+    space.pass(lapse - 4 - space.world.now);
+    assert_eq!(again(&mut space), Err(HomesError::Spent));
+    space.pass(lapse + 1 - space.world.now);
+    let next = again(&mut space).unwrap();
+    assert_ne!(next, agent);
+    assert_eq!(space.found(claimer), Some(next));
+    assert_eq!(space.query::<Option<u64>>(HOMES, "spent", claimer), None);
+    assert_eq!(space.tally().pooled, 1, "one agent a delay");
+}
+
 /// The registrar's open claim: closed until it opens; refused without its
 /// work, and with work under a salt neither the period's nor the one
 /// before; taken within its cap a period, `Cap` past it; and the period

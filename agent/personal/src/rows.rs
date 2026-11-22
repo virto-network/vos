@@ -194,6 +194,8 @@ pub struct By(pub Signer);
 impl By {
     const DEVICE: u8 = 0;
     const KIT: u8 = 1;
+    /// The last signer of all, the last kit entry.
+    pub const MAX: By = By(Signer::Kit(u8::MAX));
 }
 
 impl TableKey for By {

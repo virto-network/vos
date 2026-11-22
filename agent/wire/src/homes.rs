@@ -25,6 +25,7 @@ pub mod method {
         REKEY = "rekey";
         POOLED = "pooled";
         AGENT = "agent";
+        SPENT = "spent";
         FIND = "find";
         STANDING_OF = "standing_of";
         TALLY = "tally";
@@ -106,6 +107,10 @@ pub enum HomesError {
     /// was. The device seals its kit to the agent `pooled` answers now.
     #[codec(index = 10)]
     Taken,
+    /// The nullifier's device left or was removed within the home's
+    /// removal delay: it claims again once `spent` says the delay passed.
+    #[codec(index = 11)]
+    Spent,
 }
 
 /// A page of the pool's agents by id, from after the last one asked:

@@ -10,10 +10,16 @@
 //! operation's maturity, or one row of a removed device's silencing (an
 //! operation of its cancelled, a veto of its lifted) or of a replaced kit's
 //! (an operation of its cancelled), queued in the due index at the time it
-//! takes effect; `evidence` makes one more, a leave's maturity (two
-//! cancels, a reopen and a candidate decided at most). So no step's work
-//! grows with what an adversary queued, and everything takes effect in
-//! time order, however late the call that settles it.
+//! takes effect; `evidence` makes one more, a leave's maturity or a second
+//! signature's or a resolution's decision (two cancels, a reopen and a
+//! candidate decided at most). So no step's work grows with what an
+//! adversary queued, and everything takes effect in time order, however
+//! late the call that settles it.
+//!
+//! What a call signed makes immediate (a leave, a second signature, a
+//! resolution) takes effect at its evidence, never at the call: the
+//! devices take it only behind that evidence, so a signer who withholds
+//! it decides nothing on either side.
 
 use alloc::vec::Vec;
 
@@ -203,9 +209,25 @@ impl Personal {
                 .is_some_and(|device| device.keys.class == AdminClass::Strong)
     }
 
+    /// The device the pending candidate adds, undecided until its verdict.
+    pub(crate) fn undecided(&self) -> Option<DeviceId> {
+        self.group().candidate.and_then(|candidate| candidate.added)
+    }
+
+    /// Whether a live device besides `device` is the confirmed group's:
+    /// one the pending candidate adds commits nothing yet, and is dropped
+    /// if the candidate is void.
+    fn others_live(&self, device: DeviceId) -> bool {
+        let undecided = self.undecided();
+        self.live
+            .iter(None)
+            .any(|(id, ())| id != device && Some(id) != undecided)
+    }
+
     /// Who signs an admin call: an active device's admin key, or a kit
     /// entry's signing key; `leaving`'s on its probation too, for its own
-    /// removal.
+    /// removal. The device the pending candidate adds signs nothing until
+    /// the verdict: the devices know it only from its confirmation.
     pub(crate) fn signer(
         &self,
         caller: Principal,
@@ -213,6 +235,9 @@ impl Personal {
         leaving: Option<DeviceId>,
     ) -> Result<([u8; 32], Signer), PersonalError> {
         match self.holder(caller) {
+            Some((_, Holder::Admin(device))) if self.undecided() == Some(device) => {
+                Err(PersonalError::Undecided)
+            }
             Some((key, Holder::Kit(entry))) => Ok((key, Signer::Kit(entry))),
             Some((key, Holder::Admin(device)))
                 if leaving == Some(device)
@@ -399,8 +424,8 @@ impl Personal {
         }
         match op {
             Op::Remove(target) if leaves(by, op) => {
-                // One leave open at once; and another live device to
-                // commit it.
+                // One leave open at once; and another live device of the
+                // confirmed group to commit it.
                 let leaving =
                     prefixed!(self.against, *target, u64::MAX)
                         .into_iter()
@@ -412,7 +437,7 @@ impl Personal {
                 if leaving {
                     return Err(PersonalError::Pending);
                 }
-                if !self.live.iter(None).any(|(id, ())| id != *target) {
+                if !self.others_live(*target) {
                     return Err(PersonalError::Alone);
                 }
                 self.live(*target, now)
@@ -579,7 +604,9 @@ impl Personal {
     /// The second signature that makes the operation at `index` immediate:
     /// a removal, a kit rotation or a regroup, signed by two seasoned
     /// devices with strong admins other than its targets, or a regroup by
-    /// its device and the kit. It matures now, contested or not.
+    /// its device and the kit. It matures, contested or not, once the
+    /// second signature's evidence is posted ([`Personal::evidenced_call`]);
+    /// a signer holds one such signature of an operation at a time.
     pub(crate) fn cosign_operation(
         &mut self,
         now: u64,
@@ -618,6 +645,9 @@ impl Personal {
             Signer::Kit(_) => return Err(PersonalError::NotSigner),
         }
         self.evidenced_op(index, &operation.op)?;
+        if self.cosigning.contains(&(index, By(by))) {
+            return Err(PersonalError::Cosigned);
+        }
         let at = self.append(
             now,
             Body::Cosign {
@@ -626,15 +656,16 @@ impl Personal {
                 op: index,
             },
         );
-        self.mature(index, now, now);
+        self.cosigning.insert(&(index, By(by)), &());
         Ok(Recorded { at: now, index: at })
     }
 
     /// A resolution of the contest of the operation at `index`: `upheld`,
     /// it matures and its rival is dropped; else it is dropped and its
-    /// rival matures. The kit's acts at once; a device's, one of two
-    /// seasoned devices with strong admins other than the contest's
-    /// targets, acts when the second agrees.
+    /// rival matures. The kit's acts at its evidence; a device's, one of
+    /// two seasoned devices with strong admins other than the contest's
+    /// targets, at the evidence that makes two agree, each device's latest
+    /// resolution counting ([`Personal::evidenced_call`]).
     pub(crate) fn resolve_operation(
         &mut self,
         now: u64,
@@ -655,28 +686,19 @@ impl Personal {
             self.evidenced_op(winner, &operation.op)?;
         }
         let contest = rival.map_or(index, |rival| rival.min(index));
-        let decided = match by {
-            Signer::Kit(_) => true,
-            Signer::Device(device) => {
-                let mut targets = targets(&operation.op);
-                if let Some(rival) = rival.and_then(|rival| self.operations.get(&rival)) {
-                    targets.extend(removes(&rival.op));
-                }
-                if targets.contains(&device) {
-                    return Err(PersonalError::Targeted);
-                }
-                if !self.two_device(device, now) {
-                    return Err(PersonalError::Unseasoned);
-                }
-                self.resolutions.insert(&(contest, device), &winner);
-                self.seen.insert(&device, &now);
-                prefixed!(self.resolutions, contest, DeviceId::MAX)
-                    .into_iter()
-                    .filter(|(other, named)| *named == winner && self.two_device(*other, now))
-                    .count()
-                    >= 2
+        if let Signer::Device(device) = by {
+            let mut targets = targets(&operation.op);
+            if let Some(rival) = rival.and_then(|rival| self.operations.get(&rival)) {
+                targets.extend(removes(&rival.op));
             }
-        };
+            if targets.contains(&device) {
+                return Err(PersonalError::Targeted);
+            }
+            if !self.two_device(device, now) {
+                return Err(PersonalError::Unseasoned);
+            }
+            self.seen.insert(&device, &now);
+        }
         let at = self.append(
             now,
             Body::Resolve {
@@ -686,21 +708,75 @@ impl Personal {
                 upheld,
             },
         );
-        if decided {
-            // A replacement upheld still waits out its new key's
-            // probation: due at its own time.
-            let probation = winner
-                .and_then(|winner| self.operations.get(&winner))
-                .filter(|operation| matches!(operation.op, Op::Replace { .. }))
-                .map(|operation| operation.matures)
-                .filter(|matures| *matures > now);
-            match (winner, probation) {
-                (Some(winner), Some(matures)) => self.due.insert(&(matures, Due::Op(winner)), &()),
-                (Some(winner), None) => self.mature(winner, now, now),
-                (None, _) => self.cancel(index, Cancel::Resolved, now),
-            }
+        if let Signer::Device(device) = by {
+            // The latest resolution replaces the one before, which counts
+            // no more, evidenced or not.
+            self.resolving.insert(&(contest, device), &at);
+            self.resolutions.remove(&(contest, device));
         }
         Ok(Recorded { at: now, index: at })
+    }
+
+    /// The admin call at `index`, its evidence now posted: a leave
+    /// matures, a second signature matures its operation, a resolution
+    /// decides its contest when it is the kit's or makes two agree.
+    pub(crate) fn evidenced_call(&mut self, index: u64, now: u64) {
+        match self.log.get(&index).map(|entry| entry.body) {
+            Some(Body::Operation { .. }) => self.evidenced_leave(index, now),
+            Some(Body::Cosign { by, op, .. }) => {
+                if self.cosigning.contains(&(op, By(by))) {
+                    self.mature(op, now, now);
+                }
+            }
+            Some(Body::Resolve { by, op, upheld, .. }) => {
+                self.evidenced_resolution(index, by, op, upheld, now)
+            }
+            _ => {}
+        }
+    }
+
+    /// The resolution logged at `at`, by `by`, of the contest of the
+    /// operation at `index`, its evidence posted: the contest decided if
+    /// it is still open and this resolution decides it.
+    fn evidenced_resolution(&mut self, at: u64, by: Signer, index: u64, upheld: bool, now: u64) {
+        let Ok(operation) = self.open_at(index) else {
+            return;
+        };
+        if operation.state != OpState::Contested {
+            return;
+        }
+        let rival = self.rivals.get(&index);
+        let winner = if upheld { Some(index) } else { rival };
+        let contest = rival.map_or(index, |rival| rival.min(index));
+        let decided = match by {
+            Signer::Kit(_) => true,
+            Signer::Device(device) => {
+                if self.resolving.get(&(contest, device)) != Some(at) {
+                    return;
+                }
+                self.resolutions.insert(&(contest, device), &winner);
+                prefixed!(self.resolutions, contest, DeviceId::MAX)
+                    .into_iter()
+                    .filter(|(other, named)| *named == winner && self.two_device(*other, now))
+                    .count()
+                    >= 2
+            }
+        };
+        if !decided {
+            return;
+        }
+        // A replacement upheld still waits out its new key's probation:
+        // due at its own time.
+        let probation = winner
+            .and_then(|winner| self.operations.get(&winner))
+            .filter(|operation| matches!(operation.op, Op::Replace { .. }))
+            .map(|operation| operation.matures)
+            .filter(|matures| *matures > now);
+        match (winner, probation) {
+            (Some(winner), Some(matures)) => self.due.insert(&(matures, Due::Op(winner)), &()),
+            (Some(winner), None) => self.mature(winner, now, now),
+            (None, _) => self.cancel(index, Cancel::Resolved, now),
+        }
     }
 
     /// [`Personal::holds_evidence`], else `Unevidenced`. A cosign or a
@@ -879,6 +955,12 @@ impl Personal {
         for (device, _) in prefixed!(self.resolutions, contest, DeviceId::MAX) {
             self.resolutions.remove(&(contest, device));
         }
+        for (device, _) in prefixed!(self.resolving, contest, DeviceId::MAX) {
+            self.resolving.remove(&(contest, device));
+        }
+        for (by, ()) in prefixed!(self.cosigning, index, By::MAX) {
+            self.cosigning.remove(&(index, by));
+        }
         for target in removes(&operation.op) {
             self.against.remove(&(target, index));
             self.thaw(target, now);
@@ -929,11 +1011,12 @@ impl Personal {
         if !self.applicable(&operation.op) {
             return self.cancel(index, Cancel::KeyTaken, now);
         }
-        // Leaves opened side by side: the last live device's waits on no
+        // Leaves opened side by side, or beside an add still undecided:
+        // the last live device of the confirmed group's waits on no
         // other's commit, so it is cancelled.
         if let Op::Remove(target) = operation.op
             && leaves(operation.by, &operation.op)
-            && !self.live.iter(None).any(|(id, ())| id != target)
+            && !self.others_live(target)
         {
             return self.cancel(index, Cancel::Alone, now);
         }

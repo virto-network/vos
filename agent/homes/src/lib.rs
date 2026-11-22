@@ -23,6 +23,10 @@
 //!   recorded here (the claiming one's at the claim, the others' as their
 //!   adds are confirmed, `record`, until their removals mature, `forget`)
 //!   renews it with `renew`, a re-proof.
+//! - **Spent nullifiers:** a nullifier forgotten (its device left or was
+//!   removed) is spent for the home's removal delay, during which it
+//!   claims nothing: one nullifier takes at most one agent a delay, however
+//!   quickly its device leaves.
 //!
 //! The actor's state is its tables and cells, so a later version adds
 //! tables beside these.
@@ -42,6 +46,10 @@ use vos_wire::personal::{Kit, NewDevice, PersonalError, kit_index};
 
 /// The most recovery entries a claim's kit brings, as `Personal` takes.
 const KIT_ENTRIES: usize = vos_personal::KIT_ENTRIES;
+
+/// The lapsed spent rows a `forget` or a claim deletes: more than either
+/// adds, so the rows stay those within the delay.
+const PRUNE: usize = 2;
 
 /// A pool agent's row: its standing, the nullifier of the claim that took
 /// it, and the indexes its kit holds.
@@ -64,6 +72,10 @@ pub struct Homes {
     kits: Table<[u8; 32], u32>,
     terms: Cell<Terms>,
     counts: Cell<Counts>,
+    /// Each spent nullifier's lapse: it claims nothing before then.
+    spent: Table<[u8; 32], u64>,
+    /// The spent nullifiers by their lapse, earliest first.
+    lapses: Table<(u64, [u8; 32]), (), Ordered>,
 }
 
 #[messages]
@@ -126,9 +138,10 @@ impl Homes {
     /// with `kit`, whose `R1` is sealed to `agent`'s identity: its id. The
     /// device's nullifier must be the proof's; a nullifier holding an
     /// agent, or a kit entry indexing one, is refused, and so are keys
-    /// `Personal` would refuse (one key twice); an agent another claim
-    /// took is `Taken`, and the device seals its kit to the next. The same
-    /// claim again while its answer is awaited is sent again.
+    /// `Personal` would refuse (one key twice); a nullifier spent is
+    /// `Spent` until its lapse; an agent another claim took is `Taken`,
+    /// and the device seals its kit to the next. The same claim again
+    /// while its answer is awaited is sent again.
     #[msg(credential = Auth("home"))]
     pub async fn claim(
         &mut self,
@@ -175,6 +188,10 @@ impl Homes {
                 _ => Err(HomesError::Claimed),
             };
         }
+        let now = ctx.now();
+        if self.spent.get(&nullifier).is_some_and(|lapse| lapse > now) {
+            return Err(HomesError::Spent);
+        }
         if indexes.iter().any(|index| self.kits.contains(index)) {
             return Err(HomesError::KitTaken);
         }
@@ -186,6 +203,8 @@ impl Homes {
             });
         }
         self.pool.remove(&agent);
+        self.unspend(&nullifier);
+        self.prune(now);
         self.nullifiers.insert(&nullifier, &agent);
         for index in &indexes {
             self.kits.insert(index, &agent);
@@ -281,7 +300,8 @@ impl Homes {
     }
 
     /// A device of the calling agent whose removal matured: its nullifier
-    /// re-proves the agent no more.
+    /// re-proves the agent no more, and is spent for the removal delay
+    /// from now.
     #[msg]
     pub async fn forget(
         &mut self,
@@ -289,9 +309,16 @@ impl Homes {
         nullifier: [u8; 32],
     ) -> Result<(), HomesError> {
         let agent = self.assigned_caller(ctx.caller())?;
+        let terms = self.terms.get().ok_or(HomesError::Unconfigured)?;
+        let now = ctx.now();
         if self.nullifiers.get(&nullifier) == Some(agent) {
             self.nullifiers.remove(&nullifier);
+            self.unspend(&nullifier);
+            let lapse = now.saturating_add(terms.policy.operation_delay_ms);
+            self.spent.insert(&nullifier, &lapse);
+            self.lapses.insert(&(lapse, nullifier), &());
         }
+        self.prune(now);
         Ok(())
     }
 
@@ -337,6 +364,12 @@ impl Homes {
         self.nullifiers.get(&nullifier)
     }
 
+    /// When `nullifier`, spent, may claim again: a time past means now.
+    #[msg]
+    pub async fn spent(&self, nullifier: [u8; 32]) -> Option<u64> {
+        self.spent.get(&nullifier)
+    }
+
     /// The agent a kit entry's index names: a restore's lookup.
     #[msg]
     pub async fn find(&self, index: [u8; 32]) -> Option<u32> {
@@ -377,6 +410,28 @@ impl Homes {
 }
 
 impl Homes {
+    /// `nullifier` spent no more.
+    fn unspend(&mut self, nullifier: &[u8; 32]) {
+        if let Some(lapse) = self.spent.get(nullifier) {
+            self.spent.remove(nullifier);
+            self.lapses.remove(&(lapse, *nullifier));
+        }
+    }
+
+    /// Delete up to [`PRUNE`] spent rows lapsed by `now`.
+    fn prune(&mut self, now: u64) {
+        for _ in 0..PRUNE {
+            let Some(((lapse, nullifier), ())) = self.lapses.first() else {
+                return;
+            };
+            if lapse > now {
+                return;
+            }
+            self.lapses.remove(&(lapse, nullifier));
+            self.spent.remove(&nullifier);
+        }
+    }
+
     /// `agent`'s claim dropped: its nullifier and kit indexes, the agent
     /// left `standing`, pooled again when that is `Pooled`.
     fn drop_claim(&mut self, agent: u32, held: &Held, standing: Standing) {
