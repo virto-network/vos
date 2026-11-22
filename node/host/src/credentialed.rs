@@ -635,7 +635,7 @@ fn fresh(snapshot: &Snapshot, agent: AgentId, root: &[u8; 32], now: u64) -> Resu
 }
 
 /// The ring of `agent`'s credential actor, if it has one.
-fn ring(snapshot: &Snapshot, agent: AgentId) -> Result<Option<Ring>, Fault> {
+pub(crate) fn ring(snapshot: &Snapshot, agent: AgentId) -> Result<Option<Ring>, Fault> {
     let Some(actor) = read::<InstanceId>(snapshot, agent, &keys::credentials())? else {
         return Ok(None);
     };

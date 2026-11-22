@@ -97,7 +97,7 @@ impl Leader {
             }
         }
         let mut pending = self.filter(&snapshot, pending);
-        let time = self.time(floor);
+        let time = self.time(&snapshot, floor);
         // First, so a batch its gas or size cuts short keeps it, with the
         // rows due at the batch's time, which refine takes by their keys.
         let sweeping = first.filter(|first| self.sweeps(*first, time));
@@ -418,14 +418,15 @@ impl Leader {
             .map(|mark| mark.unwrap_or(0))
     }
 
-    /// A batch's time: the node's clock, or while it reads no later than
-    /// the agent's time, `floor`, a millisecond past it. Leadership stays:
-    /// every replica would trail an agent a fast clock once led. A trailing
-    /// leader's batches each take a time of their own, so the credential
-    /// actor's ring, which replaces a root written at its own time
-    /// (`Ring::record`), keeps the roots devices read at earlier batches
-    /// until the clock catches up.
-    pub(super) fn time(&mut self, floor: u64) -> u64 {
+    /// A batch's time: the node's clock, or while it trails the agent's
+    /// time, `floor`, a millisecond past it, as when it reads `floor` and
+    /// the credential actor's newest root is from `floor`. Leadership
+    /// stays: every replica would trail an agent a fast clock once led. A
+    /// trailing leader's batches, and one at the time of the newest root,
+    /// each take a time of their own, so the ring, which replaces a root
+    /// written at its own time (`Ring::record`), keeps the roots devices
+    /// read at earlier batches. `snapshot` is the agent's applied state.
+    pub(super) fn time(&mut self, snapshot: &Snapshot, floor: u64) -> u64 {
         let clock = (self.inner.clock)();
         let trailing = floor > clock.saturating_add(CLOCK_BOUND);
         if trailing && !self.trailing {
@@ -441,7 +442,15 @@ impl Leader {
             );
         }
         self.trailing = trailing;
-        if clock <= floor {
+        // A ring that does not read: a time of its own, as for a root
+        // from `floor`.
+        let rooted = || match crate::credentialed::ring(snapshot, self.id) {
+            Ok(ring) => {
+                ring.and_then(|ring| ring.newest().map(|newest| newest.since)) == Some(floor)
+            }
+            Err(_) => true,
+        };
+        if clock < floor || (clock == floor && rooted()) {
             floor.saturating_add(1)
         } else {
             clock

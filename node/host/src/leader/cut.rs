@@ -96,7 +96,7 @@ impl Leader {
                 return true;
             }
         };
-        let time = self.time(floor);
+        let time = self.time(&snapshot, floor);
         let due = boundary.is_some_and(|boundary| boundary <= time);
         if !due {
             return true;
