@@ -7,7 +7,7 @@ e352eb9bf04c13a38c6a9891f81acfd040f739ff5fcf78d6471f06a644ddc58a  agent/programs
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 ce85389deb6cd305845aa9cf31c8e4b5ebf4ce3a20e412308d8d2202b7022fff  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
 878a39351352a2f961c8006156278b7a4437a7112df1cddc208df065b650495d  agent/programs/target/riscv64em-vos/release/vos-personal.elf
-b05245098cb93306279bbfcac0c83258708eb2c26d2075730cc13051f501514b  agent/programs/target/riscv64em-vos/release/vos-payments.elf
+6a9baab1001cf96aa1dc2c5a093fde9bdab3dfe8d8d21c4a2d3c7a0e6a143199  agent/programs/target/riscv64em-vos/release/vos-payments.elf
 55e6b14de09c001b87d032f36a7d44b2c3e138bf0e25b0b93689648026cadfa1  agent/programs/target/riscv64em-vos/release/vos-homes.elf
 6b52f19b437273a58c0cb425b8f9d91a95c7f3e6583428041ee456ff0374c0e1  agent/programs/target/riscv64em-vos/release/vos-credential-book.elf
 e88eb723620c8ee3d0363b853c55391e09204e54628d325eec6c19ccf03a6a91  agent/programs/target/riscv64em-vos/release/vos-device-book.elf
