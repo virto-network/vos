@@ -665,6 +665,63 @@ fn a_restores_sitting_takes_the_kit_once_and_wipes_it_three_ways() {
     assert!(status.kit_known && status.kit == KitKind::Phrase);
 }
 
+/// A kit's life in the sitting runs from its entry, not from the end of
+/// the flow that entered it: a flow outlasting it ends with no kit held,
+/// and a kit held after a slow flow is wiped at its life from the entry.
+#[test]
+fn a_slow_flow_does_not_extend_the_kits_life() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let lost = phone(&world, 0x55);
+    lost.claim(&world, home, KitKind::Phrase, "lost phone");
+    let words = lost.hand.phrase();
+    lost.node.sync_personal().unwrap();
+    drop(lost);
+
+    let fresh = phone(&world, 0x56);
+    fresh.hand.will_enter(words);
+    let space = || fresh.node.space().unwrap();
+    // Every request a round trip of 0.3 s: the kit's view takes seconds.
+    world.delay(world::Delays {
+        one_way: Duration::from_millis(150),
+        ..world::Delays::default()
+    });
+    let view = || {
+        let started = std::time::Instant::now();
+        fresh
+            .node
+            .personal()
+            .unwrap()
+            .kit_view(&*fresh.hand, home_of(&world, home), KitKind::Phrase)
+            .unwrap();
+        started
+    };
+    space().hold_kit();
+
+    // The flow outlasts the kit's life: it ends with none held.
+    space().set_kit_life(1_000);
+    let started = view();
+    assert!(
+        started.elapsed() > Duration::from_millis(1_000),
+        "a slow flow"
+    );
+    assert!(!space().kit_held(), "held past its life from the entry");
+
+    // A life the flow does not outlast: wiped at its end from the entry.
+    let life = Duration::from_millis(8_000);
+    space().set_kit_life(life.as_millis() as u64);
+    let started = view();
+    let took = started.elapsed();
+    assert!(took > Duration::from_millis(1_000), "a slow flow");
+    assert!(space().kit_held());
+    std::thread::sleep((life + Duration::from_millis(900)).saturating_sub(started.elapsed()));
+    assert!(
+        !space().kit_held(),
+        "held {took:?} past its life from the entry"
+    );
+    assert_eq!(*fresh.hand.entered.lock().unwrap(), 2);
+}
+
 /// Three phones claimed and paired, past their probation and seasoning.
 fn three_phones(seed: u8) -> (Arc<World>, Held, Held, Held) {
     let world = world();

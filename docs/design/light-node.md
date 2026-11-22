@@ -5,10 +5,13 @@ agent in a space that keeps the user's devices in step, one proving path
 for every device statement, payments on cipher-clerk as the showcase of
 attestable Rust, and clients reaching a space over Tor.
 - **Status:** this describes what is built; [decided] marks an owner
-  decision (listed in §1.1 by its number, E1–E30, or cited from another
+  decision (listed in §1.1 by its number, E1–E42, or cited from another
   document), and what is not built is named so and listed in `open.md`.
 - **Numbers** carry their tag: [measured] (a run, cited), [model] (the
-  cell model, `proving.md` §8), [est] (arithmetic on those, unmeasured).
+  cell model, `proving.md` §8), [est] (arithmetic on those, unmeasured),
+  [World] (the facility's flows in process over `vos_light::testing`'s
+  `Delays::ONION`: a new connection 4 s to its stream, a round trip 0.5 s;
+  prompts answered at once; `node/light/android/tests/flows.rs`).
 
 ## 1. Goals
 
@@ -70,6 +73,18 @@ devices decrypt each other's messages".
 | E28 | A joining device's open claim at a home-only space is made by the background job after a random drawn delay from its add, never at the pairing, so the home's operators cannot link the new member to the agent by its time. Not built: no joiner makes an open claim, and only the claiming device is a member of the home (`open.md`). |
 | E29 | A device's admin key is replaced (`admin(d, new key)`) on the kit's signature or another seasoned active device's; the new key's 72 h probation stands either way. |
 | E30 | No C tor in the product, its tooling or its demo: the gateway hosts its onion with arti in process, the one path; the C tor sidecar, run once to measure it, is removed. A private test network's relays (chutney) may use C tor outside the tree. |
+| E31 | The claim asks the home's terms (`opening`) and its agent (`pooled`) first, then shows the kit; the open claim's work and `claim_open` run while the user writes it down. A home that refuses after the kit was shown voids it, says so plainly, and shows new words (2026-11-20). |
+| E32 | The kit entered on the restore screen is held in `:vos` for that screen's flows, wiped when the screen closes, when the app goes to the background, and ten minutes at most after its entry (2026-11-20). |
+| E33 | "Paired", "Committed" and "Restored" are shown at the first complete follow (this device's confirm posted, the archive kept); the remaining follows run in the background, a failure among them a notice on the overview (2026-11-20). |
+| E34 | Leave from the phone itself: the phone removes itself, the other devices commit (§3.5, rule 10) (2026-11-20). |
+| E35 | Every reconnect s4 makes by itself keeps the grant of the session it replaces; the new facility session still starts knowing nothing; a session the user starts asks as before (2026-11-20). |
+| E36 | One prompt per signature; "Commit now" from a matured removal's notice commits and revokes in one flow (2026-11-20). |
+| E37 | A first sign-in waits for the device's leaf (the feed read now and every 5 s, up to a minute, no drawn delay); the timing link this leaves is stated in §6.2 (2026-11-20). |
+| E38 | A debuggable build lets the personal-space screens be captured; a release build keeps them from capture (`FLAG_SECURE`) (2026-11-20). |
+| E39 | Every device-set call names its place, the log's head its signer read; the agent and every device take it only if no admin call was logged between that place and the call (§3.5, "The place"), so a route cannot replay a vetoed removal (2026-11-20). |
+| E40 | `claim` is the one way a personal agent is assigned and its policy set: no `assign`, no `configure` (§3.3) (2026-11-20). |
+| E41 | A device is removed on the log it verifies, never on a refusal an agent answers (§3.6) (2026-11-20). |
+| E42 | A refusal of a pairing slot's read does not end the joiner's pairing: it reads the slot again until its expiry (§3.8) (2026-11-20). |
 
 **The flows left out** [the owner, 2026-11-17]: four flows that had no
 caller in the product, or carried most of the device side's complexity,
@@ -513,16 +528,18 @@ operator makes ahead of time**:
   costs about 2 s, 0.15–0.17 s each sixteen at a time [measured,
   `core-model.md` §14.1], so a pool of a few hundred hides creation from
   users. It also runs `Personal`'s upgrades (below).
-- **The claim:** `homes.claim(keys, kit)` under
+- **The claim:** `homes.claim(device, kit, agent)` under
   `#[msg(credential = Auth("home"))]`. The pseudonym is the claiming
   device's nullifier in scope "home" [decided, E5]. `Homes` refuses a
-  nullifier already holding an agent, assigns a pooled one, indexes it
-  under the nullifier and under `H(each recovery public key)` (§3.5), and
-  sends it `assign(keys, kit)`; `Command::send` is one-way
+  nullifier already holding an agent, takes the pooled agent the device
+  named (`Taken` when another claim took it), indexes it under the
+  nullifier and under `H(each recovery public key)` (§3.5), and sends it
+  `claim(device, kit, policy, homes)`; `Command::send` is one-way
   (`agent/sdk/src/context.rs`), so `Personal` answers `assigned` or
   `refused`, and `Homes` releases a refused one. The chrome refuses a
   claim on a device that already holds a personal space's archive, so a
-  user's second device never claims a second agent by mistake.
+  user's second device never claims a second agent by mistake. Its times
+  [World]: §6.3.
 - **"home" is reserved:** the light node proves in that scope only for
   its own claim, and the facility refuses
   any request naming `Homes`' agent and instance.
@@ -596,7 +613,7 @@ this is the one taken]:
   homes)`, `Personal`'s entry for its home: the policy and the claim
   checked whole, answered by message, `assigned`, or `refused` with the
   error and nothing written: the one way an agent is assigned and its
-  policy set [decided 2026-11-20, built: no `assign` or `configure`]. The
+  policy set [E40, built: no `assign` or `configure`]. The
   reply is the agent's id.
   The same claim again (its nullifier and kit) while its answer is awaited
   is sent again, and `Personal` answers `assigned` again to a claim it
@@ -1328,9 +1345,9 @@ arm64-v8a build; the phones' timings below of 2026-11-06]:
   the inbox, keeps each delay and window at the higher of the two
   (`Policy::over`), and raises `Alarm::Policy` for one it lowers; an
   operation then asserted matured inside the kept delay is `Unsigned`.
-  `Personal::configure` applies the same rule once a claim assigned the
-  agent, so an honest home logs no lowered delay. Lowering a delay would
-  need an operation of the device set's own, signed as §3.5's are; none
+  `Personal` takes its policy only with its claim (no later call
+  configures it), so an honest home logs no lowered delay. Lowering a
+  delay would need an operation of the device set's own, signed as §3.5's are; none
   is built. A raised delay is taken: the operators can lengthen any
   delay without bound, which stops removals and restores maturing, a
   withholding B8 concedes them already.
@@ -1473,7 +1490,7 @@ host-verified]:
   operation's evidence is in, which its author's next pass posts. The
   operators run ingress and could append anything to the log, so a device
   trusts an operation only by its signature (§8, B6).
-- **The place** [decided 2026-11-20, built]: every device-set call
+- **The place** [E39, built]: every device-set call
   (add, remove, replace, rotate, regroup, restore, veto, cosign, resolve)
   names first in its arguments the log's head its signer read before the
   prompt, `Place { next, chain }`: the next index and the chain through the
@@ -1558,7 +1575,7 @@ commits), **active**, or **removed** (with its frontier). A device is
 9. **A device whose removal has matured has no voice:** its vetoes,
    `alive`, confirmations and nacks are ignored, whatever the agent
    stores.
-10. **Leave** [the owner, 2026-11-20, D4]: a device removes itself, signed
+10. **Leave** [E34]: a device removes itself, signed
     by its own admin key, active or on its probation (a frozen one too).
     The leave matures as soon as its evidence is posted, with no delay,
     and no device vetoes, cosigns or resolves it; the other devices commit
@@ -1782,7 +1799,8 @@ where the rules above leave a choice, this is the one taken]:
 **The kit and its flows as built** [built, `vos_light::kit`, the device
 group and sealed sync, tested against `Personal` in
 `node/light/tests/sealed/kit.rs` and `node/light/tests/group/set.rs`;
-where the text above leaves a choice, this is the one taken]:
+where the text above leaves a choice, this is the one taken; the
+restore's times [World]: §6.3]:
 - **The 32 bytes:** a phrase is drawn by the operating system and shown
   as BIP-39's 24 English words (its checksum checked when read back); a
   security key's are its `hmac-secret` over `SHA-256("vos/personal/kit/
@@ -1842,7 +1860,7 @@ where the text above leaves a choice, this is the one taken]:
   kit-signed operation for as long as it is open (`Alarm::Kit`); the
   owner then rotates the kit.
 - **The kit's secrecy on the phone** [built, `node/light/android`'s
-  `personal::Sitting`; the owner, 2026-11-20, D2]: a phrase is shown once
+  `personal::Sitting`; E32]: a phrase is shown once
   and two of its words are asked back before the claim goes on (a wrong
   one shows the phrase again). Entered, its words are checked one by one
   against the list in the UI as they are typed (the bad word named, the
@@ -1854,7 +1872,8 @@ where the text above leaves a choice, this is the one taken]:
   lost phone, resolving a contest, opening and finishing the restore), and
   zeroized when the screen closes, when the app goes to the background
   (the UI's stop, and `:vos`'s own background signal), when the UI's
-  process dies, at most ten minutes after the entry, and when a flow finds
+  process dies, at most ten minutes after the entry (a flow still running
+  then ends holding none), and when a flow finds
   it not a kit or not this space's. So the kit's secret lives minutes in
   `:vos` instead of one call; a flow outside the restore screen (a
   rotation, an admin key's replacement) still asks for it each time. The
@@ -1955,7 +1974,7 @@ device holds the whole quota.]
 **Sealed sync as built** [built, `vos_light::sealed` and
 `vos_light::personal`, tested against `Personal` in
 `node/light/tests/sealed`; where the text above leaves a choice, this is
-the one taken]:
+the one taken; a pass's times [World]: §6.3]:
 - **The envelope:** the header as above; the body framed by its length
   (four bytes) and zero-padded to the frame's Padmé length, the padding
   checked on open; `len_class` the padded length's bit length less one,
@@ -2038,8 +2057,8 @@ the one taken]:
   same queries, under the same key, on the same connection: only their
   order in flight changes. A quiet pass is four round trips after the
   node's time instead of nine.
-- **A flow is done at its first complete follow** [built, the owner's
-  choice D3, `job::complete`]: a pairing (the joiner's), a commit now and
+- **A flow is done at its first complete follow** [built, E33,
+  `job::complete`]: a pairing (the joiner's), a commit now and
   a restore's finish return once a follow leaves this device in the set
   and following, its vote on a pending candidate posted (the epoch may
   still wait for the other devices'), the archive and the recovery
@@ -2191,7 +2210,7 @@ in the facility's `tests/job.rs` and `killed.rs`]:
   read. A device stuck or
   out reads the log, the overview and the device set and leaves its
   scopes alone. **A device is removed on the log it verifies, never on a
-  refusal** [decided 2026-11-20, built]: an agent's answer is signed by
+  refusal** [E41, built]: an agent's answer is signed by
   nobody, so a gateway on the route could make up `NotAdmitted` for a
   live device, and a device that took it as its removal would show a
   removal that never happened. So a refusal (`NotAdmitted`, `Removed`)
@@ -2341,7 +2360,7 @@ skip expired items, each write deletes a few; no timer).
    leaves the slot open until it expires, so B can read it (A's next
    offer closes it). A refusal of B's slot reads (`NotAdmitted`, as a
    closed slot's are, and which nobody signs) does not end B's pairing: B
-   reads the slot again until its expiry [decided 2026-11-20, built].
+   reads the slot again until its expiry [E42, built].
    Someone who photographed the QR and answered
    first holds a handshake of its own, which A's last message ends: B
    cannot read that message and shows no check. No side has a check before
@@ -2442,7 +2461,7 @@ pairing`, `vos_light::home`, `vos_light::memberships`; tested against
 nodes through their sockets with the onion's mark in
 `node/host/tests/served/personal.rs`, at a test home of seconds and an open
 claim's difficulty of 4; where the text above leaves a choice, this is the
-one taken]:
+one taken; times [World]: §6.3]:
 - **The claim at a home-only space** (`home::Claim`): the open claim's
   terms (`opening`) and the agent `Homes` answers `pooled` for asked
   first, the two a home can refuse before anything is shown; then the
@@ -3284,8 +3303,8 @@ nodes may ask the onion's mark of its proven calls, or of every request
   chrome; every reconnect s4 makes by itself (the one after an
   enrollment, a retry after a dropped connection) keeps the grant of the
   session it replaces, for the same host, port and application, in s4's
-  memory alone, and a session the user starts asks as ever (owner,
-  2026-11-20; built). The new session is the facility's new session all
+  memory alone, and a session the user starts asks as ever (E35;
+  built). The new session is the facility's new session all
   the same: it starts knowing nothing (`Learned::Nothing`), never
   inherits what the old one was shown, so a session that showed the
   digests or paid still signs in nothing, and the next one signs in. A
@@ -3366,7 +3385,7 @@ nodes may ask the onion's mark of its proven calls, or of every request
     after the first root holding a new leaf points at that newest member:
     a sign-in with no path waits for the space to list the device,
     reading the feed now and every 5 s for up to a minute (built
-    2026-11-20, the owner's choice D7: no drawn delay), so a device's
+    2026-11-20, E37: no drawn delay), so a device's
     first sign-in after its invitation follows the leaf's root by a few
     seconds; a member tapping again shows the same, less tightly; the drawn delays spread the
     open times of several devices' spares into each other, and against a
@@ -3384,7 +3403,7 @@ nodes may ask the onion's mark of its proven calls, or of every request
     after a dropped connection asks nothing): the server sees a session,
     granted, that the user did not start, though every call in it still
     asks its own confirmation, so it gets no proof the user did not
-    confirm (owner's decision D5, 2026-11-20).
+    confirm (E35).
   - **Rendezvous (PG5, §2.4):** a foreground hour with a session open costs one
     a kept group (the feed, the member's, the personal agent's: 3), the
     proven spare's lives (4 to 12 unused, one a sign-in otherwise) and the
@@ -3549,6 +3568,36 @@ never a second one. Outside the model: the proof's upload (a payment's
 5 s, while the Fairphone 6's spare sent a payment in about 2 s) and the
 source's answer (the Keystore, after the user's unlock), each logged on
 the phone (`vos.node`'s stage lines).
+
+**The member's flows in the test World** [World: the facility's flows in
+process (`node/light/android/tests/flows.rs`) over `Delays::ONION`, a new
+connection 4 s to its stream and a round trip 0.5 s, prompts answered at
+once; x86 Core Ultra 7 155H, debug; not modelled: batch linger, s4's
+screens, reconnects, Tor's bootstrap and tail, Keystore and user time.
+Floors, not phone times. Before: vos-core 4caa68985, 2026-11-20; after:
+refreshed at the tip, vos-core 89e04682b with the kit's life timed from
+its entry, 2026-11-22; to be refreshed at each tip that touches a flow]:
+
+| flow | before | after (refreshed at the tip) | what changed |
+|---|---|---|---|
+| claim (phrase kit) | 52.0 s, 25 requests | 46.8 s, 23 requests; 13.4 s after "I wrote them down" with 20 s to write | the open claim's work, tree, time and proof connection while the kit is written (E31) |
+| claim, circuits at 0.15 MB/s | 57.4 s | 52.8 s | as above |
+| first sign-in after the invitation, tapped at once | 12.0 s, 2 attempts (a `NoPath` refusal, tapped again) | 10.9 s, 1 attempt | the sign-in waits for its leaf (E37) |
+| pairing, from the scan to both done | 38.9 s, 108 requests (the opener done at 30.2 s) | 22.2 s, 77 requests (the opener at 21.2 s); 2.6 s of follows after it returns | reads asked ahead; done at the first complete follow (E33) |
+| a pass (the opener's; the joiner's) | 28.6 s; 27.6 s | 18.6 s; 17.6 s | reads asked ahead |
+| commit now (a retired device's removal) | 23.2 s, 46 requests | 8.6 s, 26 requests; 3.1 s of follows after it returns | as pairing |
+| restore: the kit's view | 11.1 s | 10.6 s | |
+| restore: opened | 4.1 s | 3.5 s | |
+| restore: finished after the kit's delay | 33.0 s, 65 requests | 15.3 s, 43 requests; 3.1 s of follows after it returns | as pairing |
+| restore: the kit typed | 4–5 times a restore | once a sitting (twice in the test, one mistyped) | the kit held for the restore screen (E32) |
+| leave: from the tap to the space cleared | — | 2.7 s, 7 requests | built (E34) |
+| leave: the other phone's pass, then its commit now | — | 19.6 s, then 9.1 s | |
+| move: leave and claim at another home | 55.5 s | 50.0 s | as the claim |
+| the device list | 2.0 s | 1.5 s | |
+| the removal posted | 6.1 s | 3.0 s | |
+
+The 0.5 s request and the 4 s connection dominate every row; the values
+are the summary `flow:` lines of each run.
 
 ### 6.4 What it costs on the phone
 
@@ -3767,7 +3816,8 @@ against a no-flood baseline:
 - **timing:** a gateway sees when a read and a proof arrive; keeping
   each tree from its feed on the device (below; the wallet's `tree`
   likewise) leaves no query naming the member, and the feed's timer keeps
-  its reads apart from proofs;
+  its reads apart from proofs, but for a first sign-in waiting for its
+  leaf and a claim (below), each about once a device's life;
 - **the `map_root` fingerprint:** what a synced tree fixes (below), every
   proof against the newest root the device has read; within a timer
   period of a tree change, the members who have not read it yet still
@@ -4076,7 +4126,7 @@ device's crates faster); its size argument is small.
   prompts lent and released when it returns or the screen gives it up.
   A release build keeps every one of them and their forms from capture
   (`FLAG_SECURE`); a debuggable build does not, so its screenshots show
-  them [the owner, 2026-11-20].
+  them [E38].
   A home is entered as its code (`VOSHOME1:` and hex: the home as a device
   reaches it, which its operator publishes); a restore takes the home's
   code too, its handle checked against the card. A pairing's code is a QR
@@ -4394,7 +4444,8 @@ device. Nor does a refusal: a removed device is out on its removal's
 evidence, which the agent serves its key (§3.6, the pass), and a refusal
 the route makes up stops a pass, never removes a device (`NotAdmitted`).
 Nor a replay: every device-set call names its place, the log's head its
-signer read, and is taken there alone, by the agent and by every device,
+signer read, and is taken only if no admin call was logged between that
+place and the call, by the agent and by every device,
 so a signed removal once vetoed logged again on a forked log is refused
 (§3.5, "The place"; §3.6). *Known limit:* a device that has not read a
 veto can be shown the operation without it (withholding, B8).

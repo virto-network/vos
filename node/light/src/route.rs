@@ -61,7 +61,9 @@ pub enum Purpose {
     Proven = 0,
     /// A read that names nothing of the member's but must not link to it:
     /// the node's time, the onion set's refresh. Anonymous, each on a
-    /// connection of its own, a spare built ahead.
+    /// connection of its own, a spare built ahead; a timed fetch carries a
+    /// `Time` and the one query it dates on one connection, opened for
+    /// them alone.
     Fetch = 1,
     /// The credential tree's feed and the space's device window: anonymous,
     /// one long-lived connection, as every member reads the same.

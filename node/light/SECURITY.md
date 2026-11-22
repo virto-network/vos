@@ -125,6 +125,18 @@ searched for the secret by its `tests/leaks.rs`.
   passed; a maturity it never supports raises `Unsigned` and moves
   nothing. A device whose candidate removes a device on a maturity this
   device does not honour is refused.
+- **A device-set call names its place:** every such call
+  names first the log's head its signer read (`Place { next, chain }`);
+  this device takes it only at a place at or after its floor (the entry
+  after the last admin call it read; a paired device starts from its
+  pairing device's) and at or before the call's own entry, the chain
+  there the one it read, and otherwise raises `Alarm::Log` and reads no
+  further. So a route forking the log cannot log a once-vetoed removal
+  again and mature it. The device reads the log to its head just before
+  each prompt and signs at most three times (`StaleHead` or `Settling`
+  each a new prompt). What is left is withholding: a device that has not
+  yet read a veto can be shown the operation without it (`light-node.md`
+  §8, B8).
 - **The agent's delays are the claim's:** the claim's `Configured` sets
   the delays, the seasoning, the probation and the confirm window, which
   every device takes (a paired device from its pairing device). A later
@@ -185,6 +197,11 @@ searched for the secret by its `tests/leaks.rs`.
   takes the words gives the keyboard no suggestion and nothing to learn
   (`IME_FLAG_NO_PERSONALIZED_LEARNING`, a visible-password field), and the
   words it checks as they are typed never leave the form.
+- **Capture:** a release build keeps the personal-space screens and their
+  forms, the phrase shown and the kit entered among them, from
+  screenshots and the recents' preview (`FLAG_SECURE`); a debuggable build
+  does not, so its screenshots can hold a kit's words. A kit shown on a
+  debug build is a test kit.
 - **`R = R1 ⊕ R2`:** `R1` sealed to each kit entry's X25519 key (an
   ephemeral agreement, XChaCha20-Poly1305, the agent's identity bound),
   `R2` at the agent, released only to a matured restore's device. The kit
@@ -319,9 +336,13 @@ searched for the secret by its `tests/leaks.rs`.
   device reads again (the withholding gateway still sees the refused
   proofs it relays).
 - **The feed is read on a jittered timer of its own** (30 s, between
-  15 s and 45 s), never because a proof is about to be made: the feed's
-  connection is one circuit for as long as it is open, and a read just
-  before each proof would join the proofs through it. A `RootUnknown` or
+  15 s and 45 s), not because a proof is about to be made, with two
+  exceptions, each about once a device's life at a space: a first sign-in
+  waiting for its leaf reads it every 5 s for up to a minute and proves on
+  the read that lists it, and a personal agent's claim reads its home's
+  tree while the kit is written down (`light-node.md` §6.2, §3.8). The
+  feed's connection is one circuit for as long as it is open, and a read
+  just before each proof would join the proofs through it. A `RootUnknown` or
   `RootStale` answer makes the feed due within 10 s, at a time drawn for
   it: that read still precedes the retried proof, and since the feed's
   connection is one circuit while it stays open, two refused proofs each
@@ -435,8 +456,10 @@ What going over the onion changes for a device (`light-node.md` §6.7):
   after two refusals.
 - **Does not fix:** the timing of what a device sends (a gateway may join
   two circuits by time: the feed's timer keeps its reads apart from
-  proofs, no more); the `map_root` a proof names, which within a timer
-  period of a tree change sets apart the members who have not read it;
+  proofs, no more, and a first sign-in that waited for its leaf follows a
+  feed read on the feed's circuit by seconds, joining that proof to the
+  feed's connection and to the newest leaf, `light-node.md` §6.2); the
+  `map_root` a proof names, which within a timer period of a tree change sets apart the members who have not read it;
   small anonymity sets; a global observer correlating both ends of Tor;
   what a request carries itself (a member's signed call names its key,
   the personal agent's calls the device's sync key, an `alive` or a veto

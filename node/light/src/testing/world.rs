@@ -10,7 +10,8 @@
 //!   `Homes` too ([`World::home`]): a pool of personal agents, each one a
 //!   personal agent running `Personal` ([`vos_testkit::personal::Agent`]),
 //!   claimed by a proof in the scope "home",
-//!   which `Homes` here answers by `Personal`'s `assign`.
+//!   which `Homes` here answers by `Personal`'s `claim` (`Agent::claim`),
+//!   as a home's `Homes` sends it.
 //! - **Every proof is checked** as ingress's stateless checks do, under
 //!   the stock kernels' programs ([`Kernels`]), and recorded.
 

@@ -529,8 +529,9 @@ are under "Identity and privacy" above.
 - **History and storage:** history horizons for the key archive, garbage
   collection of covered envelopes and of earlier epochs' archives, and a
   blob store for media behind the blob-ready `push` and `since`
-  (`light-node.md` §3.4, §3.6); pipelined `since` reads, and re-reading an
-  envelope passed over once a later archive opens it.
+  (`light-node.md` §3.4, §3.6); pipelined `since` reads past each scope's
+  first page (the first are asked ahead, `light-node.md` §3.6), and
+  re-reading an envelope passed over once a later archive opens it.
 - **An encrypted export file** under the kit's key [E16].
 - **Pluggable transports** (obfs4 through lyrebird, Snowflake, WebTunnel)
   beside the plain bridges [E22]; **SSH over QUIC**, or a roaming
