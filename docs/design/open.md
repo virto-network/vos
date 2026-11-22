@@ -590,6 +590,13 @@ are under "Identity and privacy" above.
   try is refused `Once`. Reading each method's guard from the node's
   schema before the form (a node read) and keeping a once call's request
   to send again until its expiry are later work.
+- **"Not paid" is the answering node's word** [known limit, dated
+  2026-11-22, `light-node.md` §5.2]: a pending payment past its expiry is
+  said not paid, and forgotten, on a linearizable `paid` read, so a
+  replica that is behind does not answer for the space; but an operator
+  that answers it can say "no" for a transfer that ran, and a user who
+  then pays again pays twice. A read answered by a signed state root
+  (node-signed answers, above) would close it.
 - **The ledger's payment keys grow with its payments** [known limit,
   dated 2026-11-22, `light-node.md` §5.2]: `Payments` keeps each
   transfer's external id (32 bytes) for good, beside the transfer's own

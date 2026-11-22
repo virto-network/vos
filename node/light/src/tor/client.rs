@@ -272,6 +272,8 @@ struct Inner {
     state: Mutex<State>,
     /// What it opened, each hour.
     tally: Mutex<Tally>,
+    /// The runtime it was made on, which its own tasks run on.
+    runtime: tokio::runtime::Handle,
 }
 
 impl Drop for Inner {
@@ -298,6 +300,7 @@ impl Client {
                 config,
                 state: Mutex::new(State::default()),
                 tally: Mutex::new(Tally::default()),
+                runtime: tokio::runtime::Handle::current(),
             }),
         };
         client.start_reaper();
@@ -578,11 +581,12 @@ impl Client {
         asked
     }
 
-    /// The kept-open connection of `purpose` to `space` closed, at once or,
-    /// while a request holds it, once that request is done: the next
-    /// request of that purpose opens another, under its own key and circuit.
+    /// The kept-open connection of `purpose` to `space` closed: its slot
+    /// is let go at once, so the next request of that purpose opens another
+    /// under its own key and circuit, whatever holds the old one; that one
+    /// closes now, or once the connection being opened in it is.
     pub fn close_kept(&self, space: SpaceId, purpose: Purpose) {
-        let Some(slot) = self.state().groups.get(&(purpose, space)).cloned() else {
+        let Some(slot) = self.state().groups.remove(&(purpose, space)) else {
             return;
         };
         let close = |kept: &mut Kept| {
@@ -594,9 +598,9 @@ impl Client {
             close(&mut kept);
             return;
         }
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move { close(&mut *slot.lock().await) });
-        }
+        self.inner
+            .runtime
+            .spawn(async move { close(&mut *slot.lock().await) });
     }
 
     /// A kept-open group's connection, open under the space's current

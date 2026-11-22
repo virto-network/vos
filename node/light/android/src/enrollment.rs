@@ -185,6 +185,9 @@ const PAYMENT: &[u8] = b"payment/";
 pub struct Pending {
     /// The owner digest it pays from.
     pub owner: [u8; 32],
+    /// The ledger it pays at: its agent and instance.
+    pub agent: u32,
+    pub instance: u32,
     pub key: [u8; 32],
     pub payee: String,
     pub amount: u64,
@@ -249,7 +252,7 @@ impl Store {
         [PAYMENT, &origin.digest()].concat()
     }
 
-    /// The payments `origin`'s enrollment holds pending, oldest key first.
+    /// The payments `origin`'s enrollment holds pending, by their keys.
     pub fn pending(&self, origin: &Origin) -> Result<Vec<Pending>, String> {
         Ok(self
             .kept()?

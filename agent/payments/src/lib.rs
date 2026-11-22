@@ -1,10 +1,10 @@
 //! `Payments`, the space's ledger paid from by owner proofs
 //! (`light-node.md` §5.2): cipher-clerk's kernel in an actor, one account
-//! per owner digest, so per device. Each
-//! account has a name, its handle for a payee, kept in its row's
-//! `user_data`; `transfer` runs under `#[msg(credential = Owner)]` and
-//! pays from the account of the digest the caller proved, unless it is
-//! frozen, once per payment key the payer names. Accounts come by an operator's invitation naming the name and
+//! per owner digest, so per device. Each account has a name, its handle
+//! for a payee, kept in its row's `user_data`; `transfer` runs under
+//! `#[msg(credential = Owner)]` and pays from the account of the digest
+//! the caller proved, unless it is frozen, once per payment key the payer
+//! names. Accounts come by an operator's invitation naming the name and
 //! the digest, opened by any caller before it expires; the operator mints
 //! from the space's issuance, moves an account to a new owner (lifting a
 //! freeze) and freezes one. Pseudonymous and custodial by design: payers,

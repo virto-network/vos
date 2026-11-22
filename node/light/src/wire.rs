@@ -165,6 +165,25 @@ pub fn query_request(
     arguments: Vec<u8>,
     not_after: u64,
 ) -> Result<Vec<u8>, DeviceError> {
+    let query = (instance, method, arguments);
+    query_request_at(
+        agent,
+        identity,
+        query,
+        not_after,
+        Consistency::Applied { at: 0 },
+    )
+}
+
+/// The same, answered at `consistency`: [`Consistency::Linearizable`]
+/// for a read whose "no" must not be a replica's that is behind.
+pub fn query_request_at(
+    agent: u32,
+    identity: &[u8; 32],
+    (instance, method, arguments): (u32, MethodId, Vec<u8>),
+    not_after: u64,
+    consistency: Consistency,
+) -> Result<Vec<u8>, DeviceError> {
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed).map_err(|_| DeviceError::Prove)?;
     let key = SigningKey::from_bytes(&seed);
@@ -172,7 +191,7 @@ pub fn query_request(
     let mut query = QueryCall {
         key: key.verifying_key().to_bytes(),
         not_after,
-        consistency: Consistency::Applied { at: 0 },
+        consistency,
         instance: InstanceId(instance),
         method,
         arguments,

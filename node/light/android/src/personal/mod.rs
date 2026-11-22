@@ -227,6 +227,8 @@ struct Holding {
     /// Counted at each change, so a wipe timed for one kit wipes no later.
     generation: u64,
     kit: Option<Entered>,
+    /// When the kit held was entered.
+    entry: Option<Instant>,
     /// A test's life for the kit, in ms; none: [`KIT_LIFE_MS`].
     life_ms: Option<u64>,
 }
@@ -273,6 +275,7 @@ impl Sitting {
         }
         holding.generation += 1;
         holding.kit = Some(kit);
+        holding.entry = Some(entry);
         Some((holding.generation, left))
     }
 
@@ -283,16 +286,22 @@ impl Sitting {
         }
     }
 
-    fn words(&self) -> Option<Zeroizing<String>> {
-        match &self.lock().kit {
-            Some(Entered::Words(words)) => Some(words.clone()),
+    /// The phrase held, and when it was entered.
+    fn words(&self) -> Option<(Zeroizing<String>, Instant)> {
+        let holding = self.lock();
+        match (&holding.kit, holding.entry) {
+            (Some(Entered::Words(words)), Some(entry)) => Some((words.clone(), entry)),
             _ => None,
         }
     }
 
-    fn touched(&self, salt: &[u8; 32]) -> Option<Zeroizing<[u8; 32]>> {
-        match &self.lock().kit {
-            Some(Entered::Touched { salt: held, secret }) if held == salt => Some(secret.clone()),
+    /// The security key's output for `salt` held, and when it was entered.
+    fn touched(&self, salt: &[u8; 32]) -> Option<(Zeroizing<[u8; 32]>, Instant)> {
+        let holding = self.lock();
+        match (&holding.kit, holding.entry) {
+            (Some(Entered::Touched { salt: held, secret }), Some(entry)) if held == salt => {
+                Some((secret.clone(), entry))
+            }
             _ => None,
         }
     }
@@ -309,6 +318,8 @@ pub struct Asked<'a> {
     entered: Mutex<Option<(Entered, Instant)>>,
     /// The sitting's count of opens and closes when the flow began.
     opened: u64,
+    /// When the kit this flow took from the sitting was entered.
+    taken: Mutex<Option<Instant>>,
 }
 
 impl<'a> Asked<'a> {
@@ -318,6 +329,7 @@ impl<'a> Asked<'a> {
             sitting: None,
             entered: Mutex::new(None),
             opened: 0,
+            taken: Mutex::new(None),
         }
     }
 
@@ -330,7 +342,8 @@ impl<'a> Asked<'a> {
     }
 
     /// Whether the flow's sitting ended under it (closed, or the app in the
-    /// background), or the kit it entered outlived its life: every further
+    /// background), or the kit it entered or took from the sitting outlived
+    /// its life from its entry: every further
     /// prompt is declined then, so the flow ends and drops the kit it holds
     /// at the sitting's own deadlines.
     fn ended(&self) -> bool {
@@ -341,9 +354,11 @@ impl<'a> Asked<'a> {
             let holding = sitting.lock();
             (holding.opened, holding.life_ms.unwrap_or(KIT_LIFE_MS))
         };
+        let life = Duration::from_millis(life_ms);
         let outlived = crate::lock(&self.entered)
             .as_ref()
-            .is_some_and(|(_, entry)| entry.elapsed() >= Duration::from_millis(life_ms));
+            .is_some_and(|(_, entry)| entry.elapsed() >= life)
+            || crate::lock(&self.taken).is_some_and(|entry| entry.elapsed() >= life);
         opened != self.opened || outlived
     }
 
@@ -555,7 +570,8 @@ impl space::Prompts for Asked<'_> {
     }
 
     fn enter_phrase(&self) -> Option<Zeroizing<String>> {
-        if let Some(words) = self.sitting.and_then(Sitting::words) {
+        if let Some((words, entry)) = self.sitting.and_then(Sitting::words) {
+            *crate::lock(&self.taken) = Some(entry);
             return Some(words);
         }
         let answer = self.confirm(Form {
@@ -666,7 +682,10 @@ impl space::Prompts for Asked<'_> {
     /// (the kit entered, `id` empty), the one the sitting holds if any.
     fn kit_secret(&self, id: &[u8], salt: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, Error> {
         let entered = id.is_empty() && self.sitting.is_some();
-        if entered && let Some(secret) = self.sitting.and_then(|sitting| sitting.touched(salt)) {
+        if entered
+            && let Some((secret, entry)) = self.sitting.and_then(|sitting| sitting.touched(salt))
+        {
+            *crate::lock(&self.taken) = Some(entry);
             return Ok(secret);
         }
         let secret = thirty_two(

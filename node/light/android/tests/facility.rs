@@ -832,9 +832,14 @@ async fn a_sign_in_before_the_claim_waits_for_the_invitation() {
     named.granted();
     chrome.will(confirm(&[]));
     named.ask("enroll", &enrollment(), &chrome).await.unwrap();
+    let feeds = world.feed_reads();
     let joined = named.ask("sign_in", &login, &chrome).await.unwrap_err();
     assert_eq!(joined.code, Code::Refused, "{joined:?}");
     assert!(chrome.stages.lock().unwrap().is_empty());
+    assert!(
+        world.feed_reads() <= feeds + 1,
+        "the refresher's own read at most"
+    );
     // Past the last wait's end and the gap after it, a sign-in waits again.
     tokio::time::sleep(Duration::from_millis(3_600)).await;
 

@@ -198,9 +198,10 @@ searched for the secret by its `tests/leaks.rs`.
   UI's stop, and `foreground(false)`), when the UI's process dies (its
   token's death), ten minutes after its entry at most (a timer, not a
   check at the next use), and when a flow finds it not a kit or not the
-  space's. A flow in flight that holds a kit of its own is ended at the
-  same deadlines: its next prompt is declined, and the UI's stop declines
-  the form it waits on. "Zeroized" is the `:vos` side's: the words a form
+  space's. A restore screen's flow in flight that holds a kit is ended at
+  the same deadlines: its next prompt is declined, and the UI's stop
+  declines the form it waits on; a kit flow outside that screen holds its
+  kit until it ends. "Zeroized" is the `:vos` side's: the words a form
   shows or an answer carries are zeroized there once handed over or read,
   while their Java copies (the Binder parcels, the form's text in the UI)
   are left to the collector. The other kit flows ask for it at each call. The form that

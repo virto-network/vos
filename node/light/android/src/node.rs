@@ -245,16 +245,17 @@ impl Node {
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             (Arc::new(Net::over(Arc::clone(&arti), &directory)), arti)
         };
+        // Held before anything can dial.
+        if let Err(why) = &bridges {
+            arti.hold(format!("the bridges kept do not read: {why}"));
+        }
         let node = Self::over(runtime, directory, device, net, crate::personal::embedded())?;
-        match bridges {
-            Ok(_) => {
-                let net = Arc::clone(node.facility.net());
-                node.runtime.spawn(async move {
-                    // A failure is named when the chrome asks (`bootstrap`).
-                    let _ = net.bootstrap().await;
-                });
-            }
-            Err(why) => arti.hold(format!("the bridges kept do not read: {why}")),
+        if bridges.is_ok() {
+            let net = Arc::clone(node.facility.net());
+            node.runtime.spawn(async move {
+                // A failure is named when the chrome asks (`bootstrap`).
+                let _ = net.bootstrap().await;
+            });
         }
         Ok(node)
     }

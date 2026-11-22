@@ -1942,11 +1942,15 @@ restore's times [World]: §6.3]:
   zeroized when the screen closes, when the app goes to the background
   (the UI's stop, and `:vos`'s own background signal), when the UI's
   process dies, at most ten minutes after the entry, and when a flow finds
-  it not a kit or not this space's. A flow in flight is held to the same
-  deadlines: once its sitting closes (the screen, the background) or its
-  kit's ten minutes pass, every further prompt of that flow is declined,
-  so it ends and drops the kit it holds; the UI's stop declines the form
-  such a flow waits on. A form shown before the ten minutes passed may
+  it not a kit or not this space's. A restore screen's flow in flight is
+  held to the same deadlines: once its sitting closes (the screen, the
+  background) or the ten minutes from its kit's entry pass (a kit it
+  entered or took from the sitting), every further prompt of that flow is
+  declined, so it ends and drops the kit it holds; the UI's stop declines
+  the form such a flow waits on. A kit flow outside the restore screen (a
+  claim, a rotation, a regroup, a move) has no sitting and no such
+  deadline: it holds its kit until it ends, each of its forms waiting ten
+  minutes. A form shown before the ten minutes passed may
   still be answered after (each form waits ten minutes), and the flow then
   ends at its next prompt. The words in the forms' rows and in the
   answers are zeroized in `:vos` once handed over or read; the Java
@@ -3137,11 +3141,12 @@ same key, and an answer that says the proof will not run again
 (`Replayed`, an expiry) is proved again under that key at once. A lost
 answer says so ("pay the same again to learn whether it was paid; it is
 paid once"). Before a payment's form, each pending payment of the
-account is asked of the ledger by `paid`, on a fetch of its own, in the
-payment's session alone (which names the account already): paid, or not
-paid once its proof can no longer run by the device's own clock (its
-expiry plus the node's clock's 300 s bound), and the form says which;
-otherwise it stays pending. Tested: `a_payment_key_pays_once` (the ledger)
+account is asked of the ledger by `paid`, a linearizable read on a fetch
+of its own (ten seconds at most each), in the payment's session alone
+(which names the account already): paid, or not paid once its proof can
+no longer run by the device's own clock (its expiry plus the node's
+clock's 300 s bound), and the form says which; otherwise it stays
+pending. "Not paid" is the answering node's word (`open.md`). Tested: `a_payment_key_pays_once` (the ledger)
 and the facility's lost answer, restart and expiry, each paying once. The
 facility proves with the stock kernels' release artifacts it
 embeds, never a kernel a server sends (G2), so the s4 demo signs in by
@@ -3413,7 +3418,8 @@ nodes may ask the onion's mark of its proven calls, or of every request
   enrollment, a retry after a dropped connection) keeps the grant of the
   session it replaces, for the same host, port, verified host key and
   application, in s4's memory alone, across at most eight such reconnects
-  and an hour from the user's grant (past either the next session asks),
+  and an hour by the wall clock from the user's grant (past either the
+  next session asks),
   and a session the user starts asks as ever (E35; built). The new session is the facility's new session all
   the same: it starts knowing nothing (`Learned::Nothing`), never
   inherits what the old one was shown, so a session that showed the

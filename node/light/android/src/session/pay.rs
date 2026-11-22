@@ -17,7 +17,7 @@ use vos_wire::ingress::CredentialRefusal;
 use super::clock::CLOCK_SKEW_MS;
 use super::{Inner, Kernel, Learned, PROVING, SENDING, Session, declined, describe, store_error};
 use crate::chrome::{Answer, Chrome, Field, Form, short};
-use crate::enrollment::{Enrollment, Guard, Method, Pending};
+use crate::enrollment::{Enrollment, Guard, Pending};
 use crate::job::now_ms;
 use crate::{Code, Paid, Pay, Refusal, refused};
 use s4_credential_contract::{TRANSFER, account};
@@ -26,6 +26,9 @@ use vos_light::route::Purpose;
 /// The most payments a device holds pending at a space: past it, a new one
 /// waits for the ledger to settle the last.
 const MOST_PENDING: usize = 8;
+/// How long a pending payment's read may take before the form says it
+/// has no answer yet.
+const PAID_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 /// A payment's answer lost on the way: what the user is told, so a retry
 /// is known to be safe.
 const LOST: &str = "the payment's answer did not arrive: pay the same again to learn whether \
@@ -45,8 +48,9 @@ enum Settles {
     /// The transfer ran: paid, or refused by the ledger for good.
     Ran,
     /// The proof will not run again (its binding ran, or its expiry
-    /// passed): a new proof under the same key settles it.
-    ProveAgain,
+    /// passed): a new proof under the same key settles it, at the node's
+    /// time if the answer named it.
+    ProveAgain(Option<u64>),
     /// Nothing known: the payment stays pending.
     Unknown,
 }
@@ -55,10 +59,10 @@ fn settles(answer: &[u8]) -> Settles {
     use vos_abi::abi::Refusal as Node;
     match wire::credentialed_answer(answer) {
         Ok(wire::Answer::Ran { .. }) => Settles::Ran,
-        Ok(wire::Answer::Expiry { .. })
-        | Ok(wire::Answer::Refused(CredentialRefusal::Replayed)) => Settles::ProveAgain,
+        Ok(wire::Answer::Expiry { now }) => Settles::ProveAgain(Some(now)),
+        Ok(wire::Answer::Refused(CredentialRefusal::Replayed)) => Settles::ProveAgain(None),
         Ok(wire::Answer::Other(body)) => match super::answer::node_refusal(&body) {
-            Some(Node::Replayed | Node::CredentialExpired) => Settles::ProveAgain,
+            Some(Node::Replayed | Node::CredentialExpired) => Settles::ProveAgain(None),
             _ => Settles::Unknown,
         },
         _ => Settles::Unknown,
@@ -93,7 +97,7 @@ impl Session {
         self.inner.admits(&enrollment, Kernel::Owner).await?;
         self.apart(Learned::Named)?;
         self.read_clock_meanwhile(&enrollment);
-        let earlier = self.settle_pending(&enrollment, method).await?;
+        let earlier = self.settle_pending(&enrollment).await?;
         let (mut payee, mut amount) = (request.payee.clone(), request.amount.to_string());
         let mut notice = (!earlier.is_empty()).then(|| earlier.join(" "));
         let (payee, amount) = loop {
@@ -152,7 +156,10 @@ impl Session {
         // payment: its key, so the ledger pays it once.
         let pending = store.pending(&self.origin).map_err(store_error)?;
         let held = pending.into_iter().find(|pending| {
-            pending.owner == enrollment.owner && pending.payee == payee && pending.amount == amount
+            (pending.owner, pending.agent, pending.instance)
+                == (enrollment.owner, method.agent, method.instance)
+                && pending.payee == payee
+                && pending.amount == amount
         });
         let now = self.node_now(&enrollment).await?;
         let tree = self.tree();
@@ -169,7 +176,7 @@ impl Session {
                 let answer = self
                     .send_payment(&enrollment, &held.key, &again.request)
                     .await?;
-                if !matches!(settles(&answer), Settles::ProveAgain) {
+                if !matches!(settles(&answer), Settles::ProveAgain(_)) {
                     return Ok(paid(answer, 0));
                 }
             }
@@ -178,6 +185,8 @@ impl Session {
             Some(held) => held,
             None => Pending {
                 owner: enrollment.owner,
+                agent: method.agent,
+                instance: method.instance,
                 key: draw_key()?,
                 payee: payee.clone(),
                 amount,
@@ -188,7 +197,7 @@ impl Session {
         let mut now = now;
         // Once more when the answer says that proof will not run again:
         // the ledger's answer to the same key then settles it.
-        for _ in 0..2 {
+        for last in [false, true] {
             let started = Instant::now();
             let call = self.call_at(
                 &enrollment,
@@ -223,12 +232,22 @@ impl Session {
             }
             chrome.stage(SENDING);
             let answer = self.send_payment(&enrollment, &pending.key, &bytes).await?;
-            match settles(&answer) {
-                Settles::ProveAgain => now = self.node_now(&enrollment).await?,
-                _ => return Ok(paid(answer, proving_ms)),
+            let Settles::ProveAgain(at) = settles(&answer) else {
+                return Ok(paid(answer, proving_ms));
+            };
+            if last {
+                // Answered twice that the proof will not run: the payment
+                // stays pending, and that answer is the server's.
+                return Ok(paid(answer, proving_ms));
             }
+            // The node's own time, when it named one within the bound its
+            // clock is read to; otherwise the session's reading again.
+            now = match at {
+                Some(at) if at.abs_diff(now) <= CLOCK_SKEW_MS => at,
+                _ => self.node_now(&enrollment).await?,
+            };
         }
-        Err(refused(Code::Api, LOST))
+        unreachable!("the last turn returns")
     }
 
     /// A payment's request sent: its answer, the payment forgotten once
@@ -261,23 +280,27 @@ impl Session {
     /// stays pending, and a form confirmed with its values pays it once.
     /// What became of each, for the form. Read only in a payment's
     /// session, which names the account already.
-    async fn settle_pending(
-        &self,
-        enrollment: &Enrollment,
-        method: &Method,
-    ) -> Result<Vec<String>, Refusal> {
+    async fn settle_pending(&self, enrollment: &Enrollment) -> Result<Vec<String>, Refusal> {
         let store = &self.inner.store;
-        let pending: Vec<_> = store
-            .pending(&self.origin)
-            .map_err(store_error)?
-            .into_iter()
-            .filter(|pending| pending.owner == enrollment.owner)
-            .collect();
+        let mut pending = Vec::new();
+        for row in store.pending(&self.origin).map_err(store_error)? {
+            // An owner digest this enrollment no longer has pays nothing
+            // more: its rows are forgotten.
+            if row.owner != enrollment.owner {
+                store.settled(&self.origin, &row.key).map_err(store_error)?;
+            } else {
+                pending.push(row);
+            }
+        }
         let mut said = Vec::new();
         let mut open = 0;
         for pending in pending {
             let what = format!("{} to {}", pending.amount, pending.payee);
-            match self.paid(enrollment, method, &pending).await {
+            let read = tokio::time::timeout(PAID_WITHIN, self.paid(enrollment, &pending));
+            match read
+                .await
+                .unwrap_or_else(|_| Err(refused(Code::Api, "no answer in time")))
+            {
                 Ok(true) => {
                     store
                         .settled(&self.origin, &pending.key)
@@ -308,26 +331,26 @@ impl Session {
         Ok(said)
     }
 
-    /// Whether the ledger paid under `pending`'s key, by its own read.
-    async fn paid(
-        &self,
-        enrollment: &Enrollment,
-        method: &Method,
-        pending: &Pending,
-    ) -> Result<bool, Refusal> {
+    /// Whether the ledger `pending` paid at paid under its key, by a
+    /// linearizable read, so a replica that is behind does not answer
+    /// "no" for a transfer that ran.
+    async fn paid(&self, enrollment: &Enrollment, pending: &Pending) -> Result<bool, Refusal> {
         let identity = enrollment
-            .agent(method.agent)
+            .agent(pending.agent)
             .ok_or_else(|| refused(Code::NotPinned, "the ledger's agent was not pinned"))?
             .identity;
         let now = self.node_now(enrollment).await?;
         let external = vos_wire::payments::external_id(&pending.owner, &pending.key);
-        let query = wire::query_request(
-            method.agent,
+        let query = wire::query_request_at(
+            pending.agent,
             &identity,
-            method.instance,
-            MethodId(vos_light::method_id("paid")),
-            vos_abi::Encode::encode(&external),
+            (
+                pending.instance,
+                MethodId(vos_light::method_id("paid")),
+                vos_abi::Encode::encode(&external),
+            ),
             now + super::EXPIRY_MS,
+            vos_wire::ingress::Consistency::Linearizable,
         )
         .map_err(|error| refused(Code::Prove, error.to_string()))?;
         let answer = self
