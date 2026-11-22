@@ -454,7 +454,8 @@ impl Inner {
         for id in waiting {
             if let Some(run) = self.run(id) {
                 run.inbox.send(GroupInput::Blobs);
-                // A statement's proof it waited for: its leader records it.
+                // A blob it waited for, a statement's proof to record among
+                // them: its leader looks again.
                 run.agent.wake();
             }
         }

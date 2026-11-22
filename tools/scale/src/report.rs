@@ -84,7 +84,8 @@ pub struct NodeSummary {
     pub elections: u64,
     /// Stage quantiles over the window, in microseconds: `commit`, `late`,
     /// `batch`, `queued`, and the waits for an executor (`refine_queue`,
-    /// `dry_run_queue`, `root_build_queue`) with the root builds' runs.
+    /// `dry_run_queue`, `root_build_queue`) with the root builds' runs,
+    /// and the idle leaders' looks that found nothing due (`look`).
     pub stages: BTreeMap<String, (u64, u64, u64)>,
     pub halted: bool,
     pub poll_errors: u64,
@@ -456,6 +457,7 @@ fn node_summary(
             "dry_run_queue",
             "root_build_queue",
             "root_build",
+            "look",
         ] {
             if let Some(quantiles) = stage_quantiles(first, last, stage) {
                 node.stages.insert(stage.into(), quantiles);

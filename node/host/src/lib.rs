@@ -226,7 +226,8 @@ pub trait Hooks: Send + Sync {
 
     /// Whether `agent`'s leader reports its root at window `window`'s cut
     /// to the space's representative now: false holds the report, as a
-    /// leader slow to send it would, until the hook says otherwise.
+    /// leader slow to send it would, until the hook says otherwise and the
+    /// leader next looks (a cut built, an input, its clock stepping).
     fn report(&self, agent: AgentId, window: u64) -> bool {
         let _ = (agent, window);
         true

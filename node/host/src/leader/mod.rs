@@ -39,6 +39,10 @@ use anchor::Anchoring;
 use sweep::Sweeps;
 use window::{BEHIND_EVERY, WINDOW, Window};
 
+/// How long an idle leader waits to look again at the reads it may serve,
+/// its reports, closes and proofs, once one of them failed to read.
+const DUTY_RECHECK: Duration = Duration::from_secs(2);
+
 /// Lead `agent` whenever this node's replica leads its group, until the
 /// group stops.
 pub(crate) async fn lead(inner: Arc<Inner>, agent: Arc<Agent>, shared: Arc<Shared>) {
@@ -399,22 +403,25 @@ impl Leader {
                 smol::future::yield_now().await;
                 return Some(Taken::Marker);
             }
-            // A read proved at its cut, a report or a close.
-            if self.serve_due() || self.duties_due() || self.proofs_due() {
+            // A read proved at its cut, a report or a close; a check that
+            // failed to read is made again after a while.
+            let duties = [self.serve_due(), self.duties_due(), self.proofs_due()];
+            if duties.iter().any(|due| matches!(due, Ok(true))) {
                 smol::future::yield_now().await;
                 return Some(Taken::Serve);
             }
+            let unread = duties.iter().any(Result::is_err).then_some(DUTY_RECHECK);
             // A waiting anchor to offer again.
             let anchor = self.anchor_wait();
             if anchor == Some(Duration::ZERO) {
                 smol::future::yield_now().await;
                 return Some(Taken::Anchor);
             }
-            self.inner.stats.look.took(looked.elapsed());
             // A receiver found this agent behind it: windows go again.
             if behind {
                 return Some(Taken::Rounds);
             }
+            self.inner.stats.look.took(looked.elapsed());
             let woken = async {
                 match self.agent.woken.recv().await {
                     Ok(()) => Woke::Queue,
@@ -435,7 +442,7 @@ impl Leader {
                 Woke::Round
             };
             let recheck = async {
-                match [sweep, cut, anchor].into_iter().flatten().min() {
+                match [sweep, cut, anchor, unread].into_iter().flatten().min() {
                     Some(wait) => smol::Timer::after(wait).await,
                     None => std::future::pending().await,
                 };

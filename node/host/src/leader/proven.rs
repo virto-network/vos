@@ -18,9 +18,8 @@ const PROVEN: usize = 16;
 
 impl Leader {
     /// Whether a statement proved here waits to be recorded.
-    pub(super) fn proofs_due(&self) -> bool {
-        self.proofs(&self.inner.store.snapshot())
-            .is_ok_and(|proofs| !proofs.is_empty())
+    pub(super) fn proofs_due(&self) -> Result<bool, Fault> {
+        Ok(!self.proofs(&self.inner.store.snapshot())?.is_empty())
     }
 
     /// The statements proved here that `snapshot`'s agent does not hold

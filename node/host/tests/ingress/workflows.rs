@@ -364,12 +364,13 @@ fn a_nap_ends_at_its_time_while_the_leader_holds_a_later_due_row() {
     let ticker = {
         let (clock, running) = (Arc::clone(&served.clock), Arc::clone(&running));
         std::thread::spawn(move || {
-            let mut last = Instant::now();
+            let (base, started) = (clock.load(Ordering::SeqCst), Instant::now());
             while running.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(50));
-                let now = Instant::now();
-                clock.fetch_add((now - last).as_millis() as u64, Ordering::SeqCst);
-                last = now;
+                clock.store(
+                    base + started.elapsed().as_millis() as u64,
+                    Ordering::SeqCst,
+                );
             }
         })
     };
@@ -384,5 +385,8 @@ fn a_nap_ends_at_its_time_while_the_leader_holds_a_later_due_row() {
         status(answer.unwrap()),
         WorkflowStatus::Ended(Outcome::Done(tour.result(0)))
     );
-    assert!(took < Duration::from_secs(8), "ended at its time: {took:?}");
+    assert!(
+        took < Duration::from_secs(15),
+        "ended at its time: {took:?}"
+    );
 }

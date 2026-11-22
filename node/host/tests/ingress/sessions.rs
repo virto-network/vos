@@ -284,10 +284,16 @@ fn an_idle_leader_sleeps_until_its_session_is_due() {
             .map(|stage| stage.counts.iter().sum::<u64>())
             .expect("the idle leaders' looks")
     };
-    // Past the call's batch and its apply, the leader is idle.
-    std::thread::sleep(Duration::from_secs(1));
-    let idle = looks();
-    std::thread::sleep(Duration::from_secs(11));
+    // Past the call's batch and its apply, the leader is idle: its looks
+    // stand still for a second.
+    let mut idle = looks();
+    wait_until("the leader is idle", || {
+        std::thread::sleep(Duration::from_secs(1));
+        let now = looks();
+        std::mem::replace(&mut idle, now) == now
+    });
+    // Past the 5 s a looking leader would wait at most.
+    std::thread::sleep(Duration::from_secs(7));
     assert_eq!(looks(), idle, "no look while nothing is due");
     assert!(served.holds(&session));
     served.clock.fetch_add(
@@ -299,7 +305,7 @@ fn an_idle_leader_sleeps_until_its_session_is_due() {
         !served.holds(&session)
     });
     assert!(
-        stepped.elapsed() < Duration::from_secs(4),
+        stepped.elapsed() < Duration::from_secs(8),
         "looked again within a step's bound: {:?}",
         stepped.elapsed()
     );

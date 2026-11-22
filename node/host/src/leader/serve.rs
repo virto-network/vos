@@ -37,8 +37,8 @@ struct Ready {
 impl Leader {
     /// Whether a read this replica has proved at a cut, and the agent holds
     /// the close of, waits to be served.
-    pub(super) fn serve_due(&self) -> bool {
-        proved(&self.inner.store.snapshot(), self.id).is_ok_and(|ready| !ready.is_empty())
+    pub(super) fn serve_due(&self) -> Result<bool, Fault> {
+        Ok(!proved(&self.inner.store.snapshot(), self.id)?.is_empty())
     }
 
     /// The reads `snapshot` holds proved at their cuts and closed, served,

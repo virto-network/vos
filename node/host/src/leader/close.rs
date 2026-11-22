@@ -36,11 +36,10 @@ pub(super) enum Closes {
 
 impl Leader {
     /// Whether a report or a close waits on this replica's state.
-    pub(super) fn duties_due(&self) -> bool {
+    pub(super) fn duties_due(&self) -> Result<bool, Fault> {
         let snapshot = self.inner.store.snapshot();
-        self.reports(&snapshot)
-            .is_ok_and(|reports| !reports.is_empty())
-            || unsent(&snapshot, self.id, self.represents()).is_ok_and(|unsent| !unsent.is_empty())
+        Ok(!self.reports(&snapshot)?.is_empty()
+            || !unsent(&snapshot, self.id, self.represents())?.is_empty())
     }
 
     /// Whether this agent is its space's representative.
