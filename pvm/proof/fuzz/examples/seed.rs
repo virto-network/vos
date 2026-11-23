@@ -13,8 +13,9 @@
 //! `service_item` with each fixture's statement and its proof, and a
 //! registration, an anchor and a control of each golden vector; and
 //! `prove_verify_roundtrip` with a raw run's memory accesses and
-//! compression past the zone, a kernel's compression and a static jump to
-//! the halt address (`roundtrip::seeds`), beside the corpus' programs.
+//! compression past the zone, a kernel's compression, a static jump to
+//! the halt address and runs that stop where no proof ends one
+//! (`roundtrip::seeds`), beside the corpus' programs.
 //!
 //! The golden device proof is kept while the device program accepts it, so
 //! the mutation corpus replays against the same proof; it is proved and

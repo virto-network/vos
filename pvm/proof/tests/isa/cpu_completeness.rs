@@ -4,7 +4,8 @@
 //! the `ImmAlt` shifts, branches whose target is their fallthrough, signed
 //! minima and maxima, an 8-byte immediate store of a negative value, and a
 //! BLAKE2b call whose flag register is a non-zero multiple of the field's
-//! modulus.
+//! modulus; and the runs that stop where no proof ends a run, refused as
+//! such before any trace, beside those that stop where one does.
 
 use crate::common;
 use common::*;
@@ -145,4 +146,183 @@ fn a_compression_flag_of_the_modulus_proves() {
         .with_memory(memory);
     let proof = vos_pvm_proof::prove(&mut side_note).expect("proving failed");
     vos_pvm_proof::verify(proof, &side_note).expect("verification failed");
+}
+
+/// `code` (every byte an instruction start unless `bitmask` says) run with
+/// `registers` and `gas` to its stop, as a raw run on the protected zone
+/// and one page past it: how it stopped, and its side note.
+fn stopped(
+    code: &[u8],
+    bitmask: &[u8],
+    registers: &[u64],
+    gas: vos_pvm::Gas,
+) -> (vos_pvm::ExitReason, vos_pvm_proof::SideNote) {
+    let memory = vec![0u8; vos_pvm::PVM_ZONE_SIZE as usize + 4096];
+    let mut initial = [0u64; PVM_REGISTER_COUNT];
+    initial[..registers.len()].copy_from_slice(registers);
+    let pvm = Interpreter::new(
+        code.to_vec(),
+        bitmask.to_vec(),
+        vec![],
+        initial,
+        memory.clone(),
+        gas,
+    );
+    let mut tracer = TracingPvm::new(pvm);
+    let exit = tracer.run_with_precompiles();
+    (exit, tracer.into_side_note().with_memory(memory))
+}
+
+/// A run that stops at an instruction it does not complete is refused as
+/// [`SegmentError::Stop`]: a load and a store in the protected zone, a load
+/// of an unmapped page, a branch to no block start, a dynamic jump to no
+/// table entry, and out of gas at an addition, a jump or a dynamic jump to
+/// the halt address.
+#[test]
+fn a_run_stopped_where_no_proof_ends_is_refused() {
+    use vos_pvm::ExitReason::{OutOfGas, PageFault, Panic};
+    let page = u64::from(vos_pvm::PVM_ZONE_SIZE);
+    let halt = vos_pvm::PVM_HALT_ADDR;
+    let load = Opcode::LoadIndU64 as u8;
+    let trap = Opcode::Trap as u8;
+    for (name, at, code, bitmask, registers, gas, exit) in [
+        (
+            "zone load",
+            0,
+            vec![load, trap],
+            vec![1, 1],
+            vec![],
+            100,
+            Panic,
+        ),
+        (
+            "zone store",
+            0,
+            vec![Opcode::StoreIndU64 as u8, trap],
+            vec![1, 1],
+            vec![],
+            100,
+            Panic,
+        ),
+        (
+            "unmapped load",
+            0,
+            vec![load, 0x10, trap],
+            vec![1, 0, 1],
+            vec![0, 3 * page],
+            100,
+            PageFault(3 * vos_pvm::PVM_ZONE_SIZE),
+        ),
+        // The load of φ5's page completes, its register byte the branch's
+        // opcode; the branch's target, 1, follows no terminator.
+        (
+            "branch",
+            1,
+            vec![load, Opcode::BranchNeImm as u8, trap],
+            vec![1, 1, 1],
+            vec![0, 0, 0, 0, 0, page],
+            100,
+            Panic,
+        ),
+        (
+            "dynamic jump",
+            0,
+            vec![Opcode::JumpInd as u8, 0, trap],
+            vec![1, 0, 1],
+            vec![7],
+            100,
+            Panic,
+        ),
+        (
+            "addition",
+            0,
+            vec![Opcode::AddImm64 as u8, 0, 1, trap],
+            vec![1, 0, 0, 1],
+            vec![],
+            0,
+            OutOfGas,
+        ),
+        (
+            "jump",
+            0,
+            vec![Opcode::Jump as u8, 5, 0, 0, 0, trap],
+            vec![1, 0, 0, 0, 0, 1],
+            vec![],
+            0,
+            OutOfGas,
+        ),
+        (
+            "halt",
+            0,
+            vec![Opcode::JumpInd as u8, 0, trap],
+            vec![1, 0, 1],
+            vec![halt],
+            0,
+            OutOfGas,
+        ),
+    ] {
+        let (stop, mut side_note) = stopped(&code, &bitmask, &registers, gas);
+        assert_eq!(stop, exit, "{name}");
+        let last = side_note.steps.last().expect(name);
+        assert!(last.exit, "{name}");
+        assert_eq!(last.pc, at, "{name}");
+        assert!(
+            matches!(
+                vos_pvm_proof::prove(&mut side_note),
+                Err(vos_pvm_proof::SegmentError::Stop)
+            ),
+            "{name}"
+        );
+    }
+}
+
+/// A run that stops where a proof ends a run proves and verifies: a trap,
+/// an unserved host call, a dynamic jump to the halt address, and out of
+/// gas at a trap, a host call or a compression it cannot pay.
+#[test]
+fn a_run_stopped_where_a_proof_ends_proves() {
+    use vos_pvm::ExitReason::{Halt, HostCall, OutOfGas, Panic};
+    let trap = Opcode::Trap as u8;
+    let host_call = vec![Opcode::Ecalli as u8, 99, trap];
+    for (name, code, bitmask, registers, gas, exit) in [
+        ("trap", vec![trap], vec![1], vec![], 100, Panic),
+        (
+            "host call",
+            host_call.clone(),
+            vec![1, 0, 1],
+            vec![],
+            100,
+            HostCall(99),
+        ),
+        (
+            "halt",
+            vec![Opcode::JumpInd as u8, 0, trap],
+            vec![1, 0, 1],
+            vec![vos_pvm::PVM_HALT_ADDR],
+            100,
+            Halt,
+        ),
+        ("trap out of gas", vec![trap], vec![1], vec![], 0, OutOfGas),
+        (
+            "compression unpaid",
+            vec![Opcode::Ecalli as u8, 0, 4, trap],
+            vec![1, 0, 0, 1],
+            vec![],
+            100,
+            OutOfGas,
+        ),
+        (
+            "host call out of gas",
+            host_call,
+            vec![1, 0, 1],
+            vec![],
+            0,
+            OutOfGas,
+        ),
+    ] {
+        let (stop, mut side_note) = stopped(&code, &bitmask, &registers, gas);
+        assert_eq!(stop, exit, "{name}");
+        let proof = vos_pvm_proof::prove(&mut side_note).expect(name);
+        vos_pvm_proof::verify(proof, &side_note).expect(name);
+    }
 }

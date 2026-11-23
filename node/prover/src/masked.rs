@@ -252,6 +252,7 @@ fn not_proved(error: &SegmentError) -> StatementError {
             Kernel("the run does not fit its kernel's shape")
         }
         SegmentError::Transfer => Kernel("the kernel transfers to the halt address"),
+        SegmentError::Stop => Kernel("the run stops where no proof ends a run"),
         SegmentError::Segments => Bound("the run takes more segments than its gas buys"),
         SegmentError::RunLength => Bound("the run is past a proof's steps"),
         SegmentError::Stwo(_) => Failed("a segment does not prove"),

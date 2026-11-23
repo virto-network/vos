@@ -194,13 +194,15 @@ fn traced(error: &KernelTraceError) -> String {
 }
 
 /// A proof's refusal, by its kind, and only the kinds an honest trace of
-/// this target may meet: a static jump to the halt address, a window no
-/// class holds or more segments than the gas buys. Any other, an honest
-/// trace's constraints unsatisfied among them, is a bug of the prover, and
-/// panics.
+/// this target may meet: a static jump to the halt address, a run stopped
+/// where no proof ends one (a fault, a panic at a transfer, out of gas but
+/// at a trap or a host call), a window no class holds or more segments
+/// than the gas buys. Any other, an honest trace's constraints unsatisfied
+/// among them, is a bug of the prover, and panics.
 fn refused(error: &SegmentError) -> String {
     match error {
         SegmentError::Transfer => "transfer".into(),
+        SegmentError::Stop => "stop".into(),
         SegmentError::Shape { overflow: true, .. } => "shape".into(),
         SegmentError::Segments => "segments".into(),
         other => panic!("an honest trace refused: {other:?}"),
@@ -209,9 +211,11 @@ fn refused(error: &SegmentError) -> String {
 
 /// The seeds a corpus of this target starts from beside the fuzzer's: a raw
 /// run that loads, stores and compresses in the page past the zone, a
-/// kernel that compresses in its heap and halts, and a static jump to the
-/// halt address, which no proof takes. Each its name and its
-/// encoding.
+/// kernel that compresses in its heap and halts, a static jump to the
+/// halt address, which no proof takes, and raw runs that stop where no
+/// proof ends one: a load in the protected zone, a branch to no block
+/// start, a dynamic jump to no table entry and a loop out of gas at an
+/// addition. Each its name and its encoding.
 pub fn seeds() -> Vec<(&'static str, Vec<u8>)> {
     use vos_pvm_compiler::assembler::{Assembler, Reg};
     let parts = |asm: &mut Assembler| {
@@ -272,9 +276,42 @@ pub fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         regs: vec![],
         bitmask: vec![1, 0, 0, 0, 0],
     };
+    let stop = |code: Vec<u8>, regs: Vec<u64>, bitmask: Vec<u8>| {
+        encode(&FuzzInput {
+            code,
+            regs,
+            bitmask,
+        })
+    };
+    // φ0 + 0, in the zone.
+    let zone_load = stop(vec![Opcode::LoadIndU64 as u8], vec![], vec![]);
+    // A load of φ5's page, past the zone, completes (its register byte is
+    // the branch's opcode); the branch after it names itself, which follows
+    // no terminator.
+    let branch = stop(
+        vec![Opcode::LoadIndU64 as u8, Opcode::BranchNeImm as u8],
+        vec![0, 0, 0, 0, 0, page],
+        vec![],
+    );
+    // A jump to φ0 = 7, which no table entry holds.
+    let dynamic_jump = stop(vec![Opcode::JumpInd as u8, 0], vec![7], vec![1, 0]);
+    // φ0 += 1 and back, until the gas runs out at the addition.
+    let out_of_gas = stop(
+        [
+            &[Opcode::AddImm64 as u8, 0, 1, Opcode::Jump as u8][..],
+            &(-3i32).to_le_bytes(),
+        ]
+        .concat(),
+        vec![],
+        vec![1, 0, 0, 1, 0, 0, 0, 0],
+    );
     vec![
         ("memory-and-blake2b", encode(&raw)),
         ("kernel-blake2b", encode(&kernel)),
         ("static-jump-to-halt", encode(&halt)),
+        ("stop-zone-load", zone_load),
+        ("stop-branch", branch),
+        ("stop-dynamic-jump", dynamic_jump),
+        ("stop-out-of-gas", out_of_gas),
     ]
 }

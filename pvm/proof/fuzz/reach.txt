@@ -115,6 +115,7 @@ prove_verify_roundtrip	kernel: proved
 prove_verify_roundtrip	raw: a memory access
 prove_verify_roundtrip	raw: a precompile
 prove_verify_roundtrip	raw: proved
+prove_verify_roundtrip	raw: stop
 prove_verify_roundtrip	raw: transfer
 service_item	Refused(None, 1)
 service_item	Refused(Some(Anchor), 2)

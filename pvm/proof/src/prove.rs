@@ -69,6 +69,13 @@ pub enum SegmentError {
     /// The run is longer than [`MAX_RUN_STEPS`]: its ledgers' ordering
     /// deltas would pass their bits. Refused before any trace.
     RunLength,
+    /// The run stops at an instruction it does not complete, where no proof
+    /// ends a run: a fault, a panic at a static or dynamic transfer, or out
+    /// of gas at any instruction but a trap or a host call. The segment AIR
+    /// ends a run only at a trap, a host call or a dynamic jump to the halt
+    /// address; the stopped instruction's row would claim it executed.
+    /// Refused before any trace.
+    Stop,
     /// The run takes more segments than its gas buys
     /// ([`max_segments`]): refused before any proof, or once the cuts a
     /// chip's rows force pass it.
@@ -109,6 +116,7 @@ impl core::fmt::Display for SegmentError {
             Self::RunLength => {
                 formatter.write_str("the run is longer than a proof's ledgers order")
             }
+            Self::Stop => formatter.write_str("the run stops where no proof ends a run"),
             Self::Segments => formatter.write_str("the run takes more segments than its gas buys"),
         }
     }
@@ -131,6 +139,34 @@ pub const MAX_RUN_STEPS: usize = (1 << 27) - 1;
 pub(crate) fn check_transfers(side_note: &SideNote) -> Result<(), SegmentError> {
     if crate::chips::program_memory::jumps_to_halt(&side_note.code, &side_note.bitmask) {
         return Err(SegmentError::Transfer);
+    }
+    Ok(())
+}
+
+/// Whether `side_note`'s run, if it stops, stops where a proof ends a run
+/// ([`SegmentError::Stop`]): at a trap, a host call (served or not, paid or
+/// not: its row claims no more than the machine's state at the call) or a
+/// dynamic jump to the halt address. A step the machine stopped without
+/// completing it (a fault, a panic at a transfer, out of gas at any other
+/// instruction) leaves its state as it was, which the instruction's row
+/// would contradict, or, for a dynamic jump, would look its target up in a
+/// jump table that does not hold it. The recorded opcode is trusted: a run
+/// reaches only instruction starts, but at its first step, whose pc the
+/// caller sets.
+pub(crate) fn check_stop(side_note: &SideNote) -> Result<(), SegmentError> {
+    use crate::core::opcode::Opcode;
+    let Some(step) = side_note.steps.last().filter(|step| step.exit) else {
+        return Ok(());
+    };
+    let ends_run = match step.opcode {
+        Opcode::Trap | Opcode::Invalid | Opcode::Ecalli => true,
+        Opcode::JumpInd | Opcode::LoadImmJumpInd => {
+            u64::from(step.next_pc) == vos_pvm::PVM_HALT_ADDR
+        }
+        _ => false,
+    };
+    if !ends_run {
+        return Err(SegmentError::Stop);
     }
     Ok(())
 }
@@ -791,12 +827,15 @@ where
 }
 
 /// What a proof needs of `side_note` before its traces: its length within
-/// [`MAX_RUN_STEPS`], its memory witnesses checked (a malformed or faulting trace is the caller's error,
-/// not an expensive attempt at an unsatisfiable proof), its boundary
-/// registers filled, and its memory pages' Merkle payload built.
+/// [`MAX_RUN_STEPS`], no static transfer to the halt address, its stop
+/// where a proof ends a run, its memory witnesses checked (a malformed or
+/// stopped trace is the caller's error, not an expensive attempt at an
+/// unsatisfiable proof), its boundary registers filled, and its memory
+/// pages' Merkle payload built.
 fn prepare(side_note: &mut SideNote) -> Result<(), SegmentError> {
     check_run_length(side_note)?;
     check_transfers(side_note)?;
+    check_stop(side_note)?;
     validate_memory_witnesses(side_note)?;
     // RegisterMemoryBoundaryChip needs `initial_regs` populated.
     backfill_initial_regs(side_note);
