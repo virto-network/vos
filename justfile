@@ -1023,8 +1023,9 @@ _kit-workspace:
 # input of 256 KiB and a byte, 8 GiB, ten minutes an input): a device
 # input up to an io-hash and a whole device proof (`MAX_PROOF_BYTES`), and
 # an ELF as large under the memory and time derive is held to whatever the
-# ELF claims.
-_fuzz_limits := '{device_verify_bytes: [-max_len=1572896 -rss_limit_mb=8192 -timeout=600], derive_elf: [-max_len=1572896 -rss_limit_mb=512 -timeout=10]}'
+# ELF claims: no allocation past 512 MiB, the process (its corpus of such
+# ELFs and the sanitizer's quarantine among it) within 2 GiB.
+_fuzz_limits := '{device_verify_bytes: [-max_len=1572896 -rss_limit_mb=8192 -timeout=600], derive_elf: [-max_len=1572896 -malloc_limit_mb=512 -rss_limit_mb=2048 -timeout=10]}'
 _fuzz_default := '[-max_len=262145 -rss_limit_mb=8192 -timeout=600]'
 proof_fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode device_verify_bytes device_verify_mutate derive_elf program_blob service_item"
 node_fuzz_targets := "api_reader operated_decode credentialed_decode"
