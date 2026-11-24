@@ -43,7 +43,7 @@ default:
 # (`vendor-verifier`).
 
 # The fast suites' crates, which `check` and `gate` run.
-core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-pvm-codec-derive -p vos-pvm-proof-derive -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-abi -p vos-tree -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
+core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-pvm-codec-derive -p vos-pvm-proof-derive -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-abi -p vos-tree -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
 
 # A guest build for the PVM: the statement's target, its standard library
 # built from source. Every guest and blob build sets `CARGO_INCREMENTAL` to
@@ -497,9 +497,10 @@ check-no-debug-internals: (_forbidden "debug-internals")
     print "no debug outputs in a production build"
 
 # The builds without std, for an embedded target on core and alloc
-# alone, built from the toolchain's source. The proof verifier, which reads
-# every admitted format, with the proof crate's verifier path under it: both are `no_std`
-# crates, so a `std` path in either fails the build. The verifier builds for
+# alone, built from the toolchain's source. merkle-crdt, without its
+# fjall store. The proof verifier, which reads every admitted format, with
+# the proof crate's verifier path under it: both are `no_std` crates, so a
+# `std` path in either fails the build. The verifier builds for
 # the same embedded target, where no dependency has std either, and for
 # wasm32, the target of an on-chain verifier; the workspace's toolchain file
 # installs wasm32.
@@ -518,6 +519,7 @@ check-no-debug-internals: (_forbidden "debug-internals")
 # verify path's denies. Last, every guest blob checked against
 # `blobs.lock` (`check-blobs`).
 check-no-std:
+    cargo build -p merkle-crdt --no-default-features --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target wasm32-unknown-unknown
     cargo build -p vos-pvm-final-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
@@ -723,6 +725,8 @@ check: fmt-check check-tiers check-layers check-device-verifier build-final-veri
 # and the lints of other feature sets.
 gate: check doc-check deny check-locks check-venue-rules check-no-std check-no-leaks check-kit fuzz-replay fuzz-reach
     cargo clippy -p vos-pvm-recair --no-default-features --lib --quiet -- -D warnings
+    cargo clippy -p merkle-crdt --no-default-features --lib --quiet -- -D warnings
+    cargo clippy -p merkle-crdt --no-default-features --features std --lib --quiet -- -D warnings
     cargo test {{core_crates}} --doc
     cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py heavy -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4 --skip wrap_files::
 

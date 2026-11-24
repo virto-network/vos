@@ -7,8 +7,9 @@ proved with a STARK and anchored at a venue (the JAM statements service,
 or Kreivo's spaces pallet).
 
 This tree holds the first part of VOS to land: [`pvm/`](pvm/README.md),
-the virtual machine and its prover. The node, the agents and the device
-side follow from the `vos-core` branch, in a later change.
+the virtual machine and its prover, and standalone libraries under
+`support/`. The node, the agents and the device side follow from the
+`vos-core` branch, in a later change.
 
 ## What is here
 
@@ -22,6 +23,10 @@ side follow from the `vos-core` branch, in a later change.
   docs use (kernel, shape, install record, attest, segment, leaf, fold,
   wrap). Read its [SECURITY.md](pvm/proof/SECURITY.md) and
   [AUDIT.md](pvm/proof/AUDIT.md) first.
+- [`support/merkle-crdt/`](support/merkle-crdt/README.md): Merkle-CRDTs, a
+  `no_std` DAG of signed, authored nodes per sync scope, applied
+  incrementally in causal order, with a store over fjall. The node side's
+  Merge lane builds on it.
 - The design: [`docs/design/proving.md`](docs/design/proving.md) (the
   proof layers, formats, masking, verifiers, roots and anchors, and the
   mobile device profile), [`docs/design/recursion-air.md`](docs/design/recursion-air.md)

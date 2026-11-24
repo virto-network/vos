@@ -24,10 +24,12 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "MIT",
     "MIT-0",
+    "0BSD",
     "BSD-1-Clause",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "Zlib",
+    "BSL-1.0",
     "CC0-1.0",
     "Unlicense",
     "Unicode-3.0",
@@ -45,7 +47,7 @@ exceptions = [
 [bans]
 # A crate held twice fails, but those below, each with what pulls each
 # version: no upgrade the crates that pull them accept removes them.
-# Reviewed 2026-11-18.
+# Reviewed 2026-11-24.
 multiple-versions = "deny"
 skip = [
     { crate = "digest@0.10.7", reason = "blake2 0.10, sha2 0.10 and curve25519-dalek 4 take digest 0.10; sha3 0.11 takes 0.11." },
@@ -55,12 +57,18 @@ skip = [
     { crate = "hashbrown@0.14.5", reason = "dashmap 6's; indexmap 2 takes 0.17." },
     { crate = "hashbrown@0.15.5", reason = "the Stwo fork's, pinned at its revision; indexmap 2 takes 0.17." },
     { crate = "syn@1.0.109", reason = "vos-pvm-proof-derive is written against syn 1; every other macro crate takes syn 2." },
+    { crate = "getrandom@0.2.17", reason = "vos-pvm-recair takes 0.2.17 directly; tempfile 3.25 (under fjall and lsm-tree) takes 0.4.3." },
+    { crate = "hashbrown@0.16.1", reason = "quick_cache 0.6 (lsm-tree's block cache) takes 0.16.1; indexmap 2 takes 0.17.1." },
+    { crate = "lz4_flex@0.11.6", reason = "vos-pvm-bench takes 0.11.6; fjall 3.1, lsm-tree 3.1 take 0.13.1." },
 ]
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# The fork the workspace pins: the Stwo prover.
+# The forks the workspace patches in or pins: fjall and its lsm-tree, the
+# Stwo prover.
 allow-git = [
+    "https://github.com/olanod/lsm-tree",
+    "https://github.com/olanod/fjall",
     "https://github.com/olanod/stwo",
 ]
