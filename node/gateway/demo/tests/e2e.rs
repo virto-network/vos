@@ -361,6 +361,18 @@ impl Headless {
         document.revision
     }
 
+    /// End the connection as s4 does once an answer moved it: its side of
+    /// the channel ended, and the server's close, which says it read the
+    /// answer, awaited.
+    async fn end(mut self) {
+        self.channel.eof().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(self.channel.wait().await, Some(ChannelMsg::Close) | None) {}
+        })
+        .await
+        .expect("the server closes the channel");
+    }
+
     /// Take messages until the facility's `operation` was answered.
     async fn answer(&mut self, operation: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
@@ -793,6 +805,11 @@ async fn signs_in_at_once(phone: &mut Headless, user: &User) {
         }
         // The tree not read to its end yet: never a device unclaimed.
         assert!(shown.contains("no-path"), "{shown}");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the sign-in waited {:?} for a claim",
+            started.elapsed()
+        );
         user.answers.lock().unwrap().clear();
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -817,8 +834,7 @@ async fn an_invitation_after_the_enrollment_ended_its_session_claims_the_device(
     phone.answer("enroll").await;
     let (member, owner) = digests(&user.shown.lock().unwrap()[1]);
     let facility = phone.facility.clone();
-    // As s4 does: the connection ended as soon as the answer is sent.
-    drop(phone);
+    phone.end().await;
     let mut phone = Headless::connect(onion, facility, Arc::clone(&user)).await;
     phone
         .settle(0, &["Waiting for the operator's invitation"])
@@ -866,12 +882,17 @@ async fn an_invitation_while_the_digests_show_claims_the_device_once_done() {
         "nothing held while the digests show"
     );
     let facility = phone.facility.clone();
-    drop(phone);
+    phone.end().await;
     let mut phone = Headless::connect(onion, facility, Arc::clone(&user)).await;
     phone
         .settle(0, &["Waiting for the operator's invitation"])
         .await;
     signs_in_at_once(&mut phone, &user).await;
+    // Said once both of the claim's writes are made.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while said.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(
         said.lock().unwrap().as_slice(),
         ["claimed the member and the account dave: the phone finished its enrollment"]
@@ -900,6 +921,12 @@ fn an_invitation_claims_only_the_digests_a_device_answered() {
     assert_eq!(came[0].account, "erin");
     // Taken once: a second invitation finds nothing held.
     assert!(!held.invited(member, owner, "erin", stands));
+    // A claim tried again takes only an enrollment held.
+    let (other, owned) = (random(), random());
+    assert!(!held.take(other, owned));
+    held.hold(other, owned);
+    assert!(held.take(other, owned));
+    assert!(!held.take(other, owned));
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {

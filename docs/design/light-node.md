@@ -3431,7 +3431,8 @@ nodes may ask the onion's mark of its proven calls, or of every request
   awaited, five seconds at most). The demo's screens hold that answer as
   it comes, and the operator's invitation of the same digests claims the
   device whichever comes first: invited while the digests show, the claim
-  waits for the answer, "Done" (built 2026-11-24). One
+  waits for the answer, which comes with the user's "Done"; a claim that
+  failed is tried again by the operator's `claim` (built 2026-11-24). One
   session never holds both what names the device (its digests, its
   account's owner proof) and a sign-in: either is refused on a session
   that holds the other, so a server cannot join the two (built

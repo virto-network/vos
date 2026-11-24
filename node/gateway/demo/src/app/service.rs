@@ -28,7 +28,9 @@ pub struct Service {
 /// member and owner digests it answered) is held until the operator invites
 /// it, and an invitation of digests no enrollment holds yet waits for one:
 /// whichever comes second claims the device ([`crate::LocalSpace::invite`],
-/// [`crate::LocalSpace::claims`]), no session asking for it, so the session
+/// [`crate::LocalSpace::claims`]), no session asking for it (a claim that
+/// failed holds the enrollment again, for [`crate::LocalSpace::claim`]), so
+/// the session
 /// s4 carries over the onion after a clearnet enrollment signs in with
 /// nothing of the digests in it. Only digests a device answered through
 /// the screens are ever claimed. At most [`HELD`] of each, the oldest
@@ -86,7 +88,8 @@ impl Held {
         {
             Some(at) => {
                 let invited = book.waiting.remove(at);
-                bounded(&mut book.came, invited);
+                // Bounded by the invitations waiting, and taken at once.
+                book.came.push(invited);
                 self.0.came.notify_one();
             }
             None => {
@@ -112,6 +115,8 @@ impl Held {
         if book.held.len() != before {
             return true;
         }
+        let now = std::time::Instant::now();
+        book.waiting.retain(|invited| invited.until > now);
         book.waiting.retain(|invited| invited.member != member);
         bounded(
             &mut book.waiting,
@@ -123,6 +128,14 @@ impl Held {
             },
         );
         false
+    }
+
+    /// The enrollment of `member` with `owner`, if one is held: taken.
+    pub fn take(&self, member: [u8; 32], owner: [u8; 32]) -> bool {
+        let mut book = self.0.book.lock().expect("held poisoned");
+        let before = book.held.len();
+        book.held.retain(|kept| kept != &(member, owner));
+        book.held.len() != before
     }
 
     /// The invitations whose enrollment came, once there are any: taken.

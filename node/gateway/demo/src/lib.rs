@@ -281,6 +281,7 @@ impl LocalSpace {
         account: &str,
         owner: [u8; 32],
     ) -> Result<Invitation, String> {
+        let asked = std::time::Instant::now();
         let expires = self.now()? + INVITATION_MS;
         self.write(CREDENTIALS, "invite", (member, expires))?;
         self.write(
@@ -293,19 +294,38 @@ impl LocalSpace {
             "invite",
             (account.as_bytes().to_vec(), owner, expires),
         )?;
-        let stands = std::time::Duration::from_millis(INVITATION_MS);
+        // As long as the node's, which it measured before its writes.
+        let stands =
+            std::time::Duration::from_millis(INVITATION_MS).saturating_sub(asked.elapsed());
         if !self.held.invited(member, owner, account, stands) {
             return Ok(Invitation::Waiting);
         }
-        self.claim(member, account, owner)?;
+        self.claimed(member, account, owner)?;
         Ok(Invitation::Claimed)
     }
 
-    /// The device of `member` and `owner`, invited for `account`, claimed.
-    fn claim(&self, member: [u8; 32], account: &str, owner: [u8; 32]) -> Result<(), String> {
-        self.write(CREDENTIALS, "claim", member)?;
-        self.write(PAYMENTS, "open", (account.as_bytes().to_vec(), owner))?;
-        Ok(())
+    /// The device of `member` and `owner`, invited for `account`, claimed
+    /// again after a claim that failed: only an enrollment the screens
+    /// hold; whether one was.
+    pub fn claim(&self, member: [u8; 32], account: &str, owner: [u8; 32]) -> Result<bool, String> {
+        if !self.held.take(member, owner) {
+            return Ok(false);
+        }
+        self.claimed(member, account, owner)?;
+        Ok(true)
+    }
+
+    /// The device of `member` and `owner`, invited for `account`, claimed;
+    /// a claim that fails holds the enrollment again, for
+    /// [`Self::claim`].
+    fn claimed(&self, member: [u8; 32], account: &str, owner: [u8; 32]) -> Result<(), String> {
+        let claimed = self
+            .write(CREDENTIALS, "claim", member)
+            .and_then(|_| self.write(PAYMENTS, "open", (account.as_bytes().to_vec(), owner)));
+        if claimed.is_err() {
+            self.held.hold(member, owner);
+        }
+        claimed.map(drop)
     }
 
     /// Claims, for as long as it runs, each device whose enrollment the
@@ -316,14 +336,16 @@ impl LocalSpace {
             for invited in self.held.came().await {
                 let account = &invited.account;
                 let claimed = tokio::task::block_in_place(|| {
-                    self.claim(invited.member, account, invited.owner)
+                    self.claimed(invited.member, account, invited.owner)
                 });
                 said(match claimed {
                     Ok(()) => format!(
                         "claimed the member and the account {account}: the phone finished its \
                          enrollment"
                     ),
-                    Err(error) => format!("error: claiming the account {account}: {error}"),
+                    Err(error) => format!(
+                        "error: claiming the account {account}: {error} (`claim` tries again)"
+                    ),
                 });
             }
         }

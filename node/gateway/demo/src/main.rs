@@ -28,9 +28,12 @@
 //!   credential actor's tree and the account `ACCOUNT` for the owner
 //!   digest, claiming both for a device that enrolled through the screens:
 //!   at once when the phone's "Done" on its digests came first, otherwise
-//!   as it comes (a line says so then); any other line invites nothing;
+//!   as it comes, within the invitation's 10 minutes (a line says so
+//!   then); any other line invites nothing;
 //! - `invite MEMBER ACCOUNT OWNER`: the same with the two digests typed
 //!   whole, their check printed and asked as well;
+//! - `claim CODE ACCOUNT` (or `claim MEMBER ACCOUNT OWNER`): a claim that
+//!   failed, tried again, for an enrollment the screens hold;
 //! - `mint ACCOUNT AMOUNT`; `balance ACCOUNT`;
 //! - `members N`: N members of random digests enrolled, so a device's
 //!   first read of the tree's feed is a catch-up of about 77 bytes each;
@@ -125,6 +128,19 @@ fn ask(asked: &mut Option<Asked>, member: [u8; 32], account: &str, owner: [u8; 3
     )
 }
 
+/// A claim that failed, tried again.
+fn claim(
+    space: &LocalSpace,
+    member: [u8; 32],
+    account: &str,
+    owner: [u8; 32],
+) -> Result<String, String> {
+    Ok(match space.claim(member, account, owner)? {
+        true => format!("claimed the member and the account {account}"),
+        false => "nothing to claim: no enrollment of these digests is held".into(),
+    })
+}
+
 fn command(space: &LocalSpace, line: &str, asked: &mut Option<Asked>) -> Result<String, String> {
     let words: Vec<&str> = line.split_whitespace().collect();
     if let Some(Asked {
@@ -146,7 +162,8 @@ fn command(space: &LocalSpace, line: &str, asked: &mut Option<Asked>) -> Result<
             }
             Invitation::Waiting => format!(
                 "invited the member and the account {account}: claimed once the phone finishes \
-                 its enrollment (its \"Done\" on the digests)"
+                 its enrollment through these screens (its \"Done\" on the digests), within 10 \
+                 minutes"
             ),
         });
     }
@@ -163,6 +180,12 @@ fn command(space: &LocalSpace, line: &str, asked: &mut Option<Asked>) -> Result<
         ["invite", member, account, owner] => {
             Ok(ask(asked, digest(member)?, account, digest(owner)?))
         }
+        ["claim", code, account] => {
+            let (member, owner) = vos_api::read_enrollment_code(code)
+                .ok_or_else(|| format!("not an enrollment code ({})", vos_api::ENROLLMENT_CODE))?;
+            claim(space, member, account, owner)
+        }
+        ["claim", member, account, owner] => claim(space, digest(member)?, account, digest(owner)?),
         ["mint", account, amount] => {
             let amount = amount.parse().map_err(|_| "the amount is a number")?;
             space.mint(account, amount)?;
@@ -179,8 +202,8 @@ fn command(space: &LocalSpace, line: &str, asked: &mut Option<Asked>) -> Result<
         }),
         [] => Ok(String::new()),
         _ => Err(
-            "invite CODE ACCOUNT | invite MEMBER ACCOUNT OWNER | mint ACCOUNT AMOUNT | balance \
-                 ACCOUNT | members N | homes | quit"
+            "invite CODE ACCOUNT | invite MEMBER ACCOUNT OWNER | claim CODE ACCOUNT | claim MEMBER \
+                 ACCOUNT OWNER | mint ACCOUNT AMOUNT | balance ACCOUNT | members N | homes | quit"
                 .into(),
         ),
     }
