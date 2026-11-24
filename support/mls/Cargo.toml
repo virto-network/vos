@@ -1,0 +1,26 @@
+[package]
+name = "vos-mls"
+description = "VOS's one MLS layer, over mls-rs: storage providers over fjall whose writes join the caller's batch, candidates processed on a copy of the group state and swapped in on confirmation, a device's own commit held until then, the confirmation hash, and the device group's proposal policy."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Encrypted handshakes alone: no std, rayon, x509, psk, by-reference
+# proposals, out-of-order or prior-epoch secrets, custom proposals or tree
+# index. The one pinned mls-rs for VOS.
+mls-rs = { version = "=0.57.0", default-features = false, features = ["private_message"] }
+mls-rs-core = { version = "=0.27.0", default-features = false }
+# 0.22, the provider the facility's size was measured with
+# (light-node.md); 0.23 builds beside russh, both on curve25519-dalek 5.
+mls-rs-crypto-rustcrypto = { version = "=0.22.1", default-features = false }
+fjall = { workspace = true }
+# The confirmation hash and a held commit's handshake hash.
+blake2 = "0.10"
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
