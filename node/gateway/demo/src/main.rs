@@ -26,8 +26,9 @@
 //!   pasted here): its six-digit check is printed, and `yes`, once the
 //!   phone shows the same six, invites the member digest into the
 //!   credential actor's tree and the account `ACCOUNT` for the owner
-//!   digest, claiming both at once for a device that enrolled through the
-//!   screens; any other line invites nothing;
+//!   digest, claiming both for a device that enrolled through the screens:
+//!   at once when the phone's "Done" on its digests came first, otherwise
+//!   as it comes (a line says so then); any other line invites nothing;
 //! - `invite MEMBER ACCOUNT OWNER`: the same with the two digests typed
 //!   whole, their check printed and asked as well;
 //! - `mint ACCOUNT AMOUNT`; `balance ACCOUNT`;
@@ -43,7 +44,7 @@ use std::path::PathBuf;
 
 use tokio::io::AsyncBufReadExt as _;
 use vos_gateway_demo::home::{Home, SESSION};
-use vos_gateway_demo::{LocalSpace, random};
+use vos_gateway_demo::{Invitation, LocalSpace, random};
 use vos_wire::credentials::Onion;
 
 /// An invitation asked, waiting for the operator's `yes` to its check.
@@ -139,10 +140,14 @@ fn command(space: &LocalSpace, line: &str, asked: &mut Option<Asked>) -> Result<
                 .trim_end()
                 .to_owned());
         }
-        let claimed = space.invite(member, &account, owner)?;
-        return Ok(match claimed {
-            true => format!("invited and claimed the member and the account {account}"),
-            false => format!("invited the member and the account {account}"),
+        return Ok(match space.invite(member, &account, owner)? {
+            Invitation::Claimed => {
+                format!("invited and claimed the member and the account {account}")
+            }
+            Invitation::Waiting => format!(
+                "invited the member and the account {account}: claimed once the phone finishes \
+                 its enrollment (its \"Done\" on the digests)"
+            ),
         });
     }
     match words.as_slice() {
@@ -247,24 +252,32 @@ fn main() -> Result<(), String> {
                 tokio::task::block_in_place(|| homes(&space, &founded, onion))?
             );
         }
-        let mut asked = None;
-        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if line.trim() == "quit" {
-                break;
+        let console = async {
+            let mut asked = None;
+            let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.trim() == "quit" {
+                    break;
+                }
+                let done = tokio::task::block_in_place(|| match line.trim() {
+                    "homes" if asked.is_none() => match &pinned {
+                        Some(onion) => homes(&space, &founded, onion),
+                        None => Ok("no homes: start with --homes N".into()),
+                    },
+                    _ => command(&space, &line, &mut asked),
+                });
+                match done {
+                    Ok(done) if done.is_empty() => {}
+                    Ok(done) => println!("{done}"),
+                    Err(error) => println!("error: {error}"),
+                }
             }
-            let done = tokio::task::block_in_place(|| match line.trim() {
-                "homes" if asked.is_none() => match &pinned {
-                    Some(onion) => homes(&space, &founded, onion),
-                    None => Ok("no homes: start with --homes N".into()),
-                },
-                _ => command(&space, &line, &mut asked),
-            });
-            match done {
-                Ok(done) if done.is_empty() => {}
-                Ok(done) => println!("{done}"),
-                Err(error) => println!("error: {error}"),
-            }
+        };
+        // An invitation made before the phone's "Done" claims it as its
+        // enrollment comes.
+        tokio::select! {
+            () = console => {}
+            () = space.claims(|said| println!("{said}")) => {}
         }
         drop(hosted);
         Ok::<(), String>(())

@@ -25,14 +25,16 @@ use vos_facility::enrollment::Store;
 use vos_facility::net::Net;
 use vos_facility::source::BoxFuture;
 use vos_facility::{Facility, Gateway, Operation, Session, Stock};
-use vos_gateway_demo::{LocalSpace, host_key, local, random};
+use vos_gateway_demo::{Invitation, LocalSpace, host_key, local, random};
 use vos_light::tor::{Circuit, Dial, Dialing, Stream, Target};
 
-/// The user, as a script: each form answered in turn, each kept.
+/// The user, as a script: each form answered in turn, each kept; the
+/// digests' form, when `lingers`, answered only once told.
 #[derive(Default)]
 struct User {
     answers: Mutex<VecDeque<Answer>>,
     shown: Mutex<Vec<Form>>,
+    lingers: Option<tokio::sync::Notify>,
 }
 
 impl User {
@@ -43,9 +45,15 @@ impl User {
 
 impl Chrome for User {
     fn confirm(&self, form: Form) -> BoxFuture<'_, Answer> {
+        let digests = form.title == "This device's digests";
         self.shown.lock().unwrap().push(form);
         let answer = self.answers.lock().unwrap().pop_front();
-        Box::pin(async move { answer.unwrap_or(Answer::Declined) })
+        Box::pin(async move {
+            if let (true, Some(done)) = (digests, &self.lingers) {
+                done.notified().await;
+            }
+            answer.unwrap_or(Answer::Declined)
+        })
     }
 }
 
@@ -113,6 +121,8 @@ struct Headless {
     /// A result to answer every facility call with, as a hostile client
     /// would.
     hostile: Option<Value>,
+    /// The facility operations answered, in turn.
+    answered: Vec<String>,
     _handle: client::Handle<Pinning>,
 }
 
@@ -220,6 +230,7 @@ impl Headless {
             session: None,
             user,
             hostile: None,
+            answered: Vec::new(),
             _handle: handle,
         };
         headless.settle(0, &["VOS"]).await;
@@ -281,6 +292,7 @@ impl Headless {
                         result,
                     }))
                     .await;
+                    self.answered.push(call.operation.as_str().to_owned());
                 }
                 _ => {}
             }
@@ -347,6 +359,14 @@ impl Headless {
         });
         self.send(event).await;
         document.revision
+    }
+
+    /// Take messages until the facility's `operation` was answered.
+    async fn answer(&mut self, operation: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        while !self.answered.iter().any(|answered| answered == operation) {
+            self.step(deadline).await;
+        }
     }
 
     /// Whether the document shows a button `label`.
@@ -424,9 +444,14 @@ fn stock() -> Stock {
     stock
 }
 
-/// A local space and its gateway, and a headless client on its SSH port;
-/// the address of a second port of the gateway's, as its onion serves the
-/// screens (its connections marked onion), its host key the same.
+/// What the operator's tool said of the claims made after their
+/// invitations.
+type Said = Arc<Mutex<Vec<String>>>;
+
+/// A local space and its gateway, claiming as the operator's tool does,
+/// and a headless client on its SSH port; the address of a second port of
+/// the gateway's, as its onion serves the screens (its connections marked
+/// onion), its host key the same.
 async fn demo(
     user: Arc<User>,
 ) -> (
@@ -434,10 +459,18 @@ async fn demo(
     Headless,
     std::net::SocketAddr,
     [tempfile::TempDir; 2],
+    Said,
 ) {
     let data = tempfile::tempdir().unwrap();
     let space = tokio::task::block_in_place(|| {
         Arc::new(LocalSpace::found(data.path(), random(), random()).unwrap())
+    });
+    let said = Said::default();
+    let (claiming, saying) = (Arc::clone(&space), Arc::clone(&said));
+    tokio::spawn(async move {
+        claiming
+            .claims(|line| saying.lock().unwrap().push(line))
+            .await
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = local(&listener);
@@ -462,7 +495,7 @@ async fn demo(
     .with_stock(stock())
     .with_tick(Duration::from_millis(200));
     let phone = Headless::connect(address, facility, user).await;
-    (space, phone, onion, [data, store])
+    (space, phone, onion, [data, store], said)
 }
 
 /// A digest of 32 random bytes, each word below p.
@@ -473,7 +506,7 @@ fn some_owner() -> [u8; 32] {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
     let user = Arc::new(User::default());
-    let (space, mut phone, _onion, _dirs) = demo(Arc::clone(&user)).await;
+    let (space, mut phone, _onion, _dirs, _said) = demo(Arc::clone(&user)).await;
 
     // Enroll: the chrome shows what is pinned; the device answers its two
     // digests, which the operator invites before the claim.
@@ -492,8 +525,9 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
     );
     phone.settle(0, &["sign in from the next session"]).await;
     tokio::task::block_in_place(|| {
-        assert!(
+        assert_eq!(
             space.invite(member, "alice", owner).unwrap(),
+            Invitation::Claimed,
             "the invitation claims the device the screens enrolled"
         );
         space.open_account("shop", some_owner(), 50).unwrap();
@@ -592,7 +626,7 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_session_after_the_enrollment_signs_in_once_invited() {
     let user = Arc::new(User::default());
-    let (space, mut phone, onion, _dirs) = demo(Arc::clone(&user)).await;
+    let (space, mut phone, onion, _dirs, _said) = demo(Arc::clone(&user)).await;
     user.will(confirm(&[]));
     user.will(confirm(&[]));
     let at = phone.click("Enroll this device").await;
@@ -639,9 +673,10 @@ async fn the_session_after_the_enrollment_signs_in_once_invited() {
     );
     user.answers.lock().unwrap().clear();
 
-    assert!(tokio::task::block_in_place(|| space
-        .invite(member, "bob", owner)
-        .unwrap()));
+    assert_eq!(
+        tokio::task::block_in_place(|| space.invite(member, "bob", owner).unwrap()),
+        Invitation::Claimed
+    );
     assert_eq!(
         tokio::task::block_in_place(|| space.balance("bob").unwrap()),
         Some(0),
@@ -684,7 +719,7 @@ async fn the_session_after_the_enrollment_signs_in_once_invited() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_naming_another_method_never_reaches_the_node() {
     let user = Arc::new(User::default());
-    let (space, mut phone, _onion, _dirs) = demo(Arc::clone(&user)).await;
+    let (space, mut phone, _onion, _dirs, _said) = demo(Arc::clone(&user)).await;
     let request = |instance: u32, name: &str| {
         let body = vos_wire::ingress::Credentialed {
             instance: vos_abi::ids::InstanceId(instance),
@@ -728,4 +763,149 @@ async fn a_request_naming_another_method_never_reaches_the_node() {
             );
         }
     }
+}
+
+/// The sign-in of the session s4 carries over the onion, once the device
+/// is claimed: through at its first try, the device waiting for no
+/// operator.
+async fn signs_in_at_once(phone: &mut Headless, user: &User) {
+    let started = tokio::time::Instant::now();
+    let at = phone.click("Sign in").await;
+    phone.settle(at, &["Sign in with your device"]).await;
+    loop {
+        user.will(confirm(&[]));
+        let at = phone.click("Sign in with my device").await;
+        let shown = phone
+            .settle(
+                at,
+                &[
+                    "Signed in as",
+                    "no-path",
+                    "unclaimed",
+                    "Not done",
+                    "refused",
+                    "failed",
+                ],
+            )
+            .await;
+        if shown.contains("Signed in as") {
+            break;
+        }
+        // The tree not read to its end yet: never a device unclaimed.
+        assert!(shown.contains("no-path"), "{shown}");
+        user.answers.lock().unwrap().clear();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the sign-in waited {:?} for a claim",
+        started.elapsed()
+    );
+}
+
+/// s4 ends the clearnet session the moment it has sent the enrollment's
+/// answer (after the user's "Done" on the digests), and connects again
+/// over the onion: the operator's invitation, after it, claims the device
+/// at once, and the new session signs in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invitation_after_the_enrollment_ended_its_session_claims_the_device() {
+    let user = Arc::new(User::default());
+    let (space, mut phone, onion, _dirs, _said) = demo(Arc::clone(&user)).await;
+    user.will(confirm(&[]));
+    user.will(confirm(&[]));
+    phone.click("Enroll this device").await;
+    phone.answer("enroll").await;
+    let (member, owner) = digests(&user.shown.lock().unwrap()[1]);
+    let facility = phone.facility.clone();
+    // As s4 does: the connection ended as soon as the answer is sent.
+    drop(phone);
+    let mut phone = Headless::connect(onion, facility, Arc::clone(&user)).await;
+    phone
+        .settle(0, &["Waiting for the operator's invitation"])
+        .await;
+    assert_eq!(
+        tokio::task::block_in_place(|| space.invite(member, "carol", owner).unwrap()),
+        Invitation::Claimed,
+        "the invitation claims the device the screens enrolled"
+    );
+    signs_in_at_once(&mut phone, &user).await;
+}
+
+/// The operator invites while the device's digests still show, as their
+/// form asks: the invitation waits, the user's "Done" ends the session
+/// with the answer, and the enrollment claims the device as it comes; the
+/// session s4 carries over the onion then signs in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invitation_while_the_digests_show_claims_the_device_once_done() {
+    let user = Arc::new(User {
+        lingers: Some(tokio::sync::Notify::new()),
+        ..User::default()
+    });
+    let (space, mut phone, onion, _dirs, said) = demo(Arc::clone(&user)).await;
+    user.will(confirm(&[]));
+    user.will(confirm(&[]));
+    // The operator, reading the digests off the device's own screen.
+    let (operator, reading) = (Arc::clone(&space), Arc::clone(&user));
+    let invited = tokio::spawn(async move {
+        let (member, owner) = loop {
+            if let Some(form) = reading.shown.lock().unwrap().get(1) {
+                break digests(form);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let invitation =
+            tokio::task::block_in_place(|| operator.invite(member, "dave", owner).unwrap());
+        reading.lingers.as_ref().unwrap().notify_one();
+        invitation
+    });
+    phone.click("Enroll this device").await;
+    phone.answer("enroll").await;
+    assert_eq!(
+        invited.await.unwrap(),
+        Invitation::Waiting,
+        "nothing held while the digests show"
+    );
+    let facility = phone.facility.clone();
+    drop(phone);
+    let mut phone = Headless::connect(onion, facility, Arc::clone(&user)).await;
+    phone
+        .settle(0, &["Waiting for the operator's invitation"])
+        .await;
+    signs_in_at_once(&mut phone, &user).await;
+    assert_eq!(
+        said.lock().unwrap().as_slice(),
+        ["claimed the member and the account dave: the phone finished its enrollment"]
+    );
+}
+
+/// Digests no device answered through the screens are never claimed: an
+/// invitation of them waits, and another enrollment's answer claims only
+/// its own.
+#[test]
+fn an_invitation_claims_only_the_digests_a_device_answered() {
+    let held = vos_gateway_demo::app::Held::default();
+    let stands = Duration::from_secs(600);
+    let (member, owner) = (random(), random());
+    assert!(!held.invited(member, owner, "erin", stands));
+    held.hold(member, random());
+    held.hold(random(), owner);
+    assert!(
+        !held.invited(member, owner, "erin", stands),
+        "no enrollment of these digests is held"
+    );
+    held.hold(member, owner);
+    let came = block_on(held.came());
+    assert_eq!(came.len(), 1);
+    assert_eq!((came[0].member, came[0].owner), (member, owner));
+    assert_eq!(came[0].account, "erin");
+    // Taken once: a second invitation finds nothing held.
+    assert!(!held.invited(member, owner, "erin", stands));
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(future)
 }

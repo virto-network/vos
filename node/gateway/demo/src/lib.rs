@@ -41,6 +41,17 @@ pub(crate) const ROLE: u8 = 1;
 /// How long an invitation stands.
 pub const INVITATION_MS: u64 = 600_000;
 
+/// What the operator's invitation did for a device that enrolls through the
+/// screens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Invitation {
+    /// The screens held its enrollment: claimed.
+    Claimed,
+    /// None held yet: claimed once the screens hold it, while the
+    /// invitation stands.
+    Waiting,
+}
+
 /// One node of a founded space, its agent and its operator.
 pub struct LocalSpace {
     node: Node,
@@ -50,7 +61,7 @@ pub struct LocalSpace {
     agent: AgentId,
     operator: Mutex<Client>,
     programs: [(InstanceId, Vec<u8>); 3],
-    /// The enrollments the screens hold for the operator's invitations,
+    /// Where the screens' enrollments meet the operator's invitations,
     /// every port's ([`app::Held`]).
     held: app::Held,
 }
@@ -258,11 +269,18 @@ impl LocalSpace {
     /// tree, recorded with `owner` as its person's first device, so the
     /// member's devices enroll one another (a member registered already is
     /// refused there, `Held`); and the account `account` for `owner`. A
-    /// device that enrolled through the screens is claimed at once (the
-    /// member placed in the tree, the account opened, each on its
-    /// invitation's authority): whether it was. No session asks for the
-    /// claim, so none joins it to the device's sign-in.
-    pub fn invite(&self, member: [u8; 32], account: &str, owner: [u8; 32]) -> Result<bool, String> {
+    /// device that enrolled through the screens is claimed (the member
+    /// placed in the tree, the account opened, each on its invitation's
+    /// authority): at once when the screens hold its enrollment, otherwise
+    /// once they do ([`Self::claims`]) while the invitation stands. No
+    /// session asks for the claim, so none joins it to the device's
+    /// sign-in.
+    pub fn invite(
+        &self,
+        member: [u8; 32],
+        account: &str,
+        owner: [u8; 32],
+    ) -> Result<Invitation, String> {
         let expires = self.now()? + INVITATION_MS;
         self.write(CREDENTIALS, "invite", (member, expires))?;
         self.write(
@@ -275,12 +293,40 @@ impl LocalSpace {
             "invite",
             (account.as_bytes().to_vec(), owner, expires),
         )?;
-        if !self.held.take(&member, &owner) {
-            return Ok(false);
+        let stands = std::time::Duration::from_millis(INVITATION_MS);
+        if !self.held.invited(member, owner, account, stands) {
+            return Ok(Invitation::Waiting);
         }
+        self.claim(member, account, owner)?;
+        Ok(Invitation::Claimed)
+    }
+
+    /// The device of `member` and `owner`, invited for `account`, claimed.
+    fn claim(&self, member: [u8; 32], account: &str, owner: [u8; 32]) -> Result<(), String> {
         self.write(CREDENTIALS, "claim", member)?;
         self.write(PAYMENTS, "open", (account.as_bytes().to_vec(), owner))?;
-        Ok(true)
+        Ok(())
+    }
+
+    /// Claims, for as long as it runs, each device whose enrollment the
+    /// screens hold after its invitation, each said to `said` as the
+    /// operator's tool says it.
+    pub async fn claims(&self, mut said: impl FnMut(String)) {
+        loop {
+            for invited in self.held.came().await {
+                let account = &invited.account;
+                let claimed = tokio::task::block_in_place(|| {
+                    self.claim(invited.member, account, invited.owner)
+                });
+                said(match claimed {
+                    Ok(()) => format!(
+                        "claimed the member and the account {account}: the phone finished its \
+                         enrollment"
+                    ),
+                    Err(error) => format!("error: claiming the account {account}: {error}"),
+                });
+            }
+        }
     }
 
     /// An account opened by the operator's invitation for `owner`, as a

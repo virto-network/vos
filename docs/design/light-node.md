@@ -3426,7 +3426,12 @@ nodes may ask the onion's mark of its proven calls, or of every request
   proved only for a session `:vos` carries, or one to a space the user
   opted out of Tor (`Gateway.carried`): on the session s4 made itself to
   enroll, both are refused before any prompt ("reconnect"), and s4
-  connects again once an enrollment is made on it, now carried. One
+  connects again once an enrollment is made on it, now carried, after
+  the server has read the enrollment's answer (its end of the channel
+  awaited, five seconds at most). The demo's screens hold that answer as
+  it comes, and the operator's invitation of the same digests claims the
+  device whichever comes first: invited while the digests show, the claim
+  waits for the answer, "Done" (built 2026-11-24). One
   session never holds both what names the device (its digests, its
   account's owner proof) and a sign-in: either is refused on a session
   that holds the other, so a server cannot join the two (built

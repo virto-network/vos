@@ -11,8 +11,7 @@ struct Space {
     handle: [u8; 32],
 }
 
-/// The screens' server side: reads under the app's key, and the
-/// enrollments held for the operator's invitations.
+/// The screens' server side: reads under the app's key.
 pub struct Service {
     demo: Demo,
     /// The SSH host key the gateway's onions present on port 22.
@@ -22,35 +21,128 @@ pub struct Service {
     mark: Mark,
     app: Arc<AppClient>,
     space: OnceCell<Space>,
-    held: Held,
 }
 
-/// The enrollments the screens hold (the member and owner digests a
-/// device showed) until the operator invites them: the invitation claims
-/// them then ([`crate::LocalSpace::invite`]), no session asking for it, so
-/// the session s4 carries over the onion after a clearnet enrollment
-/// signs in with nothing of the digests in it. At most [`HELD`], the
-/// oldest dropped first.
+/// Where the screens' enrollments meet the operator's invitations, in
+/// either order. An enrollment the screens took from the device (the
+/// member and owner digests it answered) is held until the operator invites
+/// it, and an invitation of digests no enrollment holds yet waits for one:
+/// whichever comes second claims the device ([`crate::LocalSpace::invite`],
+/// [`crate::LocalSpace::claims`]), no session asking for it, so the session
+/// s4 carries over the onion after a clearnet enrollment signs in with
+/// nothing of the digests in it. Only digests a device answered through
+/// the screens are ever claimed. At most [`HELD`] of each, the oldest
+/// dropped first; an invitation waits as long as it stands.
 #[derive(Clone, Default)]
-pub struct Held(Arc<std::sync::Mutex<Vec<Enrolled>>>);
+pub struct Held(Arc<Meeting>);
+
+#[derive(Default)]
+struct Meeting {
+    book: std::sync::Mutex<Book>,
+    /// Told when an invitation's enrollment came.
+    came: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct Book {
+    held: Vec<Enrolled>,
+    waiting: Vec<Invited>,
+    /// Invitations whose enrollment came, to be claimed.
+    came: Vec<Invited>,
+}
 
 /// An enrollment's member and owner digests.
 type Enrolled = ([u8; 32], [u8; 32]);
 
-impl Held {
-    /// The enrollment of `member` with `owner`, if one is held: taken.
-    pub fn take(&self, member: &[u8; 32], owner: &[u8; 32]) -> bool {
-        let mut held = self.0.lock().expect("held poisoned");
-        let before = held.len();
-        held.retain(|kept| kept != &(*member, *owner));
-        held.len() != before
+/// An invitation of an enrollment's digests, for the account `account`,
+/// standing until `until`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invited {
+    pub member: [u8; 32],
+    pub owner: [u8; 32],
+    pub account: String,
+    until: std::time::Instant,
+}
+
+fn bounded<T>(list: &mut Vec<T>, item: T) {
+    list.push(item);
+    if list.len() > HELD {
+        list.remove(0);
     }
 }
 
-/// The enrollments held at most, the oldest let go past it. Any screen
-/// session holds one, anonymous ones too, so 32 holds from anyone push an
-/// earlier enrollment out before the operator invites it: the demo serves
-/// its testers on a port of theirs, never an exposed one.
+impl Held {
+    /// The enrollment of `member` with `owner`, which a device answered
+    /// through the screens: claimed by a waiting invitation of the same
+    /// digests, held for a later one otherwise.
+    pub fn hold(&self, member: [u8; 32], owner: [u8; 32]) {
+        let mut book = self.0.book.lock().expect("held poisoned");
+        let now = std::time::Instant::now();
+        book.waiting.retain(|invited| invited.until > now);
+        match book
+            .waiting
+            .iter()
+            .position(|invited| (invited.member, invited.owner) == (member, owner))
+        {
+            Some(at) => {
+                let invited = book.waiting.remove(at);
+                bounded(&mut book.came, invited);
+                self.0.came.notify_one();
+            }
+            None => {
+                book.held.retain(|(kept, _)| *kept != member);
+                bounded(&mut book.held, (member, owner));
+            }
+        }
+    }
+
+    /// The operator invited `member` with `owner` for `account`, standing
+    /// for `stands`: whether an enrollment of theirs is held, taken to be
+    /// claimed now; otherwise the invitation waits for one.
+    pub fn invited(
+        &self,
+        member: [u8; 32],
+        owner: [u8; 32],
+        account: &str,
+        stands: std::time::Duration,
+    ) -> bool {
+        let mut book = self.0.book.lock().expect("held poisoned");
+        let before = book.held.len();
+        book.held.retain(|kept| kept != &(member, owner));
+        if book.held.len() != before {
+            return true;
+        }
+        book.waiting.retain(|invited| invited.member != member);
+        bounded(
+            &mut book.waiting,
+            Invited {
+                member,
+                owner,
+                account: account.to_owned(),
+                until: std::time::Instant::now() + stands,
+            },
+        );
+        false
+    }
+
+    /// The invitations whose enrollment came, once there are any: taken.
+    pub async fn came(&self) -> Vec<Invited> {
+        loop {
+            let came = self.0.came.notified();
+            let taken = std::mem::take(&mut self.0.book.lock().expect("held poisoned").came);
+            if !taken.is_empty() {
+                return taken;
+            }
+            came.await;
+        }
+    }
+}
+
+/// The enrollments held at most, and the invitations waiting, the oldest
+/// let go past it. Any screen session holds one, anonymous ones too, so 32
+/// holds from anyone push an earlier enrollment out before the operator
+/// invites it: the demo serves its testers on a port of theirs, never an
+/// exposed one.
 const HELD: usize = 32;
 
 fn failed(message: impl Into<String>) -> HostServiceError {
@@ -149,7 +241,6 @@ impl Service {
         gateway: Arc<Gateway>,
         mark: Mark,
         app: Arc<AppClient>,
-        held: Held,
     ) -> Self {
         Self {
             demo,
@@ -158,7 +249,6 @@ impl Service {
             mark,
             app,
             space: OnceCell::new(),
-            held,
         }
     }
 
@@ -293,24 +383,6 @@ impl Service {
         ]))
     }
 
-    /// An enrollment held until the operator's invitation claims it: its
-    /// member and owner digests.
-    fn hold(&self, args: &Value) -> Result<Value, HostServiceError> {
-        let digest = |name| -> Result<[u8; 32], HostServiceError> {
-            bytes(args, name)?
-                .try_into()
-                .map_err(|_| failed(format!("`{name}` is 32 bytes")))
-        };
-        let (member, owner) = (digest("member")?, digest("owner")?);
-        let mut held = self.held.0.lock().expect("held poisoned");
-        held.retain(|(kept, _)| *kept != member);
-        held.push((member, owner));
-        if held.len() > HELD {
-            held.remove(0);
-        }
-        Ok(Value::Null)
-    }
-
     /// The name and balance of the account the owner digest `owner`
     /// holds, `null` when it holds none.
     async fn balance(&self, args: &Value) -> Result<Value, HostServiceError> {
@@ -366,7 +438,6 @@ impl Service {
         let args = &request.args;
         match request.operation.as_str() {
             "enrollment" => self.enrollment().await,
-            "hold" => self.hold(args),
             "balance" => self.balance(args).await,
             "root" => self.root().await,
             other => Err(failed(format!("no operation `{other}`"))),

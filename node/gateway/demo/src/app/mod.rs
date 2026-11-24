@@ -12,7 +12,8 @@
 //! answer is the client's word: it grants nothing here, as the proven call
 //! itself is the action, at the node. The app builds no credential bytes;
 //! its key ([`AppClient`]) only reads. The screens hold each enrollment's
-//! digests, which the operator's invitation claims at once.
+//! digests, which the operator's invitation claims, before or after it
+//! ([`Held`]).
 
 use std::sync::Arc;
 
@@ -35,7 +36,7 @@ mod service;
 
 pub use client::AppClient;
 pub use screens::{Message, Screen, Screens};
-pub use service::{Held, Service};
+pub use service::{Held, Invited, Service};
 
 /// The host service the screens call, server-side.
 pub const SERVICE: &str = "vos.gateway";
@@ -71,12 +72,13 @@ impl vos_gateway::ssh::App for DemoApp {
             Arc::clone(gateway),
             mark,
             app,
-            self.held.clone(),
         ));
-        let demo = self.demo.clone();
-        Server::new(APPLICATION, move || Screens::new(demo.clone(), mark))
-            .facility(FACILITY, 1)
-            .host_service_fn(SERVICE, move |request| Arc::clone(&service).serve(request))
+        let (demo, held) = (self.demo.clone(), self.held.clone());
+        Server::new(APPLICATION, move || {
+            Screens::new(demo.clone(), mark, held.clone())
+        })
+        .facility(FACILITY, 1)
+        .host_service_fn(SERVICE, move |request| Arc::clone(&service).serve(request))
     }
 }
 

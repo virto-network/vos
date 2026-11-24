@@ -1,6 +1,6 @@
 //! The demo's screens.
 
-use super::service::{Errors, method_error, payment_error, response as response_of};
+use super::service::{Errors, Held, method_error, payment_error, response as response_of};
 use super::*;
 
 /// Which screen is shown.
@@ -19,7 +19,6 @@ pub enum Message {
     Enroll,
     Enrollment(EffectOutput),
     Enrolled(EffectOutput),
-    Held(EffectOutput),
     SignIn,
     Proved(Screen, EffectOutput),
     Pay,
@@ -30,6 +29,9 @@ pub enum Message {
 /// One connection's screens.
 pub struct Screens {
     demo: Demo,
+    /// Where the enrollments the device answers here meet the operator's
+    /// invitations, every port's.
+    held: Held,
     /// The connection came over the gateway's onion: s4 reaches this
     /// server so once the device is enrolled here, so its screens offer no
     /// enrollment.
@@ -47,12 +49,14 @@ pub struct Screens {
 }
 
 impl Screens {
-    /// The screens of a connection on a port of transport `mark`: one over
-    /// the onion opens on *Sign in*.
-    pub fn new(demo: Demo, mark: Mark) -> Self {
+    /// The screens of a connection on a port of transport `mark`, their
+    /// enrollments `held` for the operator's invitations: one over the
+    /// onion opens on *Sign in*.
+    pub fn new(demo: Demo, mark: Mark, held: Held) -> Self {
         let carried = mark == Mark::Onion;
         Self {
             demo,
+            held,
             carried,
             signed_in: false,
             screen: if carried {
@@ -317,29 +321,20 @@ impl App for Screens {
                 match (digest("member"), digest("owner")) {
                     (Some(member), Some(owner)) => {
                         self.digests = Some((member, owner));
-                        self.status = "Enrolled on this device…".into();
-                        // Held for the operator's invitation, which claims
-                        // it: no session asks for the claim.
-                        cx.effect(service(
-                            "hold",
-                            object([
-                                ("member", Value::Bytes(member.to_vec())),
-                                ("owner", Value::Bytes(owner.to_vec())),
-                            ]),
-                            Message::Held,
-                        ));
+                        // Held here, as the answer comes: s4 ends this
+                        // session once it sent the answer, and nothing of
+                        // the session's own outlives it. The operator's
+                        // invitation claims it; no session asks for the
+                        // claim.
+                        self.held.hold(member, owner);
+                        self.status =
+                            "Enrolled on this device: once the operator invited you, sign \
+                             in from the next session"
+                                .into();
                     }
                     _ => self.status = "the device's digests do not decode".into(),
                 }
             }
-            Message::Held(output) => match output {
-                EffectOutput::HostService(Ok(_)) => {
-                    self.status = "Enrolled on this device: once the operator invited you, sign \
-                                   in from the next session"
-                        .into()
-                }
-                other => self.failed(other),
-            },
             Message::SignIn => {
                 self.status = "Asking the device…".into();
                 self.proving = None;
