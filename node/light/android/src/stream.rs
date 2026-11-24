@@ -27,7 +27,10 @@ pub fn carry(end: OwnedFd, stream: Box<dyn Duplex>) -> io::Result<()> {
 }
 
 /// Bytes both ways between the pair's end and the stream; each side's close
-/// passed on as a shutdown of its writes.
+/// passed on as a shutdown of its writes. A stream that fails (its circuit
+/// lost) closes the pair's end as a close would: a socket pair carries no
+/// error, and the client's SSH tells a server's end (its channel closed
+/// first) from a carrier's.
 async fn pump(mut ours: tokio::net::UnixStream, mut stream: Box<dyn Duplex>) {
     let _ = tokio::io::copy_bidirectional(&mut ours, &mut stream).await;
 }

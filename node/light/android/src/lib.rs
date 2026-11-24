@@ -68,8 +68,8 @@ mod warm;
 
 pub use personal::{Notice, Pending, Seen, Synced};
 pub use s4_credential_contract::{
-    Answer, Code, Enroll, Enrolled, EnrolledSpace, FACILITY, Field, Form, Gateway, JobRun, MAJOR,
-    Onion, Operation, Outcome, Paid, Pay, Refusal, SignIn, SignedIn, StreamTarget,
+    Answer, Carriage, Code, Enroll, Enrolled, EnrolledSpace, FACILITY, Field, Form, Gateway,
+    JobRun, MAJOR, Onion, Operation, Outcome, Paid, Pay, Refusal, SignIn, SignedIn, StreamTarget,
 };
 pub use session::{Facility, Session, Stock, WAITING_FOR_LIST};
 pub use warm::Warming;

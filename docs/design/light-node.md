@@ -3419,7 +3419,11 @@ nodes may ask the onion's mark of its proven calls, or of every request
   arti's `DormantMode::Soft`, and refuses every request until woken. s4's screen session is carried as bytes
   between a stream or a descriptor s4 hands over (`screens_fd`, a
   socketpair's end) and the onion's port 22, on a circuit of its own; s4
-  speaks SSH over it under its own key and pins the host key returned.
+  speaks SSH over it under its own key and pins the host key returned,
+  and is told the onion taken, which its address bar marks ("Tor") and
+  its prompts name. A carried stream that ends closes s4's end whatever
+  ended it; s4's SSH tells a server's end (its channel closed first, or a
+  DISCONNECT) from a lost circuit, which it retries through the facility.
   On the phone, s4's UI hands its end over the `:vos` interface
   (`IVosNode.screens`) when it connects to a gateway a space was enrolled
   through (a space whose routes take neither its onion nor an opt-out

@@ -488,20 +488,20 @@ natives! {
 
     /// s4's screen session with the target's gateway, carried between the
     /// UI's end of a socket pair, `descriptor` (owned from here), and that
-    /// gateway's SSH port: the SSH host key the space pinned for that port,
-    /// or none (an empty array) for an onion service first contacted.
+    /// gateway's SSH port: the carriage, naming the SSH host key the space
+    /// pinned for that port (none for an onion service first contacted)
+    /// and the onion it took.
     op fn nativeScreens(
         gateway: JObject<'l>,
         descriptor: jint,
-    ) -> JByteArray<'l>,
+    ) -> JObject<'l>,
     // SAFETY: the binder's descriptor, detached for this call alone.
     take { let end = (descriptor >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) }); },
     |env, node| {
         let end = end.ok_or_else(|| crate::refused(Code::Arguments, "no socket pair's end"))?;
         let gateway = StreamTarget::from_java(env, &gateway)?;
-        let host_key = node.screens(gateway, end)?;
-        env.byte_array_from_slice(host_key.as_ref().map_or(&[][..], |key| &key[..]))
-            .map_err(failed)
+        let carriage = node.screens(gateway, end)?;
+        made(env, &carriage)
     }
 
     op fn nativeSyncPersonal() -> JObject<'l>, |env, node| {

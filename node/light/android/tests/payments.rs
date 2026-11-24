@@ -260,3 +260,97 @@ async fn an_expired_payment_is_settled_by_the_ledgers_word() {
     assert_eq!(paid(&world), 2);
     assert!(store.pending(&origin()).unwrap().is_empty());
 }
+
+/// A source that answers only after the user took `wait` to consent, and
+/// notes when it last answered.
+struct Slow {
+    phone: Arc<Phone>,
+    wait: Duration,
+    answered: Mutex<Option<std::time::Instant>>,
+}
+
+impl Source for Slow {
+    fn kinds(&self) -> Vec<Kind> {
+        self.phone.kinds()
+    }
+
+    fn create(&self, kind: Kind) -> BoxFuture<'_, Result<Reference, SourceError>> {
+        self.phone.create(kind)
+    }
+
+    fn evaluate<'a>(
+        &'a self,
+        reference: &'a Reference,
+        input: [u8; 32],
+    ) -> BoxFuture<'a, Result<Output, SourceError>> {
+        Box::pin(async move {
+            tokio::time::sleep(self.wait).await;
+            let output = self.phone.evaluate(reference, input).await;
+            *self.answered.lock().unwrap() = Some(std::time::Instant::now());
+            output
+        })
+    }
+}
+
+/// A payment's proving time is the proof's: from the key's answer on, not
+/// the user's wait at the source before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_payments_proving_time_leaves_out_the_wait_for_the_key() {
+    let world = world();
+    let directory = tempfile::tempdir().unwrap();
+    let slow = Arc::new(Slow {
+        phone: Arc::new(Phone::new(9)),
+        wait: Duration::from_secs(2),
+        answered: Mutex::new(None),
+    });
+    let net = Arc::new(vos_facility::net::Net::new(
+        world.dial_as(PHONE),
+        directory.path(),
+    ));
+    net.set_foreground(true);
+    let facility = Facility::new(
+        Store::new(directory.path()),
+        Arc::clone(&slow) as Arc<dyn Source>,
+        net,
+    )
+    .with_tick(Duration::from_millis(100));
+    let chrome = Scripted::default();
+    let session = enrolled(&world, &facility, &chrome).await;
+    chrome.will(confirm(&["shop", "20"]));
+    let paid = session.ask("pay", &pay(), &chrome).await.unwrap();
+    let after_the_key = slow.answered.lock().unwrap().unwrap().elapsed();
+    let Value::Integer(Integer::Unsigned(proving_ms)) = field(&paid, "proving_ms") else {
+        panic!("{paid:?}");
+    };
+    assert!(
+        u128::from(*proving_ms) <= after_the_key.as_millis(),
+        "proved in {proving_ms} ms, {} ms after the key answered",
+        after_the_key.as_millis()
+    );
+}
+
+/// A session the facility carries over Tor names, in its forms, the onion
+/// it reaches the gateway at, not the address s4 was given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_form_names_the_onion_a_carried_session_reaches() {
+    let world = world();
+    let directory = tempfile::tempdir().unwrap();
+    let phone = Arc::new(Phone::new(9));
+    let facility = phone_facility(&world, directory.path(), &phone);
+    let chrome = Scripted::default();
+    enrolled(&world, &facility, &chrome).await;
+    let onion = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion";
+    let session = facility.session(vos_facility::Gateway {
+        onion: onion.into(),
+        ..gateway()
+    });
+    session.granted();
+    chrome.will(confirm(&["shop", "20"]));
+    session.ask("pay", &pay(), &chrome).await.unwrap();
+    let detail = chrome.last().detail;
+    assert!(
+        detail.starts_with(&format!("vos.test at {onion}, over Tor, asks")),
+        "{detail}"
+    );
+    assert!(!detail.contains("gateway.test"), "{detail}");
+}

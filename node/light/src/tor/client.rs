@@ -288,6 +288,9 @@ pub struct Screens {
     pub ssh_host_key: [u8; 32],
     /// The route it took.
     pub route: Route,
+    /// The onion service it reached the gateway at (`….onion`), on the
+    /// onion route.
+    pub onion: Option<String>,
 }
 
 impl Client {
@@ -654,9 +657,12 @@ impl Client {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (routes, route, version) = self.current(space, Purpose::Screens)?;
-        let (mut gateway, ssh_host_key) = self.connect(&routes, route).await?;
+        let (mut gateway, ssh_host_key, target) = self.connect(&routes, route).await?;
         let mut state = self.state();
         Self::still(&state, space, version)?;
+        // Either side's end, the gateway's close or a circuit lost, ends
+        // the other's: a socket pair has no way to say which, and s4's SSH
+        // tells them apart (a server's own end closes its channel first).
         let task = tokio::spawn(async move {
             let mut stream = stream;
             let _ = tokio::io::copy_bidirectional(&mut stream, &mut gateway).await;
@@ -667,6 +673,10 @@ impl Client {
         Ok(Screens {
             ssh_host_key,
             route,
+            onion: match target {
+                Target::Onion { address, .. } => Some(address),
+                Target::Clearnet { .. } => None,
+            },
         })
     }
 
@@ -1121,7 +1131,7 @@ impl Client {
         &self,
         routes: &Routes,
         route: Route,
-    ) -> Result<(super::Stream, [u8; 32]), Error> {
+    ) -> Result<(super::Stream, [u8; 32], Target), Error> {
         let config = self.inner.config;
         let mut last = io::Error::other("no attempt");
         let mut unpublished = true;
@@ -1147,7 +1157,7 @@ impl Client {
             .await;
             self.dialed(&target, Purpose::Screens, !matches!(dialed, Ok(Ok(_))));
             match dialed {
-                Ok(Ok(stream)) => return Ok((stream, host_key)),
+                Ok(Ok(stream)) => return Ok((stream, host_key, target)),
                 Ok(Err(error)) => {
                     unpublished &= Unpublished::is(&error);
                     last = error;

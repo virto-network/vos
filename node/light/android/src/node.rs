@@ -42,8 +42,8 @@ use crate::net::{Arti, Net};
 use crate::personal::{Artifacts, PersonalStatus, Phase, Refused, Space, Stage, Why};
 use crate::source::{BoxFuture, Kind, Output, Reference, Source, SourceError};
 use crate::{
-    Answer, Code, Enroll, Enrolled, EnrolledSpace, Facility, Form, Gateway, JobRun, Paid, Pay,
-    Refusal, Session, SignIn, SignedIn, StreamTarget, Synced, Warming, refused,
+    Answer, Carriage, Code, Enroll, Enrolled, EnrolledSpace, Facility, Form, Gateway, JobRun, Paid,
+    Pay, Refusal, Session, SignIn, SignedIn, StreamTarget, Synced, Warming, refused,
 };
 use s4_credential_contract::KeyAnswer;
 
@@ -556,24 +556,24 @@ impl Node {
     /// s4's screen session with the gateway `gateway` names, carried
     /// between `end` (the UI's end of a socket pair) and that gateway's SSH
     /// port over its space's routes, on a circuit of its own, for as long
-    /// as both sides keep it open: the SSH host key the space pinned for
-    /// that port, the one the UI accepts; a space's own onion is that
-    /// space's, however it was enrolled. An onion service no space pins is
-    /// carried over Tor all the same, on a circuit of its own, with no key
-    /// pinned: the client's known hosts decide it, as
-    /// for any first contact. `NotEnrolled` for any other gateway no space
-    /// was enrolled through: the UI connects itself.
+    /// as both sides keep it open: the carriage names the SSH host key the
+    /// space pinned for that port, the one the UI accepts, and the onion it
+    /// took; a space's own onion is that space's, however it was enrolled.
+    /// An onion service no space pins is carried over Tor all the same, on
+    /// a circuit of its own, with no key pinned: the client's known hosts
+    /// decide it, as for any first contact. `NotEnrolled` for any other
+    /// gateway no space was enrolled through: the UI connects itself.
     pub fn screens(
         &self,
         gateway: StreamTarget,
         end: std::os::fd::OwnedFd,
-    ) -> Result<Option<[u8; 32]>, Refusal> {
+    ) -> Result<Carriage, Refusal> {
         let _entered = self.runtime.enter();
         let space = match self.facility.screens_space(&gateway) {
             Ok(space) => space,
             Err(refusal) if refusal.code == Code::NotEnrolled && onion(&gateway.host) => {
                 if let Some(space) = self.facility.onion_space(&gateway.host)? {
-                    return self.carried(space, end).map(Some);
+                    return self.carried(space, end);
                 }
                 let host = gateway.host.trim_end_matches('.');
                 let stream = self
@@ -584,25 +584,32 @@ impl Node {
                     .map_err(|error| refused(Code::Api, error.to_string()))?;
                 crate::stream::carry(end, Box::new(stream))
                     .map_err(|error| refused(Code::Failed, error.to_string()))?;
-                return Ok(None);
+                return Ok(Carriage {
+                    ssh_host_key: None,
+                    onion: host.to_ascii_lowercase(),
+                });
             }
             Err(refusal) => return Err(refusal),
         };
-        self.carried(space, end).map(Some)
+        self.carried(space, end)
     }
 
-    /// s4's screens carried over `space`'s routes: the key it pinned.
+    /// s4's screens carried over `space`'s routes: the key it pinned, and
+    /// the onion it took.
     fn carried(
         &self,
         space: crate::net::SpaceId,
         end: std::os::fd::OwnedFd,
-    ) -> Result<[u8; 32], Refusal> {
+    ) -> Result<Carriage, Refusal> {
         let screens = self.awake(|| {
             self.runtime
                 .block_on(self.facility.net().client().screens_fd(space, end))
         });
         screens
-            .map(|screens| screens.ssh_host_key)
+            .map(|screens| Carriage {
+                ssh_host_key: Some(screens.ssh_host_key),
+                onion: screens.onion.unwrap_or_default(),
+            })
             .map_err(|error| refused(Code::Api, error.to_string()))
     }
 

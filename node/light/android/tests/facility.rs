@@ -339,6 +339,7 @@ async fn a_session_not_carried_over_tor_proves_nothing() {
     let clearnet = || vos_facility::Gateway {
         host_key: Some(ssh_host_key()),
         carried: false,
+        onion: String::new(),
         ..gateway()
     };
     let enrolling = facility.session(clearnet());
@@ -430,7 +431,14 @@ fn a_first_contact_with_an_onion_goes_over_tor() {
             OwnedFd::from(theirs),
         )
         .unwrap();
-    assert_eq!(pinned, None, "no key pinned at first contact");
+    assert_eq!(
+        pinned,
+        vos_facility::Carriage {
+            ssh_host_key: None,
+            onion: world::address(&world, 1),
+        },
+        "no key pinned at first contact, over Tor to the onion named"
+    );
     gateways_banner(&mut ours);
     let seen = world.state.lock().unwrap().seen.clone();
     assert_eq!(seen.len(), 1);
@@ -491,7 +499,11 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
     let before = world.state.lock().unwrap().seen.len();
     assert_eq!(
         screens("GATEWAY.test").unwrap(),
-        Some(world.onion(1).ssh_host_key)
+        vos_facility::Carriage {
+            ssh_host_key: Some(world.onion(1).ssh_host_key),
+            onion: world::address(&world, 1),
+        },
+        "the key pinned, and the onion taken"
     );
     // The screens' stream among any the background job dialled meanwhile:
     // to the onion, on a circuit no earlier stream took.
@@ -510,7 +522,7 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
         Code::NotEnrolled
     );
     assert_eq!(
-        screens("gateway.test.").unwrap(),
+        screens("gateway.test.").unwrap().ssh_host_key,
         Some(world.onion(1).ssh_host_key),
         "the gateway's name with its root's dot"
     );
@@ -525,12 +537,19 @@ fn the_screens_go_over_the_spaces_onion_or_its_opt_out() {
         )
         .unwrap();
     assert_eq!(
-        own,
+        own.ssh_host_key,
         Some(world.onion(1).ssh_host_key),
         "the space's own onion is the space's, its key pinned"
     );
     node.opt_out(HANDLE, true).unwrap();
-    assert_eq!(screens("gateway.test").unwrap(), Some(ssh_host_key()));
+    assert_eq!(
+        screens("gateway.test").unwrap(),
+        vos_facility::Carriage {
+            ssh_host_key: Some(ssh_host_key()),
+            onion: String::new(),
+        },
+        "the clearnet port: no onion"
+    );
     let seen = world.state.lock().unwrap().seen.clone();
     assert_eq!(
         world::onion_of(&seen.last().unwrap().target),
@@ -601,7 +620,7 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
             host: "gateway.test".into(),
             port: gateway().port,
         };
-        let key = node.screens(target, OwnedFd::from(theirs)).unwrap();
+        let carriage = node.screens(target, OwnedFd::from(theirs)).unwrap();
         gateways_banner(&mut ours);
         let last = world
             .state
@@ -612,7 +631,9 @@ fn the_onion_is_preferred_and_a_gateway_spelled_otherwise_is_refused() {
             .unwrap()
             .target
             .clone();
-        (key, world::onion_of(&last))
+        let onion = world::onion_of(&last);
+        assert_eq!(carriage.onion, onion.clone().unwrap_or_default());
+        (carriage.ssh_host_key, onion)
     };
     let (key, onion) = screens();
     assert_eq!(key, Some(world.onion(1).ssh_host_key));

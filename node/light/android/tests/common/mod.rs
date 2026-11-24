@@ -223,6 +223,7 @@ pub fn gateway() -> vos_facility::Gateway {
         application: "vos.test".into(),
         host_key: None,
         carried: true,
+        onion: String::new(),
     }
 }
 

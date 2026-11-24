@@ -438,7 +438,7 @@ public final class VosNode {
     }
 
     @Override
-    public byte[] screens(StreamTarget gateway, ParcelFileDescriptor end, Refusal refused) {
+    public Carriage screens(StreamTarget gateway, ParcelFileDescriptor end, Refusal refused) {
       if (end == null) {
         refused.code = ErrorCode.ARGUMENTS;
         refused.message = "the screens need the UI's end of a socket pair";
@@ -880,7 +880,8 @@ public final class VosNode {
 
   private static native JobRun[] nativeRuns(Class<JobRun> element, Refusal refused);
 
-  private static native byte[] nativeScreens(StreamTarget gateway, int descriptor, Refusal refused);
+  private static native Carriage nativeScreens(
+      StreamTarget gateway, int descriptor, Refusal refused);
 
   private static native boolean nativeClearnet(byte[] hostKey, Refusal refused);
 

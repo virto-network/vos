@@ -839,7 +839,7 @@ impl Drop for Session {
 }
 
 fn declined() -> Refusal {
-    refused(Code::Declined, "the user declined")
+    refused(Code::Declined, "you cancelled it on this device")
 }
 
 /// The store's failure as the server is told it: its own message names the
@@ -1009,11 +1009,18 @@ impl Session {
         ))
     }
 
+    /// Who asks: the application and where s4 reaches it, the onion over
+    /// Tor when the facility carries the session there.
     fn origin_line(&self) -> String {
-        format!(
-            "{} at {}:{} asks",
-            self.origin.application, self.gateway.host, self.gateway.port
-        )
+        match (self.gateway.carried, self.gateway.onion.as_str()) {
+            (true, onion) if !onion.is_empty() => {
+                format!("{} at {onion}, over Tor, asks", self.origin.application)
+            }
+            _ => format!(
+                "{} at {}:{} asks",
+                self.origin.application, self.gateway.host, self.gateway.port
+            ),
+        }
     }
     /// `enroll`: this device enrolled in the request's space, the digests
     /// shown in the chrome and answered.

@@ -198,7 +198,6 @@ impl Session {
         // Once more when the answer says that proof will not run again:
         // the ledger's answer to the same key then settles it.
         for last in [false, true] {
-            let started = Instant::now();
             let call = self.call_at(
                 &enrollment,
                 method,
@@ -209,8 +208,11 @@ impl Session {
             store
                 .keep_pending(&self.origin, &pending)
                 .map_err(store_error)?;
+            // Timed from the key's answer: the user's wait at the source
+            // is not the proof's.
             let secret = self.secret(&enrollment).await?;
             chrome.stage(PROVING);
+            let started = Instant::now();
             let bytes = Inner::prove(
                 &self.inner,
                 Kernel::Owner,

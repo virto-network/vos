@@ -637,6 +637,7 @@ async fn s4s_screens_are_carried_over_a_circuit_of_their_own() {
     let screens = client.screens_fd(a, theirs.into()).await.unwrap();
     assert_eq!(screens.ssh_host_key, gateway.host_key());
     assert_eq!(screens.route, Route::Onion);
+    assert_eq!(screens.onion, Some(onion_address(&gateway.onion(1).key)));
     assert!(client.screens_open());
     // s4's side: its SSH over its end, its own key.
     ours.set_nonblocking(true).unwrap();
