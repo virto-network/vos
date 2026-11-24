@@ -10,9 +10,10 @@ all-features = true
 version = 2
 yanked = "warn"
 # Each advisory left open, with what holds it: none has an upgrade the
-# crate that pulls it accepts. Reviewed 2026-11-17.
+# crate that pulls it accepts. Reviewed 2026-11-24.
 ignore = [
     { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained: heapless 0.7 under postcard 1; no code path on a target without atomics." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 (timing): through elliptic-curve 0.13, under mls-rs-crypto-rustcrypto's P-256/P-384 suites; the device group's suite is CURVE25519_AES128 (`vos-mls`). Fixed in 0.7 only, which elliptic-curve 0.13 does not take." },
 ]
 
 [licenses]
@@ -24,10 +25,12 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "MIT",
     "MIT-0",
+    "0BSD",
     "BSD-1-Clause",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "Zlib",
+    "BSL-1.0",
     "CC0-1.0",
     "Unlicense",
     "Unicode-3.0",
@@ -45,7 +48,7 @@ exceptions = [
 [bans]
 # A crate held twice fails, but those below, each with what pulls each
 # version: no upgrade the crates that pull them accept removes them.
-# Reviewed 2026-11-18.
+# Reviewed 2026-11-24.
 multiple-versions = "deny"
 skip = [
     { crate = "digest@0.10.7", reason = "blake2 0.10, sha2 0.10 and curve25519-dalek 4 take digest 0.10; sha3 0.11 takes 0.11." },
@@ -55,12 +58,23 @@ skip = [
     { crate = "hashbrown@0.14.5", reason = "dashmap 6's; indexmap 2 takes 0.17." },
     { crate = "hashbrown@0.15.5", reason = "the Stwo fork's, pinned at its revision; indexmap 2 takes 0.17." },
     { crate = "syn@1.0.109", reason = "vos-pvm-proof-derive is written against syn 1; every other macro crate takes syn 2." },
+    { crate = "syn@2.0.118", reason = "every macro crate but async-trait and vos-pvm-proof-derive takes 2.0.118; async-trait 0.1 (under mls-rs) takes 3.0.6." },
+    { crate = "getrandom@0.2.17", reason = "vos-pvm-recair takes 0.2.17 directly, rand_core 0.6 takes 0.2.17; mls-rs 0.57 and tempfile 3.25 (under fjall, lsm-tree and the tests) take 0.4.3." },
+    { crate = "hashbrown@0.16.1", reason = "quick_cache 0.6 (lsm-tree's block cache) takes 0.16.1; indexmap 2 takes 0.17.1." },
+    { crate = "itertools@0.12.1", reason = "the Stwo fork's, pinned at its revision; mls-rs 0.57, mls-rs-codec 0.7 take 0.14.0." },
+    { crate = "lz4_flex@0.11.6", reason = "vos-pvm-bench takes 0.11.6; fjall 3.1, lsm-tree 3.1 take 0.13.1." },
+    { crate = "rand_core@0.6.4", reason = "crypto-bigint 0.5, crypto-common 0.1, ed25519-dalek 2.2, elliptic-curve 0.13 and more take 0.6.4; mls-rs 0.57 takes 0.10.1." },
+    { crate = "sec1@0.7.3", reason = "elliptic-curve 0.13 takes 0.7.3; mls-rs-crypto-rustcrypto 0.22 takes 0.8.1." },
+    { crate = "spin@0.9.8", reason = "flume 0.12 (under fjall), heapless 0.7 take 0.9.8; mls-rs 0.57 takes 0.10.1." },
 ]
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# The fork the workspace pins: the Stwo prover.
+# The forks the workspace patches in or pins: fjall and its lsm-tree, the
+# Stwo prover.
 allow-git = [
+    "https://github.com/olanod/lsm-tree",
+    "https://github.com/olanod/fjall",
     "https://github.com/olanod/stwo",
 ]

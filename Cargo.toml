@@ -22,6 +22,7 @@ members = [
     "pvm/proof/verifier",
     "pvm/bench",
     "support/merkle-crdt",
+    "support/mls",
 ]
 exclude = [
     # Built with `cargo fuzz` (nightly flags, panic = abort).
@@ -31,6 +32,20 @@ exclude = [
     # workspace, the blob verify-only for wasm32, the runner on wasmtime.
     "pvm/proof/final-verifier/wasm",
 ]
+
+# fjall's lsm-tree: 3.1.10 with three fixes, each on a branch of the fork:
+# a popped memtable is freed outside the version history's write lock
+# (`free-popped-memtables-off-lock`), a flush or a compaction no longer
+# makes a write batch visible in part (`batch-visible-whole`), and its
+# tests' clock is per thread (`per-thread-test-clock`). This is the fork's
+# `vos` branch, which merges the three.
+#
+# fjall: 3.1.13 taking its directory's lock with `flock` where the standard
+# library cannot lock files (Android), on the fork's `android-flock` branch;
+# `vos` is the same commit.
+[patch.crates-io]
+lsm-tree = { git = "https://github.com/olanod/lsm-tree", rev = "d0791931a96ff2be9b23af4e0d1ef17a330ed9f2" }
+fjall = { git = "https://github.com/olanod/fjall", rev = "cffa5f7620be864277f7d5706a9f60e58beed219" }
 
 [workspace.package]
 version = "0.1.0"
@@ -122,6 +137,12 @@ vos-pvm-program = { path = "pvm/program" }
 vos-abi = { path = "pvm/abi" }
 vos-tree = { path = "pvm/tree" }
 merkle-crdt = { path = "support/merkle-crdt" }
+vos-mls = { path = "support/mls" }
+# Exact: the workspace nightly is a 1.90 pre-release, which a later fjall
+# release may outgrow. At least 3.1.13: before it, a database's drop could
+# block for good on a full queue of close messages its workers had all
+# stopped taking.
+fjall = "=3.1.13"
 
 # Stwo from the fork's `vos/wrap` branch: upstream `e1286720` with dashmap
 # optional, Poseidon252 behind a feature, and upstream's `74951f79`, which
