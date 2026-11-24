@@ -17,7 +17,7 @@ consensus; frames are bytes, and their meaning belongs to the layer above.
 - **The interface** is the `Network` trait: `send` refuses with a reason
   (`Refused`: a full queue, an unknown peer, an oversized frame, a link
   down for good), and arrivals come in a bounded queue per class
-  (`Arrivals`), Liveness and Consensus drained first.
+  (`Arrivals`), which a consumer drains Liveness and Consensus first.
 
 Two implementations:
 
@@ -57,6 +57,8 @@ frames' latency beside bulk frames to the same peer).
 ## Users
 
 On the `vos-core` branch: the node (`node/host`: `src/peer.rs`,
-`src/liveness.rs`, `src/dispatch.rs`, `src/api/quic.rs`, `src/tls.rs`),
-the HTTP front (`node/http/src/tls.rs`) and the test harness
-(`node/checker`).
+`src/liveness.rs`, `src/dispatch.rs`, `src/api/quic.rs`, `src/tls.rs`,
+`src/client/api.rs`), the HTTP front (`node/http/src/tls.rs`), the
+gateway (`node/gateway/src/upstream.rs`), the scale harness
+(`tools/scale`) and the carrier audit's capture of the hub's frames
+(`node/checker/src/carriers/capture.rs`).

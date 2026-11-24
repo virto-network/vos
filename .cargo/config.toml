@@ -27,9 +27,9 @@ rustflags = ["-C", "target-cpu=native"]
 # Only consulted when building `--target aarch64-unknown-linux-gnu`;
 # harmless otherwise.  The linker must be a cross-gcc (or clang with
 # `--target=`) because rust-lld is not the default for this triple.
-# A crate that compiles C (on the node side, `ring`, through its TLS
-# stack) finds the conventional `aarch64-linux-gnu-gcc` on PATH through
-# the `cc` crate; to use clang instead set
+# A crate that compiles C (`ring`, through the TLS stack) finds the
+# conventional `aarch64-linux-gnu-gcc` on PATH through the `cc` crate; to
+# use clang instead set
 #   CC_aarch64_unknown_linux_gnu=clang
 #   CFLAGS_aarch64_unknown_linux_gnu=--target=aarch64-unknown-linux-gnu
 #
