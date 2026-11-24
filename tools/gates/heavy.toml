@@ -12,3 +12,8 @@ seconds = 191
 package = "vos-pvm-recair"
 target = "gates"
 seconds = 38
+
+[[heavy]]
+package = "vos-raft"
+target = "simulated"
+seconds = 49

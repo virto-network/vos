@@ -37,6 +37,9 @@ the virtual machine and its prover, and standalone libraries under
   (the recursion AIR) and [`docs/design/open.md`](docs/design/open.md)
   (known gaps in proving and at the venues). The first two describe the
   whole system, the node side included.
+- [`support/vos-raft/`](support/vos-raft/README.md): Raft consensus as a
+  protocol core without I/O (`no_std`), and a deterministic simulator that
+  checks it under faults; the node side replicates each agent's log on it.
 - `tools/gates/`: the gates' tripwires (`just check-tiers`, `just
   doc-check`); `tools/kreivo/conformance/`: Kreivo's conformance vectors,
   data the verifier kit carries.
