@@ -1,0 +1,18 @@
+[package]
+name = "vos-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The network between VOS nodes: channels authenticated by node keys, classes of traffic, and streams by group or by frame."
+
+[dependencies]
+event-listener = "5"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-smol", "rustls-ring"] }
+quinn-proto = { version = "0.11.19", default-features = false }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+smol = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+ed25519-dalek = "2"
