@@ -1272,11 +1272,8 @@ impl Space {
             .inner()
             .store
             .all()
-            .map_err(|error| Refused {
-                why: Why::Store,
-                detail: error,
-                ..Refused::default()
-            })?;
+            // Unread, the memberships are listed unnamed.
+            .unwrap_or_default();
         Ok(all
             .into_iter()
             .map(|owed| {

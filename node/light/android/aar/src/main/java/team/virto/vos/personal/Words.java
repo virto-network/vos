@@ -170,7 +170,7 @@ public final class Words {
 
   /**
    * Each device's name as a list shows it: its label, told apart from another device's of the same
-   * label, a removed one as "an earlier" one, two live ones by their numbers.
+   * label, a removed one as "an earlier" one, two live ones by their numbers; this phone's marked.
    */
   public static String[] names(Device[] devices) {
     String[] names = new String[devices.length];
@@ -184,7 +184,9 @@ public final class Words {
           sharedLive |= !other.removed;
         }
       }
-      if (!shared) {
+      if (device.me) {
+        names[at] = device.label + " (this phone)";
+      } else if (!shared) {
         names[at] = device.label;
       } else if (device.removed && sharedLive) {
         names[at] = "An earlier " + device.label + " (device " + device.id + ")";
@@ -204,9 +206,10 @@ public final class Words {
 
   /** Device {@code id} as the screens name it: "this phone", its label, or its number. */
   public static String named(long id, Device[] devices) {
-    for (Device device : devices) {
-      if (device.id == id) {
-        return device.me ? "this phone" : device.label;
+    String[] names = names(devices);
+    for (int at = 0; at < devices.length; at++) {
+      if (devices[at].id == id) {
+        return devices[at].me ? "this phone" : names[at];
       }
     }
     return "device " + id;
@@ -221,16 +224,21 @@ public final class Words {
    * of it does nothing then, and the next commit carries it.
    */
   public static boolean tookEffect(Notice notice, long now) {
-    return notice.pending <= Pending.RESTORE
+    // `matures` is the agent's time: past it by a margin on this phone's clock, so a clock a little
+    // fast hides no veto that can still work.
+    return notice.pending < Pending.RESTORE
         && !notice.contested
         && notice.matures > 0
-        && notice.matures <= now;
+        && notice.matures + CLOCK_MARGIN <= now;
   }
+
+  /** How far this phone's clock may be off the agent's, as the screens allow for it. */
+  private static final long CLOCK_MARGIN = MINUTE;
 
   /** Who signed an operation's notice, and whether it is contested; nothing for other kinds. */
   public static String signer(Notice notice) {
     if (notice.byKit) {
-      return " (by the kit: if you did not sign it, veto it and rotate your kit)";
+      return " (by the kit: if you did not sign it, rotate your kit, and veto it while you can)";
     }
     if (notice.pending <= Pending.RESTORE) {
       return " (by device " + notice.by + (notice.contested ? ", contested" : "") + ")";

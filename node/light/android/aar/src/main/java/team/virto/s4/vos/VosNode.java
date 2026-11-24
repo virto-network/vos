@@ -808,7 +808,8 @@ public final class VosNode {
       mark("key asked");
       KeyResult result = prompts.evaluateKey(kind, key, input);
       mark("key answered");
-      if (result != null && result.status == KeyStatus.DONE) {
+      if (result != null && result.status == KeyStatus.DONE
+          && (kind == KEYSTORE || kind == SECURITY_KEY)) {
         Log.i(TAG, "proof started");
       }
       return result;
@@ -818,6 +819,9 @@ public final class VosNode {
   private static Announced announced(IVosPrompts prompts, String what, Long granted) {
     return prompts == null ? null : new Announced(prompts, what, granted);
   }
+
+  /** An onion's address, which the log names no more than as "….onion". */
+  private static final String ONION = "[a-z2-7]{56}\\.onion";
 
   /** A personal flow's call of the library, given the prompts it is lent. */
   private interface Flow<T> {
@@ -840,7 +844,7 @@ public final class VosNode {
                     + refused.why
                     + (refused.detail == null || refused.detail.isEmpty()
                         ? ""
-                        : " (" + refused.detail + ")"))
+                        : " (" + refused.detail.replaceAll(ONION, "….onion") + ")"))
             + Announced.at(announced));
     return result;
   }

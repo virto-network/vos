@@ -667,7 +667,7 @@ impl Node {
         Ok(Personal {
             space,
             job: &self.job,
-            following: following(space),
+            phase: phase(space),
             _awake: self.wake(),
         })
     }
@@ -709,19 +709,17 @@ impl Node {
     }
 }
 
-/// Whether the device holds its group and follows it.
-fn following(space: &Space) -> bool {
-    space
-        .status()
-        .is_ok_and(|status| status.phase == Phase::Held)
+/// The device's phase, if it reads.
+fn phase(space: &Space) -> Option<Phase> {
+    space.status().ok().map(|status| status.phase)
 }
 
 /// The personal space lent to one flow ([`Node::personal`]).
 pub struct Personal<'a> {
     space: &'a Arc<Space>,
     job: &'a Arc<Job>,
-    /// Whether the device followed its group before the flow.
-    following: bool,
+    /// The device's phase before the flow.
+    phase: Option<Phase>,
     _awake: Awake<'a>,
 }
 
@@ -736,9 +734,9 @@ impl std::ops::Deref for Personal<'_> {
 impl Drop for Personal<'_> {
     fn drop(&mut self) {
         // Its notices of being out of the group go once it follows it; of
-        // what came before, once the flow brought it back.
-        if following(self.space) {
-            self.job.following(!self.following);
+        // the kit's operations before, once its own restore finished.
+        if phase(self.space) == Some(Phase::Held) {
+            self.job.following(self.phase == Some(Phase::Restoring));
         }
         if self.space.grouped() {
             self.job

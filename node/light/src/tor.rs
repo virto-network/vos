@@ -80,13 +80,13 @@ pub struct Config {
     /// A fresh connection's attempts, each on a new circuit.
     pub attempts: usize,
     /// The pause before one more attempt when every attempt found the
-    /// onion service unpublished or unreachable ([`Unpublished`]): the
-    /// `n`th of [`Config::agains`] after `n` such pauses.
+    /// onion service unpublished or unreachable ([`Unpublished`]): before
+    /// the `n`th of [`Config::agains`], `n` × `again`.
     pub again: Duration,
     /// The attempts made after those pauses, while every attempt still
     /// finds the service so: a service whose circuits fail for a while (a
-    /// host stalled, a descriptor republished) is waited for, within
-    /// `again` × (1 + 2 + … + `agains`).
+    /// host stalled, a descriptor republished) is waited for, `again` ×
+    /// (1 + … + `agains`) at most.
     pub agains: usize,
     /// How long a kept-open connection stays without a request.
     pub idle: Duration,
@@ -113,7 +113,7 @@ impl Default for Config {
             proven: Duration::from_secs(90),
             attempts: 3,
             again: Duration::from_secs(5),
-            agains: 3,
+            agains: 2,
             idle: Duration::from_secs(300),
             spare_gap: Duration::from_secs(4),
             spare_idle: Duration::from_secs(600),

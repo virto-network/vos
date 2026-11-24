@@ -205,7 +205,7 @@ public final class PersonalActivity extends Activity {
     // `:vos` keeps no watcher of a screen not shown. A form a flow of the sitting waits on is
     // declined, so the flow ends and drops the kit it holds too.
     if (sitting) {
-      forms.dismissAll();
+      forms.dismissAll("the app went to the background while a form waited for you: try again");
     }
     forgetKit();
     background(personal -> personal.watch(null));
@@ -239,7 +239,7 @@ public final class PersonalActivity extends Activity {
     if (cancelOnDestroy != null) {
       cancelOnDestroy.run();
     }
-    forms.dismissAll();
+    forms.dismissAll("the screen closed while a form waited for you: try again");
     keys.close();
     forgetKit();
     worker.shutdown();
@@ -495,7 +495,11 @@ public final class PersonalActivity extends Activity {
           // A decline this chrome made itself (a form unanswered in time, the app going) is said:
           // the user did not decline.
           String closedWhy = forms.closedSince(formsClosed);
-          if (refused.why == Why.DECLINED && closedWhy != null) {
+          boolean stopped =
+              refused.why == Why.DECLINED
+                  || refused.why == Why.CANCELLED
+                  || refused.why == Why.KIT_NOT_WRITTEN;
+          if (stopped && closedWhy != null) {
             refused.why = Why.FAILED;
             refused.detail = closedWhy;
           }

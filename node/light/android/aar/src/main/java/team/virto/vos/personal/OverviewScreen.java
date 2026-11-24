@@ -165,7 +165,6 @@ final class OverviewScreen extends Screen {
         into.addView(
             text(
                 names[at]
-                    + (device.me ? " (this phone)" : "")
                     + ": "
                     + Words.standing(device.standing)
                     + ", last call at your agent "

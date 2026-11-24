@@ -396,23 +396,29 @@ impl Job {
     }
 
     /// The device holds its group, following it: a notice that it is out
-    /// of it (removed, stuck) applies no more; and once it `rejoined`
-    /// (paired again, restored, claimed), neither do the restores it
-    /// stopped nor the kit's operations it raised before.
-    pub fn following(&self, rejoined: bool) {
+    /// of it (removed, stuck) applies no more; and once its own restore
+    /// finished (`restored`), neither do the restores it stopped nor the
+    /// kit's operations it raised before, the restore's among them. Read
+    /// first without the pass's lock, which is taken only to write.
+    pub fn following(&self, restored: bool) {
+        let gone = |raised: &Raised| {
+            let notice = &raised.notice;
+            matches!(notice.pending, Pending::Removed | Pending::Stuck)
+                || (restored && (notice.pending == Pending::Restoring || kit_alarm(notice)))
+        };
+        if !self
+            .runs
+            .read()
+            .is_ok_and(|state| state.raised.iter().any(gone))
+        {
+            return;
+        }
         let _one = crate::lock(&self.running);
         let Ok(mut state) = self.runs.read() else {
             return;
         };
-        let before = state.raised.len();
-        state.raised.retain(|raised| {
-            let notice = &raised.notice;
-            !matches!(notice.pending, Pending::Removed | Pending::Stuck)
-                && !(rejoined && (notice.pending == Pending::Restoring || kit_alarm(notice)))
-        });
-        if state.raised.len() != before {
-            let _ = self.runs.write(&state);
-        }
+        state.raised.retain(|raised| !gone(raised));
+        let _ = self.runs.write(&state);
     }
 
     /// The notices standing after the last pass.

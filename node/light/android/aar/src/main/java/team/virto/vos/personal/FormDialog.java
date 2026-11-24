@@ -79,12 +79,12 @@ final class FormDialog implements VosPrompts.Forms {
     }
   }
 
-  /** The activity is going: every form open declined. */
-  void dismissAll() {
+  /** The activity is going ({@code why}): every form open declined. */
+  void dismissAll(String why) {
     synchronized (open) {
       for (CompletableFuture<Answer> answer : open) {
         if (answer.complete(declined())) {
-          closedItself("the app went to the background while a form waited for you: try again");
+          closedItself(why);
         }
       }
     }

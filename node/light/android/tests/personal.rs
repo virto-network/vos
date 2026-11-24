@@ -753,7 +753,7 @@ fn a_restore_cut_by_the_kits_life_says_so() {
         )
     };
     space().hold_kit();
-    let life = Duration::from_millis(4_000);
+    let life = Duration::from_millis(12_000);
     space().set_kit_life(life.as_millis() as u64);
     fresh
         .node

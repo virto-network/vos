@@ -1964,8 +1964,8 @@ restore's times [World]: §6.3]:
   the sitting's kit only with half its life left at least, else asks for
   it again, and its new kit's form says the minutes left. A new kit not
   written down (its phrase cancelled, its check declined) ends any flow
-  with `Why::KitNotWritten`: nothing changed, the words shown are void. The words in the forms' rows and in the
-  answers are zeroized in `:vos` once handed over or read; the Java
+  with `Why::KitNotWritten`: nothing changed, the words shown are void.
+  The words in the forms' rows and in the answers are zeroized in `:vos` once handed over or read; the Java
   copies (the Binder parcels, the form's text in the UI) are the
   collector's to reclaim, not zeroized. So the kit's secret lives minutes in
   `:vos` instead of one call; a flow outside the restore screen (a

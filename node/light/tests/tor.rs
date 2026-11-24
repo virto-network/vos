@@ -450,7 +450,7 @@ async fn a_failed_connection_is_retried_on_a_new_circuit() {
 /// them the request fails; a burst that failed otherwise is not tried
 /// again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unpublished_onion_is_tried_once_more_after_a_pause() {
+async fn an_unpublished_onion_is_tried_again_after_growing_pauses() {
     let gateway = Gateway::new();
     let config = config();
     let client = client(&gateway, config);

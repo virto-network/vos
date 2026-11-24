@@ -86,7 +86,6 @@ final class DevicesScreen extends Screen {
       into.addView(
           text(
               names[at]
-                  + (device.me ? " (this phone)" : "")
                   + "\n"
                   + Words.standing(device.standing)
                   + (device.removed ? ", its removal matured" : removal(device, now))

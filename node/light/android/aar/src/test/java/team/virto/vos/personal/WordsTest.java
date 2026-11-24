@@ -46,8 +46,8 @@ public final class WordsTest {
     assertEquals("A device is being removed (by device 2, contested)", Words.notice(notice));
     notice.byKit = true;
     assertEquals(
-        "A device is being removed (by the kit: if you did not sign it, veto it and rotate your"
-            + " kit)",
+        "A device is being removed (by the kit: if you did not sign it, rotate your kit, and veto"
+            + " it while you can)",
         Words.notice(notice));
     Notice alarm = new Notice();
     alarm.pending = Pending.ALARM;
@@ -117,7 +117,7 @@ public final class WordsTest {
     String[] names = Words.names(devices);
     assertEquals("An earlier Fairphone 6 (device 0)", names[0]);
     assertEquals("Pixel", names[1]);
-    assertEquals("Fairphone 6 (device 2)", names[2]);
+    assertEquals("Fairphone 6 (this phone)", names[2]);
   }
 
   @Test
@@ -128,13 +128,13 @@ public final class WordsTest {
     removal.by = 2;
     removal.target = 1;
     removal.targeted = true;
-    removal.matures = NOW - 1;
+    removal.matures = NOW - 2 * 60_000;
     assertEquals(
         "This phone is being removed (by Fairphone 6)", Words.notice(removal, devices));
     assertTrue(Words.tookEffect(removal, NOW));
     assertTrue(Words.when(removal, NOW).contains("took effect"));
-    removal.matures = NOW + 5 * 60_000;
-    assertFalse(Words.tookEffect(removal, NOW));
+    removal.matures = NOW - 1;
+    assertFalse("a clock a little fast hides no veto", Words.tookEffect(removal, NOW));
   }
 
   @Test
