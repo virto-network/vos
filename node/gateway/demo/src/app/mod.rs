@@ -17,7 +17,9 @@
 
 use std::sync::Arc;
 
-use s4_server::rui::{App, Cx, Effect, EffectOutput, EffectRequest, View, ViewContext, view};
+use s4_server::rui::{
+    App, Cx, Effect, EffectOutput, EffectRequest, Subscriptions, View, ViewContext, view,
+};
 use s4_server::{HostServiceError, HostServiceRequest, Identifier, Server, Value};
 use tokio::sync::OnceCell;
 use vos_abi::abi::Failure;

@@ -51,6 +51,8 @@ struct Book {
     waiting: Vec<Invited>,
     /// Invitations whose enrollment came, to be claimed.
     came: Vec<Invited>,
+    /// An enrollment the screens took was met by its invitation.
+    met: bool,
 }
 
 /// An enrollment's member and owner digests.
@@ -90,6 +92,7 @@ impl Held {
                 let invited = book.waiting.remove(at);
                 // Bounded by the invitations waiting, and taken at once.
                 book.came.push(invited);
+                book.met = true;
                 self.0.came.notify_one();
             }
             None => {
@@ -113,6 +116,7 @@ impl Held {
         let before = book.held.len();
         book.held.retain(|kept| kept != &(member, owner));
         if book.held.len() != before {
+            book.met = true;
             return true;
         }
         let now = std::time::Instant::now();
@@ -135,7 +139,17 @@ impl Held {
         let mut book = self.0.book.lock().expect("held poisoned");
         let before = book.held.len();
         book.held.retain(|kept| kept != &(member, owner));
+        book.met |= book.held.len() != before;
         book.held.len() != before
+    }
+
+    /// Whether an enrollment the screens took waits for the operator's
+    /// invitation: one is held, or none was ever met by its invitation.
+    /// The screens cannot tell which device an anonymous session is, so
+    /// this is what the demo knows of its enrollments, not of the session's.
+    pub fn awaits_invitation(&self) -> bool {
+        let book = self.0.book.lock().expect("held poisoned");
+        !book.held.is_empty() || !book.met
     }
 
     /// The invitations whose enrollment came, once there are any: taken.

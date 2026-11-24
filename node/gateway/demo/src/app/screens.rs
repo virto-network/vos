@@ -24,6 +24,8 @@ pub enum Message {
     Pay,
     Balance(EffectOutput),
     Refreshed(EffectOutput),
+    /// A look at whether an enrollment still waits for the operator.
+    Look,
 }
 
 /// One connection's screens.
@@ -38,6 +40,10 @@ pub struct Screens {
     carried: bool,
     /// A sign-in of this session's went through.
     signed_in: bool,
+    /// An enrollment the screens took waits for the operator's invitation,
+    /// as last looked: looked again each second while it does, so the line
+    /// changes as the invitation comes.
+    waiting: bool,
     screen: Screen,
     payee: String,
     amount: String,
@@ -56,6 +62,7 @@ impl Screens {
         let carried = mark == Mark::Onion;
         Self {
             demo,
+            waiting: held.awaits_invitation(),
             held,
             carried,
             signed_in: false,
@@ -131,19 +138,34 @@ fn map_text(value: &Value, name: &str) -> Option<String> {
     }
 }
 
-/// What a carried session says of the enrollment it cannot see.
+/// What a carried session says of the enrollment it cannot see, while
+/// one the screens took waits for the operator.
 const ENROLLED_WAITING: &str = "Enrolled. Waiting for the operator's invitation: once the \
                                 operator has invited this device, sign in here.";
+/// What it says once the operator's invitation met the enrollments.
+const INVITED: &str = "Invited: sign in.";
 
 fn short(bytes: &[u8]) -> String {
     hex::encode(&bytes[..bytes.len().min(8)])
 }
 
 impl Screens {
+    /// The carried session's line on the enrollment: none once it signed
+    /// in.
+    fn enrollment_line(&self) -> Option<&'static str> {
+        match (self.signed_in, self.held.awaits_invitation()) {
+            (true, _) => None,
+            (false, true) => Some(ENROLLED_WAITING),
+            (false, false) => Some(INVITED),
+        }
+    }
+
     fn failed(&mut self, output: EffectOutput) {
         self.status = match output {
             EffectOutput::HostService(Err(error)) => error.message,
-            EffectOutput::Facility(Err(error)) => format!("{}: {}", error.code, error.message),
+            // The facility's message is said to the user; its code is the
+            // facility's own.
+            EffectOutput::Facility(Err(error)) => format!("Not done: {}", error.message),
             _ => "an unexpected answer".into(),
         };
     }
@@ -242,9 +264,10 @@ impl App for Screens {
         page = match self.screen {
             // A device s4 carries here is enrolled here: a second
             // enrollment would only show its digests again, joined to this
-            // session. What it waits for is the operator, which this
-            // server cannot tell apart from a device already invited.
-            Screen::Enroll if self.carried => page.text(ENROLLED_WAITING),
+            // session. What it may wait for is the operator's invitation.
+            Screen::Enroll if self.carried => {
+                page.text(self.enrollment_line().unwrap_or("Enrolled and signed in."))
+            }
             Screen::Enroll => {
                 let page = page
                     .text("Enroll this device")
@@ -269,11 +292,9 @@ impl App for Screens {
                 let page = page
                     .text("Sign in with your device")
                     .button("Sign in with my device", Message::SignIn);
-                // Until this session signs in: after that the device is
-                // known invited.
-                match self.carried && !self.signed_in {
-                    true => page.text(ENROLLED_WAITING),
-                    false => page,
+                match self.enrollment_line().filter(|_| self.carried) {
+                    Some(line) => page.text(line),
+                    None => page,
                 }
             }
             Screen::Pay => {
@@ -381,6 +402,20 @@ impl App for Screens {
                 other => self.failed(other),
             },
             Message::Refreshed(_) => {}
+            Message::Look => {
+                let waiting = self.held.awaits_invitation();
+                if waiting == self.waiting {
+                    cx.skip_redraw();
+                }
+                self.waiting = waiting;
+            }
+        }
+    }
+
+    fn subscriptions(&self) -> Subscriptions<Message> {
+        match self.carried && !self.signed_in && self.waiting {
+            true => Subscriptions::new().timer("invitation", 1000, |_| Message::Look),
+            false => Subscriptions::new(),
         }
     }
 }

@@ -57,6 +57,11 @@ impl Chrome for User {
     }
 }
 
+/// How the screens say the facility's `no-path` and `unclaimed` refusals:
+/// in the facility's words, its codes its own.
+const NO_PATH: &str = "still reading its space's tree";
+const UNCLAIMED: &str = "has not invited it yet";
+
 fn confirm(values: &[&str]) -> Answer {
     Answer::Confirmed {
         choice: 0,
@@ -226,6 +231,7 @@ impl Headless {
                 // The facility's dial plays Tor's part: the session is
                 // carried.
                 carried: true,
+                onion: String::new(),
             },
             session: None,
             user,
@@ -598,8 +604,8 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
                 at,
                 &[
                     "Signed in as",
-                    "no-path",
-                    "unclaimed",
+                    NO_PATH,
+                    UNCLAIMED,
                     "Not done",
                     "refused",
                     "failed",
@@ -611,7 +617,7 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
         }
         // The tree not read to its end, or read before the claim.
         assert!(
-            shown.contains("no-path") || shown.contains("unclaimed"),
+            shown.contains(NO_PATH) || shown.contains(UNCLAIMED),
             "{shown}"
         );
         user.answers.lock().unwrap().clear();
@@ -664,16 +670,10 @@ async fn the_session_after_the_enrollment_signs_in_once_invited() {
         let shown = phone
             .settle(
                 at,
-                &[
-                    "no-path",
-                    "unclaimed",
-                    "Signed in as",
-                    "Not done",
-                    "refused",
-                ],
+                &[NO_PATH, UNCLAIMED, "Signed in as", "Not done", "refused"],
             )
             .await;
-        if !shown.contains("no-path") {
+        if !shown.contains(NO_PATH) {
             break shown;
         }
         user.answers.lock().unwrap().clear();
@@ -694,6 +694,25 @@ async fn the_session_after_the_enrollment_signs_in_once_invited() {
         Some(0),
         "the account the invitation named, opened"
     );
+    // The page says so by itself, with no tap.
+    phone.settle(0, &["Invited: sign in"]).await;
+
+    // The form cancelled: said in words, no facility's code.
+    let cancelled = loop {
+        let at = phone.click("Sign in with my device").await;
+        let shown = phone
+            .settle(at, &[NO_PATH, UNCLAIMED, "Signed in as", "Not done"])
+            .await;
+        if !shown.contains(NO_PATH) && !shown.contains(UNCLAIMED) {
+            break shown;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    assert!(
+        cancelled.contains("Not done: you cancelled it on this device"),
+        "{cancelled}"
+    );
+    assert!(!cancelled.contains("vos.credential"), "{cancelled}");
 
     let signed = loop {
         user.will(confirm(&[]));
@@ -703,8 +722,8 @@ async fn the_session_after_the_enrollment_signs_in_once_invited() {
                 at,
                 &[
                     "Signed in as",
-                    "no-path",
-                    "unclaimed",
+                    NO_PATH,
+                    UNCLAIMED,
                     "Not done",
                     "refused",
                     "failed",
@@ -715,7 +734,7 @@ async fn the_session_after_the_enrollment_signs_in_once_invited() {
             break shown;
         }
         assert!(
-            shown.contains("no-path") || shown.contains("unclaimed"),
+            shown.contains(NO_PATH) || shown.contains(UNCLAIMED),
             "{shown}"
         );
         user.answers.lock().unwrap().clear();
@@ -792,8 +811,8 @@ async fn signs_in_at_once(phone: &mut Headless, user: &User) {
                 at,
                 &[
                     "Signed in as",
-                    "no-path",
-                    "unclaimed",
+                    NO_PATH,
+                    UNCLAIMED,
                     "Not done",
                     "refused",
                     "failed",
@@ -804,7 +823,7 @@ async fn signs_in_at_once(phone: &mut Headless, user: &User) {
             break;
         }
         // The tree not read to its end yet: never a device unclaimed.
-        assert!(shown.contains("no-path"), "{shown}");
+        assert!(shown.contains(NO_PATH), "{shown}");
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "the sign-in waited {:?} for a claim",
@@ -884,9 +903,8 @@ async fn an_invitation_while_the_digests_show_claims_the_device_once_done() {
     let facility = phone.facility.clone();
     phone.end().await;
     let mut phone = Headless::connect(onion, facility, Arc::clone(&user)).await;
-    phone
-        .settle(0, &["Waiting for the operator's invitation"])
-        .await;
+    // The invitation met the enrollment as it came: the demo says so.
+    phone.settle(0, &["Invited: sign in"]).await;
     signs_in_at_once(&mut phone, &user).await;
     // Said once both of the claim's writes are made.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
