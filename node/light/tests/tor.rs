@@ -200,6 +200,7 @@ fn config() -> Config {
         proven: Duration::from_secs(5),
         attempts: 3,
         again: Duration::from_millis(200),
+        agains: 2,
         idle: Duration::from_secs(60),
         spare_gap: Duration::from_millis(20),
         spare_idle: Duration::from_secs(60),
@@ -445,8 +446,8 @@ async fn a_failed_connection_is_retried_on_a_new_circuit() {
 }
 
 /// An onion service not yet published fails every attempt of a burst:
-/// once each did, one more is made after a pause, and goes through. Past
-/// that one the request fails; a burst that failed otherwise is not tried
+/// once each did, more are made after longer pauses, and go through. Past
+/// them the request fails; a burst that failed otherwise is not tried
 /// again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unpublished_onion_is_tried_once_more_after_a_pause() {
@@ -455,20 +456,23 @@ async fn an_unpublished_onion_is_tried_once_more_after_a_pause() {
     let client = client(&gateway, config);
     let a = space(1);
     client.set_space(a, Routes::onions(vec![gateway.onion(1)]));
-    gateway.fault(&[Fault::Unpublished; 3]);
+    gateway.fault(&[Fault::Unpublished; 4]);
     let started = std::time::Instant::now();
     client.request(a, Purpose::Fetch, &query()).await.unwrap();
-    assert!(started.elapsed() >= config.again);
-    assert_eq!(gateway.dials(), 4);
-    gateway.fault(&[Fault::Unpublished; 4]);
+    assert!(
+        started.elapsed() >= config.again * 3,
+        "pauses of 1 and 2 times `again`"
+    );
+    assert_eq!(gateway.dials(), 5);
+    gateway.fault(&[Fault::Unpublished; 5]);
     match client.request(a, Purpose::Fetch, &query()).await {
         Err(Error::Unreachable(why)) => assert!(why.contains("not found"), "{why}"),
         other => panic!("{other:?}"),
     }
-    assert_eq!(gateway.dials(), 8);
+    assert_eq!(gateway.dials(), 10);
     gateway.fault(&[Fault::Unpublished, Fault::Fail, Fault::Unpublished]);
     assert!(client.request(a, Purpose::Fetch, &query()).await.is_err());
-    assert_eq!(gateway.dials(), 11);
+    assert_eq!(gateway.dials(), 13);
 }
 
 /// A gateway presenting another host key than the pinned one is not

@@ -82,7 +82,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Refused(refused) => refused.fmt(f),
             Error::Dormant => f.write_str("Tor is dormant"),
-            Error::Unreachable(why) => write!(f, "the space's gateways do not answer: {why}"),
+            Error::Unreachable(why) => write!(f, "no gateway answered: {why}"),
             Error::Lost => f.write_str("the connection was lost"),
             Error::Malformed => f.write_str("not a node-API request"),
             Error::Local(why) => write!(f, "the descriptor: {why}"),
@@ -1062,14 +1062,14 @@ impl Client {
         // The first onion drawn for each connection, so no onion of a set of
         // two or four carries every connection of the device.
         let turn = rand_u64();
-        for attempt in 0..=attempts {
-            if attempt == attempts {
+        for attempt in 0..attempts + config.agains as u64 {
+            if attempt >= attempts {
                 // Every attempt found the service unpublished: once more,
-                // after a pause.
+                // after a longer pause each time.
                 if !unpublished {
                     break;
                 }
-                tokio::time::sleep(config.again).await;
+                tokio::time::sleep(config.again * (attempt - attempts + 1) as u32).await;
                 if self.is_dormant() {
                     return Err(Error::Dormant);
                 }
@@ -1129,12 +1129,12 @@ impl Client {
         // The first onion drawn for each connection, so no onion of a set of
         // two or four carries every connection of the device.
         let turn = rand_u64();
-        for attempt in 0..=attempts {
-            if attempt == attempts {
+        for attempt in 0..attempts + config.agains as u64 {
+            if attempt >= attempts {
                 if !unpublished {
                     break;
                 }
-                tokio::time::sleep(config.again).await;
+                tokio::time::sleep(config.again * (attempt - attempts + 1) as u32).await;
             }
             if self.is_dormant() {
                 return Err(Error::Dormant);

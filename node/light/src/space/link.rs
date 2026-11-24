@@ -449,6 +449,7 @@ impl<H: Host> Control for AgentLink<'_, H> {
                 Read::Log(from) => (method::LOG, from.encode(), None),
                 Read::Overview => (method::OVERVIEW, ().encode(), None),
                 Read::Devices => (method::DEVICES, ().encode(), None),
+                Read::Recovery => (method::RECOVERY, ().encode(), None),
                 Read::Since(scope, position) => {
                     (method::SINCE, (*scope, *position).encode(), Some(*scope))
                 }

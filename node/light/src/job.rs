@@ -143,6 +143,8 @@ pub enum Read {
     Overview,
     Devices,
     Since(vos_wire::personal::Scope, u64),
+    /// The recovery scope's view, which a restore's finish reads.
+    Recovery,
 }
 
 /// A connection to the personal agent with what a pass reads and posts
@@ -181,6 +183,8 @@ pub enum Notice {
         index: u64,
         by: Signer,
         kind: Kind,
+        /// The device it removes or replaces the admin key of, if one.
+        target: Option<DeviceId>,
         matures: u64,
         contested: bool,
         at: Option<u64>,
@@ -230,6 +234,14 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// The device `op` removes, or replaces the admin key of.
+    pub fn target(op: &Op) -> Option<DeviceId> {
+        match op {
+            Op::Remove(device) | Op::Replace { device, .. } => Some(*device),
+            _ => None,
+        }
+    }
+
     pub fn of(op: &Op) -> Self {
         match op {
             Op::Add(_) => Kind::Add,
@@ -297,6 +309,7 @@ impl Pass {
                 index: open.index,
                 by: open.by,
                 kind: Kind::of(&open.op),
+                target: Kind::target(&open.op),
                 matures: open.matures,
                 contested: open.contested,
                 cannot_resolve: open.cannot_resolve,

@@ -18,6 +18,7 @@ use super::{
     entered_kit, failed, logged, new_kit, secret,
 };
 use crate::group::{Agent as GroupAgent, DeviceGroup, Restored};
+use crate::job::{Control as _, Read};
 use crate::personal::{Link as _, recover};
 use crate::route::Purpose;
 
@@ -249,6 +250,15 @@ impl<H: Host> Personal<H> {
             // wakes before it used.
             let mut link = self.link(&kept, Purpose::Personal, agent, &key, &mut held.sync);
             answered(link.settle())?;
+            // Every read below asked at once, one round trip over Tor in
+            // place of one each.
+            link.ahead(&[
+                Read::Recovery,
+                Read::Since(RECOVERY, 0),
+                Read::Overview,
+                Read::Devices,
+                Read::Log(0),
+            ]);
             let view: RecoveryView = answered(link.query(method::RECOVERY, ()))?;
             let mut envelopes = Vec::new();
             loop {
@@ -321,9 +331,9 @@ impl<H: Host> Personal<H> {
         held.group = Some(group);
         held.state.restoring = None;
         self.keep(&held.light, &held.state)?;
-        self.follow(&mut held)?;
         drop(held);
-        // Its first commit re-seals the kit under a new `R`.
+        // Its first commit re-seals the kit under a new `R`; the commit
+        // follows the log first, so no follow is made here before it.
         self.update(prompts)?;
         Ok(Claimed {
             agent: agent.0,

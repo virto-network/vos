@@ -72,6 +72,10 @@ pub struct Phone {
     pub decline_check: Mutex<bool>,
     /// How long the user takes to compare a pairing's check.
     pub comparing: Mutex<std::time::Duration>,
+    /// How long the user takes to write a new phrase down.
+    pub writing: Mutex<std::time::Duration>,
+    /// The next phrase shown is cancelled.
+    pub decline_phrase: Mutex<bool>,
     /// The admin keys made from now on are software keys, as a keystore
     /// with no Ed25519 in its TEE makes them.
     pub software: Mutex<bool>,
@@ -107,6 +111,8 @@ impl Phone {
             checks: Mutex::new(Vec::new()),
             decline_check: Mutex::new(false),
             comparing: Mutex::new(std::time::Duration::ZERO),
+            writing: Mutex::new(std::time::Duration::ZERO),
+            decline_phrase: Mutex::new(false),
             software: Mutex::new(false),
             dead: AtomicBool::new(false),
         }
@@ -249,7 +255,8 @@ impl Prompts for Phone {
         assert_eq!(words.split(' ').count(), 24, "a phrase's 24 words");
         self.phrases.lock().unwrap().push(words.to_owned());
         self.cards.lock().unwrap().push(card.clone());
-        !self.declines()
+        std::thread::sleep(*self.writing.lock().unwrap());
+        !std::mem::take(&mut *self.decline_phrase.lock().unwrap()) && !self.declines()
     }
 
     fn show_card(&self, card: &Card, void: Option<&str>) -> bool {

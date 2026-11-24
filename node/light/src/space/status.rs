@@ -41,6 +41,9 @@ pub struct Status {
     /// The kind of the kit the device set holds, as this device verified
     /// it: what a kit's call from this install enters.
     pub kit: Option<vos_wire::personal::KitKind>,
+    /// This device's admin key, once made, is a delayed admin's (not kept
+    /// in hardware): it opens no pairing.
+    pub delayed: bool,
 }
 
 impl<H: Host> Personal<H> {
@@ -84,6 +87,10 @@ pub(super) fn read(held: &Held) -> Result<Status, super::Error> {
             .as_ref()
             .and_then(|group| group.kit().first())
             .map(|key| key.kind),
+        delayed: held
+            .state
+            .admin
+            .is_some_and(|admin| admin.class() != vos_wire::personal::AdminClass::Strong),
     })
 }
 

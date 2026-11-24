@@ -1169,7 +1169,9 @@ impl SecurityKey for Touched<'_> {
 
 /// A new kit of `kind` for the home `kept`: a phrase shown once beside
 /// its card, or a security key's, its discoverable credential made at its
-/// prompt, then its card; `void`, why it replaces one shown before.
+/// prompt, then its card; `void`, why it replaces one shown before. Not
+/// written down ([`Error::KitNotWritten`]): the flow ends having changed
+/// nothing.
 fn new_kit(
     prompts: &dyn Prompts,
     kind: KitKind,
@@ -1181,7 +1183,7 @@ fn new_kit(
             let secret = KitSecret::phrase().ok_or_else(|| failed("no randomness"))?;
             let words = secret.words().ok_or_else(|| failed("a phrase has words"))?;
             if !prompts.show_phrase(&words, &kept.card(), void) {
-                return Err(Error::Declined);
+                return Err(Error::KitNotWritten);
             }
             Ok(secret)
         }
@@ -1189,7 +1191,7 @@ fn new_kit(
             let id = prompts.create_kit_key()?;
             let secret = KitSecret::security_key(&mut Touched { prompts, id })?;
             if !prompts.show_card(&kept.card(), void) {
-                return Err(Error::Declined);
+                return Err(Error::KitNotWritten);
             }
             Ok(secret)
         }

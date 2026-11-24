@@ -57,6 +57,7 @@ impl<H: Host> Personal<H> {
                         index,
                         by: operation.by,
                         kind: Kind::of(&operation.op),
+                        target: Kind::target(&operation.op),
                         matures: operation.matures,
                         contested: operation.state == OpState::Contested,
                         at: Some(operation.at),

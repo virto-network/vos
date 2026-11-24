@@ -34,6 +34,9 @@ pub enum Error {
     Declined,
     /// The user cancelled the pairing.
     Cancelled,
+    /// The new kit was not written down (its phrase not checked back, its
+    /// card not confirmed): nothing changed, and what was shown is void.
+    KitNotWritten,
     /// Those are not the kit's 24 words.
     NotAKit,
     /// The kit opens no archive the agent holds.
@@ -147,6 +150,9 @@ impl std::fmt::Display for Error {
             ),
             Error::Declined => f.write_str("the user declined"),
             Error::Cancelled => f.write_str("the pairing was cancelled"),
+            Error::KitNotWritten => f.write_str(
+                "the new kit was not written down: nothing changed, and what was shown is void",
+            ),
             Error::NotAKit => f.write_str("those are not the kit's 24 words"),
             Error::WrongKit => f.write_str("the kit opens no archive the agent holds"),
             Error::NotAPairingCode => f.write_str("not a pairing code"),
