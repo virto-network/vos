@@ -80,14 +80,16 @@ final class DevicesScreen extends Screen {
   private void devices(LinearLayout into) {
     into.addView(heading("Devices"));
     long now = System.currentTimeMillis();
-    for (Device device : devices) {
+    String[] names = Words.names(devices);
+    for (int at = 0; at < devices.length; at++) {
+      Device device = devices[at];
       into.addView(
           text(
-              device.label
+              names[at]
                   + (device.me ? " (this phone)" : "")
                   + "\n"
                   + Words.standing(device.standing)
-                  + (device.removed ? ", its removal matured" : "")
+                  + (device.removed ? ", its removal matured" : removal(device, now))
                   + ", admin key "
                   + (device.strong ? "strong" : "weak")
                   + ", last call at your agent "
@@ -118,6 +120,18 @@ final class DevicesScreen extends Screen {
                     this::regroup)));
   }
 
+  /** An open removal of {@code device}, as its row says it; empty when none. */
+  private String removal(Device device, long now) {
+    for (Notice notice : open) {
+      if (notice.pending == Pending.REMOVE && notice.targeted && notice.target == device.id) {
+        return Words.tookEffect(notice, now)
+            ? ", removed: out once a commit carries it"
+            : ", being removed: it takes effect " + Words.when(notice.matures, now);
+      }
+    }
+    return "";
+  }
+
   private void operations(LinearLayout into) {
     into.addView(heading("Changes open"));
     if (open.length == 0) {
@@ -125,7 +139,11 @@ final class DevicesScreen extends Screen {
     }
     long now = System.currentTimeMillis();
     for (Notice notice : open) {
-      into.addView(text(Words.notice(notice) + Words.when(notice, now)));
+      into.addView(text(Words.notice(notice, devices) + Words.when(notice, now)));
+      if (Words.tookEffect(notice, now)) {
+        // Nothing vetoes or approves it now: only the commit is left, offered below.
+        continue;
+      }
       if (notice.contested && notice.kitOnly) {
         into.addView(
             text(
@@ -160,10 +178,20 @@ final class DevicesScreen extends Screen {
     into.addView(heading("Memberships to finish"));
     for (Membership membership : owed) {
       boolean enroll = membership.owed == Owed.ENROLL;
+      String space = Words.space(membership);
+      if (!enroll && !membership.enrolled) {
+        // Confirmed by this phone's own enrollment there, which it does not hold yet.
+        into.addView(
+            text(
+                "Confirm this phone in "
+                    + space
+                    + ": enroll this phone in that space first (from its gateway, as you"
+                    + " enrolled your other device), then confirm it here."));
+        into.addView(button("Give it up", v -> giveUp(membership)));
+        continue;
+      }
       into.addView(
-          text(
-              (enroll ? "Enroll your new device in space " : "Confirm this phone in space ")
-                  + Words.shortHex(membership.space)));
+          text((enroll ? "Enroll your new device in " : "Confirm this phone in ") + space));
       into.addView(
           buttons(
               button(
@@ -178,15 +206,16 @@ final class DevicesScreen extends Screen {
                                   ? Boolean.TRUE
                                   : null,
                           done -> reload())),
-              button(
-                  "Give it up",
-                  v ->
-                      app.run(
-                          "Giving it up…",
-                          (personal, prompts, refused) ->
-                              personal.dropEnrollment(membership, refused) ? Boolean.TRUE : null,
-                          done -> reload()))));
+              button("Give it up", v -> giveUp(membership))));
     }
+  }
+
+  private void giveUp(Membership membership) {
+    app.run(
+        "Giving it up…",
+        (personal, prompts, refused) ->
+            personal.dropEnrollment(membership, refused) ? Boolean.TRUE : null,
+        done -> reload());
   }
 
   private void keys(LinearLayout into) {
@@ -277,7 +306,12 @@ final class DevicesScreen extends Screen {
           int revoked = personal.revoke(device.id, prompts, refused);
           return refused.why == Why.NONE ? revoked : null;
         },
-        (Integer revoked) -> app.say("Revoked in " + revoked + " space(s)."));
+        (Integer revoked) ->
+            app.say(
+                revoked == 0
+                    ? device.label + " is in no other space your personal space records: nothing to"
+                        + " revoke."
+                    : "Revoked in " + revoked + " space(s)."));
   }
 
   private void veto(Notice notice) {

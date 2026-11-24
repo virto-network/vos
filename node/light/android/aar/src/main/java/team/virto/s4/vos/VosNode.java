@@ -35,6 +35,7 @@ import team.virto.vos.personal.Paired;
 import team.virto.vos.personal.PersonalStatus;
 import team.virto.vos.personal.Posted;
 import team.virto.vos.personal.Refused;
+import team.virto.vos.personal.Stage;
 import team.virto.vos.personal.Synced;
 
 /**
@@ -210,6 +211,9 @@ public final class VosNode {
    * IVosPrompts#stage}). A stage carries no secret and no value.
    */
   void stage(IVosPrompts prompts, byte stage) {
+    if (prompts instanceof Announced) {
+      ((Announced) prompts).mark(stageName(stage));
+    }
     IVosWatcher watching = watcher;
     if (watching == null) {
       return;
@@ -218,6 +222,32 @@ public final class VosNode {
       watching.stage(stage);
     } catch (RemoteException gone) {
       watcher = null;
+    }
+  }
+
+  /** A personal flow's stage, as the log names it. */
+  private static String stageName(byte stage) {
+    switch (stage) {
+      case Stage.REACHING:
+        return "reaching the home";
+      case Stage.PROVING:
+        return "proving";
+      case Stage.WRITING_KIT:
+        return "writing the kit";
+      case Stage.JOINING:
+        return "joining";
+      case Stage.SCANNED:
+        return "code scanned";
+      case Stage.CHECKED:
+        return "check confirmed";
+      case Stage.HANDING_OVER:
+        return "handing over";
+      case Stage.APPROVING:
+        return "approving";
+      case Stage.LEAVING:
+        return "leaving";
+      default:
+        return "stage " + stage;
     }
   }
 
@@ -465,7 +495,7 @@ public final class VosNode {
 
     @Override
     public Claimed claim(ClaimRequest request, IVosPrompts prompts, Refused refused) {
-      return nativeClaim(request, prompts, refused);
+      return flow("claim", prompts, refused, logged -> nativeClaim(request, logged, refused));
     }
 
     @Override
@@ -475,7 +505,7 @@ public final class VosNode {
 
     @Override
     public Paired pairAwait(IVosPrompts prompts, Refused refused) {
-      return nativePairAwait(prompts, refused);
+      return flow("pair await", prompts, refused, logged -> nativePairAwait(logged, refused));
     }
 
     @Override
@@ -485,7 +515,11 @@ public final class VosNode {
 
     @Override
     public Paired pairJoin(byte[] code, String label, IVosPrompts prompts, Refused refused) {
-      return nativePairJoin(code, label, prompts, refused);
+      return flow(
+          "pair join",
+          prompts,
+          refused,
+          logged -> nativePairJoin(code, label, logged, refused));
     }
 
     @Override
@@ -495,12 +529,20 @@ public final class VosNode {
 
     @Override
     public boolean enrollDevice(Membership membership, IVosPrompts prompts, Refused refused) {
-      return nativeEnrollDevice(membership, prompts, refused);
+      return flow(
+          "enroll device",
+          prompts,
+          refused,
+          logged -> nativeEnrollDevice(membership, logged, refused));
     }
 
     @Override
     public boolean confirmDevice(Membership membership, IVosPrompts prompts, Refused refused) {
-      return nativeConfirmDevice(membership, prompts, refused);
+      return flow(
+          "confirm device",
+          prompts,
+          refused,
+          logged -> nativeConfirmDevice(membership, logged, refused));
     }
 
     @Override
@@ -510,7 +552,7 @@ public final class VosNode {
 
     @Override
     public int revoke(long device, IVosPrompts prompts, Refused refused) {
-      return nativeRevoke(device, prompts, refused);
+      return flow("revoke", prompts, refused, logged -> nativeRevoke(device, logged, refused));
     }
 
     @Override
@@ -525,62 +567,78 @@ public final class VosNode {
 
     @Override
     public Posted remove(long device, IVosPrompts prompts, Refused refused) {
-      return nativeRemove(device, prompts, refused);
+      return flow("remove", prompts, refused, logged -> nativeRemove(device, logged, refused));
     }
 
     @Override
     public Posted veto(long index, IVosPrompts prompts, Refused refused) {
-      return nativeVeto(index, prompts, refused);
+      return flow("veto", prompts, refused, logged -> nativeVeto(index, logged, refused));
     }
 
     @Override
     public Posted cosign(long index, IVosPrompts prompts, Refused refused) {
-      return nativeCosign(index, prompts, refused);
+      return flow("cosign", prompts, refused, logged -> nativeCosign(index, logged, refused));
     }
 
     @Override
     public Posted resolve(long index, boolean upheld, IVosPrompts prompts, Refused refused) {
-      return nativeResolve(index, upheld, prompts, refused);
+      return flow(
+          "resolve",
+          prompts,
+          refused,
+          logged -> nativeResolve(index, upheld, logged, refused));
     }
 
     @Override
     public Posted rotateKit(byte kit, IVosPrompts prompts, Refused refused) {
-      return nativeRotateKit(kit, prompts, refused);
+      return flow("rotate kit", prompts, refused, logged -> nativeRotateKit(kit, logged, refused));
     }
 
     @Override
     public Posted replaceAdmin(byte kit, IVosPrompts prompts, Refused refused) {
-      return nativeReplaceAdmin(kit, prompts, refused);
+      return flow(
+          "replace admin",
+          prompts,
+          refused,
+          logged -> nativeReplaceAdmin(kit, logged, refused));
     }
 
     @Override
     public byte[] adminOffer(IVosPrompts prompts, Refused refused) {
-      return nativeAdminOffer(prompts, refused);
+      return flow("admin offer", prompts, refused, logged -> nativeAdminOffer(logged, refused));
     }
 
     @Override
     public Posted replaceAdminOf(byte[] code, IVosPrompts prompts, Refused refused) {
-      return nativeReplaceAdminOf(code, prompts, refused);
+      return flow(
+          "replace admin of",
+          prompts,
+          refused,
+          logged -> nativeReplaceAdminOf(code, logged, refused));
     }
 
     @Override
     public Posted regroup(IVosPrompts prompts, Refused refused) {
-      return nativeRegroup(prompts, refused);
+      return flow("regroup", prompts, refused, logged -> nativeRegroup(logged, refused));
     }
 
     @Override
     public boolean update(IVosPrompts prompts, Refused refused) {
-      return nativeUpdate(prompts, refused);
+      return flow("update", prompts, refused, logged -> nativeUpdate(logged, refused));
     }
 
     @Override
     public boolean leave(IVosPrompts prompts, Refused refused) {
-      return nativeLeave(prompts, refused);
+      return flow("leave", prompts, refused, logged -> nativeLeave(logged, refused));
     }
 
     @Override
     public int commitRemovals(IVosPrompts prompts, Refused refused) {
-      return nativeCommitRemovals(prompts, refused);
+      return flow(
+          "commit removals",
+          prompts,
+          refused,
+          logged -> nativeCommitRemovals(logged, refused));
     }
 
     @Override
@@ -620,44 +678,68 @@ public final class VosNode {
 
     @Override
     public Posted restore(ClaimRequest request, byte old, IVosPrompts prompts, Refused refused) {
-      return nativeRestore(request, old, prompts, refused);
+      return flow(
+          "restore",
+          prompts,
+          refused,
+          logged -> nativeRestore(request, old, logged, refused));
     }
 
     @Override
     public KitView kitView(Home home, byte kit, IVosPrompts prompts, Refused refused) {
-      return nativeKitView(home, kit, prompts, refused);
+      return flow(
+          "kit view",
+          prompts,
+          refused,
+          logged -> nativeKitView(home, kit, logged, refused));
     }
 
     @Override
     public Posted removeByKit(
         Home home, byte kit, long device, IVosPrompts prompts, Refused refused) {
-      return nativeRemoveByKit(home, kit, device, prompts, refused);
+      return flow(
+          "remove by kit",
+          prompts,
+          refused,
+          logged -> nativeRemoveByKit(home, kit, device, logged, refused));
     }
 
     @Override
     public Posted resolveByKit(
         Home home, byte kit, long index, boolean upheld, IVosPrompts prompts, Refused refused) {
-      return nativeResolveByKit(home, kit, index, upheld, prompts, refused);
+      return flow(
+          "resolve by kit",
+          prompts,
+          refused,
+          logged -> nativeResolveByKit(home, kit, index, upheld, logged, refused));
     }
 
     @Override
     public Claimed restored(byte kit, IVosPrompts prompts, Refused refused) {
-      return nativeRestored(kit, prompts, refused);
+      return flow(
+          "restore finish",
+          prompts,
+          refused,
+          logged -> nativeRestored(kit, logged, refused));
     }
 
     @Override
     public Claimed moveHome(ClaimRequest request, IVosPrompts prompts, Refused refused) {
-      return nativeMoveHome(request, prompts, refused);
+      return flow(
+          "move home",
+          prompts,
+          refused,
+          logged -> nativeMoveHome(request, logged, refused));
     }
   }
 
   /**
    * The UI's prompts, saying when a key was used (the proof starts then, with nothing more asked of
-   * the UI), passing on the stages the operation reports, and logging each stage of a sign-in or a
-   * payment with the milliseconds since it was asked: the form shown and answered, the key asked
-   * and answered, proving, sending, then done. A late form is the reads before it; a gap from the
-   * form's answer to the key's ask is the node's time read. Nothing of the form's values or the
-   * key's output is logged.
+   * the UI), passing on the stages the operation reports, and logging each stage of a sign-in, a
+   * payment or a personal flow with the milliseconds since it was asked: the form shown and
+   * answered, each key asked and answered, the flow's stages (proving, sending, …), then done. A
+   * late form is the reads before it; a gap from the form's answer to the key's ask is the node's
+   * time read. Nothing of the form's values or the key's output is logged.
    */
   private static final class Announced extends IVosPrompts.Stub {
     private final IVosPrompts prompts;
@@ -701,7 +783,10 @@ public final class VosNode {
 
     @Override
     public KeyResult createKey(byte kind) throws RemoteException {
-      return prompts.createKey(kind);
+      mark("key made: asked");
+      KeyResult result = prompts.createKey(kind);
+      mark("key made: answered");
+      return result;
     }
 
     @Override
@@ -712,7 +797,10 @@ public final class VosNode {
 
     @Override
     public KeyResult signKey(byte kind, byte[] key, byte[] message) throws RemoteException {
-      return prompts.signKey(kind, key, message);
+      mark("key signs: asked");
+      KeyResult result = prompts.signKey(kind, key, message);
+      mark("key signs: answered");
+      return result;
     }
 
     @Override
@@ -729,6 +817,32 @@ public final class VosNode {
 
   private static Announced announced(IVosPrompts prompts, String what, Long granted) {
     return prompts == null ? null : new Announced(prompts, what, granted);
+  }
+
+  /** A personal flow's call of the library, given the prompts it is lent. */
+  private interface Flow<T> {
+    T call(IVosPrompts prompts);
+  }
+
+  /**
+   * A personal flow, logged as a sign-in is: started, each form, key and stage with its time, then
+   * done or refused (its kind and detail, no secret in either).
+   */
+  private static <T> T flow(String what, IVosPrompts prompts, Refused refused, Flow<T> flow) {
+    Announced announced = announced(prompts, what, null);
+    T result = flow.call(announced);
+    Log.i(
+        TAG,
+        (refused.why == 0
+                ? what + " done"
+                : what
+                    + " refused: "
+                    + refused.why
+                    + (refused.detail == null || refused.detail.isEmpty()
+                        ? ""
+                        : " (" + refused.detail + ")"))
+            + Announced.at(announced));
+    return result;
   }
 
   private static native boolean nativeOpen(

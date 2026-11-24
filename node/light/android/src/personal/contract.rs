@@ -327,6 +327,16 @@ byte_enum! {
         DelayedAdmin = 49 as DELAYED_ADMIN,
         /// The other device declined the pairing.
         PairingDeclined = 50 as PAIRING_DECLINED,
+        /// The new kit was not written down: nothing changed, and what was
+        /// shown of it is void.
+        KitNotWritten = 51 as KIT_NOT_WRITTEN,
+        /// The restore screen's kit outlived its life from its entry while
+        /// the flow ran, which stopped at its next prompt: the kit is
+        /// entered again.
+        KitLapsed = 52 as KIT_LAPSED,
+        /// The restore screen closed, or the app went to the background,
+        /// while the flow ran, which stopped at its next prompt.
+        SittingClosed = 53 as SITTING_CLOSED,
     }
 }
 
@@ -356,7 +366,8 @@ parcel! {
     /// One thing the chrome raises: an operation's at its log `index`,
     /// taken at `at` (the agent's time, 0 when this pass did not read it)
     /// and maturing at `matures` unless vetoed, signed by device `by` or by
-    /// the kit (`by_kit`), `contested` by another (a contest this device
+    /// the kit (`by_kit`), naming device `target` (a removal's, an admin
+    /// key's replacement's: `targeted`), `contested` by another (a contest this device
     /// cannot resolve when `cannot_resolve`, the kit alone when `kit_only`); a
     /// restore stopped, at its log `index`; or an alarm of its kind,
     /// `index` its place (its log index, epoch, position or skew) and its
@@ -376,6 +387,8 @@ parcel! {
         pub remedy: Remedy => enum Remedy,
         pub cannot_resolve: bool => boolean,
         pub kit_only: bool => boolean,
+        pub target: u32 => long,
+        pub targeted: bool => boolean,
     }
 
     /// The personal space's state, read without a request: its phase (a
@@ -383,8 +396,10 @@ parcel! {
     /// agent and this device's id, Tor's state and why it is blocked, the
     /// memberships owed, the notices standing, what needs repair, the kind
     /// of kit a kit's call here enters (a restore's, else the device
-    /// set's; known when `kit_known`), and why the last personal pass
-    /// failed (empty when it did not), standing until a pass changes it.
+    /// set's; known when `kit_known`), why the last personal pass failed
+    /// (empty when it did not), standing until a pass changes it, and
+    /// whether this device's admin key, once made, is a delayed admin's
+    /// (not kept in hardware: it opens no pairing).
     #[derive(Clone, Debug, PartialEq, Eq, Default)]
     pub struct PersonalStatus {
         pub phase: Phase => enum Phase,
@@ -400,6 +415,7 @@ parcel! {
         pub kit: KitKind => enum KitKind,
         pub kit_known: bool => boolean,
         pub failed: String => String,
+        pub delayed: bool => boolean,
     }
 
     /// Why a personal operation was refused: its kind, a device it names
@@ -470,14 +486,19 @@ parcel! {
     }
 
     /// A membership in a space other than the home: the space, its handle,
-    /// its credential actor's agent and instance, and what is owed there.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    /// its credential actor's agent and instance, what is owed there, and,
+    /// once this device is enrolled there (`enrolled`), the space's name
+    /// as its gateway gave it at the enrollment (its application, else its
+    /// host): none before.
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Membership {
         pub space: [u8; 32] => byte[],
         pub handle: [u8; 32] => byte[],
         pub agent: u32 => long,
         pub instance: u32 => long,
         pub owed: Owed => enum Owed,
+        pub enrolled: bool => boolean,
+        pub name: String => String,
     }
 
     /// A device of the set, as the chrome lists it: its id and label,

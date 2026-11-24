@@ -30,6 +30,10 @@ final class RestoreScreen extends Screen {
   private KitView view;
   /** The home's code field, while this phone knows no home. */
   private HomeField homeField;
+  /** The screen drawn again once the restore's delay passed, so its finish is offered then. */
+  private final Runnable matured = this::redraw;
+  /** The view the redraw is posted on. */
+  private LinearLayout drawn;
 
   RestoreScreen(PersonalActivity app) {
     this(app, false);
@@ -69,7 +73,25 @@ final class RestoreScreen extends Screen {
 
   @Override
   void closed() {
+    unschedule();
     app.forgetKit();
+  }
+
+  @Override
+  void left() {
+    unschedule();
+  }
+
+  @Override
+  void resumed() {
+    // Back on the screen, it is drawn as the time is now.
+    redraw();
+  }
+
+  private void unschedule() {
+    if (drawn != null) {
+      drawn.removeCallbacks(matured);
+    }
   }
 
   /** The home this phone knows: its restore's, or its personal space's; null when none. */
@@ -104,6 +126,21 @@ final class RestoreScreen extends Screen {
     }
     if (!restoring()) {
       into.addView(heading("2. Open the restore"));
+      into.addView(
+          status.delayed
+              ? warning(
+                  "This phone's admin key is not kept in hardware: restored here, your personal"
+                      + " space can pair no new device from it. To pair your other devices, "
+                      + "restore on a phone whose admin key is kept in hardware.")
+              : text(
+                  "Restore on a phone that keeps its admin key in hardware (an Ed25519 key in "
+                      + "its secure hardware, Android 13 or later): one that does not pairs no "
+                      + "new device, and with no other device left none could."));
+      into.addView(
+          text(
+              "Opening the restore makes a new recovery kit for the restored space: its words are"
+                  + " shown once, and two of them asked back. It replaces your old kit once this"
+                  + " phone shows \"Restored\"."));
       into.addView(text("This phone's name"));
       into.addView(kept(field("Its name on your other devices", label, false), t -> label = t));
       into.addView(text("Your new kit, made for the restored space"));
@@ -129,6 +166,12 @@ final class RestoreScreen extends Screen {
       return;
     }
     into.addView(heading("2. Opened ✓"));
+    if (status.delayed) {
+      into.addView(
+          warning(
+              "This phone's admin key is not kept in hardware: once restored, it pairs no new "
+                  + "device. To pair your other devices, restore on a phone whose key is."));
+    }
     into.addView(
         text(
             "Keep your old kit until this phone shows \"Restored\": the new one restores nothing "
@@ -154,19 +197,25 @@ final class RestoreScreen extends Screen {
                   redraw();
                 })));
     long now = System.currentTimeMillis();
-    boolean matured = status.matures > 0 && status.matures <= now;
-    into.addView(heading("3. Wait for the kit's delay" + (matured ? " ✓" : "")));
-    if (!matured) {
+    boolean ripe = status.matures > 0 && status.matures <= now;
+    into.addView(heading("3. Wait for the kit's delay" + (ripe ? " ✓" : "")));
+    unschedule();
+    if (!ripe) {
       into.addView(
           text(
               status.matures > 0
-                  ? "It takes effect " + Words.until(status.matures, now) + ", unless one of "
-                      + "your devices answers that it is alive. Come back then."
+                  ? "It takes effect " + Words.when(status.matures, now) + ", unless one of "
+                      + "your devices answers that it is alive: then this screen offers to "
+                      + "finish it. Should a device stop it, finishing says so."
                   : "The home has not shown its delay yet: try finishing it; if it is too early, "
                       + "the home says so."));
+      if (status.matures > 0) {
+        drawn = into;
+        into.postDelayed(matured, status.matures - now + 1_000);
+      }
     }
     into.addView(heading("4. Finish it"));
-    if (matured || status.matures == 0) {
+    if (ripe || status.matures == 0) {
       into.addView(button("Finish the restore", v -> finish()));
     }
   }
@@ -239,7 +288,10 @@ final class RestoreScreen extends Screen {
       }
     }
     for (Notice notice : view.operations) {
-      into.addView(text(Words.notice(notice)));
+      into.addView(
+          text(
+              Words.notice(notice, view.devices)
+                  + Words.when(notice, System.currentTimeMillis())));
       if (notice.contested) {
         into.addView(
             buttons(
@@ -361,7 +413,8 @@ final class RestoreScreen extends Screen {
     byte kit = old;
     Home home = known();
     app.run(
-        "Reading your personal space back…",
+        "Reading your personal space back over Tor (several seconds), then your biometric is"
+            + " asked…",
         (personal, prompts, refused) -> personal.restored(kit, prompts, refused),
         (Claimed claimed) -> {
           app.home();

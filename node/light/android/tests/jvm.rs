@@ -57,6 +57,8 @@ fn every_type_crosses_its_parcelable_unchanged() {
                         remedy: Remedy::RePair,
                         cannot_resolve: true,
                         kit_only: true,
+                        target: u32::MAX,
+                        targeted: true,
                     })
                     .collect(),
                 seen: vec![Seen {
@@ -123,6 +125,8 @@ fn every_type_crosses_its_parcelable_unchanged() {
                     agent: 5,
                     instance: 9,
                     owed: *owed,
+                    enrolled: *owed == Owed::Enroll,
+                    name: "club.example".into(),
                 },
             );
         }
@@ -195,6 +199,7 @@ fn every_type_crosses_its_parcelable_unchanged() {
                     kit: KitKind::SecurityKey,
                     kit_known: true,
                     failed: "the agent's log: unreachable".into(),
+                    delayed: at % 2 == 1,
                 },
             );
         }
@@ -218,6 +223,8 @@ fn every_type_crosses_its_parcelable_unchanged() {
             agent: 5,
             instance: 9,
             owed: Owed::Enroll,
+            enrolled: false,
+            name: String::new(),
         }
         .to_java(env)
         .unwrap();

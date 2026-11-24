@@ -1958,7 +1958,13 @@ restore's times [World]: §6.3]:
   deadline: it holds its kit until it ends, each of its forms waiting ten
   minutes. A form shown before the ten minutes passed may
   still be answered after (each form waits ten minutes), and the flow then
-  ends at its next prompt. The words in the forms' rows and in the
+  ends at its next prompt, its refusal saying which deadline ended it
+  (`Why::KitLapsed`, `Why::SittingClosed`), never as the user's decline.
+  The restore's opening, which shows a new kit (minutes of writing), takes
+  the sitting's kit only with half its life left at least, else asks for
+  it again, and its new kit's form says the minutes left. A new kit not
+  written down (its phrase cancelled, its check declined) ends any flow
+  with `Why::KitNotWritten`: nothing changed, the words shown are void. The words in the forms' rows and in the
   answers are zeroized in `:vos` once handed over or read; the Java
   copies (the Binder parcels, the form's text in the UI) are the
   collector's to reclaim, not zeroized. So the kit's secret lives minutes in
@@ -3751,6 +3757,20 @@ its entry, 2026-11-22; to be refreshed at each tip that touches a flow]:
 
 The 0.5 s request and the 4 s connection dominate every row; the values
 are the summary `flow:` lines of each run.
+
+**The restore's finish** [measured, World (`node/light/android`'s test
+harness, homes in process) with every request delayed to a 300 ms round
+trip, x86 Intel Core Ultra 7 155H, 2026-11-24]: from "Finish the restore"
+to the admin key's first signature (the biometric) took 24.9 round trips
+(43 requests), the whole finish 38.5; on the phones (Pixel 1, Fairphone 6,
+a live onion) 10–20 s before the biometric and 5–10 s after. Asking the
+recovery view, its first page, the overview, the devices and the log at
+once (`Read::Recovery`, one round trip) and dropping the follow the commit
+makes again cut that to 17.8 round trips before the biometric (37
+requests), 32.3 in all. What is left is the commit's own wake, settle and
+follow before it signs, and the kit's wake before the sync key is
+admitted; the screen says that the reads take seconds before the
+biometric.
 
 ### 6.4 What it costs on the phone
 

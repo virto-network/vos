@@ -44,6 +44,10 @@ final class FormDialog implements VosPrompts.Forms {
   private final PersonalActivity activity;
   private final Set<CompletableFuture<Answer>> open = new HashSet<>();
   private final List<AlertDialog> shown = new ArrayList<>();
+  /** The forms this chrome closed itself (unanswered in time, the activity going), counted. */
+  private long closed;
+  /** Why the last of them was closed. */
+  private String closedWhy;
 
   FormDialog(PersonalActivity activity) {
     this.activity = activity;
@@ -60,6 +64,8 @@ final class FormDialog implements VosPrompts.Forms {
       return answer.get(ANSWER_MINUTES, TimeUnit.MINUTES);
     } catch (TimeoutException late) {
       activity.runOnUiThread(this::dismissShown);
+      closedItself(
+          "the form waited " + ANSWER_MINUTES + " minutes for you, so it was closed: try again");
       return declined();
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
@@ -77,10 +83,27 @@ final class FormDialog implements VosPrompts.Forms {
   void dismissAll() {
     synchronized (open) {
       for (CompletableFuture<Answer> answer : open) {
-        answer.complete(declined());
+        if (answer.complete(declined())) {
+          closedItself("the app went to the background while a form waited for you: try again");
+        }
       }
     }
     dismissShown();
+  }
+
+  private synchronized void closedItself(String why) {
+    closed++;
+    closedWhy = why;
+  }
+
+  /** How many forms this chrome closed itself so far: a mark for {@link #closedSince}. */
+  synchronized long closedMark() {
+    return closed;
+  }
+
+  /** Why a form was closed by this chrome since {@code mark}, not by the user; null if none. */
+  synchronized String closedSince(long mark) {
+    return closed == mark ? null : closedWhy;
   }
 
   private void dismissShown() {

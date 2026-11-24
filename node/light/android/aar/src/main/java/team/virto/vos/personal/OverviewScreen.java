@@ -159,10 +159,12 @@ final class OverviewScreen extends Screen {
     if (devices == null) {
       into.addView(text(unread == null ? "Reading your devices…" : "Not read: " + unread));
     } else {
-      for (Device device : devices) {
+      String[] names = Words.names(devices);
+      for (int at = 0; at < devices.length; at++) {
+        Device device = devices[at];
         into.addView(
             text(
-                device.label
+                names[at]
                     + (device.me ? " (this phone)" : "")
                     + ": "
                     + Words.standing(device.standing)
@@ -171,12 +173,17 @@ final class OverviewScreen extends Screen {
       }
     }
     if (status.owed > 0) {
-      into.addView(warning(status.owed + " membership(s) of your other spaces wait for you."));
+      into.addView(
+          warning(
+              "Memberships to finish: "
+                  + status.owed
+                  + " in your other space(s), to enroll or confirm there."));
+      into.addView(button("Finish them now", v -> app.open(new DevicesScreen(app))));
     }
     boolean owed = false;
     boolean removals = false;
     for (Notice notice : status.standing) {
-      into.addView(warning(Words.notice(notice)));
+      into.addView(warning(Words.notice(notice, devices)));
       owed |= notice.pending == Pending.COMMIT || notice.pending == Pending.RESEAL;
       removals |= notice.pending == Pending.COMMIT;
     }
@@ -188,13 +195,31 @@ final class OverviewScreen extends Screen {
               v -> commit(revoking)));
     }
     into.addView(button("Devices, changes and keys", v -> app.open(new DevicesScreen(app))));
-    into.addView(button("Pair a new device", v -> app.open(new PairScreen(app, true))));
+    if (status.delayed) {
+      // A delayed admin opens no pairing: said here, not after the tap.
+      into.addView(text(Words.delayedAdmin(strongOther())));
+    } else {
+      into.addView(button("Pair a new device", v -> app.open(new PairScreen(app, true))));
+    }
     into.addView(button("Sync now", v -> sync()));
     into.addView(button("Move home", v -> app.open(new MoveScreen(app))));
     into.addView(
         button(
             "Pair again after a move or a regroup (scan the code of a device there)",
             v -> app.open(new PairScreen(app, false))));
+  }
+
+  /** Whether another device of the set, not removed, keeps its admin key in hardware. */
+  private boolean strongOther() {
+    if (devices == null) {
+      return true;
+    }
+    for (Device device : devices) {
+      if (!device.me && !device.removed && device.strong) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** This phone left its personal space: the two ways back in. */

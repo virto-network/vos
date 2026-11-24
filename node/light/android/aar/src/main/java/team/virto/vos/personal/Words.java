@@ -57,13 +57,39 @@ public final class Words {
     if (notice.contested) {
       return ": it waits for a resolution";
     }
-    return notice.matures > 0 ? ", it takes effect " + until(notice.matures, now) : "";
+    if (tookEffect(notice, now)) {
+      return ": it took effect, and the next commit carries it";
+    }
+    return notice.matures > 0 ? ", it takes effect " + when(notice.matures, now) : "";
   }
 
   /** How long until {@code at}, against {@code now}. */
   public static String until(long at, long now) {
     long left = at - now;
     return left <= 0 ? "now" : "in " + span(left);
+  }
+
+  /**
+   * A delayed admin's pairing, said before it is tried: this phone pairs no device; {@code
+   * strongOther}, whether another device of the set can.
+   */
+  public static String delayedAdmin(boolean strongOther) {
+    return "This phone's admin key is not kept in hardware, so it cannot pair a new device: "
+        + (strongOther
+            ? "pair it from one of your other devices whose key is."
+            : "none of your devices can now. To pair one, restore your personal space with your"
+                + " recovery kit on a phone whose admin key is kept in hardware, then pair from"
+                + " it.");
+  }
+
+  /** The time of day of {@code at} (ms since the epoch), on this phone's clock: "16:26". */
+  public static String clock(long at) {
+    return String.format(java.util.Locale.ROOT, "%tR", at);
+  }
+
+  /** When {@code at} is, from {@code now}: "at 16:26 (in 4 min)", or "now". */
+  public static String when(long at, long now) {
+    return at <= now ? "now" : "at " + clock(at) + " (" + until(at, now) + ")";
   }
 
   private static String span(long ms) {
@@ -117,10 +143,94 @@ public final class Words {
     return pending(notice.pending) + signer(notice);
   }
 
+  /**
+   * What a notice is, its devices named as {@code devices} list them ("this phone", a label);
+   * {@link #notice(Notice)} when they are not read.
+   */
+  public static String notice(Notice notice, Device[] devices) {
+    if (devices == null || notice.pending > Pending.RESTORE) {
+      return notice(notice);
+    }
+    String what = pending(notice.pending);
+    if (notice.targeted && notice.pending == Pending.REMOVE) {
+      what = capital(named(notice.target, devices)) + " is being removed";
+    } else if (notice.targeted && notice.pending == Pending.REPLACE) {
+      String target = named(notice.target, devices);
+      what = capital(target) + (target.endsWith("s") ? "'" : "'s") + " admin key is being replaced";
+    }
+    if (notice.byKit) {
+      return what + signer(notice);
+    }
+    return what
+        + " (by "
+        + named(notice.by, devices)
+        + (notice.contested ? ", contested" : "")
+        + ")";
+  }
+
+  /**
+   * Each device's name as a list shows it: its label, told apart from another device's of the same
+   * label, a removed one as "an earlier" one, two live ones by their numbers.
+   */
+  public static String[] names(Device[] devices) {
+    String[] names = new String[devices.length];
+    for (int at = 0; at < devices.length; at++) {
+      Device device = devices[at];
+      boolean shared = false;
+      boolean sharedLive = false;
+      for (Device other : devices) {
+        if (other != device && other.label.equals(device.label)) {
+          shared = true;
+          sharedLive |= !other.removed;
+        }
+      }
+      if (!shared) {
+        names[at] = device.label;
+      } else if (device.removed && sharedLive) {
+        names[at] = "An earlier " + device.label + " (device " + device.id + ")";
+      } else {
+        names[at] = device.label + " (device " + device.id + ")";
+      }
+    }
+    return names;
+  }
+
+  /** A membership's space as the screens name it: its name, or its handle's first bytes. */
+  public static String space(Membership membership) {
+    return membership.name != null && !membership.name.isEmpty()
+        ? "the space " + membership.name
+        : "the space " + shortHex(membership.space);
+  }
+
+  /** Device {@code id} as the screens name it: "this phone", its label, or its number. */
+  public static String named(long id, Device[] devices) {
+    for (Device device : devices) {
+      if (device.id == id) {
+        return device.me ? "this phone" : device.label;
+      }
+    }
+    return "device " + id;
+  }
+
+  private static String capital(String text) {
+    return text.isEmpty() ? text : Character.toUpperCase(text.charAt(0)) + text.substring(1);
+  }
+
+  /**
+   * Whether {@code notice}, an operation open, took effect at {@code now}: a veto or an approval
+   * of it does nothing then, and the next commit carries it.
+   */
+  public static boolean tookEffect(Notice notice, long now) {
+    return notice.pending <= Pending.RESTORE
+        && !notice.contested
+        && notice.matures > 0
+        && notice.matures <= now;
+  }
+
   /** Who signed an operation's notice, and whether it is contested; nothing for other kinds. */
   public static String signer(Notice notice) {
     if (notice.byKit) {
-      return " (by the kit)";
+      return " (by the kit: if you did not sign it, veto it and rotate your kit)";
     }
     if (notice.pending <= Pending.RESTORE) {
       return " (by device " + notice.by + (notice.contested ? ", contested" : "") + ")";
@@ -148,7 +258,8 @@ public final class Words {
       case Alarm.CLOCK:
         return "This device's clock is " + at + " s off the agent's";
       case Alarm.KIT:
-        return "The recovery kit signed operation " + at + ": veto it, or rotate the kit";
+        return "Your recovery kit signed a change to your devices: if you did not, veto it and"
+            + " rotate your kit";
       case Alarm.ROLLBACK:
         return "The agent's log went back to " + at;
       case Alarm.VIEW:
@@ -394,6 +505,15 @@ public final class Words {
         return "the pairing's code expired";
       case Why.PAIRING_DECLINED:
         return "the pairing was declined on your other device";
+      case Why.KIT_NOT_WRITTEN:
+        return "the new kit was not written down and checked, so nothing changed: what it showed"
+            + " is void, and the next try shows a new one";
+      case Why.KIT_LAPSED:
+        return "the kit you entered is held ten minutes at most, and they ended before this was"
+            + " done, so it stopped: a new kit it showed is void; enter your kit again to go on";
+      case Why.SITTING_CLOSED:
+        return "the screen closed or the app went to the background before this was done, so it"
+            + " stopped: a new kit it showed is void";
       case Why.IN_SET_ALREADY:
         return "this phone is in that personal space already";
       case Why.NOT_IN_AGENT_SET:

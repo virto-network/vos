@@ -57,4 +57,7 @@ enum Why {
     FAILED = 48,
     DELAYED_ADMIN = 49,
     PAIRING_DECLINED = 50,
+    KIT_NOT_WRITTEN = 51,
+    KIT_LAPSED = 52,
+    SITTING_CLOSED = 53,
 }

@@ -45,7 +45,10 @@ public final class WordsTest {
     notice.contested = true;
     assertEquals("A device is being removed (by device 2, contested)", Words.notice(notice));
     notice.byKit = true;
-    assertEquals("A device is being removed (by the kit)", Words.notice(notice));
+    assertEquals(
+        "A device is being removed (by the kit: if you did not sign it, veto it and rotate your"
+            + " kit)",
+        Words.notice(notice));
     Notice alarm = new Notice();
     alarm.pending = Pending.ALARM;
     alarm.alarm = Alarm.CANNOT_FOLLOW;
@@ -93,5 +96,49 @@ public final class WordsTest {
     handle[0] = (byte) 0xab;
     handle[31] = (byte) 0xcd;
     assertEquals("ab000000…000000cd", Words.shortHex(handle));
+  }
+
+  private static Device device(long id, String label, boolean removed, boolean me) {
+    Device device = new Device();
+    device.id = id;
+    device.label = label;
+    device.removed = removed;
+    device.me = me;
+    return device;
+  }
+
+  @Test
+  public void devicesOfOneLabelAreToldApart() {
+    Device[] devices = {
+      device(0, "Fairphone 6", true, false),
+      device(1, "Pixel", false, false),
+      device(2, "Fairphone 6", false, true),
+    };
+    String[] names = Words.names(devices);
+    assertEquals("An earlier Fairphone 6 (device 0)", names[0]);
+    assertEquals("Pixel", names[1]);
+    assertEquals("Fairphone 6 (device 2)", names[2]);
+  }
+
+  @Test
+  public void aRemovalNamesThisPhoneAndSaysWhenItTookEffect() {
+    Device[] devices = {device(1, "Pixel", false, true), device(2, "Fairphone 6", false, false)};
+    Notice removal = new Notice();
+    removal.pending = Pending.REMOVE;
+    removal.by = 2;
+    removal.target = 1;
+    removal.targeted = true;
+    removal.matures = NOW - 1;
+    assertEquals(
+        "This phone is being removed (by Fairphone 6)", Words.notice(removal, devices));
+    assertTrue(Words.tookEffect(removal, NOW));
+    assertTrue(Words.when(removal, NOW).contains("took effect"));
+    removal.matures = NOW + 5 * 60_000;
+    assertFalse(Words.tookEffect(removal, NOW));
+  }
+
+  @Test
+  public void theKitsAlarmNamesNoOperationNumber() {
+    assertFalse(Words.alarm(Alarm.KIT, 14).contains("14"));
   }
 }

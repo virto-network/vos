@@ -110,7 +110,7 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
         .node
         .personal()
         .unwrap()
-        .enroll_device(&*first.hand, owed[0])
+        .enroll_device(&*first.hand, owed[0].clone())
         .unwrap();
     assert!(
         first
@@ -128,7 +128,7 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
         .node
         .personal()
         .unwrap()
-        .confirm_device(&*second.hand, confirming[0])
+        .confirm_device(&*second.hand, confirming[0].clone())
         .unwrap_err();
     assert_eq!(refused.why, Why::NotEnrolled, "{refused:?}");
     let theirs = second.enroll();
@@ -140,7 +140,7 @@ fn a_personal_space_is_claimed_paired_retired_and_moved() {
         .node
         .personal()
         .unwrap()
-        .confirm_device(&*second.hand, confirming[0])
+        .confirm_device(&*second.hand, confirming[0].clone())
         .unwrap();
     assert!(
         second
@@ -722,6 +722,77 @@ fn a_slow_flow_does_not_extend_the_kits_life() {
     assert_eq!(*fresh.hand.entered.lock().unwrap(), 2);
 }
 
+/// A restore opened with the sitting's kit whose life ends while the new
+/// phrase is written down ends saying so, not as a decline; a kit with
+/// less than half its life left is not taken for a restore's opening, but
+/// entered again; and the new phrase declined ends the restore saying
+/// nothing was opened.
+#[test]
+fn a_restore_cut_by_the_kits_life_says_so() {
+    let world = world();
+    let home = world.home(HOME, 2, 1);
+    let lost = phone(&world, 0x57);
+    lost.claim(&world, home, KitKind::Phrase, "lost phone");
+    let words = lost.hand.phrase();
+    lost.node.sync_personal().unwrap();
+    drop(lost);
+
+    let fresh = phone(&world, 0x58);
+    fresh.hand.will_enter(words);
+    let space = || fresh.node.space().unwrap();
+    let entered = || *fresh.hand.entered.lock().unwrap();
+    let restore = || {
+        fresh.node.personal().unwrap().restore(
+            &*fresh.hand,
+            Claim {
+                home: home_of(&world, home),
+                kit: KitKind::Phrase,
+                label: "new phone".into(),
+            },
+            KitKind::Phrase,
+        )
+    };
+    space().hold_kit();
+    let life = Duration::from_millis(4_000);
+    space().set_kit_life(life.as_millis() as u64);
+    fresh
+        .node
+        .personal()
+        .unwrap()
+        .kit_view(&*fresh.hand, home_of(&world, home), KitKind::Phrase)
+        .unwrap();
+    assert_eq!(entered(), 1);
+
+    // The new phrase written down past the kit's life: the check is not
+    // asked, and the flow says why it ended.
+    *fresh.hand.writing.lock().unwrap() = life;
+    let refused = restore().unwrap_err();
+    assert_eq!(refused.why, Why::KitLapsed, "{refused:?}");
+    assert_eq!(entered(), 1, "the sitting's kit taken");
+    assert_eq!(
+        fresh.node.status().unwrap().phase,
+        vos_facility::personal::Phase::None
+    );
+
+    // The new phrase cancelled: nothing opened, and said.
+    *fresh.hand.writing.lock().unwrap() = Duration::ZERO;
+    *fresh.hand.decline_phrase.lock().unwrap() = true;
+    let refused = restore().unwrap_err();
+    assert_eq!(refused.why, Why::KitNotWritten, "{refused:?}");
+    assert_eq!(entered(), 2, "the lapsed kit entered again");
+
+    // Held with less than half its life left: entered again for the
+    // opening, which ends opened.
+    std::thread::sleep(life / 2 + Duration::from_millis(200));
+    assert!(space().kit_held());
+    restore().unwrap();
+    assert_eq!(entered(), 3, "a kit near its life's end entered again");
+    assert_eq!(
+        fresh.node.status().unwrap().phase,
+        vos_facility::personal::Phase::Restoring
+    );
+}
+
 /// Three phones claimed and paired, past their probation and seasoning.
 fn three_phones(seed: u8) -> (Arc<World>, Held, Held, Held) {
     let world = world();
@@ -981,7 +1052,7 @@ fn a_space_enrolled_after_the_claim_is_offered_and_revoked() {
         .node
         .personal()
         .unwrap()
-        .enroll_device(&*first.hand, owed[0])
+        .enroll_device(&*first.hand, owed[0].clone())
         .unwrap();
     let theirs = second.enroll();
     assert!(in_club(&world, &theirs));
@@ -990,7 +1061,7 @@ fn a_space_enrolled_after_the_claim_is_offered_and_revoked() {
         .node
         .personal()
         .unwrap()
-        .confirm_device(&*second.hand, confirming[0])
+        .confirm_device(&*second.hand, confirming[0].clone())
         .unwrap();
 
     after(policy().probation_ms);

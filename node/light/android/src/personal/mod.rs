@@ -286,24 +286,47 @@ impl Sitting {
         }
     }
 
-    /// The phrase held, and when it was entered.
-    fn words(&self) -> Option<(Zeroizing<String>, Instant)> {
+    /// The kit's life, as the sitting holds it.
+    fn life(&self) -> Duration {
+        Duration::from_millis(self.lock().life_ms.unwrap_or(KIT_LIFE_MS))
+    }
+
+    /// The phrase held, and when it was entered; none when less than
+    /// `reserve` of its life is left.
+    fn words(&self, reserve: Duration) -> Option<(Zeroizing<String>, Instant)> {
         let holding = self.lock();
         match (&holding.kit, holding.entry) {
-            (Some(Entered::Words(words)), Some(entry)) => Some((words.clone(), entry)),
+            (Some(Entered::Words(words)), Some(entry)) if holding.lasts(entry, reserve) => {
+                Some((words.clone(), entry))
+            }
             _ => None,
         }
     }
 
-    /// The security key's output for `salt` held, and when it was entered.
-    fn touched(&self, salt: &[u8; 32]) -> Option<(Zeroizing<[u8; 32]>, Instant)> {
+    /// The security key's output for `salt` held, and when it was entered;
+    /// none when less than `reserve` of its life is left.
+    fn touched(
+        &self,
+        salt: &[u8; 32],
+        reserve: Duration,
+    ) -> Option<(Zeroizing<[u8; 32]>, Instant)> {
         let holding = self.lock();
         match (&holding.kit, holding.entry) {
-            (Some(Entered::Touched { salt: held, secret }), Some(entry)) if held == salt => {
+            (Some(Entered::Touched { salt: held, secret }), Some(entry))
+                if held == salt && holding.lasts(entry, reserve) =>
+            {
                 Some((secret.clone(), entry))
             }
             _ => None,
         }
+    }
+}
+
+impl Holding {
+    /// Whether a kit entered at `entry` has `reserve` of its life left.
+    fn lasts(&self, entry: Instant, reserve: Duration) -> bool {
+        let life = Duration::from_millis(self.life_ms.unwrap_or(KIT_LIFE_MS));
+        life.saturating_sub(entry.elapsed()) >= reserve
     }
 }
 
@@ -320,6 +343,12 @@ pub struct Asked<'a> {
     opened: u64,
     /// When the kit this flow took from the sitting was entered.
     taken: Mutex<Option<Instant>>,
+    /// The part of the kit's life a kit taken from the sitting has left,
+    /// at least, as a fraction of it: a flow that shows a new kit takes
+    /// the user minutes, which a kit near its end would cut short.
+    reserve: u32,
+    /// Why the sitting declined a prompt of this flow, once it did.
+    cut: Mutex<Option<Why>>,
 }
 
 impl<'a> Asked<'a> {
@@ -330,6 +359,8 @@ impl<'a> Asked<'a> {
             entered: Mutex::new(None),
             opened: 0,
             taken: Mutex::new(None),
+            reserve: 0,
+            cut: Mutex::new(None),
         }
     }
 
@@ -341,41 +372,89 @@ impl<'a> Asked<'a> {
         }
     }
 
-    /// Whether the flow's sitting ended under it (closed, or the app in the
-    /// background), or the kit it entered or took from the sitting outlived
-    /// its life from its entry: every further
+    /// As [`Asked::within`], a kit taken from the sitting having half its
+    /// life left at least: the restore's opening, which shows a new kit.
+    fn within_reserving(prompts: &'a dyn Prompts, sitting: &'a Sitting) -> Self {
+        Self {
+            reserve: 2,
+            ..Self::within(prompts, sitting)
+        }
+    }
+
+    /// The life a kit taken from the sitting has left, at least.
+    fn reserve(&self) -> Duration {
+        match (self.sitting, self.reserve) {
+            (Some(sitting), parts) if parts > 0 => sitting.life() / parts,
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// When the kit this flow holds outlives its life (the one it entered
+    /// or took from the sitting): none outside a sitting.
+    fn deadline(&self) -> Option<Instant> {
+        let life = self.sitting?.life();
+        let entered = crate::lock(&self.entered).as_ref().map(|(_, entry)| *entry);
+        let taken = *crate::lock(&self.taken);
+        entered
+            .into_iter()
+            .chain(taken)
+            .min()
+            .map(|entry| entry + life)
+    }
+
+    /// Why the flow's sitting ended under it, if it did: closed (the
+    /// screen, the app in the background), or the kit it entered or took
+    /// from the sitting outlived its life from its entry. Every further
     /// prompt is declined then, so the flow ends and drops the kit it holds
-    /// at the sitting's own deadlines.
-    fn ended(&self) -> bool {
-        let Some(sitting) = self.sitting else {
-            return false;
+    /// at the sitting's own deadlines; the first reason is kept for the
+    /// flow's refusal to say.
+    fn ended(&self) -> Option<Why> {
+        let sitting = self.sitting?;
+        let why = if sitting.lock().opened != self.opened {
+            Why::SittingClosed
+        } else if self.deadline().is_some_and(|at| Instant::now() >= at) {
+            Why::KitLapsed
+        } else {
+            return None;
         };
-        let (opened, life_ms) = {
-            let holding = sitting.lock();
-            (holding.opened, holding.life_ms.unwrap_or(KIT_LIFE_MS))
-        };
-        let life = Duration::from_millis(life_ms);
-        let outlived = crate::lock(&self.entered)
-            .as_ref()
-            .is_some_and(|(_, entry)| entry.elapsed() >= life)
-            || crate::lock(&self.taken).is_some_and(|entry| entry.elapsed() >= life);
-        opened != self.opened || outlived
+        Some(*crate::lock(&self.cut).get_or_insert(why))
     }
 
     /// `form` asked of the chrome, unless the flow's sitting ended.
     fn confirm(&self, form: Form) -> Answer {
-        if self.ended() {
+        if self.ended().is_some() {
             return Answer::Declined;
         }
-        self.prompts.confirm(form)
+        let answer = self.prompts.confirm(form);
+        // A form the sitting's end declined (the UI's stop) says that end.
+        if !matches!(answer, Answer::Confirmed { .. }) {
+            let _ = self.ended();
+        }
+        answer
     }
 
     /// A key's prompt, unless the flow's sitting ended.
     fn key(&self, ask: impl FnOnce(&dyn Prompts) -> KeyAnswer) -> KeyAnswer {
-        if self.ended() {
+        if self.ended().is_some() {
             return KeyAnswer::Declined;
         }
-        ask(self.prompts)
+        let answer = ask(self.prompts);
+        if matches!(answer, KeyAnswer::Declined) {
+            let _ = self.ended();
+        }
+        answer
+    }
+
+    /// The flow's error, as the refusal says it: a decline the sitting's
+    /// end made says that end.
+    fn refused(&self, error: Error) -> Refused {
+        match (error, *crate::lock(&self.cut)) {
+            (Error::Declined | Error::KitNotWritten, Some(why)) => Refused {
+                why,
+                ..Refused::default()
+            },
+            (error, _) => error.into(),
+        }
     }
 }
 
@@ -450,6 +529,22 @@ fn thirty_two(answer: KeyAnswer, what: &str) -> Result<Zeroizing<[u8; 32]>, Erro
 }
 
 impl Asked<'_> {
+    /// Within a sitting, the time left to the kit the flow holds, said
+    /// where a new kit is shown: the flow ends with it. Empty outside one.
+    fn within_life(&self) -> String {
+        let Some(left) = self
+            .deadline()
+            .map(|at| at.saturating_duration_since(Instant::now()))
+        else {
+            return String::new();
+        };
+        format!(
+            " Do it within {} min: the old kit you entered is held no longer, and nothing is \
+             opened without it.",
+            left.as_secs() / 60
+        )
+    }
+
     fn shown(&self, form: Form) -> bool {
         matches!(self.confirm(form), Answer::Confirmed { .. })
     }
@@ -528,10 +623,12 @@ impl space::Prompts for Asked<'_> {
                 .collect();
             let shown = self.shown(Form {
                 title: "Your recovery phrase".into(),
-                detail: "Write these 24 words down, in order, with the card below them, and keep \
-                         them apart from this phone. They restore your personal space at this \
-                         home if every device is lost; this is the only time they are shown."
-                    .into(),
+                detail: format!(
+                    "Write these 24 words down, in order, with the card below them, and keep \
+                     them apart from this phone. They restore your personal space at this home \
+                     if every device is lost; this is the only time they are shown.{}",
+                    self.within_life()
+                ),
                 rows,
                 fields: Vec::new(),
                 notice: notice.take(),
@@ -558,9 +655,11 @@ impl space::Prompts for Asked<'_> {
     fn show_card(&self, card: &Card, void: Option<&str>) -> bool {
         self.shown(Form {
             title: "Your recovery key's card".into(),
-            detail: "Write this card down and keep it with the security key: it names the home \
-                     a restore with the key goes to."
-                .into(),
+            detail: format!(
+                "Write this card down and keep it with the security key: it names the home a \
+                 restore with the key goes to.{}",
+                self.within_life()
+            ),
             rows: card_rows(card),
             fields: Vec::new(),
             notice: void.map(str::to_owned),
@@ -570,7 +669,8 @@ impl space::Prompts for Asked<'_> {
     }
 
     fn enter_phrase(&self) -> Option<Zeroizing<String>> {
-        if let Some((words, entry)) = self.sitting.and_then(Sitting::words) {
+        let reserve = self.reserve();
+        if let Some((words, entry)) = self.sitting.and_then(|sitting| sitting.words(reserve)) {
             *crate::lock(&self.taken) = Some(entry);
             return Some(words);
         }
@@ -683,7 +783,9 @@ impl space::Prompts for Asked<'_> {
     fn kit_secret(&self, id: &[u8], salt: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, Error> {
         let entered = id.is_empty() && self.sitting.is_some();
         if entered
-            && let Some((secret, entry)) = self.sitting.and_then(|sitting| sitting.touched(salt))
+            && let Some((secret, entry)) = self
+                .sitting
+                .and_then(|sitting| sitting.touched(salt, self.reserve()))
         {
             *crate::lock(&self.taken) = Some(entry);
             return Ok(secret);
@@ -746,6 +848,7 @@ impl From<Error> for Refused {
             Error::NeedsRepair(detail) => detailed(Why::NeedsRepair, detail),
             Error::Declined => why(Why::Declined),
             Error::Cancelled => why(Why::Cancelled),
+            Error::KitNotWritten => why(Why::KitNotWritten),
             Error::NotAKit => why(Why::NotAKit),
             Error::WrongKit => why(Why::WrongKit),
             Error::NotAPairingCode => why(Why::NotAPairingCode),
@@ -788,11 +891,26 @@ impl From<Error> for Refused {
                 Why::RegistrarRefused,
                 error.map(|error| format!("{error:?}")).unwrap_or_default(),
             ),
-            Error::Unreachable(detail) => detailed(Why::Unreachable, detail),
+            // Every flow's requests go to the home, but a membership's.
+            Error::Unreachable(detail) => {
+                detailed(Why::Unreachable, format!("your home: {detail}"))
+            }
             Error::Prove(detail) => detailed(Why::Prove, detail),
             Error::Store(detail) => detailed(Why::Store, detail),
             Error::Failed(detail) => detailed(Why::Failed, detail),
         }
+    }
+}
+
+/// A membership flow's error, its requests the other spaces'.
+fn elsewhere(error: Error) -> Refused {
+    match error {
+        Error::Unreachable(detail) => Refused {
+            why: Why::Unreachable,
+            detail: format!("that space: {detail}"),
+            ..Refused::default()
+        },
+        error => error.into(),
     }
 }
 
@@ -917,6 +1035,8 @@ impl From<space::Membership> for Membership {
                 space::Owed::Enroll => Owed::Enroll,
                 space::Owed::Confirm => Owed::Confirm,
             },
+            enrolled: false,
+            name: String::new(),
         }
     }
 }
@@ -998,11 +1118,10 @@ impl Space {
     /// the entry ended while the flow ran; its wipe timed from the entry.
     fn with_kit<T>(
         &self,
-        prompts: Lent<'_>,
+        asked: Asked<'_>,
         flow: impl FnOnce(&Asked<'_>) -> Result<T, Error>,
     ) -> Result<T, Refused> {
-        let opened = self.sitting.lock().opened;
-        let asked = Asked::within(prompts, &self.sitting);
+        let opened = asked.opened;
         let done = flow(&asked);
         let entered = crate::lock(&asked.entered).take();
         match &done {
@@ -1019,7 +1138,7 @@ impl Space {
                 }
             }
         }
-        Ok(done?)
+        done.map_err(|error| asked.refused(error))
     }
 
     pub fn grouped(&self) -> bool {
@@ -1068,6 +1187,7 @@ impl Space {
             owed: status.owed,
             kit,
             kit_known,
+            delayed: status.delayed,
             ..PersonalStatus::default()
         })
     }
@@ -1141,21 +1261,52 @@ impl Space {
             .into())
     }
 
+    /// The memberships owed, each named as this device's enrollment there
+    /// names its space, once it has one.
     pub fn memberships(&self) -> Result<Vec<Membership>, Refused> {
         let all = self.personal.memberships()?;
-        Ok(all.into_iter().map(Into::into).collect())
+        let enrollments = self
+            .personal
+            .host()
+            .facility
+            .inner()
+            .store
+            .all()
+            .map_err(|error| Refused {
+                why: Why::Store,
+                detail: error,
+                ..Refused::default()
+            })?;
+        Ok(all
+            .into_iter()
+            .map(|owed| {
+                let mut membership = Membership::from(owed);
+                if let Some(enrollment) = enrollments
+                    .iter()
+                    .find(|enrollment| enrollment.handle == membership.handle)
+                {
+                    membership.enrolled = true;
+                    membership.name = if enrollment.application.is_empty() {
+                        format!("{}:{}", enrollment.host, enrollment.port)
+                    } else {
+                        enrollment.application.clone()
+                    };
+                }
+                membership
+            })
+            .collect())
     }
 
     pub fn enroll_device(&self, prompts: Lent<'_>, owed: Membership) -> Result<(), Refused> {
-        Ok(self
-            .personal
-            .enroll_device(&Asked::new(prompts), owed.into())?)
+        self.personal
+            .enroll_device(&Asked::new(prompts), owed.into())
+            .map_err(elsewhere)
     }
 
     pub fn confirm_device(&self, prompts: Lent<'_>, owed: Membership) -> Result<(), Refused> {
-        Ok(self
-            .personal
-            .confirm_device(&Asked::new(prompts), owed.into())?)
+        self.personal
+            .confirm_device(&Asked::new(prompts), owed.into())
+            .map_err(elsewhere)
     }
 
     pub fn drop_enrollment(&self, owed: Membership) -> Result<(), Refused> {
@@ -1164,7 +1315,9 @@ impl Space {
 
     /// Each space's leaf of the removed `device` revoked.
     pub fn revoke(&self, prompts: Lent<'_>, device: u32) -> Result<u32, Refused> {
-        Ok(self.personal.revoke(&Asked::new(prompts), device)?)
+        self.personal
+            .revoke(&Asked::new(prompts), device)
+            .map_err(elsewhere)
     }
 
     pub fn devices(&self) -> Result<Vec<Device>, Refused> {
@@ -1179,7 +1332,7 @@ impl Space {
         kind: KitKind,
     ) -> Result<KitView, Refused> {
         let home = home.check()?;
-        let view = self.with_kit(prompts, |asked| {
+        let view = self.with_kit(Asked::within(prompts, &self.sitting), |asked| {
             self.personal.kit_view(asked, home.into(), kind.into())
         })?;
         Ok(KitView {
@@ -1200,7 +1353,7 @@ impl Space {
         device: u32,
     ) -> Result<Posted, Refused> {
         let home = home.check()?;
-        self.with_kit(prompts, |asked| {
+        self.with_kit(Asked::within(prompts, &self.sitting), |asked| {
             self.personal
                 .remove_by_kit(asked, home.into(), kind.into(), device)
         })
@@ -1216,7 +1369,7 @@ impl Space {
         upheld: bool,
     ) -> Result<Posted, Refused> {
         let home = home.check()?;
-        self.with_kit(prompts, |asked| {
+        self.with_kit(Asked::within(prompts, &self.sitting), |asked| {
             self.personal
                 .resolve_by_kit(asked, home.into(), kind.into(), index, upheld)
         })
@@ -1294,7 +1447,10 @@ impl Space {
         let carried = self.personal.update(&Asked::new(prompts))?;
         let mut revoked = 0;
         for device in carried {
-            revoked += self.personal.revoke(&Asked::new(prompts), device)?;
+            revoked += self
+                .personal
+                .revoke(&Asked::new(prompts), device)
+                .map_err(elsewhere)?;
         }
         Ok(revoked)
     }
@@ -1306,7 +1462,10 @@ impl Space {
         old: KitKind,
     ) -> Result<Posted, Refused> {
         let request = claim(request)?;
-        let posted = self.with_kit(prompts, |asked| {
+        // The kit taken from the sitting has half its life left, at
+        // least, for the new kit's words to be written down within it.
+        let asked = Asked::within_reserving(prompts, &self.sitting);
+        let posted = self.with_kit(asked, |asked| {
             self.personal.restore(asked, request, old.into())
         })?;
         // The finish enters the same kit: its kind is named to the screen,
@@ -1320,7 +1479,9 @@ impl Space {
     }
 
     pub fn restored(&self, prompts: Lent<'_>, kind: KitKind) -> Result<Claimed, Refused> {
-        let claimed = self.with_kit(prompts, |asked| self.personal.restored(asked, kind.into()))?;
+        let claimed = self.with_kit(Asked::within(prompts, &self.sitting), |asked| {
+            self.personal.restored(asked, kind.into())
+        })?;
         if let Ok(kept) = Kept::open(&self.directory) {
             let _ = kept.remove(RESTORE_KIT);
         }

@@ -156,10 +156,10 @@ final class PairScreen extends Screen {
     app.ask(
         "Paired",
         paired
-            + " Confirm it in your "
+            + " Memberships to finish: enroll it in your "
             + count
-            + " other space(s) now: it is enrolled there by this phone's proof. Later, from"
-            + " Devices, changes and keys.",
+            + " other space(s) now, by this phone's proof there; or later, from Devices, changes"
+            + " and keys.",
         "Now",
         () ->
             app.run(
@@ -227,9 +227,10 @@ final class PairScreen extends Screen {
           app.say(
               joined
                   + (paired.memberships > 0
-                      ? " Once your other phone enrolled it in your "
+                      ? " Memberships to finish: once your other phone enrolled it in your "
                           + paired.memberships
-                          + " other space(s), confirm it there from Devices, changes and keys."
+                          + " other space(s), enroll this phone in each from its gateway, then"
+                          + " confirm it from Devices, changes and keys."
                       : ""));
         },
         (personal, prompts, refused) -> {

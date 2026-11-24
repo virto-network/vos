@@ -395,6 +395,26 @@ impl Job {
         }
     }
 
+    /// The device holds its group, following it: a notice that it is out
+    /// of it (removed, stuck) applies no more; and once it `rejoined`
+    /// (paired again, restored, claimed), neither do the restores it
+    /// stopped nor the kit's operations it raised before.
+    pub fn following(&self, rejoined: bool) {
+        let _one = crate::lock(&self.running);
+        let Ok(mut state) = self.runs.read() else {
+            return;
+        };
+        let before = state.raised.len();
+        state.raised.retain(|raised| {
+            let notice = &raised.notice;
+            !matches!(notice.pending, Pending::Removed | Pending::Stuck)
+                && !(rejoined && (notice.pending == Pending::Restoring || kit_alarm(notice)))
+        });
+        if state.raised.len() != before {
+            let _ = self.runs.write(&state);
+        }
+    }
+
     /// The notices standing after the last pass.
     pub fn standing(&self) -> Result<Vec<Notice>, Refusal> {
         let state = self.runs.read().map_err(job_error)?;
@@ -532,16 +552,18 @@ impl Job {
 /// nothing.
 fn standing(before: Vec<Raised>, found: Option<Vec<Notice>>, now: u64) -> Vec<Raised> {
     let Some(found) = found else {
-        return before
-            .into_iter()
-            .map(|raised| Raised {
-                notice: Notice {
-                    fresh: false,
-                    ..raised.notice
-                },
-                ..raised
-            })
-            .collect();
+        return one_an_event(
+            before
+                .into_iter()
+                .map(|raised| Raised {
+                    notice: Notice {
+                        fresh: false,
+                        ..raised.notice
+                    },
+                    ..raised
+                })
+                .collect(),
+        );
     };
     let mut after: Vec<Raised> = found
         .into_iter()
@@ -588,7 +610,25 @@ fn standing(before: Vec<Raised>, found: Option<Vec<Notice>>, now: u64) -> Vec<Ra
         kept.drain(..kept.len() - STANDING);
     }
     after.append(&mut kept);
-    after
+    one_an_event(after)
+}
+
+/// One notice an event: the kit's alarm of an operation whose own notice
+/// stands (the operation open, signed by the kit; the restore this device
+/// stopped) says nothing more.
+fn one_an_event(mut raised: Vec<Raised>) -> Vec<Raised> {
+    let told: Vec<u64> = raised
+        .iter()
+        .filter(|one| one.notice.pending as u8 <= Pending::Restoring as u8)
+        .map(|one| one.notice.index)
+        .collect();
+    raised.retain(|one| !(kit_alarm(&one.notice) && told.contains(&one.notice.index)));
+    raised
+}
+
+/// Whether `notice` is the kit's alarm: the kit signed an operation.
+fn kit_alarm(notice: &Notice) -> bool {
+    notice.pending == Pending::Alarm && notice.alarm == crate::personal::contract::Alarm::Kit
 }
 
 /// A notice of the light node's pass, as the chrome raises it.
@@ -603,6 +643,7 @@ pub(crate) fn notice(raised: vos_light::job::Notice) -> Notice {
             index,
             by,
             kind,
+            target,
             matures,
             contested,
             at,
@@ -628,6 +669,8 @@ pub(crate) fn notice(raised: vos_light::job::Notice) -> Notice {
             contested,
             cannot_resolve,
             kit_only,
+            target: target.unwrap_or(0),
+            targeted: target.is_some(),
             ..Notice::default()
         },
         Found::Restore { index } => Notice {
@@ -725,11 +768,53 @@ mod tests {
             ..Notice::default()
         };
         let stood = standing(before.clone(), Some(vec![open]), 2);
-        assert_eq!(stood.len(), 3, "{stood:?}");
+        assert_eq!(stood.len(), 2, "{stood:?}");
+        assert!(
+            !stood.iter().any(|raised| kit_alarm(&raised.notice)),
+            "one notice an event: the kit's alarm goes with the restore's own"
+        );
         let gone = standing(before.clone(), Some(Vec::new()), 2);
         assert!(gone.is_empty(), "{gone:?}");
         let unreached = standing(before, None, 2);
-        assert_eq!(unreached.len(), 2, "a pass that reached nothing keeps them");
+        assert_eq!(
+            unreached.len(),
+            1,
+            "a pass that reached nothing keeps them, one an event"
+        );
+        // The kit's alarm of an operation with no notice of its own stands.
+        let alone = standing(Vec::new(), Some(vec![kit.clone()]), 2);
+        assert_eq!(alone.len(), 1);
+    }
+
+    /// Following its group, the device's notices of being out of it go;
+    /// back in it, so do the restores it stopped and the kit's alarms.
+    #[test]
+    fn notices_that_apply_no_more_go() {
+        let directory = tempfile::tempdir().unwrap();
+        let job = Job::new(directory.path());
+        let plain = |pending| Notice {
+            pending,
+            ..Notice::default()
+        };
+        let kit = Notice {
+            alarm: Kind::Kit,
+            index: 14,
+            ..plain(Pending::Alarm)
+        };
+        let all = vec![
+            raised(plain(Pending::Removed), 1),
+            raised(kit.clone(), 1),
+            raised(plain(Pending::Commit), 1),
+        ];
+        let mut state = job.runs.read().unwrap();
+        state.raised = all;
+        job.runs.write(&state).unwrap();
+        job.following(false);
+        let pending: Vec<Pending> = job.standing().unwrap().iter().map(|n| n.pending).collect();
+        assert_eq!(pending, [Pending::Alarm, Pending::Commit]);
+        job.following(true);
+        let pending: Vec<Pending> = job.standing().unwrap().iter().map(|n| n.pending).collect();
+        assert_eq!(pending, [Pending::Commit]);
     }
 
     /// A clock alarm of another skew stands in the place of the last one.

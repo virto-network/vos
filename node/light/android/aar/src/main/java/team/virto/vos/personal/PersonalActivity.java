@@ -454,6 +454,7 @@ public final class PersonalActivity extends Activity {
       boolean covered,
       Done<Refused> refusedThen) {
     VosPrompts prompts = new VosPrompts(keys, forms);
+    long formsClosed = forms.closedMark();
     busy.setLayoutParams(
         covered
             ? new FrameLayout.LayoutParams(
@@ -490,6 +491,13 @@ public final class PersonalActivity extends Activity {
             refused.detail = "the facility stopped: " + error.getMessage();
           } finally {
             prompts.release();
+          }
+          // A decline this chrome made itself (a form unanswered in time, the app going) is said:
+          // the user did not decline.
+          String closedWhy = forms.closedSince(formsClosed);
+          if (refused.why == Why.DECLINED && closedWhy != null) {
+            refused.why = Why.FAILED;
+            refused.detail = closedWhy;
           }
           T answered = refused.why != Why.NONE ? null : result;
           runOnUiThread(
