@@ -1,0 +1,16 @@
+[package]
+name = "vos-raft"
+description = "Raft consensus as a protocol core without I/O (no_std + alloc), with a deterministic simulator."
+keywords = ["raft", "consensus", "no-std", "distributed-systems", "vos"]
+categories = ["network-programming", "no-std"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dev-dependencies]
+# Property-based testing — random message sequences vs. Raft safety
+# invariants.
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
