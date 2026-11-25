@@ -95,19 +95,19 @@ pub struct Changes<H: Hasher> {
     /// Nodes held until their parents arrive.
     pub held: Vec<(Cid<H>, Vec<u8>)>,
     /// Held nodes released: applied, refused or dropped.
-    pub released: Vec<Cid<H>>,
+    pub released: BTreeSet<Cid<H>>,
     /// Nodes that became heads, each with its author and sequence number.
-    pub heads_added: Vec<(Cid<H>, Author, u64)>,
+    pub heads_added: BTreeMap<Cid<H>, (Author, u64)>,
     /// Heads the batch's nodes name, no longer heads.
-    pub heads_removed: Vec<Cid<H>>,
+    pub heads_removed: BTreeSet<Cid<H>>,
     /// Authors whose highest sequence number moved, with a node at it.
-    pub latest: Vec<(Author, u64, Cid<H>)>,
+    pub latest: BTreeMap<Author, (u64, Cid<H>)>,
     /// Equivocations found.
-    pub equivocations: Vec<(Author, u64)>,
+    pub equivocations: BTreeSet<(Author, u64)>,
     /// The cursor after the batch, when it moved.
     pub cursor: Option<u64>,
-    /// Local nodes to push.
-    pub outbox: Vec<(Author, u64, Cid<H>)>,
+    /// Local nodes to push, by author and sequence number.
+    pub outbox: BTreeMap<(Author, u64), Cid<H>>,
     /// Local nodes pushed, by author and sequence number.
     pub pushed: Vec<(Author, u64)>,
     /// Rows written (`Some`) or deleted (`None`).
@@ -119,13 +119,13 @@ impl<H: Hasher> Default for Changes<H> {
         Self {
             applied: Vec::new(),
             held: Vec::new(),
-            released: Vec::new(),
-            heads_added: Vec::new(),
-            heads_removed: Vec::new(),
-            latest: Vec::new(),
-            equivocations: Vec::new(),
+            released: BTreeSet::new(),
+            heads_added: BTreeMap::new(),
+            heads_removed: BTreeSet::new(),
+            latest: BTreeMap::new(),
+            equivocations: BTreeSet::new(),
             cursor: None,
-            outbox: Vec::new(),
+            outbox: BTreeMap::new(),
             pushed: Vec::new(),
             rows: BTreeMap::new(),
         }
@@ -257,19 +257,13 @@ impl<H: Hasher> Store<H> for MemStore<H> {
         for cid in changes.heads_removed {
             loaded.heads.remove(&cid);
         }
-        for (cid, author, seq) in changes.heads_added {
-            loaded.heads.insert(cid, (author, seq));
-        }
-        for (author, seq, cid) in changes.latest {
-            loaded.latest.insert(author, (seq, cid));
-        }
+        loaded.heads.extend(changes.heads_added);
+        loaded.latest.extend(changes.latest);
         loaded.equivocations.extend(changes.equivocations);
         if changes.cursor.is_some() {
             loaded.cursor = changes.cursor;
         }
-        for (author, seq, cid) in changes.outbox {
-            loaded.outbox.insert((author, seq), cid);
-        }
+        loaded.outbox.extend(changes.outbox);
         for pushed in changes.pushed {
             loaded.outbox.remove(&pushed);
         }
