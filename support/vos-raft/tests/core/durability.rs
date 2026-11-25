@@ -395,15 +395,17 @@ fn stale_append_entries_does_not_regress_follower_log() {
     assert_eq!(core.status().last_log_index, 3);
 }
 
-/// Eight entries weighing 300 bytes each by `weight`, committed through 8
-/// and applied through none, in a log whose compaction is due at 1,000
-/// bytes: a compaction is due by their weight, and the tail it keeps is
-/// bounded by it.
-fn compacted_by_weight(payload: Vec<u8>, weight: fn(&[u8]) -> u64) -> Core<u16> {
+/// Eight entries weighing 300 bytes each by `weight` (the default, the
+/// payload's length, when `None`), committed through 8 and applied through
+/// none, in a log whose compaction is due at 1,000 bytes: a compaction is
+/// due by their weight, and the tail it keeps is bounded by it.
+fn compacted_by_weight(payload: Vec<u8>, weight: Option<fn(&[u8]) -> u64>) -> Core<u16> {
     let mut cfg = config();
     cfg.compact_hysteresis = 1_000;
     cfg.compact_bytes = 1_000;
-    cfg.payload_weight = weight;
+    if let Some(weight) = weight {
+        cfg.payload_weight = weight;
+    }
     let entries = (1..=8)
         .map(|index| LogEntry::data(index, 1, payload.clone()))
         .collect();
@@ -436,7 +438,7 @@ fn compacted_by_weight(payload: Vec<u8>, weight: fn(&[u8]) -> u64) -> Core<u16> 
 /// entry costs 300 bytes as the cache counts it: 64 beyond its payload.
 #[test]
 fn large_entries_make_a_compaction_due_by_their_bytes() {
-    let core = compacted_by_weight(vec![0; 236], |payload| payload.len() as u64);
+    let core = compacted_by_weight(vec![0; 236], None);
     // The tail's entry count bounds it as well.
     assert_eq!(core.compaction_point(6, 1, 700), 5);
 }
@@ -446,9 +448,10 @@ fn large_entries_make_a_compaction_due_by_their_bytes() {
 /// stands for: 36 bytes standing for 200 more weigh 300 with the 64 beyond.
 #[test]
 fn a_hosts_payload_weight_counts_toward_compaction() {
-    compacted_by_weight(vec![2; 36], |payload| {
-        payload.len() as u64 + u64::from(payload[0]) * 100
-    });
+    compacted_by_weight(
+        vec![2; 36],
+        Some(|payload| payload.len() as u64 + u64::from(payload[0]) * 100),
+    );
 }
 
 /// A candidate asks for votes, and leads, only once its own term is
