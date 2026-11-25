@@ -693,12 +693,12 @@ pub struct Impersonation {
 }
 
 impl Impersonation {
-    /// `message` sent to node `to` as a request, on its stream.
+    /// `message` sent to node `to`, on its class and stream.
     pub fn send(&self, to: NodeNumber, message: &PeerMessage) {
         self.endpoint
             .send(
                 to,
-                Class::Requests,
+                vos_node::peer::class(message),
                 vos_node::peer::stream(message, vos_node::peer::LANES),
                 message.encode(),
             )

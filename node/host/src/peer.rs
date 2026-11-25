@@ -3,9 +3,14 @@
 //! reaches a group. A check needs no I/O; what fails one is dropped and
 //! counted.
 //!
-//! - **Any configured node may send.** A replica that has not yet seen a
-//!   change of its group's members still takes the new members' messages;
-//!   the core counts votes and acknowledgements only from members.
+//! - **Any configured node may send; a Raft message only from a node the
+//!   agent's placement admits** (its replicas, and those of the
+//!   configuration before while it is uncommitted), checked when it is
+//!   routed, as forwards and blob requests are. The placement, which the
+//!   directory spreads, names a change's new members before a replica that
+//!   lags it has seen the entry adding them, so it still takes their
+//!   messages; the core counts votes and acknowledgements only from
+//!   members, and takes nothing that would replace a committed entry.
 //! - **An append comes from the leader it names, a vote request from the
 //!   candidate it names.** The sender is the network's authenticated peer,
 //!   delivered directly: a relaying network would need the origin signed

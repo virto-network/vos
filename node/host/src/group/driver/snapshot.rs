@@ -387,9 +387,21 @@ impl Driver {
                     current: configuration.members,
                     joint_old: configuration.joint_old,
                 });
-        let switch =
+        // Not this replica's to switch to now (it no longer follows a
+        // leader, or the snapshot disagrees with what it committed): the
+        // leader sends another.
+        let Some(switch) =
             self.core
-                .snapshot_switch(install.index, install.snapshot_term, configuration.as_ref());
+                .snapshot_switch(install.index, install.snapshot_term, configuration.as_ref())
+        else {
+            tracing::warn!(
+                agent = self.shared.agent.0,
+                "a snapshot this replica may not switch to was dropped"
+            );
+            self.snapshots.install = Some(install);
+            self.abandon();
+            return true;
+        };
         let keeps_suffix = switch.truncate_after.is_none();
         let snapshot = self.inner.store.snapshot();
         let (old_epoch, before) = match snapshot
@@ -443,8 +455,7 @@ impl Driver {
             return true;
         }
         let index = install.index;
-        self.core
-            .snapshot_installed(index, install.snapshot_term, configuration);
+        self.core.snapshot_installed(switch);
         self.reports.switched(index, keeps_suffix);
         if keeps_suffix {
             self.last_index = self.last_index.max(index);

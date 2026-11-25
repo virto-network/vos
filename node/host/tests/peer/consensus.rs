@@ -1,5 +1,7 @@
 //! Arrivals through the checks to a real consensus core: a new member
-//! heard, and followed.
+//! heard, and followed. The node routes a Raft message only from a node the
+//! agent's placement admits, which names a change's new members before a
+//! replica that lags it has seen the entry adding them: node 4 here.
 
 use super::*;
 

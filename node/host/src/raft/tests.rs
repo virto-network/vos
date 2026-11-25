@@ -526,12 +526,12 @@ impl Group {
         let Some(core) = replica.core.as_mut() else {
             return;
         };
-        if core.role() != Role::Follower
-            || core.status().leader_hint != Some(from)
-            || index <= replica.applied
-        {
+        if core.status().leader_hint != Some(from) || index <= replica.applied {
             return;
         }
+        let Some(switch) = core.snapshot_switch(index, term, configuration.as_ref()) else {
+            return;
+        };
         let store = replica.store.as_ref().unwrap();
         let writer = replica.writer.as_ref().unwrap();
         let old = store.snapshot().epoch(AGENT).unwrap();
@@ -549,10 +549,9 @@ impl Group {
             rows,
         }]))
         .unwrap();
-        let switch = core.snapshot_switch(index, term, configuration.as_ref());
         smol::block_on(writer.commit(vec![switch_change(AGENT, epoch, index, term, &switch)]))
             .unwrap();
-        core.snapshot_installed(index, term, configuration);
+        core.snapshot_installed(switch);
         replica.applied = index;
         smol::block_on(writer.commit(vec![drop(old)])).unwrap();
         assert!(store.stale_epochs(AGENT).unwrap().is_empty());

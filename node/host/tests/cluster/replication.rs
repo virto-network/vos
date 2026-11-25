@@ -17,7 +17,7 @@ use vos_node::store::EntryKind;
 use vos_node::{CallError, Hooks, Node, Reply, Space};
 use vos_wire::batch::Batch;
 use vos_wire::ingress::{Call, Contact, NodeId, Response};
-use vos_wire::peer::{NodeNumber, PeerMessage};
+use vos_wire::peer::{NodeNumber, PeerMessage, Raft};
 
 use crate::common::{COUNTER, Cluster, WithholdBlobs, retired, wait_until};
 
@@ -110,6 +110,45 @@ fn an_agent_created_on_three_nodes_applies_alike_on_each() {
         pins.windows(2).all(|pair| pair[0] == pair[1]),
         "pins differ"
     );
+}
+
+/// A Raft message from a node of the space that replicates none of the
+/// agent never reaches its group: an append naming itself leader at a
+/// later term, which the leader's core would step down for, is dropped and
+/// counted, and the leader leads on at its term.
+#[test]
+fn a_raft_message_from_a_node_outside_the_placement_is_dropped() {
+    let mut cluster = Cluster::new(4);
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    let leader = cluster.leader(agent);
+    let term = cluster.node(leader).replica(agent).unwrap().term;
+    let dropped = |cluster: &Cluster| {
+        cluster
+            .node(leader)
+            .probes()
+            .dropped(PeerRefusal::NotAReplica)
+    };
+    let before = dropped(&cluster);
+    let stranger = cluster.impersonate(4);
+    stranger.send(
+        leader,
+        &PeerMessage::Raft {
+            agent,
+            message: Raft::Append {
+                term: term + 10,
+                leader: 4,
+                prev_index: 1 << 40,
+                prev_term: term + 9,
+                commit: 0,
+                round: 1,
+                entries: Vec::new(),
+            },
+        },
+    );
+    wait_until("the append is dropped", || dropped(&cluster) > before);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(cluster.node(leader).leads(agent));
+    assert_eq!(cluster.node(leader).replica(agent).unwrap().term, term);
 }
 
 /// A call forwarded to a replica as its leader at a term it does not lead

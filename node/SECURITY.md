@@ -24,6 +24,12 @@ holds is `node/light/SECURITY.md`'s, and what a verified proof proves is
   evidence keeps the proofs in the non-repudiation side store (not built).
   Likewise a replica forwards a verified call to the agent's leader with
   its origin alone, and the leader takes it as a replica's word.
+- **A group hears only its agent's placement.** A Raft message reaches an
+  agent's group only from a node the placement names (and, while it is
+  uncommitted, the configuration before), as forwards and blob requests
+  do. Inside the group Raft tolerates crashes, not lies: a replica of it
+  that lies can break the group's safety (`support/vos-raft/README.md`,
+  "Limits").
 - **A gateway holds no authority.** It translates
   `POST /agents/{agent}/credentialed` and `GET /time` onto the node API
   and runs none of the checks: every check is the node's, whoever relays
