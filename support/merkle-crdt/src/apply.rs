@@ -1,4 +1,4 @@
-use crate::{Author, Cid, Hasher, Store};
+use crate::{Author, Cid, Error, Hasher, Node, Store};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -86,12 +86,12 @@ impl<H: Hasher, O, F: FnMut(Event<'_, H, O>, &mut dyn Rows)> Apply<H, O> for F {
 /// Rows over a store under a batch's writes. A read the store fails is
 /// kept, and fails the batch; so does a write no store takes.
 pub(crate) struct Overlay<'a, H: Hasher, S: Store<H>> {
-    pub(crate) store: &'a S,
-    pub(crate) written: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    pub(crate) error: Option<S::Error>,
+    store: &'a S,
+    written: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    error: Option<S::Error>,
     /// Whether a write was past a store's limits.
-    pub(crate) unfit: bool,
-    pub(crate) hasher: PhantomData<H>,
+    unfit: bool,
+    hasher: PhantomData<H>,
 }
 
 impl<'a, H: Hasher, S: Store<H>> Overlay<'a, H, S> {
@@ -103,6 +103,40 @@ impl<'a, H: Hasher, S: Store<H>> Overlay<'a, H, S> {
             unfit: false,
             hasher: PhantomData,
         }
+    }
+
+    /// Apply `node` to `crdt` through these rows. The store's error comes
+    /// first, which the CRDT may have seen as a missing row, then a row no
+    /// store takes (whose write the CRDT may have read back as missing),
+    /// then the CRDT's.
+    pub(crate) fn apply<O, A: Apply<H, O>>(
+        &mut self,
+        crdt: &mut A,
+        cid: &Cid<H>,
+        node: &Node<H, O>,
+        equivocation: bool,
+    ) -> Result<(), Error<S::Error, A::Error>> {
+        let event = Event {
+            cid,
+            author: &node.payload.author,
+            seq: node.payload.seq,
+            parents: &node.parents,
+            ops: &node.payload.ops,
+            equivocation,
+        };
+        let result = crdt.apply(event, self);
+        if let Some(error) = self.error.take() {
+            return Err(Error::Store(error));
+        }
+        if self.unfit {
+            return Err(Error::Row);
+        }
+        result.map_err(Error::Apply)
+    }
+
+    /// The batch's writes.
+    pub(crate) fn into_written(self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        self.written
     }
 }
 
