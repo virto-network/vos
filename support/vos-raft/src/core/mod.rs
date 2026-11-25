@@ -57,217 +57,27 @@ use crate::config::{Config, NodeId};
 use crate::log_entry::LogEntry;
 use crate::log_view::LogView;
 use crate::message::Message;
-use crate::meta::{HardState, Meta};
 use crate::random::Random;
 use crate::role::Role;
 
 mod durability;
 mod election;
+mod host;
 mod membership;
 mod replication;
+mod types;
 
 pub use membership::ActiveConfigRecord;
+pub use types::{
+    Action, Answer, ChangeMembershipError, Load, ProposeError, ReadIndexError, Recovered,
+    SnapshotSwitch, Status, Write,
+};
 
 /// The most a message may raise a replica's term by: no correct group
 /// moves that far past one of its replicas, and a sender that names a term
 /// near the last there is can then burn the group's terms only this many
 /// at a time.
 const TERM_LEAP: u64 = 1 << 32;
-
-/// Why a proposal was not appended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ProposeError {
-    /// This replica is not the leader, or is handing leadership over.
-    NotLeader,
-    /// The replica's host stopped it (its store failed, or it shut down).
-    /// The core never returns it.
-    Stopped,
-}
-
-/// Why a read index was not granted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ReadIndexError {
-    NotLeader,
-    /// The leader stepped down before a quorum confirmed it.
-    LeaderStepped,
-    /// Too many reads are queued.
-    Backpressure,
-    /// The read's deadline passed first.
-    TimedOut,
-    /// The replica's host stopped it. The core never returns it.
-    Stopped,
-}
-
-/// Why a membership change was not started.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ChangeMembershipError {
-    NotLeader,
-    /// Another change is still in progress.
-    InProgress,
-    EmptyConfig,
-    /// A member is named twice: each counts once toward a quorum.
-    DuplicateMember,
-    /// The replica's host stopped it. The core never returns it.
-    Stopped,
-}
-
-/// One ordered write. A host applies it atomically: truncate, then append,
-/// then the meta and configuration rows.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Write<N: NodeId> {
-    pub seq: u64,
-    pub truncate_after: Option<u64>,
-    pub entries: Vec<LogEntry<N>>,
-    /// The term, vote and commit index; the snapshot pointer is the
-    /// host's, which only a compaction and a snapshot switch move.
-    pub meta: Option<HardState<N>>,
-    pub active_config: Option<ActiveConfigRecord<N>>,
-    /// Whether the write must be synced before it counts: entries, terms and
-    /// votes are; a commit-index move alone is not.
-    pub sync: bool,
-}
-
-/// A request for log entries the core's cache no longer holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Load {
-    pub from: u64,
-    pub to: u64,
-    /// The term the request was made in; older results are dropped.
-    pub term: u64,
-    /// The host may return a shorter prefix within this many bytes, but at
-    /// least one entry.
-    pub max_bytes: usize,
-}
-
-/// The answer to a request the host made with a token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Answer {
-    Propose {
-        token: u64,
-        result: Result<u64, ProposeError>,
-    },
-    ReadIndex {
-        token: u64,
-        result: Result<u64, ReadIndexError>,
-    },
-    ChangeMembership {
-        token: u64,
-        result: Result<u64, ChangeMembershipError>,
-    },
-}
-
-/// What the host must do next.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Action<N: NodeId> {
-    Write(Write<N>),
-    Send {
-        to: N,
-        message: Message<N>,
-    },
-    LoadEntries(Load),
-    /// Entries through `index` may be applied.
-    Committed {
-        index: u64,
-    },
-    /// Stream this replica's state, as of the snapshot through `index`, to
-    /// `to`, with the configuration it holds.
-    SendSnapshot {
-        to: N,
-        index: u64,
-        term: u64,
-        configuration: Option<ActiveConfigRecord<N>>,
-    },
-    /// The log may be compacted through `through`. `configuration` is the
-    /// one in effect there, when known, which the host keeps with the log's
-    /// start: a later truncation that removes every configuration entry
-    /// above it falls back to it.
-    CompactBound {
-        through: u64,
-        configuration: Option<ActiveConfigRecord<N>>,
-    },
-    Answer(Answer),
-    Changed {
-        term: u64,
-        role: Role,
-        leader: Option<N>,
-    },
-}
-
-/// The rows a host's snapshot switch writes in the same atomic batch as
-/// the state: drop the log after `truncate_after` (when the log disagrees
-/// at the snapshot's index), then the meta and the membership record.
-/// Only [`Core::snapshot_switch`] makes one, and
-/// [`Core::snapshot_installed`] takes it back once it is durable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotSwitch<N: NodeId> {
-    pub truncate_after: Option<u64>,
-    /// With the snapshot's last index and its term.
-    pub meta: Meta<N>,
-    pub active_config: ActiveConfigRecord<N>,
-    /// The configuration in effect at the snapshot's index, when known,
-    /// kept with the log's start.
-    pub log_start_config: Option<ActiveConfigRecord<N>>,
-    /// Whether `active_config` is the one the snapshot carried.
-    carried: bool,
-}
-
-/// What a replica recovers from its store.
-#[derive(Debug, Clone)]
-pub struct Recovered<N: NodeId> {
-    pub meta: Meta<N>,
-    /// The live log, from the snapshot boundary on.
-    pub entries: Vec<LogEntry<N>>,
-    pub active_config: Option<ActiveConfigRecord<N>>,
-    /// The configuration in effect at the log's start, if the host kept it.
-    pub log_start_config: Option<ActiveConfigRecord<N>>,
-    /// The highest applied index recovered.
-    pub applied: u64,
-    /// The last log position (index, term) a replica held before its host
-    /// wiped its log and state, keeping its term and vote: it votes only
-    /// for candidates whose log reaches it, and campaigns only once its
-    /// own log does, as if it still held that log. A host that wipes a
-    /// replica a change removed keeps it, so the replica, added again
-    /// empty, never votes for a removed one that never learned of its
-    /// removal, nor leads by a configuration older than one it held.
-    pub vote_floor: Option<(u64, u64)>,
-}
-
-impl<N: NodeId> Default for Recovered<N> {
-    fn default() -> Self {
-        Self {
-            meta: Meta::default(),
-            entries: Vec::new(),
-            active_config: None,
-            log_start_config: None,
-            applied: 0,
-            vote_floor: None,
-        }
-    }
-}
-
-/// A diagnostic view of a replica.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Status<N: NodeId> {
-    pub role: Role,
-    pub current_term: u64,
-    pub voted_for: Option<N>,
-    pub last_log_index: u64,
-    pub commit_index: u64,
-    pub snap_last_index: u64,
-    pub durable_index: u64,
-    pub members: Vec<N>,
-    pub joint_old: Option<Vec<N>>,
-    pub active_config_index: Option<u64>,
-    pub leader_hint: Option<N>,
-    /// Messages dropped since the replica started: what no correct peer
-    /// sends, and what it does not take from outside its configuration
-    /// (answers, and vote requests while it hears a leader).
-    pub refused: u64,
-}
 
 // ── Internal state ─────────────────────────────────────────
 
@@ -576,38 +386,6 @@ impl<N: NodeId> Core<N> {
         }
     }
 
-    /// Whether a tick at `now` would start a campaign, or a campaign's
-    /// next round: a member that does not lead, can write, holds the log it
-    /// held before any wipe, and whose election deadline is due.
-    pub fn campaign_due(&self, now: u64) -> bool {
-        self.role != Role::Leader
-            && now.max(self.now) >= self.election_deadline
-            && self.is_member()
-            && !self.writer_stalled
-            && !self.short_of_floor()
-            && self.term < u64::MAX
-    }
-
-    /// Put off a campaign due at `now` until `until`: a host that bounds
-    /// the campaigns its groups run at once defers the others, and starts
-    /// each again as one ends ([`Self::campaign_now`]).
-    pub fn defer_campaign(&mut self, now: u64, until: u64) {
-        self.now = self.now.max(now);
-        if self.role != Role::Leader {
-            self.election_deadline = until.max(self.now);
-        }
-    }
-
-    /// A campaign put off may start at `now`: its election deadline comes
-    /// due then, unless it heard a leader since within the election
-    /// timeout's lower end.
-    pub fn campaign_now(&mut self, now: u64) {
-        self.now = self.now.max(now);
-        if self.role != Role::Leader && !self.leader_heard_within(0) {
-            self.election_deadline = self.election_deadline.min(self.now);
-        }
-    }
-
     /// Whether it is campaigning: a pre-candidate or a candidate.
     pub fn campaigning(&self) -> bool {
         matches!(self.role, Role::PreCandidate | Role::Candidate)
@@ -890,132 +668,6 @@ impl<N: NodeId> Core<N> {
         }
         if stalled && self.role == Role::Leader {
             self.transfer_leadership(None);
-        }
-    }
-
-    /// Vouch for this replica's leader and members from the host's pair
-    /// heartbeats, at `now`: `listed(node, term)` says when `node` last
-    /// said it leads this group at `term`, `heard(node)` when `node` was
-    /// last heard at all, both on the core's clock.
-    ///
-    /// A follower whose leader listed the group at its term within the
-    /// election timeout's lower bound hears of it then. A leader counts each
-    /// member heard within check-quorum's window as heard from, while the
-    /// member answers it, and sends no idle heartbeats to those not heard.
-    pub fn vouch(
-        &mut self,
-        now: u64,
-        listed: impl Fn(N, u64) -> Option<u64>,
-        heard: impl Fn(N) -> Option<u64>,
-    ) {
-        self.now = self.now.max(now);
-        let (low, high) = self.cfg.election_timeout_ms;
-        if self.role == Role::Follower {
-            if let Some(leader) = self.seen_leader
-                && let Some(at) = listed(leader, self.term)
-                && at + low > self.now
-            {
-                self.heard_leader_at(at);
-            }
-            return;
-        }
-        let Some(leading) = self.leading.as_mut() else {
-            return;
-        };
-        let (me, now, last) = (self.cfg.me, self.now, self.log.last_index());
-        // A member owed entries counts only while it answers over
-        // Raft now and then: a leader whose frames go unanswered for
-        // three times the longer of an election timeout and an
-        // append's resend steps down, however alive the member's
-        // node is.
-        let patience = 3 * high.max(self.cfg.resend_timeout_ms);
-        let mut silent = BTreeSet::new();
-        for member in self.active.others(me) {
-            if heard(member).is_none_or(|at| at + high <= now) {
-                silent.insert(member);
-            } else if leading.peers.get(&member).is_some_and(|progress| {
-                progress.matched >= last || progress.answered + patience > now
-            }) {
-                leading.recent.insert(member);
-            }
-        }
-        // A host that hears too few to make a quorum may be the one
-        // gone deaf: its leader goes on sending, and lets
-        // check-quorum judge by the answers.
-        if !self
-            .active
-            .quorum_holds(|member| member == me || !silent.contains(&member))
-        {
-            silent.clear();
-        }
-        for (peer, progress) in &mut leading.peers {
-            progress.silent = silent.contains(peer);
-        }
-    }
-
-    /// Whether the core's only deadline is one the host's pair heartbeat
-    /// stands in for: a follower's election timer while its leader was
-    /// vouched for more than `margin` before its stickiness lapses, or an
-    /// idle leader's check-quorum while every member's node is heard and
-    /// holds every entry and the commit. The host may then stop ticking it
-    /// until a message comes, its leader stops listing the group at its
-    /// term, or a member's node falls silent, provided it notices either
-    /// within `margin`; it vouches before the tick it then gives
-    /// ([`Self::vouch`]).
-    pub fn quiescent(&self, margin: u64) -> bool {
-        if !self.reads.is_empty() || self.writer_stalled || !self.is_member() {
-            return false;
-        }
-        match self.role {
-            Role::Follower => {
-                self.seen_leader.is_some_and(|leader| leader != self.cfg.me)
-                    && self.leader_heard_within(margin)
-            }
-            Role::Leader => self.leading.as_ref().is_some_and(|leading| {
-                self.election_deadline == u64::MAX
-                    && leading.transfer.is_none()
-                    && leading.peers.values().all(|progress| {
-                        !progress.silent
-                            && progress.in_flight.is_none()
-                            && progress.snapshotting.is_none()
-                            && !progress.loading
-                    })
-            }),
-            Role::PreCandidate | Role::Candidate => false,
-        }
-    }
-
-    /// The host ticks a quiescent core again after a wait, at `now`: a
-    /// leader whose check-quorum came due meanwhile counts as heard only
-    /// the members heard since, which the host's vouch that follows adds,
-    /// not those heard before the wait.
-    pub fn resume(&mut self, now: u64) {
-        self.now = self.now.max(now);
-        if let Some(leading) = self.leading.as_mut()
-            && self.now >= leading.check_quorum_due
-        {
-            leading.recent.clear();
-        }
-    }
-
-    /// `node` came back (a new run of it, or heard again after a silence):
-    /// a leader no longer counts it as caught up, and sends it a heartbeat
-    /// at once, so a replica that restarted learns its leader and the
-    /// commit without waiting for its own deadline.
-    pub fn probe(&mut self, node: N) {
-        if node == self.cfg.me {
-            return;
-        }
-        let Some(leading) = self.leading.as_mut() else {
-            return;
-        };
-        if let Some(progress) = leading.peers.get_mut(&node) {
-            progress.acked_commit = 0;
-            progress.silent = false;
-        }
-        let round = leading.round;
-        if self.active.contains(node) {
-            self.heartbeat_to(node, round);
         }
     }
 
