@@ -145,7 +145,7 @@ skip = [
     { crate = "sha3@0.10.9", reason = "derive-deftly-macros 1.12, k12 0.3, tor-llcrypto 0.47 and 1 more take 0.10.9; ml-kem 0.3, russh 0.65 take 0.12.0." },
     { crate = "sha3@0.11.0", reason = "stwo 2.2 takes 0.11.0; ml-kem 0.3, russh 0.65 take 0.12.0." },
     { crate = "signature@2.2.0", reason = "ecdsa 0.16, ed25519 2.2, rsa 0.9 and 8 more take 2.2.0; ecdsa 0.17, ed25519 3.0, ed25519-dalek 3.0 and 2 more take 3.0.0." },
-    { crate = "spin@0.9.8", reason = "flume 0.12, heapless 0.7, lazy_static 1.5 take 0.9.8; mls-rs 0.57 takes 0.10.1." },
+    { crate = "spin@0.9.9", reason = "flume 0.12, heapless 0.7, lazy_static 1.5 take 0.9.9; mls-rs 0.57 takes 0.10.1." },
     { crate = "spki@0.7.3", reason = "ecdsa 0.16, pkcs1 0.7, pkcs8 0.10 and 1 more take 0.7.3; ecdsa 0.17, pkcs5 0.8, pkcs8 0.11 and 1 more take 0.8.1." },
     { crate = "strsim@0.10.0", reason = "darling_core 0.14 takes 0.10.0; clap_builder 4.6, darling_core 0.20, darling_core 0.24 take 0.11.1." },
     { crate = "syn@2.0.118", reason = "asn1-rs-derive 0.6, asn1-rs-impl 0.2, blanket 0.3 and 42 more take 2.0.118; async-trait 0.1, clap_derive 4.6, darling_core 0.24 and 12 more take 3.0.6." },
