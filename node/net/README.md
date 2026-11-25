@@ -63,24 +63,28 @@ What a sender can make a node spend, over QUIC (`quic::Config`):
   64 in all. A handshake has 10 s; one that fails keeps its place for 1 s,
   so a stranger's address costs the node at most 8 handshakes a second,
   and every stranger together 64, on the thread that carries the peers'
-  frames. A peer's own address is never crowded out by strangers.
+  frames. Strangers at other addresses never take a peer's own
+  address's places; a peer that dials from an address other than its
+  configured one competes with strangers for the 64.
 - **One inbound connection per key:** a newer one replaces the older.
   A peer removed from the table, or given another number, loses it at
   once.
 - **Frames being assembled:** each class's frames from one peer take
-  their bytes from a budget of 4 of that class's largest frames before
-  they are read; past it a stream waits unread.
-- **Frames waiting for the consumer:** each class's queue holds at most
-  4 of its largest frames' bytes (and 1,024 frames, 16 for Bulk), from
-  every peer; a frame counts until the consumer drops it.
-- **Protocol violations:** the first is logged; past 16 on one
+  their bytes from a budget of 4 of that class's largest frames (1 MiB
+  at least; a budget under its bound takes one frame more) before they
+  are read; past it a stream waits unread.
+- **Frames waiting for the consumer:** each class's queue holds, from
+  every peer, the bytes of 4 of its largest frames, counted the same
+  way (and 1,024 frames, 16 for Bulk); a frame counts until the consumer
+  drops it.
+- **Protocol violations:** the first is logged; at the 16th on one
   connection, it is closed.
 
 Limits that stay:
 
 - What quinn buffers for a peer's streams not being read is bounded by
   `quic::Config::streams` times a stream's window (1 MiB): 8 GiB at the
-  default of 8,192 streams. A finite connection window would bound it
+  default of 8,192 streams, 4 GiB at the 4,096 a VOS node sets. A finite connection window would bound it
   lower but would let unread streams of one class stall a peer's
   heartbeats; a node sets `streams` to what its traffic needs.
 - A peer's frames of one class share that class's queue with every other
@@ -88,6 +92,12 @@ Limits that stay:
 - A configured peer can still spend the node's thread on what it sends;
   vos-net bounds memory and handshakes, not a peer's well-formed traffic.
 - A frame queued before its peer was removed may still be read after.
+- Every sender's first datagram still costs the node a retry, and one
+  past its address's places a refusal, on the network's thread.
+- A stranger sharing a peer's address (behind one NAT, in one IPv6 /64)
+  shares that address's places.
+- Peers' connections do not migrate: a peer whose NAT binding changes
+  loses its inbound connection until it idles out, and redials.
 
 ## Tests
 
@@ -103,7 +113,7 @@ own).
 
 ## Users
 
-The node (`node/host`: `src/peer.rs`,
+Built for the VOS node (`node/host`: `src/peer.rs`,
 `src/liveness.rs`, `src/dispatch.rs`, `src/api/quic.rs`, `src/tls.rs`,
 `src/client/api.rs`), the HTTP front (`node/http/src/tls.rs`), the
 gateway (`node/gateway/src/upstream.rs`), the scale harness
