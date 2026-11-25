@@ -4,7 +4,7 @@
 
 use alloc::vec::Vec;
 
-use super::{ChangeMembershipError, Core, SnapshotSwitch};
+use super::{ChangeMembershipError, Core, Progress, SnapshotSwitch};
 use crate::config::NodeId;
 use crate::log_entry::{EntryKind, LogEntry};
 use crate::message::{AppendResult, Message};
@@ -119,21 +119,12 @@ impl<N: NodeId> Core<N> {
         };
         let active = &self.active;
         for member in active.others(me) {
-            leading.next_index.entry(member).or_insert(next);
-            leading.match_index.entry(member).or_insert(0);
-            leading.answered.entry(member).or_insert(now);
+            leading
+                .peers
+                .entry(member)
+                .or_insert_with(|| Progress::new(next, now));
         }
-        let tracked = |member: &N| active.contains(*member);
-        leading.next_index.retain(|member, _| tracked(member));
-        leading.match_index.retain(|member, _| tracked(member));
-        leading.in_flight.retain(|member, _| tracked(member));
-        leading.snapshotting.retain(|member, _| tracked(member));
-        leading.acked_round.retain(|member, _| tracked(member));
-        leading.answered.retain(|member, _| tracked(member));
-        leading.sent_commit.retain(|member, _| tracked(member));
-        leading.acked_commit.retain(|member, _| tracked(member));
-        leading.loading.retain(tracked);
-        leading.silent.retain(tracked);
+        leading.peers.retain(|member, _| active.contains(*member));
     }
 
     pub(super) fn start_membership_change(

@@ -279,33 +279,61 @@ struct Sending {
     deadline: u64,
 }
 
+/// What a leader tracks of one peer, a member of its configuration.
+#[derive(Debug, Clone)]
+struct Progress {
+    /// The next index to send it.
+    next: u64,
+    /// The highest index it is known to hold.
+    matched: u64,
+    /// One append in flight.
+    in_flight: Option<Sending>,
+    /// A snapshot on its way: no appends until it acknowledges it.
+    snapshotting: Option<Sending>,
+    /// Waiting for entries the cache had to load.
+    loading: bool,
+    /// The latest round it has answered at this term.
+    acked_round: u64,
+    /// The commit index it was last sent.
+    sent_commit: u64,
+    /// The highest commit index it answered an append carrying.
+    acked_commit: u64,
+    /// When it last sent a message at this term, or this leadership
+    /// began: a peer owed entries that stops answering answers for itself
+    /// at check-quorum, however alive its node.
+    answered: u64,
+    /// Its node the host has not heard lately ([`Core::vouch`]): an idle
+    /// leader sends it no heartbeats.
+    silent: bool,
+}
+
+impl Progress {
+    fn new(next: u64, now: u64) -> Self {
+        Self {
+            next,
+            matched: 0,
+            in_flight: None,
+            snapshotting: None,
+            loading: false,
+            acked_round: 0,
+            sent_commit: 0,
+            acked_commit: 0,
+            answered: now,
+            silent: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LeaderState<N: NodeId> {
-    next_index: BTreeMap<N, u64>,
-    match_index: BTreeMap<N, u64>,
-    /// One append in flight per peer.
-    in_flight: BTreeMap<N, Sending>,
-    /// Peers receiving a snapshot: no appends until they acknowledge it.
-    snapshotting: BTreeMap<N, Sending>,
-    /// Peers waiting for entries the cache had to load.
-    loading: BTreeSet<N>,
+    /// Each member other than this replica.
+    peers: BTreeMap<N, Progress>,
     /// Heartbeat rounds at this term, numbered from 1.
     round: u64,
-    /// The latest round each peer has answered at this term.
-    acked_round: BTreeMap<N, u64>,
-    /// The commit index each peer was last sent.
-    sent_commit: BTreeMap<N, u64>,
-    /// The highest commit index each peer answered an append carrying.
-    acked_commit: BTreeMap<N, u64>,
-    /// When each peer last sent a message at this term, or this
-    /// leadership began: a peer owed entries that stops answering answers
-    /// for itself at check-quorum, however alive its node.
-    answered: BTreeMap<N, u64>,
-    /// Peers heard from since the last check-quorum.
+    /// Members heard from since the last check-quorum, kept apart from
+    /// `peers`: a member removed and added again before the next
+    /// check-quorum still counts as heard.
     recent: BTreeSet<N>,
-    /// Members whose node the host has not heard lately
-    /// ([`Core::vouch`]): an idle leader sends them no heartbeats.
-    silent: BTreeSet<N>,
     /// A leadership transfer in progress, and when it gives up.
     transfer: Option<(N, u64)>,
     check_quorum_due: u64,
@@ -316,18 +344,9 @@ struct LeaderState<N: NodeId> {
 impl<N: NodeId> LeaderState<N> {
     fn new(check_quorum_due: u64, no_op: u64) -> Self {
         Self {
-            next_index: BTreeMap::new(),
-            match_index: BTreeMap::new(),
-            in_flight: BTreeMap::new(),
-            snapshotting: BTreeMap::new(),
-            loading: BTreeSet::new(),
+            peers: BTreeMap::new(),
             round: 0,
-            acked_round: BTreeMap::new(),
-            sent_commit: BTreeMap::new(),
-            acked_commit: BTreeMap::new(),
-            answered: BTreeMap::new(),
             recent: BTreeSet::new(),
-            silent: BTreeSet::new(),
             transfer: None,
             check_quorum_due,
             no_op,
@@ -336,12 +355,7 @@ impl<N: NodeId> LeaderState<N> {
 
     /// The highest index `peer` is known to hold.
     fn matched(&self, peer: N) -> u64 {
-        self.match_index.get(&peer).copied().unwrap_or(0)
-    }
-
-    /// The next index to send `peer`.
-    fn next(&self, peer: N) -> u64 {
-        self.next_index.get(&peer).copied().unwrap_or(1)
+        self.peers.get(&peer).map_or(0, |progress| progress.matched)
     }
 }
 
@@ -608,11 +622,10 @@ impl<N: NodeId> Core<N> {
             }
         }
         if let Some(leading) = &self.leading {
-            for in_flight in leading.in_flight.values() {
-                deadline = deadline.min(in_flight.deadline);
-            }
-            for snapshotting in leading.snapshotting.values() {
-                deadline = deadline.min(snapshotting.deadline);
+            for progress in leading.peers.values() {
+                for sending in progress.in_flight.iter().chain(&progress.snapshotting) {
+                    deadline = deadline.min(sending.deadline);
+                }
             }
             if let Some((_, at)) = leading.transfer {
                 deadline = deadline.min(at);
@@ -636,7 +649,9 @@ impl<N: NodeId> Core<N> {
             && self.active.contains(from)
         {
             leading.recent.insert(from);
-            leading.answered.insert(from, self.now);
+            if let Some(progress) = leading.peers.get_mut(&from) {
+                progress.answered = self.now;
+            }
         }
         match message {
             append @ Message::Append { .. } => self.on_append(from, append),
@@ -853,8 +868,10 @@ impl<N: NodeId> Core<N> {
 
     /// Streaming a snapshot to `to` failed; it goes back to probing.
     pub fn snapshot_failed(&mut self, to: N) {
-        if let Some(leading) = self.leading.as_mut() {
-            leading.snapshotting.remove(&to);
+        if let Some(leading) = self.leading.as_mut()
+            && let Some(progress) = leading.peers.get_mut(&to)
+        {
+            progress.snapshotting = None;
         }
     }
 
@@ -916,12 +933,9 @@ impl<N: NodeId> Core<N> {
         for member in self.active.others(me) {
             if heard(member).is_none_or(|at| at + high <= now) {
                 silent.insert(member);
-            } else if leading.matched(member) >= last
-                || leading
-                    .answered
-                    .get(&member)
-                    .is_some_and(|at| at + patience > now)
-            {
+            } else if leading.peers.get(&member).is_some_and(|progress| {
+                progress.matched >= last || progress.answered + patience > now
+            }) {
                 leading.recent.insert(member);
             }
         }
@@ -934,7 +948,9 @@ impl<N: NodeId> Core<N> {
         {
             silent.clear();
         }
-        leading.silent = silent;
+        for (peer, progress) in &mut leading.peers {
+            progress.silent = silent.contains(peer);
+        }
     }
 
     /// Whether the core's only deadline is one the host's pair heartbeat
@@ -957,11 +973,13 @@ impl<N: NodeId> Core<N> {
             }
             Role::Leader => self.leading.as_ref().is_some_and(|leading| {
                 self.election_deadline == u64::MAX
-                    && leading.silent.is_empty()
-                    && leading.in_flight.is_empty()
-                    && leading.snapshotting.is_empty()
-                    && leading.loading.is_empty()
                     && leading.transfer.is_none()
+                    && leading.peers.values().all(|progress| {
+                        !progress.silent
+                            && progress.in_flight.is_none()
+                            && progress.snapshotting.is_none()
+                            && !progress.loading
+                    })
             }),
             Role::PreCandidate | Role::Candidate => false,
         }
@@ -991,8 +1009,10 @@ impl<N: NodeId> Core<N> {
         let Some(leading) = self.leading.as_mut() else {
             return;
         };
-        leading.acked_commit.remove(&node);
-        leading.silent.remove(&node);
+        if let Some(progress) = leading.peers.get_mut(&node) {
+            progress.acked_commit = 0;
+            progress.silent = false;
+        }
         let round = leading.round;
         if self.active.contains(node) {
             self.heartbeat_to(node, round);
@@ -1036,7 +1056,8 @@ impl<N: NodeId> Core<N> {
     /// The highest index `peer` is known to hold, while this replica
     /// leads.
     pub fn match_index(&self, peer: N) -> Option<u64> {
-        self.leading.as_ref()?.match_index.get(&peer).copied()
+        let progress = self.leading.as_ref()?.peers.get(&peer)?;
+        Some(progress.matched)
     }
 
     pub fn status(&self) -> Status<N> {

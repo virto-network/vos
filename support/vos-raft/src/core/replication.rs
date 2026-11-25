@@ -2,7 +2,6 @@
 //! leader sending entries, heartbeats and commits, loading what its cache
 //! lacks, and advancing its commit and its reads.
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use super::{Action, Answer, Core, Load, PendingAck, PendingRead, ReadIndexError, Sending};
@@ -14,19 +13,6 @@ use crate::role::Role;
 /// Handovers a leader whose writer stays stalled attempts before it steps
 /// down.
 const STALLED_HANDOVERS: u32 = 3;
-
-/// Take the peers whose deadline in `slots` passed by `now`, in order.
-fn expired<N: NodeId>(slots: &mut BTreeMap<N, Sending>, now: u64) -> Vec<N> {
-    let mut expired = Vec::new();
-    slots.retain(|&peer, slot| {
-        let live = slot.deadline > now;
-        if !live {
-            expired.push(peer);
-        }
-        live
-    });
-    expired
-}
 
 impl<N: NodeId> Core<N> {
     /// An append from `from`; [`Self::receive`] passes no other message.
@@ -210,32 +196,29 @@ impl<N: NodeId> Core<N> {
         let Some(leading) = self.leading.as_mut() else {
             return;
         };
+        let sent = leading.round;
+        let Some(progress) = leading.peers.get_mut(&from) else {
+            return;
+        };
         // No answer is to a round not yet sent, or holds past this log.
-        let acked = leading.acked_round.entry(from).or_insert(0);
-        *acked = (*acked).max(round.min(leading.round));
+        progress.acked_round = progress.acked_round.max(round.min(sent));
         match result {
             AppendResult::Matched { matched } => {
                 let matched = matched.min(last);
-                let acked = leading.acked_commit.entry(from).or_insert(0);
-                *acked = (*acked).max(commit.min(matched));
-                if matched > leading.matched(from) {
-                    leading.match_index.insert(from, matched);
-                }
-                let next = leading.next_index.entry(from).or_insert(1);
-                *next = (*next).max(matched.saturating_add(1));
-                if leading
+                progress.acked_commit = progress.acked_commit.max(commit.min(matched));
+                progress.matched = progress.matched.max(matched);
+                progress.next = progress.next.max(matched.saturating_add(1));
+                if progress
                     .in_flight
-                    .get(&from)
                     .is_some_and(|in_flight| matched >= in_flight.last)
                 {
-                    leading.in_flight.remove(&from);
+                    progress.in_flight = None;
                 }
-                if leading
+                if progress
                     .snapshotting
-                    .get(&from)
                     .is_some_and(|snapshotting| matched >= snapshotting.last)
                 {
-                    leading.snapshotting.remove(&from);
+                    progress.snapshotting = None;
                 }
                 self.leader_progress();
                 self.replicate_to(from);
@@ -246,8 +229,8 @@ impl<N: NodeId> Core<N> {
                 conflict_term,
                 conflict_first,
             } => {
-                let next = leading.next(from);
-                let floor = leading.matched(from).saturating_add(1);
+                let next = progress.next;
+                let floor = progress.matched.saturating_add(1);
                 // Only a rejection of the current probe moves the probe,
                 // and is answered at once; one that cannot move it waits
                 // for the resend, so a follower that lost what it
@@ -265,8 +248,8 @@ impl<N: NodeId> Core<N> {
                     };
                     let moved = hint.min(rejected).max(floor).max(1);
                     if moved != next {
-                        leading.next_index.insert(from, moved);
-                        leading.in_flight.remove(&from);
+                        progress.next = moved;
+                        progress.in_flight = None;
                     }
                 }
                 self.try_resolve_reads();
@@ -320,12 +303,14 @@ impl<N: NodeId> Core<N> {
         if leading.transfer.is_some_and(|(target, _)| target == peer) {
             return false;
         }
-        leading.silent.contains(&peer)
-            || (leading.matched(peer) >= self.log.last_index()
-                && leading.acked_commit.get(&peer).copied().unwrap_or(0) >= self.commit
-                && !leading.in_flight.contains_key(&peer)
-                && !leading.snapshotting.contains_key(&peer)
-                && !leading.loading.contains(&peer))
+        leading.peers.get(&peer).is_some_and(|progress| {
+            progress.silent
+                || (progress.matched >= self.log.last_index()
+                    && progress.acked_commit >= self.commit
+                    && progress.in_flight.is_none()
+                    && progress.snapshotting.is_none()
+                    && !progress.loading)
+        })
     }
 
     pub(super) fn replicate_all(&mut self) {
@@ -343,25 +328,22 @@ impl<N: NodeId> Core<N> {
         }
         let (term, last) = (self.term, self.log.last_index());
         let (snap, snap_term) = (self.log.snap_index(), self.log.snap_term());
-        let Some(leading) = self.leading.as_mut() else {
+        let Some(progress) = self
+            .leading
+            .as_mut()
+            .and_then(|leading| leading.peers.get_mut(&peer))
+        else {
             return;
         };
-        if leading.in_flight.contains_key(&peer)
-            || leading.snapshotting.contains_key(&peer)
-            || leading.loading.contains(&peer)
-        {
+        if progress.in_flight.is_some() || progress.snapshotting.is_some() || progress.loading {
             return;
         }
-        let next = leading.next(peer);
+        let next = progress.next;
         if next <= snap && snap > 0 {
-            let deadline = self.now + self.cfg.snapshot_timeout_ms;
-            leading.snapshotting.insert(
-                peer,
-                Sending {
-                    last: snap,
-                    deadline,
-                },
-            );
+            progress.snapshotting = Some(Sending {
+                last: snap,
+                deadline: self.now + self.cfg.snapshot_timeout_ms,
+            });
             // The snapshot is at the log's start: its configuration is the
             // one in effect there, when known; never a guess.
             self.actions.push(Action::SendSnapshot {
@@ -394,7 +376,7 @@ impl<N: NodeId> Core<N> {
                         max_bytes: self.cfg.max_append_bytes,
                     }));
                 }
-                leading.loading.insert(peer);
+                progress.loading = true;
             }
         }
     }
@@ -409,11 +391,14 @@ impl<N: NodeId> Core<N> {
         let Some(leading) = self.leading.as_mut() else {
             return;
         };
-        if leading.in_flight.contains_key(&peer) || leading.snapshotting.contains_key(&peer) {
+        let round = leading.round;
+        let Some(progress) = leading.peers.get_mut(&peer) else {
+            return;
+        };
+        if progress.in_flight.is_some() || progress.snapshotting.is_some() {
             return;
         }
-        leading.in_flight.insert(peer, Sending { last, deadline });
-        let round = leading.round;
+        progress.in_flight = Some(Sending { last, deadline });
         self.append_to(peer, round, entries);
     }
 
@@ -423,8 +408,10 @@ impl<N: NodeId> Core<N> {
         let Some(leading) = self.leading.as_ref() else {
             return;
         };
-        let commit = self.commit.min(leading.matched(peer));
-        if commit <= leading.sent_commit.get(&peer).copied().unwrap_or(0) {
+        let Some(progress) = leading.peers.get(&peer) else {
+            return;
+        };
+        if self.commit.min(progress.matched) <= progress.sent_commit {
             return;
         }
         let round = leading.round;
@@ -439,16 +426,18 @@ impl<N: NodeId> Core<N> {
         let Some(leading) = self.leading.as_mut() else {
             return;
         };
+        let mut progress = leading.peers.get_mut(&peer);
+        let (next, matched) = progress
+            .as_ref()
+            .map_or((1, 0), |progress| (progress.next, progress.matched));
         let prev_index = match entries.first() {
             Some(first) => first.index - 1,
-            None => leading
-                .next(peer)
-                .saturating_sub(1)
-                .max(self.log.snap_index()),
+            None => next.saturating_sub(1).max(self.log.snap_index()),
         };
-        let commit = self.commit.min(leading.matched(peer));
-        let sent = leading.sent_commit.entry(peer).or_insert(0);
-        *sent = (*sent).max(commit);
+        let commit = self.commit.min(matched);
+        if let Some(progress) = progress.as_mut() {
+            progress.sent_commit = progress.sent_commit.max(commit);
+        }
         let message = Message::Append {
             term: self.term,
             leader: self.cfg.me,
@@ -472,7 +461,18 @@ impl<N: NodeId> Core<N> {
         let waiting: Vec<N> = self
             .leading
             .as_mut()
-            .map(|leading| core::mem::take(&mut leading.loading).into_iter().collect())
+            .map(|leading| {
+                let loading = leading
+                    .peers
+                    .iter_mut()
+                    .filter(|(_, progress)| progress.loading);
+                loading
+                    .map(|(&peer, progress)| {
+                        progress.loading = false;
+                        peer
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         // A load that is empty, or starts past its first index (the store
         // compacted in between), leaves its peers to their next answer, so
@@ -484,7 +484,8 @@ impl<N: NodeId> Core<N> {
             let next = self
                 .leading
                 .as_ref()
-                .and_then(|leading| leading.next_index.get(&peer).copied());
+                .and_then(|leading| leading.peers.get(&peer))
+                .map(|progress| progress.next);
             if next == Some(load.from) {
                 self.send_entries(peer, entries.clone());
             } else {
@@ -498,8 +499,24 @@ impl<N: NodeId> Core<N> {
         let Some(leading) = self.leading.as_mut() else {
             return;
         };
-        let resends = expired(&mut leading.in_flight, now);
-        let snapshots = expired(&mut leading.snapshotting, now);
+        // The peers whose append or snapshot timed out, in order.
+        let (mut resends, mut snapshots) = (Vec::new(), Vec::new());
+        for (&peer, progress) in &mut leading.peers {
+            if progress
+                .in_flight
+                .take_if(|sent| sent.deadline <= now)
+                .is_some()
+            {
+                resends.push(peer);
+            }
+            if progress
+                .snapshotting
+                .take_if(|sent| sent.deadline <= now)
+                .is_some()
+            {
+                snapshots.push(peer);
+            }
+        }
         // A transfer that did not finish in time is given up, and the
         // leader takes proposals again.
         let dropped = leading.transfer.take_if(|&mut (_, at)| at <= now).is_some();
@@ -592,12 +609,10 @@ impl<N: NodeId> Core<N> {
         let (me, now, solo) = (self.cfg.me, self.now, self.is_solo());
         let expired = |read: &PendingRead| read.deadline.is_some_and(|deadline| deadline <= now);
         let answered = |member, round| {
-            self.leading.as_ref().is_some_and(|leading| {
-                leading
-                    .acked_round
-                    .get(&member)
-                    .is_some_and(|&acked| acked >= round)
-            })
+            self.leading
+                .as_ref()
+                .and_then(|leading| leading.peers.get(&member))
+                .is_some_and(|progress| progress.acked_round >= round)
         };
         let done: Vec<PendingRead> = self
             .reads
