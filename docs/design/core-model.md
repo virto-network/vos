@@ -850,7 +850,7 @@ rule on a log, masking, a list type, and thin clients.
   - one store commit an ingest or a local operation: the nodes, the
     author index, the heads, the cursor and the CRDT's rows.
 
-  Full validation and rebuild remain only for recovery and audits. The
+  A full replay of a store's nodes is the tests' oracle, not the library's. The
   former full apply took 8.7 s to sync one operation onto a 1M-operation
   history; an incremental prototype took about 1.9 µs, 1.5–1.8× its cost
   at 1k (an LWW map on an in-memory store without signature checks)
