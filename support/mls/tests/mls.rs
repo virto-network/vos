@@ -585,17 +585,22 @@ fn count(member: &Member, prefix: &[u8]) -> usize {
 /// refused, and refused again after a reopen, writing nothing.
 #[test]
 fn a_welcome_naming_an_overlong_key_package_is_refused() {
+    use mls_rs::error::MlsError;
     let member = member(2);
     let before = rows(&member);
     for length in [60_000, 70_000] {
         let welcome = welcome_for(&vec![0x41; length]);
         assert!(matches!(
             member.mls.join(&welcome, T),
-            Err(Error::Refused(Refusal::Rejected(_)))
+            Err(Error::Refused(Refusal::Rejected(
+                MlsError::WelcomeKeyPackageNotFound
+            )))
         ));
         assert!(matches!(
             reopen(&member, 2).join(&welcome, T),
-            Err(Error::Refused(Refusal::Rejected(_)))
+            Err(Error::Refused(Refusal::Rejected(
+                MlsError::WelcomeKeyPackageNotFound
+            )))
         ));
     }
     assert_eq!(rows(&member), before);
@@ -942,7 +947,10 @@ fn a_member_of_a_credential_of_another_length_is_not_made() {
     let store = Store::new(db, keyspace);
     let namespace = Namespace::current(store.clone(), b"mls/".to_vec());
     for length in [0, 63, 65] {
-        assert!(Mls::open(namespace.clone(), &vec![1; length], BTreeMap::new()).is_err());
+        assert!(matches!(
+            Mls::open(namespace.clone(), &vec![1; length], BTreeMap::new()),
+            Err(Error::Credential)
+        ));
     }
     assert_eq!(store.keyspace().iter().count(), 0);
 }

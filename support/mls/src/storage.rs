@@ -14,7 +14,7 @@
 //! batch.
 //!
 //! **Every key is bounded before it reaches fjall**, which takes a key of
-//! 1 to 65,535 bytes and a value of up to 4 GiB and panics on any other: a
+//! 1 to 65,535 bytes and a value under 4 GiB and panics on any other: a
 //! read of a key it cannot hold finds no row, a batch holding one is an
 //! error and writes nothing, and a key package is looked up only by a
 //! reference of the suite's hash length.
@@ -165,7 +165,7 @@ impl Namespace {
     }
 
     /// Delete every row whose name starts with `name`, committed or
-    /// staged: staged, or a copy's.
+    /// staged: on the current namespace, staged for its next batch.
     pub(crate) fn delete_all(&self, name: &[u8]) -> Result<(), fjall::Error> {
         let prefix = self.key(name);
         let mut keys: Vec<Vec<u8>> = lock(&self.staged)
