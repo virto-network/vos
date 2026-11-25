@@ -9,7 +9,8 @@ use std::sync::{Arc, Weak};
 /// the network runs on it, quinn's included, so a connection's readers are
 /// polled in the order they were woken: the receiving side's turns rely
 /// on it, which async-executor does not promise (a test below shows it
-/// holds). A panic in a task ends the thread, and with it the network. Tasks reach it by a [`Spawner`], which does not keep it alive.
+/// holds). A panic in a task ends the thread, and with it the network.
+/// Tasks reach it by a [`Spawner`], which does not keep it alive.
 pub struct Runner {
     executor: Arc<smol::Executor<'static>>,
     stop: smol::channel::Sender<()>,

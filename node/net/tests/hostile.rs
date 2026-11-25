@@ -176,7 +176,16 @@ fn a_peer_holds_one_inbound_connection() {
             assert_eq!(next(&a_arrivals.consensus).await.frame, b"hi");
             held.push((client, connection, stream));
         }
-        smol::Timer::after(Duration::from_millis(300)).await;
+        // The earlier seven close as the later ones are taken.
+        let started = Instant::now();
+        while held[..7]
+            .iter()
+            .any(|(_, connection, _)| connection.close_reason().is_none())
+            && started.elapsed() < Duration::from_secs(10)
+        {
+            smol::Timer::after(Duration::from_millis(10)).await;
+        }
+        smol::Timer::after(Duration::from_millis(100)).await;
         let open: Vec<bool> = held
             .iter()
             .map(|(_, connection, _)| connection.close_reason().is_none())
@@ -294,8 +303,11 @@ fn a_full_queue_of_one_class_does_not_hold_another() {
             )
             .await;
         }
-        smol::Timer::after(Duration::from_millis(300)).await;
-        assert!(b_arrivals.requests.is_full());
+        let started = Instant::now();
+        while !b_arrivals.requests.is_full() {
+            assert!(started.elapsed() < Duration::from_secs(30), "never full");
+            smol::Timer::after(Duration::from_millis(10)).await;
+        }
         send(a, 2, Class::Consensus, 1, b"consensus".to_vec()).await;
         send(a, 2, Class::Liveness, 1, b"alive".to_vec()).await;
         let started = Instant::now();
@@ -321,8 +333,8 @@ async fn latencies(a: &Quic, arrivals: &Arrivals, samples: usize) -> Vec<Duratio
 }
 
 /// Keys that are not configured keep dialing a node from an address no
-/// peer has: the node runs few of their handshakes, and its peers' frames
-/// flow on.
+/// peer has (127.0.0.2, on Linux's loopback): the node runs few of their
+/// handshakes, and its peers' frames flow on.
 #[test]
 fn strangers_take_few_handshakes() {
     let nodes = cluster(2);

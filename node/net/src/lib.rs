@@ -154,28 +154,31 @@ pub(crate) const FRAME_COST: usize = 64;
 pub(crate) struct Budgets {
     held: [AtomicUsize; 4],
     budgets: [usize; 4],
-    released: event_listener::Event,
+    /// Per class, so a frame let go wakes only its own class's waiters.
+    released: [event_listener::Event; 4],
 }
+
+/// The least a budget holds, so classes of small frames still take many.
+const BUDGET_FLOOR: usize = 1 << 20;
 
 impl Budgets {
     /// A budget of `frames` of each class's largest frames.
     pub(crate) fn new(limits: &Limits, frames: usize) -> Arc<Self> {
         Arc::new(Self {
             held: Default::default(),
-            budgets: Class::ALL.map(|class| limits.frames(class, frames)),
-            released: event_listener::Event::new(),
+            budgets: Class::ALL.map(|class| limits.frames(class, frames).max(BUDGET_FLOOR)),
+            released: Default::default(),
         })
     }
 
-    /// Hold a frame of `bytes`, if it fits, or if nothing is held: a
-    /// budget always takes one frame.
+    /// Hold a frame of `bytes` while the class is under its budget: one
+    /// under it takes one frame more, as a peer's send queue does.
     pub(crate) fn try_hold(self: &Arc<Self>, class: Class, bytes: usize) -> Option<Hold> {
         let cost = bytes.saturating_add(FRAME_COST);
         let budget = self.budgets[class as usize];
         self.held[class as usize]
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                let after = held.saturating_add(cost);
-                (held == 0 || after <= budget).then_some(after)
+                (held < budget).then(|| held.saturating_add(cost))
             })
             .ok()?;
         Some(Hold {
@@ -188,7 +191,7 @@ impl Budgets {
     /// Hold a frame of `bytes`, waiting until it fits.
     pub(crate) async fn hold(self: &Arc<Self>, class: Class, bytes: usize) -> Hold {
         loop {
-            let released = self.released.listen();
+            let released = self.released[class as usize].listen();
             if let Some(hold) = self.try_hold(class, bytes) {
                 return hold;
             }
@@ -223,7 +226,7 @@ impl Drop for Hold {
     fn drop(&mut self) {
         if let Some(budgets) = self.budgets.take() {
             budgets.held[self.class as usize].fetch_sub(self.cost, Ordering::AcqRel);
-            budgets.released.notify(usize::MAX);
+            budgets.released[self.class as usize].notify(usize::MAX);
         }
     }
 }
@@ -258,14 +261,6 @@ impl std::fmt::Debug for Incoming {
             .finish()
     }
 }
-
-impl PartialEq for Incoming {
-    fn eq(&self, other: &Self) -> bool {
-        (self.from, self.stream, &self.frame) == (other.from, other.stream, &other.frame)
-    }
-}
-
-impl Eq for Incoming {}
 
 /// Arrivals, a queue per class: a consumer drains Liveness and Consensus
 /// first, so a backlog of bulk never sits ahead of a heartbeat. Each
@@ -322,9 +317,7 @@ impl Deliver {
         let bytes = incoming.frame.len();
         let held = self.waiting.hold(class, bytes).or(async {
             // The consumer is gone: nothing it would read is held.
-            while !queue.is_closed() {
-                smol::Timer::after(CLOSED).await;
-            }
+            queue.closed().await;
             Hold::none()
         });
         incoming.held = held.await;
@@ -364,10 +357,6 @@ impl Deliver {
         queue.is_closed() || (!queue.is_full() && self.waiting.has_room(class))
     }
 }
-
-/// How often a reader waiting for room looks whether the consumer is
-/// gone.
-const CLOSED: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Why a frame was not queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

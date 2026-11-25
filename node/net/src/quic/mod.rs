@@ -137,12 +137,13 @@ pub struct Config {
     pub quiet: Duration,
     /// A connection quiet for this long closes: [`IDLE`] by default.
     pub idle: Duration,
-    /// The frames of one class a peer may have this node assemble at
-    /// once, in that class's largest frames: 4 by default.
+    /// The bytes of one class's frames a peer may have this node assemble
+    /// at once, in that class's largest frames (1 MiB at least): 4 by
+    /// default. A budget under its bound takes one frame more.
     pub assembling: usize,
-    /// The frames of one class, from every peer, waiting for the
-    /// consumer, in that class's largest frames: 4 by default (each queue
-    /// also holds 1,024 frames at most, 16 for Bulk).
+    /// The bytes of one class's frames, from every peer, waiting for the
+    /// consumer, counted as `assembling` is: 4 by default (each queue also
+    /// holds 1,024 frames at most, 16 for Bulk).
     pub waiting: usize,
     pub handshakes: Handshakes,
 }
@@ -497,5 +498,38 @@ impl Network for Quic {
                 released.await;
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configuration_that_takes_no_frame_is_refused() {
+        let config = || Config::new(1, [1; 32], "127.0.0.1:0".parse().unwrap());
+        let refused = |config: Config| {
+            Quic::bind(config).err().map(|error| error.kind()) == Some(io::ErrorKind::InvalidInput)
+        };
+        assert!(refused(Config {
+            streams: 0,
+            ..config()
+        }));
+        assert!(refused(Config {
+            assembling: 0,
+            ..config()
+        }));
+        assert!(refused(Config {
+            limits: Limits {
+                liveness: 0,
+                ..Limits::default()
+            },
+            ..config()
+        }));
+        assert!(refused(Config {
+            idle: Duration::from_secs(u64::MAX / 2),
+            ..config()
+        }));
+        assert!(Quic::bind(config()).is_ok());
     }
 }
