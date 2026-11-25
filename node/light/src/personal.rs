@@ -884,7 +884,7 @@ impl<'a, L: Link> SealedSync<'a, L> {
     ) -> Result<bool, SyncError<L::Error>> {
         let from = match removed.last {
             None => Some(0),
-            Some(last) if removed.position == last => Some(removed.seq + 1),
+            Some(last) if removed.position == last => Some(removed.seq.saturating_add(1)),
             Some(last) => match self
                 .light
                 .store()
@@ -898,7 +898,9 @@ impl<'a, L: Link> SealedSync<'a, L> {
                         .node(instance, &merkle_crdt::Cid(cid))?
                         .and_then(|node| merkle_crdt::Header::<Blake2b256>::read(&node))
                     {
-                        Some(header) if header.author == removed.author => Some(header.seq + 1),
+                        Some(header) if header.author == removed.author => {
+                            Some(header.seq.saturating_add(1))
+                        }
                         _ if removed.position > last => Some(removed.seq),
                         _ => None,
                     }

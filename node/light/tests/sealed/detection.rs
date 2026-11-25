@@ -250,6 +250,18 @@ pub(super) fn sealed_by(
         .unwrap();
     let mut node = node.bytes;
     edit(&mut node);
+    seal_node(phone, instance, key, epoch, node)
+}
+
+/// `node` sealed by `phone` for the agent under `key` at `epoch`, with the
+/// writer's view and `seen` positions it has.
+fn seal_node(
+    phone: &Phone,
+    instance: InstanceId,
+    key: &[u8; 32],
+    epoch: u64,
+    node: Vec<u8>,
+) -> Vec<u8> {
     let scope = scope_of(phone, instance);
     let (index, chain) = phone.group.as_ref().unwrap().view();
     let body = Sealed {
@@ -1061,6 +1073,63 @@ fn a_backdated_envelope_past_its_frontier_is_refused() {
     assert_eq!(ingested.quarantined.len(), 1);
     assert_eq!(ingested.quarantined[0].why, Quarantine::CutOff);
     assert_eq!(count(&a.light, NOTES, 98), None);
+}
+
+/// A removed device's envelope at its frontier carries a node at the last
+/// sequence number, signed by its key, which no chain reaches: the reader
+/// cuts its author off from there, one past it saturating, and refuses
+/// the node.
+#[test]
+fn a_frontier_node_at_the_last_number_cuts_its_author_off() {
+    let (mut home, mut phones) = household(2);
+    let scope = scope_of(&phones[0], NOTES);
+    let (a, b) = phones.split_at_mut(1);
+    let (a, b) = (&mut a[0], &mut b[0]);
+    write(&mut home, b, &[NOTES], NOTES, 1);
+    let epoch = b.group().confirmed();
+    let key = b.group().key(scope).unwrap();
+    operate(
+        &mut home,
+        &a.admin.clone(),
+        &a.sync.clone(),
+        "remove",
+        1u32.encode(),
+        None,
+    );
+    home.pass(policy().operation_delay_ms);
+    woken(&mut home, &a.sync);
+    read(&mut home, a);
+
+    // The operators show, at its frontier, a node of its own at the last
+    // number in place of the one the agent took.
+    let last = merkle_crdt::Node::<vos_light::sync::Blake2b256, vos_light::sync::Ops>::sign(
+        &b.sync,
+        &merkle_crdt::Scope(scope),
+        u64::MAX,
+        vec![],
+        Default::default(),
+    );
+    let envelope = seal_node(b, NOTES, &key, epoch, last.to_bytes());
+    let swapped = move |at: Scope, mut held: Vec<vos_wire::personal::Envelope>| {
+        if at == scope {
+            let frontier = held
+                .iter_mut()
+                .find(|envelope| envelope.position == 1)
+                .unwrap();
+            frontier.id = vos_wire::personal::envelope_id(&envelope);
+            frontier.bytes = envelope.clone();
+        }
+        held
+    };
+    let caught = shown(&mut home, a, &[NOTES], swapped, |sync| sync.catch_up(NOTES)).unwrap();
+    let ingested = caught.ingested.unwrap();
+    assert!(ingested.applied.is_empty());
+    assert_eq!(
+        ingested.refused,
+        vec![(Some(last.cid()), merkle_crdt::Refusal::BrokenChain)]
+    );
+    let author = merkle_crdt::Author(b.sync_key());
+    assert_eq!(a.light.cutoff(NOTES, &author).unwrap(), Some(u64::MAX));
 }
 
 /// B2: the operators delete a device's envelope. Its sample audit fetches
