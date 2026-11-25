@@ -33,8 +33,8 @@ pub fn client_config(
     Identity::new(secret).client_with(ALPN, node, transport)
 }
 
-/// The dialing side of another protocol: for a test that a node refuses
-/// it.
+/// The dialing side of another protocol, for tests: that a node refuses
+/// it, or how a node takes a client of the peers' protocol.
 pub fn client_config_for(
     secret: &[u8; 32],
     alpn: &[u8],
@@ -45,7 +45,9 @@ pub fn client_config_for(
 }
 
 /// The endpoint's configuration for the node whose secret seed is
-/// `secret`: its stateless resets keyed by it, as the peers' are.
+/// `secret`: its stateless resets and connection ids keyed by it and by
+/// this protocol, apart from the peers' endpoint's. Address validation,
+/// bounds on handshakes and connections are the caller's.
 pub fn endpoint_config(secret: &[u8; 32]) -> quinn::EndpointConfig {
-    Identity::new(secret).endpoint()
+    Identity::new(secret).endpoint(ALPN)
 }

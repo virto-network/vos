@@ -130,8 +130,10 @@ fn a_peer_shut_down_and_started_again_is_reachable_at_once() {
             {
                 break incoming.unwrap();
             }
+            // Well within the 30 s an old connection would take to idle
+            // out, with room for a loaded host.
             assert!(
-                started.elapsed() < Duration::from_secs(1),
+                started.elapsed() < Duration::from_secs(5),
                 "unreachable after a restart"
             );
         };

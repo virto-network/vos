@@ -1,6 +1,5 @@
-//! The network between VOS nodes. It knows nothing of consensus: a later
-//! consensus for public spaces, or another transport, sits on the same
-//! interface.
+//! The network between VOS nodes. It knows nothing of consensus; the
+//! defaults of [`Limits`] are what a VOS node sends.
 //!
 //! - **Authenticated channels between node keys.** A node is its ed25519
 //!   key; every arrival carries the authenticated peer it came from.
@@ -9,9 +8,14 @@
 //! - **Streams by id or by message.** Liveness, Consensus and Requests
 //!   frames travel on a long-lived stream per id (the caller's: a node
 //!   folds its groups onto a bounded set of lanes), so one id's large
-//!   frame never delays another's; Bulk opens a stream per frame. Order holds within one stream on one connection, and only
-//!   there: a redial can reorder across the old and new connections. A
-//!   frame is delivered at most once.
+//!   frame never delays another's; Bulk opens a stream per frame. Order
+//!   holds within one id on one connection, and only there: a redial can
+//!   reorder across the old and new connections. A frame is delivered at
+//!   most once, and may be delivered long after it was sent: only a
+//!   Liveness frame is dropped for its age.
+//! - **What a peer can make a node hold is bounded in bytes:** the frames
+//!   it has the node assemble, per class; the frames waiting for the
+//!   consumer, per class for every peer; one inbound connection per key.
 //! - **Frames are bytes;** their meaning belongs to the layer above.
 //!
 //! [`quic::Quic`] runs it over QUIC with TLS 1.3 bound to node keys;
@@ -20,6 +24,10 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use smol::future::FutureExt;
 
 pub mod api;
 pub mod memory;
@@ -48,10 +56,10 @@ pub struct Peer {
 pub enum Class {
     /// Pair heartbeats, sent ahead of every other class.
     Liveness = 0,
-    /// Consensus messages, a stream per group.
+    /// Consensus messages, a stream per id.
     Consensus = 1,
     /// Client requests forwarded, and messages between agents, a stream
-    /// per agent so a session's pipelined requests keep their order.
+    /// per id, so a session's pipelined requests keep their order.
     Requests = 2,
     /// Blobs and snapshot chunks, a stream per frame.
     Bulk = 3,
@@ -109,7 +117,7 @@ impl Limits {
         bulk: (64 << 20) + (64 << 10),
     };
 
-    fn of(&self, class: Class) -> usize {
+    pub(crate) fn of(&self, class: Class) -> usize {
         let limit = match class {
             Class::Liveness => self.liveness,
             Class::Consensus => self.consensus,
@@ -124,23 +132,145 @@ impl Limits {
     /// takes one frame more.
     fn queue(&self, class: Class) -> usize {
         match class {
-            Class::Bulk => self.bulk,
-            class => 4 * self.of(class),
+            Class::Bulk => self.of(class),
+            class => self.of(class).saturating_mul(4),
+        }
+    }
+
+    /// `frames` of `class`'s largest frames, with what each costs beyond
+    /// its bytes.
+    fn frames(&self, class: Class, frames: usize) -> usize {
+        self.of(class)
+            .saturating_add(FRAME_COST)
+            .saturating_mul(frames)
+    }
+}
+
+/// What a frame costs beyond its bytes, so empty frames are bounded too.
+pub(crate) const FRAME_COST: usize = 64;
+
+/// Bytes held per class under a budget each, and a wakeup whenever some
+/// are let go.
+pub(crate) struct Budgets {
+    held: [AtomicUsize; 4],
+    budgets: [usize; 4],
+    released: event_listener::Event,
+}
+
+impl Budgets {
+    /// A budget of `frames` of each class's largest frames.
+    pub(crate) fn new(limits: &Limits, frames: usize) -> Arc<Self> {
+        Arc::new(Self {
+            held: Default::default(),
+            budgets: Class::ALL.map(|class| limits.frames(class, frames)),
+            released: event_listener::Event::new(),
+        })
+    }
+
+    /// Hold a frame of `bytes`, if it fits, or if nothing is held: a
+    /// budget always takes one frame.
+    pub(crate) fn try_hold(self: &Arc<Self>, class: Class, bytes: usize) -> Option<Hold> {
+        let cost = bytes.saturating_add(FRAME_COST);
+        let budget = self.budgets[class as usize];
+        self.held[class as usize]
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                let after = held.saturating_add(cost);
+                (held == 0 || after <= budget).then_some(after)
+            })
+            .ok()?;
+        Some(Hold {
+            budgets: Some(Arc::clone(self)),
+            class,
+            cost,
+        })
+    }
+
+    /// Hold a frame of `bytes`, waiting until it fits.
+    pub(crate) async fn hold(self: &Arc<Self>, class: Class, bytes: usize) -> Hold {
+        loop {
+            let released = self.released.listen();
+            if let Some(hold) = self.try_hold(class, bytes) {
+                return hold;
+            }
+            released.await;
+        }
+    }
+
+    pub(crate) fn has_room(&self, class: Class) -> bool {
+        self.held[class as usize].load(Ordering::Acquire) < self.budgets[class as usize]
+    }
+}
+
+/// A frame's bytes held under a budget, let go when dropped.
+pub(crate) struct Hold {
+    budgets: Option<Arc<Budgets>>,
+    class: Class,
+    cost: usize,
+}
+
+impl Hold {
+    /// Nothing held.
+    pub(crate) fn none() -> Self {
+        Self {
+            budgets: None,
+            class: Class::Liveness,
+            cost: 0,
         }
     }
 }
 
-/// A frame that arrived.
-#[derive(Debug, PartialEq, Eq)]
+impl Drop for Hold {
+    fn drop(&mut self) {
+        if let Some(budgets) = self.budgets.take() {
+            budgets.held[self.class as usize].fetch_sub(self.cost, Ordering::AcqRel);
+            budgets.released.notify(usize::MAX);
+        }
+    }
+}
+
+/// A frame that arrived. It holds its place in its class's arrival
+/// budget until it is dropped.
 pub struct Incoming {
     /// The authenticated peer it came from.
     pub from: NodeNumber,
     pub stream: u64,
     pub frame: Vec<u8>,
+    held: Hold,
 }
 
+impl Incoming {
+    pub(crate) fn new(from: NodeNumber, stream: u64, frame: Vec<u8>) -> Self {
+        Self {
+            from,
+            stream,
+            frame,
+            held: Hold::none(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Incoming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Incoming")
+            .field("from", &self.from)
+            .field("stream", &self.stream)
+            .field("frame", &self.frame)
+            .finish()
+    }
+}
+
+impl PartialEq for Incoming {
+    fn eq(&self, other: &Self) -> bool {
+        (self.from, self.stream, &self.frame) == (other.from, other.stream, &other.frame)
+    }
+}
+
+impl Eq for Incoming {}
+
 /// Arrivals, a queue per class: a consumer drains Liveness and Consensus
-/// first, so a backlog of bulk never sits ahead of a heartbeat.
+/// first, so a backlog of bulk never sits ahead of a heartbeat. Each
+/// queue is bounded in frames and in bytes; a frame counts against the
+/// bytes until the consumer drops it.
 pub struct Arrivals {
     pub liveness: smol::channel::Receiver<Incoming>,
     pub consensus: smol::channel::Receiver<Incoming>,
@@ -152,6 +282,7 @@ pub struct Arrivals {
 #[derive(Clone)]
 pub(crate) struct Deliver {
     queues: [smol::channel::Sender<Incoming>; 4],
+    waiting: Arc<Budgets>,
 }
 
 /// How many frames each class's arrival queue holds before a stream's
@@ -159,8 +290,13 @@ pub(crate) struct Deliver {
 const ARRIVALS: usize = 1024;
 /// Bulk frames are large: few wait.
 const BULK_ARRIVALS: usize = 16;
+/// The bytes each class's arrival queue holds, unless configured
+/// otherwise: this many of its largest frames.
+pub(crate) const WAITING: usize = 4;
 
-pub(crate) fn arrivals() -> (Deliver, Arrivals) {
+/// Arrival queues bounded in bytes by `waiting` of each class's largest
+/// frames under `limits`.
+pub(crate) fn arrivals(limits: &Limits, waiting: usize) -> (Deliver, Arrivals) {
     let (liveness, liveness_rx) = smol::channel::bounded(ARRIVALS);
     let (consensus, consensus_rx) = smol::channel::bounded(ARRIVALS);
     let (requests, requests_rx) = smol::channel::bounded(ARRIVALS);
@@ -168,6 +304,7 @@ pub(crate) fn arrivals() -> (Deliver, Arrivals) {
     (
         Deliver {
             queues: [liveness, consensus, requests, bulk],
+            waiting: Budgets::new(limits, waiting),
         },
         Arrivals {
             liveness: liveness_rx,
@@ -180,25 +317,57 @@ pub(crate) fn arrivals() -> (Deliver, Arrivals) {
 
 impl Deliver {
     /// Hand an arrival over, waiting while its class's queue is full.
-    pub(crate) async fn deliver(&self, class: Class, incoming: Incoming) -> bool {
-        self.queues[class as usize].send(incoming).await.is_ok()
+    pub(crate) async fn deliver(&self, class: Class, mut incoming: Incoming) -> bool {
+        let queue = &self.queues[class as usize];
+        let bytes = incoming.frame.len();
+        let held = self.waiting.hold(class, bytes).or(async {
+            // The consumer is gone: nothing it would read is held.
+            while !queue.is_closed() {
+                smol::Timer::after(CLOSED).await;
+            }
+            Hold::none()
+        });
+        incoming.held = held.await;
+        queue.send(incoming).await.is_ok()
     }
 
     pub(crate) fn try_deliver(
         &self,
         class: Class,
-        incoming: Incoming,
+        mut incoming: Incoming,
     ) -> Result<(), smol::channel::TrySendError<Incoming>> {
-        self.queues[class as usize].try_send(incoming)
+        let queue = &self.queues[class as usize];
+        if queue.is_closed() {
+            return Err(smol::channel::TrySendError::Closed(incoming));
+        }
+        match self.waiting.try_hold(class, incoming.frame.len()) {
+            Some(held) => incoming.held = held,
+            None => return Err(smol::channel::TrySendError::Full(incoming)),
+        }
+        queue.try_send(incoming).map_err(|error| {
+            let mut incoming = match error {
+                smol::channel::TrySendError::Full(incoming)
+                | smol::channel::TrySendError::Closed(incoming) => incoming,
+            };
+            incoming.held = Hold::none();
+            match queue.is_closed() {
+                true => smol::channel::TrySendError::Closed(incoming),
+                false => smol::channel::TrySendError::Full(incoming),
+            }
+        })
     }
 
     /// Whether a frame of `class` would be taken now, or dropped because
     /// the consumer is gone: either way, not a wait.
     pub(crate) fn has_room(&self, class: Class) -> bool {
         let queue = &self.queues[class as usize];
-        queue.is_closed() || !queue.is_full()
+        queue.is_closed() || (!queue.is_full() && self.waiting.has_room(class))
     }
 }
+
+/// How often a reader waiting for room looks whether the consumer is
+/// gone.
+const CLOSED: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Why a frame was not queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
