@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,38 +13,7 @@ use super::executor::{Spawner, Tasks};
 use super::{
     BULK_STREAMS, CRYPTO_ERRORS, DIAL, HEADER, Inner, MAX_BACKOFF, MIN_BACKOFF, SETTLED, code,
 };
-use crate::{Class, FRAME_COST, Limits, Peer};
-
-/// Frames waiting for one peer, the bytes they hold per class, and its
-/// connection.
-pub(super) struct Shared {
-    held: [AtomicUsize; 4],
-    /// Notified whenever held bytes are released.
-    pub(super) released: event_listener::Event,
-    limits: Limits,
-    /// The connection this node holds to the peer, while it does.
-    pub(super) connection: Mutex<Option<quinn::Connection>>,
-    /// The name the peer last dialed in with.
-    pub(super) incarnation: Mutex<Option<String>>,
-}
-
-impl Shared {
-    /// Hold `bytes` for a frame of `class`, unless the class's queue is
-    /// full. A queue under its budget takes any frame its class allows, so
-    /// it holds less than its budget and one frame.
-    pub(super) fn hold(&self, class: Class, bytes: usize) -> bool {
-        let budget = self.limits.queue(class);
-        self.held[class as usize]
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                (held < budget).then_some(held + bytes + FRAME_COST)
-            })
-            .is_ok()
-    }
-
-    pub(super) fn has_room(&self, class: Class) -> bool {
-        self.held[class as usize].load(Ordering::Acquire) < self.limits.queue(class)
-    }
-}
+use crate::{Budgets, Class, Hold, Peer};
 
 /// A frame on its way, holding its bytes in its peer's queue until it is
 /// written or lost.
@@ -53,16 +21,8 @@ pub(super) struct Outgoing {
     pub(super) class: Class,
     pub(super) stream: u64,
     pub(super) frame: Vec<u8>,
-    pub(super) shared: Arc<Shared>,
+    pub(super) _held: Hold,
     pub(super) queued: Instant,
-}
-
-impl Drop for Outgoing {
-    fn drop(&mut self) {
-        self.shared.held[self.class as usize]
-            .fetch_sub(self.frame.len() + FRAME_COST, Ordering::AcqRel);
-        self.shared.released.notify(usize::MAX);
-    }
 }
 
 /// The sending side to one peer: its queue, and the task that dials it and
@@ -70,19 +30,18 @@ impl Drop for Outgoing {
 pub(super) struct Link {
     pub(super) peer: Peer,
     pub(super) frames: smol::channel::Sender<Outgoing>,
-    pub(super) shared: Arc<Shared>,
+    /// The bytes its queued frames hold, per class.
+    pub(super) queued: Arc<Budgets>,
+    /// The connection this node holds to the peer, while it does.
+    pub(super) connection: Arc<Mutex<Option<quinn::Connection>>>,
+    /// The name the peer last dialed in with.
+    pub(super) incarnation: Option<String>,
     pub(super) task: smol::Task<()>,
 }
 
 impl Link {
     pub(super) fn spawn(inner: &Inner, peer: Peer) -> Self {
-        let shared = Arc::new(Shared {
-            held: Default::default(),
-            released: event_listener::Event::new(),
-            limits: inner.limits,
-            connection: Mutex::new(None),
-            incarnation: Mutex::new(None),
-        });
+        let connection = Arc::default();
         let (frames, queued) = smol::channel::unbounded();
         let client = inner.identity.client(peer.key, Arc::clone(&inner.dialing));
         let dialing = Dialing {
@@ -95,12 +54,14 @@ impl Link {
         };
         let task = inner
             .spawner
-            .spawn(dialing.run(queued, Arc::clone(&shared)))
+            .spawn(dialing.run(queued, Arc::clone(&connection)))
             .expect("the network's executor runs while it is open");
         Self {
             peer,
             frames,
-            shared,
+            queued: Budgets::with(Class::ALL.map(|class| inner.limits.queue(class))),
+            connection,
+            incarnation: None,
             task,
         }
     }
@@ -119,7 +80,11 @@ struct Dialing {
 impl Dialing {
     /// Dial the peer whenever there is something to send, and write to it
     /// until the connection closes.
-    async fn run(self, queued: smol::channel::Receiver<Outgoing>, shared: Arc<Shared>) {
+    async fn run(
+        self,
+        queued: smol::channel::Receiver<Outgoing>,
+        held: Arc<Mutex<Option<quinn::Connection>>>,
+    ) {
         let address = self.address;
         let mut next = None;
         let mut backoff = MIN_BACKOFF;
@@ -152,10 +117,10 @@ impl Dialing {
                     continue;
                 }
             };
-            *shared.connection.lock().expect("the connection") = Some(connection.clone());
+            *held.lock().expect("the connection") = Some(connection.clone());
             let connected = Instant::now();
             self.write(&connection, &mut next, &queued).await;
-            *shared.connection.lock().expect("the connection") = None;
+            *held.lock().expect("the connection") = None;
             if refused(&connection) {
                 // The peer took the handshake, then refused this node:
                 // dialing again at once would only be refused again.
