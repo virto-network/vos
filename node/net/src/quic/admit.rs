@@ -137,14 +137,14 @@ mod tests {
     #[test]
     fn places_are_per_address_and_in_all_for_strangers() {
         let admission = Arc::new(Admission::new(Handshakes {
-            total: 3,
+            total: 5,
             per_address: 2,
             deadline: Duration::from_secs(1),
             failed: Duration::from_secs(1),
         }));
         admission.set_peers(&[peer_at("10.0.0.1:1"), peer_at("10.0.0.1:2")]);
         let ip = |text: &str| text.parse::<IpAddr>().unwrap();
-        // Two places an address, three in all for strangers.
+        // Two places an address, five in all for strangers.
         let a = [
             admission.take(ip("10.1.0.1")),
             admission.take(ip("10.1.0.1")),
@@ -152,10 +152,17 @@ mod tests {
         assert!(a.iter().all(Option::is_some));
         assert!(admission.take(ip("10.1.0.1")).is_none());
         // One /64 is one address; an IPv4-mapped address is its IPv4 one.
-        let b = admission.take(ip("2001:db8::1")).unwrap();
+        let b = [
+            admission.take(ip("2001:db8::1")),
+            admission.take(ip("2001:db8::ffff")),
+        ];
+        assert!(b.iter().all(Option::is_some));
         assert!(admission.take(ip("2001:db8::2")).is_none());
         assert!(admission.take(ip("::ffff:10.1.0.1")).is_none());
-        drop(b);
+        // The total holds strangers at any address.
+        let c = admission.take(ip("10.2.0.1")).unwrap();
+        assert!(admission.take(ip("10.3.0.1")).is_none());
+        drop((b, c));
         // A peers' address has its own, two for each peer there.
         let listed: Vec<_> = (0..4).map(|_| admission.take(ip("10.0.0.1"))).collect();
         assert!(listed.iter().all(Option::is_some));

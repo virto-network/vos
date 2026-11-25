@@ -4,8 +4,8 @@
 //! delivered, and a queue past its class's budget refuses, as over QUIC.
 //! Arrival queues are bounded in frames and bytes, as over QUIC. Order
 //! holds per pair of endpoints, as it does per id over QUIC (and here
-//! across ids too, which QUIC does not promise). As
-//! over QUIC, a node takes frames only from the peers it lists.
+//! across ids too, which QUIC does not promise). As over QUIC, a node
+//! takes frames only from the peers it lists.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -179,7 +179,8 @@ impl Hub {
         self.state().delay = delay;
     }
 
-    /// The largest frames of each class.
+    /// The largest frames of each class. An endpoint joined before keeps
+    /// the arrival budgets the limits at its join gave.
     pub fn set_limits(&self, limits: Limits) {
         self.state().limits = limits;
     }

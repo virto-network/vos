@@ -568,5 +568,17 @@ mod tests {
             anyone.recv_from(&mut answer).is_err(),
             "the API endpoint answered a peer connection's id"
         );
+        // An id of its own it does answer, with that id's reset token.
+        let keys = identity.keys(crate::api::ALPN);
+        let own = MarkedIds {
+            key: keys.connection_ids,
+            random: ring::rand::SystemRandom::new(),
+        }
+        .generate_cid();
+        packet[1..1 + own.len()].copy_from_slice(&own);
+        anyone.send_to(&packet, api).unwrap();
+        let (length, _) = anyone.recv_from(&mut answer).expect("a stateless reset");
+        let token = ring::hmac::sign(&keys.reset, &own);
+        assert_eq!(&answer[length - 16..length], &token.as_ref()[..16]);
     }
 }
