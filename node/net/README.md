@@ -54,7 +54,7 @@ validation and bounds on its handshakes and connections are its caller's.
 
 ## Bounds against peers
 
-What a sender can make a node spend, over QUIC (`quic::Config`):
+What a sender can make a node spend, over QUIC:
 
 - **Handshakes.** A sender proves its address (a QUIC retry) before the
   node runs its side of a handshake. Handshakes under way are bounded per
@@ -105,7 +105,7 @@ Limits that stay:
 partitions, losses, delays, restarts, the peer list); `tests/quic.rs`
 (three nodes on localhost: every class, order within a stream, keys not
 configured refused on either side, oversized frames, removed and
-unreachable peers, quiet streams); `tests/restart.rs` (a peer killed and
+unreachable peers, each class's send queue budget, quiet streams); `tests/restart.rs` (a peer killed and
 started again in a child process); `tests/head_of_line.rs` (consensus
 frames' latency beside bulk frames to the same peer); `tests/hostile.rs`
 (the bounds above, against peers and strangers running code of their
