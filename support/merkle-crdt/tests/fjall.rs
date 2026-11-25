@@ -7,11 +7,9 @@ mod common;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use std::collections::BTreeSet;
-
-use common::{H, Ops, Replayed, Rng, SCOPE, Server, Step, crdt, generate, read, replay};
+use common::{H, Ops, Replayed, Rng, SCOPE, Server, Step, crdt, generate, node, read, replay};
 use fjall::{Database, KeyspaceCreateOptions};
-use merkle_crdt::{Cid, Error, Event, FjallError, FjallStore, Node, Replica, Rows, Store};
+use merkle_crdt::{Changes, Cid, Error, Event, FjallError, FjallStore, Replica, Rows, Store};
 
 type Fjall = Replica<H, Ops, FjallStore>;
 
@@ -78,20 +76,12 @@ fn accepted() -> Vec<(u64, Vec<u8>)> {
         .collect()
 }
 
-fn server(items: &[(u64, Vec<u8>)], page: usize) -> Server {
-    Server {
-        items: items.to_vec(),
-        page,
-        trips: 0,
-    }
-}
-
 #[test]
 fn a_reopened_store_is_the_replica_it_was() {
     let dir = tempfile::tempdir().unwrap();
     let items = accepted();
     let (db, mut replica) = open(dir.path());
-    read(&mut replica, &mut server(&items[..300], 32));
+    read(&mut replica, &mut Server::new(&items[..300], 32));
     replica
         .record(&common::key(7), vec![(1, 1)], &mut crdt)
         .unwrap();
@@ -109,7 +99,7 @@ fn a_reopened_store_is_the_replica_it_was() {
     assert_eq!(replica.have(), have);
     assert_eq!(replica.outbox().unwrap().len(), 1);
 
-    read(&mut replica, &mut server(&items, 32));
+    read(&mut replica, &mut Server::new(&items, 32));
     assert_eq!(replica.held(), 0);
     let rebuilt = replayed(&db);
     assert_eq!(rows(replica.store()), rebuilt.rows);
@@ -123,11 +113,9 @@ fn a_reopened_store_is_the_replica_it_was() {
 fn a_commit_carries_the_callers_writes() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::builder(dir.path()).open().unwrap();
-    let own = db
-        .keyspace("own", fjall::KeyspaceCreateOptions::default)
-        .unwrap();
+    let own = db.keyspace("own", KeyspaceCreateOptions::default).unwrap();
     let mut store = FjallStore::open(&db, "scope").unwrap();
-    let changes = merkle_crdt::Changes::<H> {
+    let changes = Changes::<H> {
         rows: [(b"row".to_vec(), Some(b"value".to_vec()))].into(),
         ..Default::default()
     };
@@ -151,7 +139,7 @@ fn crash_writer() {
     let (_db, mut replica) = open(dir.as_ref());
     let key = common::key(9);
     let mut i = 0;
-    let mut server = server(&items, 7);
+    let mut server = Server::new(&items, 7);
     loop {
         let (page, _) = server.since(replica.cursor());
         if page.is_empty() {
@@ -214,7 +202,7 @@ fn a_killed_writer_leaves_whole_batches() {
     }
     assert!(moved > 0, "no writer wrote before it was killed");
     let (db, mut replica) = open(dir.path());
-    read(&mut replica, &mut server(&items, 64));
+    read(&mut replica, &mut Server::new(&items, 64));
     assert_eq!(replica.held(), 0);
     let rebuilt = replayed(&db);
     assert_eq!(rows(replica.store()), rebuilt.rows);
@@ -229,12 +217,12 @@ fn a_row_fjall_refuses_is_an_error() {
     let long = vec![1; merkle_crdt::MAX_ROW_KEY + 1];
     for bad in [Vec::new(), long] {
         let mut write = |_: Event<'_, H, Ops>, rows: &mut dyn Rows| rows.write(&bad, Some(b"x"));
-        let node = Node::<H, Ops>::sign(&common::key(1), &SCOPE, 0, vec![], BTreeSet::new());
+        let node = node(&common::key(1), 0, vec![], []);
         assert!(matches!(
             replica.ingest([node.to_bytes()], None, &mut write),
             Err(Error::Row)
         ));
-        let changes = merkle_crdt::Changes::<H> {
+        let changes = Changes::<H> {
             rows: [(bad.clone(), Some(b"x".to_vec()))].into(),
             ..Default::default()
         };
