@@ -244,6 +244,33 @@ fn a_queue_to_an_unreachable_peer_fills() {
     });
 }
 
+/// Each class's queue to a peer takes frames while it holds less than
+/// four of its largest frames (one, for Bulk), counting each frame's bytes
+/// and 64 more.
+#[test]
+fn each_class_s_queue_to_a_peer_holds_its_budget() {
+    let (a, _) = Quic::bind(Config {
+        limits: Limits {
+            liveness: 1000,
+            consensus: 2000,
+            requests: 3000,
+            bulk: 4000,
+        },
+        ..Config::new(1, secret(1), any_port())
+    })
+    .unwrap();
+    // Nothing answers there.
+    let silent = std::net::UdpSocket::bind(any_port()).unwrap();
+    a.set_peers(vec![peer_at(2, silent.local_addr().unwrap())]);
+    let taken = |class| {
+        (0..)
+            .take_while(|_| a.send(2, class, 1, vec![0; 100]).is_ok())
+            .count()
+    };
+    // A frame costs 164: 4,000, 8,000, 12,000 and 4,000 bytes' budgets.
+    assert_eq!(Class::ALL.map(taken), [25, 49, 74, 25]);
+}
+
 #[test]
 fn quiet_streams_finish_so_others_can_open() {
     smol::block_on(async {
