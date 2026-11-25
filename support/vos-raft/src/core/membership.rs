@@ -69,6 +69,11 @@ impl<N: NodeId> ActiveConfigRecord<N> {
         self.current.iter().chain(added).copied()
     }
 
+    /// The members other than `me`.
+    pub(super) fn others(&self, me: N) -> impl Iterator<Item = N> + '_ {
+        self.members().filter(move |&member| member != me)
+    }
+
     pub(super) fn contains(&self, node: N) -> bool {
         self.current.contains(&node)
             || self
@@ -113,7 +118,7 @@ impl<N: NodeId> Core<N> {
             return;
         };
         let active = &self.active;
-        for member in active.members().filter(|&member| member != me) {
+        for member in active.others(me) {
             leading.next_index.entry(member).or_insert(next);
             leading.match_index.entry(member).or_insert(0);
             leading.answered.entry(member).or_insert(now);
@@ -233,14 +238,13 @@ impl<N: NodeId> Core<N> {
         truncate_after: Option<u64>,
         appends: &[LogEntry<N>],
     ) {
-        let invalidated_config = match (truncate_after, self.active.log_index) {
-            (Some(after), Some(index)) => after < index,
-            _ => false,
+        let below = |index: Option<u64>| {
+            truncate_after
+                .zip(index)
+                .is_some_and(|(after, index)| after < index)
         };
-        let invalidated_pending = match (truncate_after, self.pending_joint_entry) {
-            (Some(after), Some(index)) => after < index,
-            _ => false,
-        };
+        let invalidated_config = below(self.active.log_index);
+        let invalidated_pending = below(self.pending_joint_entry);
         // A truncation that removes the entry the view came from falls back
         // to the latest configuration entry it keeps, else the log start's.
         let adopted = appends
