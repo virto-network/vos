@@ -26,6 +26,9 @@
 //! unsupported. Every time is in seconds since the Unix epoch, as mls-rs
 //! counts.
 
+mod candidate;
+mod error;
+mod held;
 mod policy;
 mod storage;
 
@@ -36,19 +39,18 @@ use mls_rs::client_builder::{
     WithKeyPackageRepo, WithMlsRules,
 };
 use mls_rs::error::MlsError;
-use mls_rs::group::{CommitEffect, CommitSecrets, LeafNode, LeafNodeSource, Node, ReceivedMessage};
 use mls_rs::identity::SigningIdentity;
 use mls_rs::identity::basic::BasicCredential;
 use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
 use mls_rs::time::MlsTime;
-use mls_rs::{
-    CipherSuite, CipherSuiteProvider, Client, CryptoProvider, ExtensionList, Group, MlsMessage,
-    WireFormat,
-};
+use mls_rs::{CipherSuite, CipherSuiteProvider, Client, CryptoProvider, ExtensionList, Group};
 use mls_rs_core::crypto::SignatureSecretKey;
 use mls_rs_core::error::IntoAnyError;
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
+pub use candidate::{Candidate, Kind};
+pub use error::{Error, Refusal};
+pub use held::Commit;
 use policy::Rules;
 pub use policy::{Expected, Identity, Refused};
 pub use storage::{Namespace, Store, Writes};
@@ -95,174 +97,6 @@ const GROUP: &[u8] = b"group";
 const HELD: &[u8] = b"held";
 const NEXT: &[u8] = b"next";
 
-/// Why an operation failed. A failed operation writes nothing: the
-/// current state stays as the last batch left it. Two exceptions, both a
-/// store's failure: a batch whose sync failed may be found applied after a
-/// reopen, and an error reading the group back after
-/// a written batch leaves that batch written.
-#[derive(Debug)]
-pub enum Error {
-    Store(fjall::Error),
-    /// A row the store cannot hold: an empty key, a key over 65,535 bytes
-    /// or a value of 4 GiB or more.
-    Unstorable,
-    Mls(MlsError),
-    /// A candidate refused: it is not a commit this group's rules and
-    /// state accept. Its committer's to answer for.
-    Refused(Refusal),
-    /// No group yet, or none any more.
-    NoGroup,
-    /// A group already, where an operation makes one.
-    Grouped,
-    /// A commit is held already: confirm or void it first.
-    Held,
-    /// No commit held, or not the candidate's, or not for the epoch after
-    /// the current one.
-    NotHeld,
-    /// A candidate swapped over a state it was not made from: another
-    /// group or epoch than the current one, or, for the device's own, a
-    /// commit held since.
-    Stale,
-    /// A namespace row that does not read.
-    Corrupt,
-    /// A credential that is not a device's 64 bytes.
-    Credential,
-}
-
-impl From<fjall::Error> for Error {
-    fn from(error: fjall::Error) -> Self {
-        Error::Store(error)
-    }
-}
-
-impl From<MlsError> for Error {
-    fn from(error: MlsError) -> Self {
-        Error::Mls(error)
-    }
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Store(error) => write!(f, "the MLS store: {error}"),
-            Error::Unstorable => f.write_str("a row the MLS store cannot hold"),
-            Error::Mls(error) => write!(f, "MLS: {error:?}"),
-            Error::Refused(refusal) => write!(f, "a candidate refused: {refusal:?}"),
-            Error::NoGroup => f.write_str("no group"),
-            Error::Grouped => f.write_str("a group already"),
-            Error::Held => f.write_str("a commit is held already"),
-            Error::NotHeld => f.write_str("not the commit held"),
-            Error::Stale => f.write_str("a candidate of a state no longer current"),
-            Error::Corrupt => f.write_str("an MLS row does not read"),
-            Error::Credential => f.write_str("a credential that is not a device's"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-/// Why a candidate was refused.
-#[derive(Debug)]
-pub enum Refusal {
-    /// Not an MLS message.
-    Malformed,
-    /// A handshake in the clear: the group's are encrypted.
-    Plaintext,
-    /// Not a commit.
-    NotCommit,
-    /// A commit whose committer kept its leaf: no path.
-    NoPath,
-    /// A Welcome into a group this layer does not keep: its id longer than
-    /// the suite's hash, or its epoch past half of what a `u64` counts.
-    Group,
-    /// A commit whose committer's leaf is not the one its log entry names:
-    /// another credential than the expected one (the renewed one, when a
-    /// renewal is expected), or another signature key.
-    Leaf,
-    /// mls-rs refused it: its framing, its signature, its secrets, or the
-    /// group's rules.
-    Rejected(MlsError),
-}
-
-/// What a candidate is to this device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    /// Its own commit, held and applied.
-    Own,
-    /// Another device's commit, processed.
-    Received,
-    /// A Welcome: the device joins with it, leaving any group it is in.
-    Joined,
-    /// Its own restart: a new group it made, with the members it added.
-    Started,
-    /// A commit that removes this device.
-    Removed,
-}
-
-/// A candidate's group state, on a copy: swapped in on confirmation
-/// ([`Mls::swap`]), or dropped. It is bound to the state it was made from:
-/// the current group's id and epoch then, and, for the device's own, the
-/// commit held.
-pub struct Candidate {
-    group: Group<Config>,
-    namespace: Namespace,
-    kind: Kind,
-    base: Option<(Vec<u8>, u64)>,
-    held: Option<[u8; 32]>,
-}
-
-impl Candidate {
-    pub fn kind(&self) -> Kind {
-        self.kind
-    }
-
-    /// The epoch it moves to; for a commit that removes this device, the
-    /// current one, which mls-rs does not advance.
-    pub fn epoch(&self) -> u64 {
-        self.group.current_epoch()
-    }
-
-    /// Its epoch's authenticator, which the confirmation hashes; none for a
-    /// commit that removes this device.
-    pub fn authenticator(&self) -> Result<Option<Vec<u8>>, Error> {
-        if self.kind == Kind::Removed {
-            return Ok(None);
-        }
-        Ok(Some(self.group.epoch_authenticator()?.to_vec()))
-    }
-
-    /// Its members' credentials; for a commit that removes this device,
-    /// the current ones.
-    pub fn credentials(&self) -> Vec<Vec<u8>> {
-        credentials(&self.group)
-    }
-
-    /// The MLS exporter's secret of its epoch for `label` and `context`,
-    /// `len` bytes: none for a commit that removes this device.
-    pub fn export(
-        &self,
-        label: &[u8],
-        context: &[u8],
-        len: usize,
-    ) -> Result<Option<Vec<u8>>, Error> {
-        if self.kind == Kind::Removed {
-            return Ok(None);
-        }
-        Ok(Some(
-            self.group.export_secret(label, context, len)?.to_vec(),
-        ))
-    }
-}
-
-/// A device's own commit, held until it is confirmed: its handshake, the
-/// Welcome for the devices it adds, and the epoch it moves to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Commit {
-    pub handshake: Vec<u8>,
-    pub welcome: Option<Vec<u8>>,
-    pub epoch: u64,
-}
-
 /// The confirmation hash of an epoch: `BLAKE2b-256(domain ‖ agent ‖
 /// epoch ‖ epoch_authenticator)`, the epoch little-endian. A device posts
 /// it, signed, once it processed the epoch's candidate; one hash from
@@ -275,14 +109,6 @@ pub fn confirmation(domain: &[u8], agent: &[u8; 32], epoch: u64, authenticator: 
     hasher.update(agent);
     hasher.update(epoch.to_le_bytes());
     hasher.update(authenticator);
-    hasher.finalize().into()
-}
-
-/// A handshake's hash, which a held commit is matched by.
-fn handshake_hash(handshake: &[u8]) -> [u8; 32] {
-    let mut hasher = Blake2b::<U32>::new();
-    hasher.update(b"vos/mls/handshake");
-    hasher.update(handshake);
     hasher.finalize().into()
 }
 
@@ -303,13 +129,6 @@ fn leaves(group: &Group<Config>) -> Vec<(u32, Vec<u8>)> {
             Some((member.index, basic.identifier.clone()))
         })
         .collect()
-}
-
-fn leaf(group: &Group<Config>, index: u32) -> Option<LeafNode> {
-    match group.export_tree().nodes().get(2 * index as usize) {
-        Some(Some(Node::Leaf(leaf))) => Some(leaf.clone()),
-        _ => None,
-    }
 }
 
 /// A leaf's signing key and identity; its row is the two encoded in turn.
@@ -341,54 +160,6 @@ impl Signer {
     }
 }
 
-/// A held commit's row: its handshake's hash, its epoch little-endian and
-/// its secrets.
-struct Held {
-    hash: [u8; 32],
-    epoch: u64,
-    secrets: Vec<u8>,
-}
-
-impl Held {
-    fn encode(&self) -> Vec<u8> {
-        [&self.hash[..], &self.epoch.to_le_bytes(), &self.secrets].concat()
-    }
-
-    fn decode(bytes: &[u8]) -> Option<Self> {
-        let (hash, rest) = bytes.split_first_chunk::<32>()?;
-        let (epoch, secrets) = rest.split_first_chunk::<8>()?;
-        Some(Self {
-            hash: *hash,
-            epoch: u64::from_le_bytes(*epoch),
-            secrets: secrets.to_vec(),
-        })
-    }
-}
-
-/// `group`'s state and the commit of `handshake` to `epoch`, held, staged
-/// in `namespace`: the commit as its caller posts it.
-fn stage_held(
-    namespace: &Namespace,
-    group: &mut Group<Config>,
-    handshake: Vec<u8>,
-    welcome: Option<Vec<u8>>,
-    epoch: u64,
-    secrets: Vec<u8>,
-) -> Result<Commit, Error> {
-    let held = Held {
-        hash: handshake_hash(&handshake),
-        epoch,
-        secrets,
-    };
-    group.write_to_storage()?;
-    namespace.put(HELD, Some(held.encode()));
-    Ok(Commit {
-        handshake,
-        welcome,
-        epoch,
-    })
-}
-
 /// A member of one MLS group, over a namespace: its leaf's signing key and
 /// identity, and its current group once it made or joined one.
 pub struct Mls {
@@ -402,14 +173,6 @@ pub struct Mls {
 /// one happened under it.
 fn failure(namespace: &Namespace, error: MlsError) -> Error {
     namespace.take_failure().unwrap_or(Error::Mls(error))
-}
-
-/// mls-rs's refusal of a candidate as this layer's: `namespace`'s store
-/// read's failure if one happened under it.
-fn rejected(namespace: &Namespace, error: MlsError) -> Error {
-    namespace
-        .take_failure()
-        .unwrap_or(Error::Refused(Refusal::Rejected(error)))
 }
 
 /// A group's id and epoch, which a candidate made from it is bound to.
@@ -630,172 +393,6 @@ impl Mls {
         )
     }
 
-    /// The epoch of the commit held, if one is.
-    pub fn held(&self) -> Result<Option<u64>, Error> {
-        Ok(self.held_row()?.map(|held| held.epoch))
-    }
-
-    fn held_row(&self) -> Result<Option<Held>, Error> {
-        self.namespace
-            .get(HELD)?
-            .map(|bytes| Held::decode(&bytes).ok_or(Error::Corrupt))
-            .transpose()
-    }
-
-    /// Stage the deletes of a held commit's rows: the commit, a restart's
-    /// new group's id and a renewal's signer.
-    fn unhold(&self) {
-        for row in [HELD, NEXT, RENEWED] {
-            self.namespace.put(row, None);
-        }
-    }
-
-    /// Commit adding the devices of `adds` (their key packages) and
-    /// removing the members whose credentials are `removes`, with a path,
-    /// at `time`, held: the current state, the held commit and the
-    /// caller's `rows` of it in one batch, written before this returns.
-    pub fn commit(
-        &mut self,
-        adds: &[Vec<u8>],
-        removes: &[Vec<u8>],
-        time: u64,
-        rows: impl FnOnce(&Commit) -> Writes,
-    ) -> Result<Commit, Error> {
-        self.hold(|member| member.held_commit(None, adds, removes, time), rows)
-    }
-
-    /// [`Mls::commit`], the leaf's credential renewed to `credential` (its
-    /// signing key kept): the member's from the commit's swap.
-    pub fn renew(
-        &mut self,
-        credential: &[u8],
-        adds: &[Vec<u8>],
-        removes: &[Vec<u8>],
-        time: u64,
-        rows: impl FnOnce(&Commit) -> Writes,
-    ) -> Result<Commit, Error> {
-        self.hold(
-            |member| member.held_commit(Some(credential), adds, removes, time),
-            rows,
-        )
-    }
-
-    /// The commit `build` makes, held: its state, the held commit and the
-    /// caller's `rows` of it in one batch, written before this returns; on
-    /// a failure, which may have spent a generation in memory alone, the
-    /// group as the store holds it again. Refused while one is held.
-    fn hold(
-        &mut self,
-        build: impl FnOnce(&mut Self) -> Result<Commit, Error>,
-        rows: impl FnOnce(&Commit) -> Writes,
-    ) -> Result<Commit, Error> {
-        if self.held_row()?.is_some() {
-            return Err(Error::Held);
-        }
-        self.staged(build, rows)
-    }
-
-    /// The commit built detached, and the current state and the held
-    /// commit staged.
-    fn held_commit(
-        &mut self,
-        renewed: Option<&[u8]>,
-        adds: &[Vec<u8>],
-        removes: &[Vec<u8>],
-        time: u64,
-    ) -> Result<Commit, Error> {
-        let renewal = match renewed {
-            Some(credential) => {
-                let renewal = Signer {
-                    secret: self.signer.secret.clone(),
-                    identity: SigningIdentity::new(
-                        BasicCredential::new(credential.to_vec()).into_credential(),
-                        self.signer.identity.signature_key.clone(),
-                    ),
-                };
-                // The group as a client allowing the renewal loads it.
-                let id = self.group()?.group_id().to_vec();
-                let allowing = client(
-                    &self.namespace,
-                    Rules::default(),
-                    Some(self.signer.clone()),
-                    Identity::renewing(self.credential(), credential.to_vec()),
-                );
-                self.group = Some(
-                    allowing
-                        .load_group(&id)
-                        .map_err(|error| failure(&self.namespace, error))?,
-                );
-                self.namespace.put(RENEWED, Some(renewal.encode()?));
-                Some(renewal)
-            }
-            None => None,
-        };
-        let group = self.group.as_mut().ok_or(Error::NoGroup)?;
-        let members = leaves(group);
-        let mut builder = group.commit_builder().commit_time(MlsTime::from(time));
-        if let Some(Signer { secret, identity }) = renewal {
-            builder = builder.set_new_signing_identity(secret, identity);
-        }
-        for package in adds {
-            let message = MlsMessage::from_bytes(package)?;
-            builder = builder.add_member(message)?;
-        }
-        for credential in removes {
-            let (index, _) = members
-                .iter()
-                .find(|(_, member)| member == credential)
-                .ok_or(Error::Mls(MlsError::MemberNotFound))?;
-            builder = builder.remove_member(*index)?;
-        }
-        let (output, secrets) = builder.build_detached()?;
-        let handshake = output.commit_message.to_bytes()?;
-        let welcome = output
-            .welcome_messages
-            .first()
-            .map(MlsMessage::to_bytes)
-            .transpose()?;
-        let epoch = group
-            .current_epoch()
-            .checked_add(1)
-            .ok_or(Error::Mls(MlsError::InvalidEpoch))?;
-        let secrets = secrets.to_bytes()?;
-        stage_held(&self.namespace, group, handshake, welcome, epoch, secrets)
-    }
-
-    /// Restart: a new group of this member alone at `time`, its commit
-    /// applied at once and held, the current group kept until the restart
-    /// is swapped in. The new group's state, the held commit and the
-    /// caller's `rows` of it in one batch, written before this returns.
-    pub fn restart(
-        &mut self,
-        time: u64,
-        rows: impl FnOnce(&Commit) -> Writes,
-    ) -> Result<Commit, Error> {
-        self.hold(|member| member.started(time), rows)
-    }
-
-    fn started(&mut self, time: u64) -> Result<Commit, Error> {
-        let mut group = self.new_group(time)?;
-        let output = group
-            .commit_builder()
-            .commit_time(MlsTime::from(time))
-            .build()?;
-        group.apply_pending_commit()?;
-        let handshake = output.commit_message.to_bytes()?;
-        let epoch = group.current_epoch();
-        let commit = stage_held(
-            &self.namespace,
-            &mut group,
-            handshake,
-            None,
-            epoch,
-            Vec::new(),
-        )?;
-        self.namespace.put(NEXT, Some(group.group_id().to_vec()));
-        Ok(commit)
-    }
-
     /// A copy of group `id`'s state under `rules` and `identity`.
     fn copy(
         &self,
@@ -808,200 +405,5 @@ impl Mls {
             .load_group(id)
             .map_err(|error| failure(&namespace, error))?;
         Ok((group, namespace))
-    }
-
-    /// The held commit `handshake` applied on a copy: only if `handshake`
-    /// is the held commit's and the current epoch is the one before it.
-    pub fn own(&self, handshake: &[u8]) -> Result<Candidate, Error> {
-        let held = self.held_row()?.ok_or(Error::NotHeld)?;
-        if held.hash != handshake_hash(handshake) {
-            return Err(Error::NotHeld);
-        }
-        let base = self.group.as_ref().map(base);
-        if let Some(next) = self.namespace.get(NEXT)? {
-            let (group, namespace) = self.copy(&next, Rules::default(), Identity::default())?;
-            return Ok(Candidate {
-                group,
-                namespace,
-                kind: Kind::Started,
-                base,
-                held: Some(held.hash),
-            });
-        }
-        if self.epoch()?.checked_add(1) != Some(held.epoch) {
-            return Err(Error::NotHeld);
-        }
-        // `apply_detached_commit` validates nothing: the identities the
-        // copy is loaded with are not used.
-        let (mut group, namespace) = self.copy(
-            self.group()?.group_id(),
-            Rules::default(),
-            Identity::default(),
-        )?;
-        let secrets = CommitSecrets::from_bytes(&held.secrets).map_err(|_| Error::Corrupt)?;
-        group.apply_detached_commit(secrets)?;
-        Ok(Candidate {
-            group,
-            namespace,
-            kind: Kind::Own,
-            base,
-            held: Some(held.hash),
-        })
-    }
-
-    /// Another member's commit `handshake` processed on a copy at `time`
-    /// (the log's batch time, so processing it again gives the same
-    /// candidate), under its logged effect [`Expected`]. A refusal is
-    /// [`Error::Refused`].
-    pub fn process(
-        &self,
-        handshake: &[u8],
-        time: u64,
-        expected: Expected,
-    ) -> Result<Candidate, Error> {
-        let refused = |refusal| Err(Error::Refused(refusal));
-        let Ok(message) = MlsMessage::from_bytes(handshake) else {
-            return refused(Refusal::Malformed);
-        };
-        if message.wire_format() != WireFormat::PrivateMessage {
-            return refused(Refusal::Plaintext);
-        }
-        let current = self.group()?;
-        let identity = match &expected.renewed {
-            Some(after) => Identity::renewing(expected.committer.clone(), after.clone()),
-            None => Identity::default(),
-        };
-        let leaf_credential = expected
-            .renewed
-            .clone()
-            .unwrap_or_else(|| expected.committer.clone());
-        let (mut group, namespace) =
-            self.copy(current.group_id(), Rules::expecting(expected), identity)?;
-        let received = group
-            .process_incoming_message_with_time(message, MlsTime::from(time))
-            .map_err(|error| rejected(&namespace, error))?;
-        let ReceivedMessage::Commit(description) = received else {
-            return refused(Refusal::NotCommit);
-        };
-        let kind = match description.effect {
-            CommitEffect::NewEpoch(_) => Kind::Received,
-            CommitEffect::Removed { .. } => Kind::Removed,
-            // The policy refuses a ReInit proposal before mls-rs computes
-            // a commit's effect.
-            CommitEffect::ReInit(_) => return refused(Refusal::NotCommit),
-        };
-        if kind == Kind::Received {
-            let (Some(before), Some(after)) = (
-                leaf(current, description.committer),
-                leaf(&group, description.committer),
-            ) else {
-                return refused(Refusal::NoPath);
-            };
-            if !matches!(after.leaf_node_source, LeafNodeSource::Commit(_))
-                || after.public_key == before.public_key
-            {
-                return refused(Refusal::NoPath);
-            }
-            let credential = after.signing_identity.credential.as_basic();
-            if credential.is_none_or(|basic| basic.identifier != leaf_credential)
-                || after.signing_identity.signature_key != before.signing_identity.signature_key
-            {
-                return refused(Refusal::Leaf);
-            }
-        }
-        Ok(Candidate {
-            group,
-            namespace,
-            kind,
-            base: Some(base(current)),
-            held: None,
-        })
-    }
-
-    /// Join with `welcome` on a copy at `time`, under the key package this
-    /// member made: a candidate for the epoch the Welcome names, which a
-    /// member of a group joins to leave it for a new one.
-    pub fn join(&self, welcome: &[u8], time: u64) -> Result<Candidate, Error> {
-        let Ok(message) = MlsMessage::from_bytes(welcome) else {
-            return Err(Error::Refused(Refusal::Malformed));
-        };
-        let namespace = self.namespace.copy();
-        let (group, _) = signing(&namespace, &self.signer)
-            .join_group(None, &message, Some(MlsTime::from(time)))
-            .map_err(|error| rejected(&namespace, error))?;
-        if group.group_id().len() > storage::HASH_BYTES || group.current_epoch() > EPOCH_MAX {
-            return Err(Error::Refused(Refusal::Group));
-        }
-        Ok(Candidate {
-            group,
-            namespace,
-            kind: Kind::Joined,
-            base: self.group.as_ref().map(base),
-            held: None,
-        })
-    }
-
-    /// Make `candidate` current, in one batch with `rows`: its state into
-    /// the current namespace, any held commit deleted (its epoch is
-    /// decided), with a held restart's new group unless it is the
-    /// candidate's. A candidate that removes this member deletes the group;
-    /// a new group's deletes the group it leaves, and a Welcome's every key
-    /// package this member made. [`Error::Stale`] for a candidate made
-    /// from another state than the current one.
-    pub fn swap(&mut self, candidate: Candidate, rows: Writes) -> Result<(), Error> {
-        let Candidate {
-            mut group,
-            namespace,
-            kind,
-            base: made_from,
-            held,
-        } = candidate;
-        let current_held = self.held_row()?.map(|held| held.hash);
-        if made_from != self.group.as_ref().map(base)
-            || held.is_some_and(|hash| current_held != Some(hash))
-        {
-            return Err(Error::Stale);
-        }
-        self.staged(
-            |member| {
-                let next = member.namespace.get(NEXT)?;
-                let current = member.group.as_ref().map(|group| group.group_id().to_vec());
-                let kept = (kind != Kind::Removed).then(|| group.group_id().to_vec());
-                for id in [next, current].into_iter().flatten() {
-                    if Some(&id) != kept.as_ref() {
-                        member.namespace.put(&storage::state_row(&id), None);
-                    }
-                }
-                match kept {
-                    Some(id) => {
-                        if kind == Kind::Own
-                            && let Some(renewed) = member.namespace.get(RENEWED)?
-                        {
-                            member.namespace.put(SIGNER, Some(renewed));
-                        }
-                        if kind == Kind::Joined {
-                            member.namespace.delete_all(storage::PACKAGES)?;
-                        }
-                        group.write_to_storage()?;
-                        member.namespace.stage_copy(&namespace);
-                        member.namespace.put(GROUP, Some(id));
-                    }
-                    None => member.namespace.put(GROUP, None),
-                }
-                member.unhold();
-                Ok(())
-            },
-            |_| rows,
-        )
-    }
-
-    /// Delete the held commit, its candidate void, in one batch with
-    /// `rows`: a held restart's new group with it.
-    pub fn void(&mut self, rows: Writes) -> Result<(), Error> {
-        if let Some(next) = self.namespace.get(NEXT)? {
-            self.namespace.put(&storage::state_row(&next), None);
-        }
-        self.unhold();
-        self.write(rows)
     }
 }
