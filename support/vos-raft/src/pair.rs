@@ -307,65 +307,11 @@ impl<N: Ord + Copy, G: Ord + Copy, T: Ord + Copy> PeerTable<N, G, T> {
         let mut changed = cleared;
         let applies =
             listing.since == 0 || peer.whole.is_some_and(|(taken, _)| listing.since <= taken);
-        // The listing this frame leaves: a listing whole counts only what
-        // its round names, as it drops the rest once whole; the table
-        // never holds more than twice the bound, old and new together.
-        let kept = |group: &G| match peer.leading.get(group) {
-            Some(&(_, named)) => listing.since != 0 || named == round,
-            None => false,
-        };
-        let added = listing
-            .leading
-            .iter()
-            .filter(|(group, _)| !kept(group))
-            .count();
-        let held = if listing.since == 0 {
-            peer.leading
-                .values()
-                .filter(|&&(_, named)| named == round)
-                .count()
-        } else {
-            peer.leading.len()
-        };
-        let fresh = listing
-            .leading
-            .iter()
-            .filter(|(group, _)| !peer.leading.contains_key(group))
-            .count();
-        let refused = applies
-            && (held.saturating_add(added) > self.limit
-                || peer.leading.len().saturating_add(fresh) > self.limit.saturating_mul(2));
+        let refused = applies && peer.overflows(self.limit, round, &listing);
         if !applies || refused {
             peer.taking = None;
         } else {
-            for (group, term) in listing.leading {
-                if peer
-                    .leading
-                    .insert(group, (term, round))
-                    .map(|(was, _)| was)
-                    != Some(term)
-                {
-                    changed.push(group);
-                }
-            }
-            for group in listing.unlisted {
-                if peer.leading.remove(&group).is_some() {
-                    changed.push(group);
-                }
-            }
-            if peer.taking == Some((round, parts)) {
-                if listing.since == 0 {
-                    peer.leading.retain(|group, (_, named)| {
-                        let kept = *named == round;
-                        if !kept {
-                            changed.push(*group);
-                        }
-                        kept
-                    });
-                }
-                peer.whole = Some((round, now));
-                peer.taking = None;
-            }
+            peer.take(now, round, parts, listing, &mut changed);
         }
         Some(Heard {
             new_run,
@@ -401,6 +347,75 @@ impl<N: Ord + Copy, G: Ord + Copy, T: Ord + Copy> PeerTable<N, G, T> {
     pub fn taken(&self, node: N) -> Option<(u64, u64)> {
         let peer = self.peers.get(&node)?;
         peer.whole.map(|(round, _)| (peer.last.0, round))
+    }
+}
+
+impl<G: Ord + Copy, T> Peer<G, T> {
+    /// Whether `listing`, of round `round`, would list more than `limit`
+    /// groups: a round of changes counts what is listed and the groups it
+    /// adds; a listing whole counts only what its round names, as it drops
+    /// the rest once whole, and never lets the table hold more than twice
+    /// the bound, old and new together.
+    fn overflows(&self, limit: usize, round: u64, listing: &Round<G>) -> bool {
+        let fresh = listing
+            .leading
+            .iter()
+            .filter(|(group, _)| !self.leading.contains_key(group))
+            .count();
+        let grown = self.leading.len().saturating_add(fresh);
+        if listing.since != 0 {
+            return grown > limit;
+        }
+        let named = |group: &G| {
+            self.leading
+                .get(group)
+                .is_some_and(|&(_, named)| named == round)
+        };
+        let held = self
+            .leading
+            .values()
+            .filter(|&&(_, named)| named == round)
+            .count();
+        let added = listing
+            .leading
+            .iter()
+            .filter(|(group, _)| !named(group))
+            .count();
+        held.saturating_add(added) > limit || grown > limit.saturating_mul(2)
+    }
+
+    /// Apply `listing`, a part of round `round` heard at `now`, adding the
+    /// groups it changes to `changed`: once each of its `parts` has
+    /// arrived, the round is taken whole.
+    fn take(&mut self, now: T, round: u64, parts: u32, listing: Round<G>, changed: &mut Vec<G>) {
+        for (group, term) in listing.leading {
+            if self
+                .leading
+                .insert(group, (term, round))
+                .map(|(was, _)| was)
+                != Some(term)
+            {
+                changed.push(group);
+            }
+        }
+        for group in listing.unlisted {
+            if self.leading.remove(&group).is_some() {
+                changed.push(group);
+            }
+        }
+        if self.taking == Some((round, parts)) {
+            if listing.since == 0 {
+                self.leading.retain(|group, (_, named)| {
+                    let kept = *named == round;
+                    if !kept {
+                        changed.push(*group);
+                    }
+                    kept
+                });
+            }
+            self.whole = Some((round, now));
+            self.taking = None;
+        }
     }
 }
 
