@@ -47,6 +47,7 @@ pub fn follower(term: u64, terms: &[u64], commit: u64) -> Core<u16> {
     core
 }
 
+/// An append in round 1 of data entries at (index, term).
 pub fn append(
     term: u64,
     leader: u16,
@@ -54,17 +55,29 @@ pub fn append(
     commit: u64,
     entries: &[(u64, u64)],
 ) -> Message<u16> {
+    let entries = entries
+        .iter()
+        .map(|&(index, term)| LogEntry::data(index, term, vec![0xee]))
+        .collect();
+    append_entries(term, leader, prev, commit, entries)
+}
+
+/// An append in round 1 of `entries`.
+pub fn append_entries(
+    term: u64,
+    leader: u16,
+    (prev_index, prev_term): (u64, u64),
+    commit: u64,
+    entries: Vec<LogEntry<u16>>,
+) -> Message<u16> {
     Message::Append {
         term,
         leader,
-        prev_index: prev.0,
-        prev_term: prev.1,
+        prev_index,
+        prev_term,
         commit,
         round: 1,
-        entries: entries
-            .iter()
-            .map(|&(index, term)| LogEntry::data(index, term, vec![0xee]))
-            .collect(),
+        entries,
     }
 }
 
