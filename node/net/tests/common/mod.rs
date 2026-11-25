@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
 use vos_net::quic::{Config, Quic};
-use vos_net::{Arrivals, Class, Incoming, Limits, Network, NodeNumber, Peer, Refused, public_key};
+use vos_net::{Arrivals, Class, Incoming, Network, NodeNumber, Peer, Refused, public_key};
 
 /// Node `number`'s secret seed.
 pub fn secret(number: NodeNumber) -> [u8; 32] {
@@ -27,12 +27,13 @@ pub fn vacant_address() -> SocketAddr {
         .unwrap()
 }
 
-pub fn bind(number: NodeNumber, listen: SocketAddr, limits: Limits) -> (Quic, Arrivals) {
-    Quic::bind(Config {
-        limits,
-        ..Config::new(number, secret(number), listen)
-    })
-    .unwrap()
+/// Node `number`'s configuration, on any port.
+pub fn config(number: NodeNumber) -> Config {
+    Config::new(number, secret(number), any_port())
+}
+
+pub fn bind(number: NodeNumber) -> (Quic, Arrivals) {
+    Quic::bind(config(number)).unwrap()
 }
 
 /// Bind `address` again once the last run has let it go.
@@ -74,18 +75,45 @@ pub fn peer_of(number: NodeNumber, quic: &Quic) -> Peer {
 
 /// Nodes 1..=count, each configured with every other.
 pub fn cluster(count: u8) -> Vec<(Quic, Arrivals)> {
-    let nodes: Vec<_> = (1..=count)
-        .map(|number| bind(number, any_port(), Limits::default()))
+    join((1..=count).map(config).collect())
+}
+
+/// Nodes `a` and `b`, each configured with the other.
+pub fn pair(a: Config, b: Config) -> ((Quic, Arrivals), (Quic, Arrivals)) {
+    let mut nodes = join(vec![a, b]);
+    let b = nodes.pop().unwrap();
+    (nodes.pop().unwrap(), b)
+}
+
+/// A node of each configuration, each configured with every other.
+fn join(configs: Vec<Config>) -> Vec<(Quic, Arrivals)> {
+    let numbers: Vec<NodeNumber> = configs.iter().map(|config| config.number).collect();
+    let nodes: Vec<_> = configs
+        .into_iter()
+        .map(|config| Quic::bind(config).unwrap())
         .collect();
     let peers: Vec<Peer> = nodes
         .iter()
-        .zip(1..)
+        .zip(numbers)
         .map(|((quic, _), number)| peer_of(number, quic))
         .collect();
     for (quic, _) in &nodes {
         quic.set_peers(peers.clone());
     }
     nodes
+}
+
+/// Node 1, configured with node 2 at an address nothing listens on yet.
+pub fn node_1() -> (Quic, Arrivals, SocketAddr) {
+    let (a, arrivals) = bind(1);
+    let address = vacant_address();
+    a.set_peers(vec![peer_at(2, address)]);
+    (a, arrivals, address)
+}
+
+/// The `percent`th percentile of `sorted`.
+pub fn percentile(sorted: &[Duration], percent: usize) -> Duration {
+    sorted[(sorted.len() * percent / 100).min(sorted.len() - 1)]
 }
 
 pub async fn within<T>(limit: Duration, future: impl Future<Output = T>) -> Option<T> {

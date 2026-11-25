@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::net::{SocketAddr, UdpSocket};
+use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -20,18 +20,14 @@ use vos_net::{Arrivals, Class, Limits, NodeKey, public_key};
 /// The peers' protocol.
 const ALPN: &[u8] = b"vos/1";
 
-fn endpoint_at(address: SocketAddr, server: Option<quinn::ServerConfig>) -> quinn::Endpoint {
+fn endpoint(server: Option<quinn::ServerConfig>) -> quinn::Endpoint {
     quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         server,
-        UdpSocket::bind(address).unwrap(),
+        UdpSocket::bind(any_port()).unwrap(),
         Arc::new(quinn::SmolRuntime),
     )
     .unwrap()
-}
-
-fn endpoint(server: Option<quinn::ServerConfig>) -> quinn::Endpoint {
-    endpoint_at(any_port(), server)
 }
 
 /// A client of the peers' protocol holding `secret`, dialing `node`.
@@ -143,7 +139,7 @@ fn other_server(secret: [u8; 32]) -> quinn::Endpoint {
 #[test]
 fn a_dialed_peer_is_granted_no_streams() {
     smol::block_on(async {
-        let (a, _a_arrivals) = bind(1, any_port(), Limits::default());
+        let (a, _a_arrivals) = bind(1);
         let other = other_server(secret(2));
         a.set_peers(vec![peer_at(2, other.local_addr().unwrap())]);
         send(&a, 2, Class::Consensus, 1, b"hello".to_vec()).await;
@@ -161,8 +157,7 @@ fn a_dialed_peer_is_granted_no_streams() {
 #[test]
 fn a_peer_holds_one_inbound_connection() {
     smol::block_on(async {
-        let (a, a_arrivals) = bind(1, any_port(), Limits::default());
-        a.set_peers(vec![peer_at(2, vacant_address())]);
+        let (a, a_arrivals, _) = node_1();
         let mut held = Vec::new();
         for _ in 0..8 {
             let (client, connection) = dial_as_2(&a).await;
@@ -204,8 +199,7 @@ fn a_peer_holds_one_inbound_connection() {
 #[test]
 fn unfinished_frames_from_one_peer_are_bounded() {
     smol::block_on(async {
-        let (a, a_arrivals) = bind(1, any_port(), Limits::default());
-        a.set_peers(vec![peer_at(2, vacant_address())]);
+        let (a, a_arrivals, _) = node_1();
         let (_client, connection) = dial_as_2(&a).await;
         let limit = Limits::default().consensus;
         const STREAMS: u64 = 12;
@@ -412,12 +406,11 @@ fn strangers_take_few_handshakes() {
     for stranger in strangers {
         stranger.join().unwrap();
     }
-    let at = |sorted: &[Duration], part: usize| sorted[sorted.len() * part / 100];
     println!(
         "{during} handshakes in {elapsed:?}, {} refused in all; a peer's frames: p50 {:?}, p99 {:?}",
         refused.load(Ordering::Relaxed),
-        at(&loud, 50),
-        at(&loud, 99),
+        percentile(&loud, 50),
+        percentile(&loud, 99),
     );
     // One address's places, eight, each kept a second after a failed
     // handshake.
@@ -427,7 +420,7 @@ fn strangers_take_few_handshakes() {
         "{during} strangers' handshakes in {elapsed:?}, past {bound}"
     );
     assert!(
-        at(&loud, 99) < Duration::from_secs(1),
+        percentile(&loud, 99) < Duration::from_secs(1),
         "strangers' handshakes delayed a peer's frames"
     );
 }
@@ -437,8 +430,7 @@ fn strangers_take_few_handshakes() {
 #[test]
 fn a_removed_peer_s_inbound_connection_closes() {
     smol::block_on(async {
-        let (a, a_arrivals) = bind(1, any_port(), Limits::default());
-        a.set_peers(vec![peer_at(2, vacant_address())]);
+        let (a, a_arrivals, _) = node_1();
         let (_client, connection) = dial_as_2(&a).await;
         let mut stream = connection.open_uni().await.unwrap();
         stream
@@ -462,7 +454,7 @@ fn a_removed_peer_s_inbound_connection_closes() {
 #[test]
 fn a_peer_that_closes_at_once_is_dialed_with_backoff() {
     smol::block_on(async {
-        let (a, _a_arrivals) = bind(1, any_port(), Limits::default());
+        let (a, _a_arrivals) = bind(1);
         let other = other_server(secret(2));
         a.set_peers(vec![peer_at(2, other.local_addr().unwrap())]);
         let closing = smol::spawn({

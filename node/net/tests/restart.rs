@@ -10,8 +10,8 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use common::*;
+use vos_net::Class;
 use vos_net::quic::Quic;
-use vos_net::{Class, Limits};
 
 const PEER: &str = "VOS_NET_RESTARTED_PEER";
 
@@ -86,14 +86,6 @@ impl Drop for Run {
         let _ = self.process.kill();
         let _ = self.process.wait();
     }
-}
-
-/// Node 1, configured with node 2 at an address of its own.
-fn node_1() -> (Quic, vos_net::Arrivals, SocketAddr) {
-    let (a, arrivals) = bind(1, any_port(), Limits::default());
-    let address = vacant_address();
-    a.set_peers(vec![peer_at(2, address)]);
-    (a, arrivals, address)
 }
 
 /// Node 2 never sends after its restart: node 1's next frame meets the

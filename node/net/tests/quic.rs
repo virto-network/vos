@@ -81,7 +81,7 @@ fn a_key_not_configured_is_refused_on_either_side() {
         let (a, _) = &nodes[0];
         let (b, b_arrivals) = &nodes[1];
         // Node 9 knows node 2, but node 2 does not know node 9's key.
-        let (stranger, _) = bind(9, any_port(), Limits::default());
+        let (stranger, _) = bind(9);
         stranger.set_peers(vec![peer_of(2, b)]);
         send(&stranger, 2, Class::Consensus, 1, b"let me in".to_vec()).await;
         // Nor does it take a configured number with another node's key:
@@ -152,7 +152,7 @@ fn a_peer_shut_down_and_started_again_is_reachable_at_once() {
 #[test]
 fn a_liveness_frame_is_not_held_for_a_later_connection() {
     smol::block_on(async {
-        let (a, _) = bind(1, any_port(), Limits::default());
+        let (a, _) = bind(1);
         // Node 2's address, nothing listening there yet.
         let address = vacant_address();
         a.set_peers(vec![peer_at(2, address)]);
@@ -178,10 +178,16 @@ fn an_oversized_frame_is_refused() {
             consensus: 8 << 20,
             ..Limits::default()
         };
-        let (a, _) = bind(1, any_port(), large);
-        let (b, b_arrivals) = bind(2, any_port(), small);
-        a.set_peers(vec![peer_of(2, &b)]);
-        b.set_peers(vec![peer_of(1, &a)]);
+        let ((a, _), (b, b_arrivals)) = pair(
+            Config {
+                limits: large,
+                ..config(1)
+            },
+            Config {
+                limits: small,
+                ..config(2)
+            },
+        );
         // The sender refuses what its own limits refuse.
         assert_eq!(
             b.send(1, Class::Consensus, 1, vec![0; (1 << 20) + 1]),
@@ -218,7 +224,7 @@ fn a_removed_peer_is_cut_off() {
 #[test]
 fn a_queue_to_an_unreachable_peer_fills() {
     smol::block_on(async {
-        let (a, _) = bind(1, any_port(), Limits::default());
+        let (a, _) = bind(1);
         // Nothing listens there.
         let silent = std::net::UdpSocket::bind(any_port()).unwrap();
         a.set_peers(vec![peer_at(2, silent.local_addr().unwrap())]);
@@ -257,7 +263,7 @@ fn each_class_s_queue_to_a_peer_holds_its_budget() {
             requests: 3000,
             bulk: 4000,
         },
-        ..Config::new(1, secret(1), any_port())
+        ..config(1)
     })
     .unwrap();
     // Nothing answers there.
@@ -277,18 +283,16 @@ fn quiet_streams_finish_so_others_can_open() {
     smol::block_on(async {
         // Node 2 lets node 1 hold eight streams open at once, and node 1
         // finishes a stream quiet for 200 ms.
-        let (a, _) = Quic::bind(Config {
-            quiet: Duration::from_millis(200),
-            ..Config::new(1, secret(1), any_port())
-        })
-        .unwrap();
-        let (b, b_arrivals) = Quic::bind(Config {
-            streams: 8,
-            ..Config::new(2, secret(2), any_port())
-        })
-        .unwrap();
-        a.set_peers(vec![peer_of(2, &b)]);
-        b.set_peers(vec![peer_of(1, &a)]);
+        let ((a, _), (_b, b_arrivals)) = pair(
+            Config {
+                quiet: Duration::from_millis(200),
+                ..config(1)
+            },
+            Config {
+                streams: 8,
+                ..config(2)
+            },
+        );
         for id in 0..8 {
             send(&a, 2, Class::Consensus, id, b"busy".to_vec()).await;
             assert_eq!(next(&b_arrivals.consensus).await.stream, id);
@@ -308,14 +312,13 @@ fn quiet_streams_finish_so_others_can_open() {
 #[test]
 fn a_quiet_stream_s_successor_keeps_its_order() {
     smol::block_on(async {
-        let (a, _) = Quic::bind(Config {
-            quiet: Duration::from_millis(50),
-            ..Config::new(1, secret(1), any_port())
-        })
-        .unwrap();
-        let (b, b_arrivals) = bind(2, any_port(), Limits::default());
-        a.set_peers(vec![peer_of(2, &b)]);
-        b.set_peers(vec![peer_of(1, &a)]);
+        let ((a, _), (_b, b_arrivals)) = pair(
+            Config {
+                quiet: Duration::from_millis(50),
+                ..config(1)
+            },
+            config(2),
+        );
         // Nothing is consumed while three bursts go out, each on a new
         // stream for the same id: the first burst's reader waits on a full
         // arrival queue, holding frames its successors must not pass.
