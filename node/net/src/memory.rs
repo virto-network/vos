@@ -242,11 +242,11 @@ impl Endpoint {
                             break;
                         };
                         match deliver.try_deliver(class, incoming) {
-                            Err(smol::channel::TrySendError::Full(back)) => {
+                            Ok(()) => break,
+                            Err(back) => {
                                 incoming = back;
                                 smol::Timer::after(POLL).await;
                             }
-                            _ => break,
                         }
                     }
                     if let Some(held) = held.lock().expect("the held bytes").get_mut(&(to, class)) {
@@ -326,11 +326,10 @@ impl Network for Endpoint {
             let Some(deliver) = deliver else {
                 return Ok(());
             };
-            return match deliver.try_deliver(class, incoming) {
-                Err(smol::channel::TrySendError::Full(_)) => Err(Refused::Full),
-                // Delivered, or lost with a consumer that is gone.
-                _ => Ok(()),
-            };
+            // Delivered, or lost with a consumer that is gone.
+            return deliver
+                .try_deliver(class, incoming)
+                .map_err(|_| Refused::Full);
         }
         // A delayed link's queue holds what it has yet to deliver, under its
         // class's budget: one under it takes one frame more.
