@@ -111,7 +111,9 @@ exclude = [
     "node/light/android",
 ]
 
-# fjall's lsm-tree: 3.1.10 with three fixes, each on a branch of the fork:
+# fjall's lsm-tree: 3.1.10 and two upstream commits after it (a warning on
+# a small cache shard, a comment), with three fixes, each on a branch of the
+# fork:
 # a popped memtable is freed outside the version history's write lock
 # (`free-popped-memtables-off-lock`), a flush or a compaction no longer
 # makes a write batch visible in part (`batch-visible-whole`), and its
