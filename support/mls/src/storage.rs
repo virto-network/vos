@@ -132,11 +132,9 @@ impl Namespace {
         lock(self.target()).insert(key, value);
     }
 
-    /// Write the staged rows and `rows` in one synced batch: all
-    /// of them, or, on an error, none, the staged rows kept for the next.
-    /// A row the store cannot hold is [`Error::Unstorable`]. A failed sync
-    /// is [`Error::Store`], and fjall then takes no more writes; its
-    /// journal may hold the batch, so a reopen can find it applied.
+    /// Write the staged rows and `rows` in one synced batch: all of them,
+    /// or none, the staged rows kept. A row the store cannot hold is
+    /// [`Error::Unstorable`], a failed sync [`Error::Store`].
     pub(crate) fn commit(&self, rows: Writes) -> Result<(), Error> {
         let mut staged = lock(&self.staged);
         let fits = |(key, value): (&Vec<u8>, &Option<Vec<u8>>)| {
