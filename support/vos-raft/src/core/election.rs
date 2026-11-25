@@ -64,7 +64,6 @@ impl<N: NodeId> Core<N> {
         self.leading = None;
         // A load asked while leading is answered to no one now.
         self.loads.clear();
-        self.current_term_first_index = None;
         self.pre_candidate_misses = 0;
         self.reset_election_timer();
     }
@@ -187,14 +186,13 @@ impl<N: NodeId> Core<N> {
         self.led = Some(self.term);
         self.votes.clear();
         self.seen_leader = Some(self.cfg.me);
-        self.leading = Some(LeaderState::new());
-        self.rebuild_leader_tracking();
         // A new leader commits an entry of its own term before it serves
         // reads, so no read sees state a later leader could revert.
         let index = self.log.last_index() + 1;
-        self.current_term_first_index = Some(index);
+        let check_quorum_due = self.now + self.cfg.election_timeout_ms.1;
+        self.leading = Some(LeaderState::new(check_quorum_due, index));
+        self.rebuild_leader_tracking();
         self.write_entries(alloc::vec![LogEntry::data(index, self.term, Vec::new())]);
-        self.check_quorum_due = self.now + self.cfg.election_timeout_ms.1;
         self.send_heartbeats();
     }
 
@@ -215,8 +213,8 @@ impl<N: NodeId> Core<N> {
         }
         if let Some(leading) = self.leading.as_mut() {
             leading.recent.clear();
+            leading.check_quorum_due = self.now + self.cfg.election_timeout_ms.1;
         }
-        self.check_quorum_due = self.now + self.cfg.election_timeout_ms.1;
     }
 
     /// Whether a candidate whose log ends at (`last_index`, `last_term`)
