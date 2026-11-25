@@ -4,6 +4,7 @@
 
 mod common;
 
+use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -128,6 +129,9 @@ fn a_commit_carries_the_callers_writes() {
 
 const CHILD: &str = "MERKLE_CRDT_CRASH_DIR";
 
+/// What the writer prints once its first batch is committed.
+const COMMITTED: &str = "crash_writer: committed";
+
 /// The writer the crash test kills: catches up a page at a time, and
 /// records a local node after each page, forever.
 #[test]
@@ -142,23 +146,23 @@ fn crash_writer() {
     let mut server = Server::new(&items, 7);
     loop {
         let (page, _) = server.since(replica.cursor());
-        if page.is_empty() {
-            replica.record(&key, vec![(i, i)], &mut crdt).unwrap();
-            i += 1;
-            continue;
+        if let Some(last) = page.last().map(|(position, _)| *position) {
+            replica
+                .ingest(page.into_iter().map(|(_, b)| b), Some(last), &mut crdt)
+                .unwrap();
         }
-        let last = page.last().unwrap().0;
-        replica
-            .ingest(page.into_iter().map(|(_, b)| b), Some(last), &mut crdt)
-            .unwrap();
         replica.record(&key, vec![(i, i)], &mut crdt).unwrap();
         i += 1;
+        if i == 1 {
+            println!("{COMMITTED}");
+        }
     }
 }
 
-/// Kill the writer at random points; after each kill the store reopens to
-/// a replica whose rows are the replay of its nodes, whose cursor names
-/// exactly the nodes it applied or holds, and which finishes the catch-up.
+/// Kill the writer at random points, the first time after it committed;
+/// after each kill the store reopens to a replica whose rows are the
+/// replay of its nodes, whose cursor names exactly the nodes it applied or
+/// holds, and which finishes the catch-up.
 #[test]
 fn a_killed_writer_leaves_whole_batches() {
     let dir = tempfile::tempdir().unwrap();
@@ -172,10 +176,17 @@ fn a_killed_writer_leaves_whole_batches() {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "crash_writer", "--nocapture"])
             .env(CHILD, dir.path())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        if round == 0 {
+            let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+            assert!(
+                lines.any(|line| line.unwrap().contains(COMMITTED)),
+                "the writer stopped before it committed"
+            );
+        }
         std::thread::sleep(Duration::from_millis(20 + rng.below(180) as u64));
         child.kill().unwrap();
         child.wait().unwrap();
