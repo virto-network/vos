@@ -248,9 +248,9 @@ impl Candidate {
         Ok(Some(self.group.epoch_authenticator()?.to_vec()))
     }
 
-    /// Its members' credentials, by leaf; for a commit that removes this
-    /// device, the current ones.
-    pub fn credentials(&self) -> Vec<(u32, Vec<u8>)> {
+    /// Its members' credentials; for a commit that removes this device,
+    /// the current ones.
+    pub fn credentials(&self) -> Vec<Vec<u8>> {
         credentials(&self.group)
     }
 
@@ -296,14 +296,22 @@ pub fn confirmation(domain: &[u8], agent: &[u8; 32], epoch: u64, authenticator: 
 }
 
 /// A handshake's hash, which a held commit is matched by.
-pub fn handshake_hash(handshake: &[u8]) -> [u8; 32] {
+fn handshake_hash(handshake: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2b::<U32>::new();
     hasher.update(b"vos/mls/handshake");
     hasher.update(handshake);
     hasher.finalize().into()
 }
 
-fn credentials(group: &Group<Config>) -> Vec<(u32, Vec<u8>)> {
+fn credentials(group: &Group<Config>) -> Vec<Vec<u8>> {
+    leaves(group)
+        .into_iter()
+        .map(|(_, credential)| credential)
+        .collect()
+}
+
+/// A group's members' credentials, by leaf.
+fn leaves(group: &Group<Config>) -> Vec<(u32, Vec<u8>)> {
     group
         .roster()
         .members_iter()
@@ -402,10 +410,10 @@ fn client(
 impl Mls {
     /// The member whose leaf credential is `credential`, in `namespace`:
     /// the one it holds, whatever `credential` says, or, in a namespace
-    /// holding none, a new one, its signing key drawn and written in one
-    /// batch with `rows`. [`Error::Credential`] for a new one whose
-    /// `credential` is not 64 bytes.
-    pub fn open(namespace: Namespace, credential: &[u8], rows: Writes) -> Result<Self, Error> {
+    /// holding none, a new one, its signing key drawn and written.
+    /// [`Error::Credential`] for a new one whose `credential` is not 64
+    /// bytes.
+    pub fn open(namespace: Namespace, credential: &[u8]) -> Result<Self, Error> {
         let signer = match namespace.get(SIGNER)? {
             Some(bytes) => decode_signer(&bytes)?,
             None if credential.len() != policy::CREDENTIAL_BYTES => {
@@ -435,7 +443,7 @@ impl Mls {
             namespace,
             group: None,
         };
-        mls.flush(rows)?;
+        mls.flush(Writes::new())?;
         Ok(mls)
     }
 
@@ -526,19 +534,14 @@ impl Mls {
         Ok(self.group()?.current_epoch())
     }
 
-    /// The current epoch's authenticator.
-    pub fn authenticator(&self) -> Result<Vec<u8>, Error> {
-        Ok(self.group()?.epoch_authenticator()?.to_vec())
-    }
-
     /// The MLS exporter's secret of the current epoch for `label` and
     /// `context`, `len` bytes.
     pub fn export(&self, label: &[u8], context: &[u8], len: usize) -> Result<Vec<u8>, Error> {
         Ok(self.group()?.export_secret(label, context, len)?.to_vec())
     }
 
-    /// The current members' credentials, by leaf.
-    pub fn credentials(&self) -> Result<Vec<(u32, Vec<u8>)>, Error> {
+    /// The current members' credentials.
+    pub fn credentials(&self) -> Result<Vec<Vec<u8>>, Error> {
         Ok(credentials(self.group()?))
     }
 
@@ -550,11 +553,10 @@ impl Mls {
     }
 
     /// A key package for a device that adds this one, made at `time` by
-    /// this device's clock: its secrets written in one batch with `rows`.
-    /// It is valid from an hour before `time`, so the devices
-    /// that add it, process its add and join with it may be that far
-    /// behind, and for 365 days from then.
-    pub fn key_package(&mut self, time: u64, rows: Writes) -> Result<Vec<u8>, Error> {
+    /// this device's clock, its secrets written. It is valid from an hour
+    /// before `time`, so the devices that add it, process its add and join
+    /// with it may be that far behind, and for 365 days from then.
+    pub fn key_package(&mut self, time: u64) -> Result<Vec<u8>, Error> {
         let not_before = MlsTime::from(time.saturating_sub(CLOCK_MARGIN));
         self.staged(
             |member| {
@@ -568,7 +570,7 @@ impl Mls {
                     .map_err(|error| member.failure(error))?;
                 Ok(message.to_bytes()?)
             },
-            |_| rows,
+            |_| Writes::new(),
         )
     }
 
@@ -596,9 +598,9 @@ impl Mls {
         )
     }
 
-    /// The commit held, if one is: its handshake's hash and its epoch.
-    pub fn held(&self) -> Result<Option<([u8; 32], u64)>, Error> {
-        Ok(self.held_row()?.map(|held| (held.hash, held.epoch)))
+    /// The epoch of the commit held, if one is.
+    pub fn held(&self) -> Result<Option<u64>, Error> {
+        Ok(self.held_row()?.map(|held| held.epoch))
     }
 
     fn held_row(&self) -> Result<Option<Held>, Error> {
@@ -689,7 +691,7 @@ impl Mls {
         };
         let secret = self.signer.0.clone();
         let group = self.group.as_mut().ok_or(Error::NoGroup)?;
-        let members = credentials(group);
+        let members = leaves(group);
         let mut builder = group.commit_builder().commit_time(MlsTime::from(time));
         if let Some(identity) = renewal {
             builder = builder.set_new_signing_identity(secret, identity);
@@ -947,7 +949,7 @@ impl Mls {
             base: made_from,
             held,
         } = candidate;
-        let current_held = self.held()?.map(|(hash, _)| hash);
+        let current_held = self.held_row()?.map(|held| held.hash);
         if made_from != self.group.as_ref().map(base)
             || held.is_some_and(|hash| current_held != Some(hash))
         {
