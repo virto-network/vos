@@ -5,9 +5,10 @@ use vos_raft::core::{Action, Answer, ChangeMembershipError, Core, Recovered};
 use vos_raft::{ActiveConfigRecord, AppendResult, Config, EntryKind, LogEntry, Message};
 
 use crate::common::{
-    LEADER_A, LEADER_B, ME, acked_at, append, committed, compact_bounds, config, entries_to,
-    follow, follower, lead, leader_of_three_with, leader_of_two, loads, matched, persist_all,
-    persist_into, persist_last, recovered, sent, snapshotted, without_pre_votes, writes,
+    LEADER_A, LEADER_B, ME, acked_at, append, append_entries, committed, compact_bounds, config,
+    entries_to, follow, follower, lead, leader_of_three_with, leader_of_two, loads, matched,
+    persist_all, persist_into, persist_last, recovered, sent, snapshotted, without_pre_votes,
+    writes,
 };
 
 const JOINER: u16 = 4;
@@ -81,15 +82,7 @@ fn a_truncation_falls_back_to_the_log_start_configuration() {
     );
     core.receive(
         LEADER_A,
-        Message::Append {
-            term: 2,
-            leader: LEADER_A,
-            prev_index: 12,
-            prev_term: 1,
-            commit: 12,
-            round: 1,
-            entries: vec![change],
-        },
+        append_entries(2, LEADER_A, (12, 1), 12, vec![change]),
     );
     core.take_actions();
     assert_eq!(core.status().joint_old, Some(vec![ME, LEADER_A, 4]));
@@ -299,15 +292,7 @@ fn a_removed_voter_campaigns_only_in_the_configuration_it_holds() {
     let members = vec![LEADER_A, LEADER_B, JOINER];
     let joint = LogEntry::config_change(2, 1, Some(old.clone()), members.clone());
     let last = LogEntry::config_change(3, 1, None, members.clone());
-    let from_a = |entries: Vec<LogEntry<u16>>| Message::Append {
-        term: 1,
-        leader: LEADER_A,
-        prev_index: 1,
-        prev_term: 1,
-        commit: 1,
-        round: 1,
-        entries,
-    };
+    let from_a = |entries: Vec<LogEntry<u16>>| append_entries(1, LEADER_A, (1, 1), 1, entries);
     let campaigns = |actions: &[Action<u16>]| {
         sent(actions)
             .into_iter()
@@ -412,10 +397,7 @@ fn truncate_dropping_originating_config_change_invalidates_persisted_view() {
     assert_eq!(core.status().members, grown);
     // A leader of term 5 replaces entry 1 with data.
     core.receive(LEADER_A, append(5, LEADER_A, (0, 0), 0, &[(1, 5)]));
-    let records: Vec<_> = writes(&core.take_actions())
-        .into_iter()
-        .filter_map(|write| write.active_config)
-        .collect();
+    let records = records(&core.take_actions());
     let members = vec![ME, LEADER_A, LEADER_B];
     assert_eq!(records, [record(Some(0), members.clone(), None)]);
     assert_eq!(core.status().members, members);
@@ -485,38 +467,46 @@ fn a_discard_drops_the_configuration_of_an_entry_it_drops() {
     assert!(core.status().joint_old.is_some());
     // The joint entry at 2 was never reported: the host gives up on it.
     core.discard_unreported();
-    let records: Vec<_> = writes(&core.take_actions())
-        .into_iter()
-        .filter_map(|write| write.active_config)
-        .collect();
+    let records = records(&core.take_actions());
     let status = core.status();
     assert_eq!(status.last_log_index, 1);
     assert_eq!((status.members, status.joint_old), (old.clone(), None));
     assert_eq!(records, [record(Some(0), old, None)]);
 }
 
-/// A record naming an entry past the recovered log's end (the host cut
-/// the log at open) is not adopted, and is written again.
-#[test]
-fn recovery_drops_a_record_whose_entry_the_log_no_longer_holds() {
+/// What a replica recovers whose host cut its log at open: entries 1..=8,
+/// and a record of a joint configuration whose entry, 10, is gone.
+fn cut_log() -> Recovered<u16> {
     let (members, old) = joint();
     let entries = (1..=8)
         .map(|index| LogEntry::data(index, 1, vec![]))
         .collect();
-    let recovered = Recovered {
-        active_config: Some(record(Some(10), members, Some(old.clone()))),
+    Recovered {
+        active_config: Some(record(Some(10), members, Some(old))),
         ..recovered(1, 8, entries)
-    };
-    let mut core = Core::new(config(), recovered, 0, 5);
+    }
+}
+
+/// The membership records the writes in `actions` carry.
+fn records(actions: &[Action<u16>]) -> Vec<ActiveConfigRecord<u16>> {
+    writes(actions)
+        .into_iter()
+        .filter_map(|write| write.active_config)
+        .collect()
+}
+
+/// A record naming an entry past the recovered log's end (the host cut
+/// the log at open) is not adopted, and is written again.
+#[test]
+fn recovery_drops_a_record_whose_entry_the_log_no_longer_holds() {
+    let (_, old) = joint();
+    let mut core = Core::new(config(), cut_log(), 0, 5);
     let status = core.status();
     assert_eq!(
         (status.members, status.joint_old, status.active_config_index),
         (old.clone(), None, Some(0))
     );
-    let records: Vec<_> = writes(&core.take_actions())
-        .into_iter()
-        .filter_map(|write| write.active_config)
-        .collect();
+    let records = records(&core.take_actions());
     assert_eq!(records, [record(Some(0), old, None)]);
 }
 
@@ -525,18 +515,10 @@ fn recovery_drops_a_record_whose_entry_the_log_no_longer_holds() {
 /// compacted past the missing entry.
 #[test]
 fn a_change_whose_joint_entry_was_cut_is_never_finalized() {
-    let (members, old) = joint();
-    let entries = (1..=8)
-        .map(|index| LogEntry::data(index, 1, vec![]))
-        .collect();
-    let recovered = Recovered {
-        active_config: Some(record(Some(10), members, Some(old))),
-        ..recovered(1, 8, entries)
-    };
     let mut cfg = config();
     cfg.pre_vote = false;
     cfg.compact_hysteresis = 1;
-    let mut core = Core::new(cfg, recovered, 0, 5);
+    let mut core = Core::new(cfg, cut_log(), 0, 5);
     persist_all(&mut core);
     // It leads at term 2 with A's vote; its no-op is entry 9.
     let mut actions = lead_with_a(&mut core, 1_000);
@@ -579,15 +561,7 @@ fn a_record_goes_in_the_write_that_holds_its_entry() {
     let joint_entry = LogEntry::config_change(2, 2, Some(old), members);
     core.receive(
         LEADER_B,
-        Message::Append {
-            term: 2,
-            leader: LEADER_B,
-            prev_index: 1,
-            prev_term: 1,
-            commit: 1,
-            round: 1,
-            entries: vec![joint_entry],
-        },
+        append_entries(2, LEADER_B, (1, 1), 1, vec![joint_entry]),
     );
     let written = writes(&core.take_actions());
     let records: Vec<_> = written
