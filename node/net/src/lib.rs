@@ -164,9 +164,14 @@ const BUDGET_FLOOR: usize = 1 << 20;
 impl Budgets {
     /// A budget of `frames` of each class's largest frames.
     pub(crate) fn new(limits: &Limits, frames: usize) -> Arc<Self> {
+        Self::with(Class::ALL.map(|class| limits.frames(class, frames).max(BUDGET_FLOOR)))
+    }
+
+    /// A budget of `budgets[class]` bytes for each class.
+    pub(crate) fn with(budgets: [usize; 4]) -> Arc<Self> {
         Arc::new(Self {
             held: Default::default(),
-            budgets: Class::ALL.map(|class| limits.frames(class, frames).max(BUDGET_FLOOR)),
+            budgets,
             released: Default::default(),
         })
     }
@@ -201,6 +206,17 @@ impl Budgets {
 
     pub(crate) fn has_room(&self, class: Class) -> bool {
         self.held[class as usize].load(Ordering::Acquire) < self.budgets[class as usize]
+    }
+
+    /// Resolves once the class is under its budget.
+    pub(crate) async fn room(&self, class: Class) {
+        loop {
+            let released = self.released[class as usize].listen();
+            if self.has_room(class) {
+                return;
+            }
+            released.await;
+        }
     }
 }
 

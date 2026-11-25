@@ -381,19 +381,17 @@ impl Inner {
     /// Peer `from` dialed in with `name`: if that is a new incarnation,
     /// this node's connection to it reached the old one.
     fn dialed_in(&self, from: NodeNumber, name: Option<String>) {
-        let links = self.links.lock().expect("the links");
-        let Some(link) = links.get(&from) else {
+        let mut links = self.links.lock().expect("the links");
+        let Some(link) = links.get_mut(&from) else {
             return;
         };
-        let mut seen = link.shared.incarnation.lock().expect("the incarnation");
-        let connection = link.shared.connection.lock().expect("the connection");
-        if seen.is_some()
-            && *seen != name
-            && let Some(connection) = connection.as_ref()
+        if link.incarnation.is_some()
+            && link.incarnation != name
+            && let Some(connection) = link.connection.lock().expect("the connection").as_ref()
         {
             connection.close(code::RESTARTED, b"");
         }
-        *seen = name;
+        link.incarnation = name;
     }
 
     /// `connection`, just authenticated as `key`'s: the number the key is
@@ -461,14 +459,15 @@ impl Network for Quic {
         }
         let links = self.inner.links.lock().expect("the links");
         let link = links.get(&to).ok_or(Refused::UnknownPeer)?;
-        if !link.shared.hold(class, frame.len()) {
-            return Err(Refused::Full);
-        }
+        let held = link
+            .queued
+            .try_hold(class, frame.len())
+            .ok_or(Refused::Full)?;
         let outgoing = Outgoing {
             class,
             stream,
             frame,
-            shared: Arc::clone(&link.shared),
+            _held: held,
             queued: Instant::now(),
         };
         link.frames.try_send(outgoing).map_err(|_| Refused::Closed)
@@ -479,23 +478,16 @@ impl Network for Quic {
     }
 
     fn ready(&self, to: NodeNumber, class: Class) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        let shared = self
+        let queued = self
             .inner
             .links
             .lock()
             .expect("the links")
             .get(&to)
-            .map(|link| Arc::clone(&link.shared));
+            .map(|link| Arc::clone(&link.queued));
         Box::pin(async move {
-            let Some(shared) = shared else {
-                return;
-            };
-            loop {
-                let released = shared.released.listen();
-                if shared.has_room(class) {
-                    return;
-                }
-                released.await;
+            if let Some(queued) = queued {
+                queued.room(class).await;
             }
         })
     }
