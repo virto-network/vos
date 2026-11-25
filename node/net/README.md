@@ -24,25 +24,70 @@ Two implementations:
 - `quic::Quic`: QUIC (quinn on smol) with TLS 1.3 bound to node keys both
   ways: each side presents its key as a raw public key (RFC 7250) and
   checks the other's against its configuration. Each node dials the peers
-  it sends to and sends only on its own connection; a dropped connection
-  is redialed with backoff while frames wait in a bounded queue per peer
-  and class. Stateless resets are keyed by the node's secret, so a
-  restarted node resets at once the connections its last run held.
+  it sends to and sends only on its own connection; the dialed side may
+  open no stream on it. A dropped connection is redialed on the next frame
+  sent, with backoff when it was refused or closed soon after it was made;
+  frames sent meanwhile wait in a bounded queue per peer and class, and
+  those already handed to the dropped connection are lost with it.
+  Stateless resets are keyed by the node's secret and the endpoint's
+  protocol, so a restarted node resets at once the connections its last
+  run held, and the node API's endpoint gives out no reset token of a
+  peer connection.
 - `memory::Hub`: endpoints in one process, for tests, with links that can
   be cut, lose frames at a rate and delay them.
 
 `api` holds the TLS configuration of the node API's QUIC endpoint (its own
-protocol, `vos-api/1`, its own allowlist and executor).
+protocol, `vos-api/1`, its own allowlist, keys and executor); address
+validation and bounds on its handshakes and connections are its caller's.
 
 ## Guarantees
 
 - A frame is delivered at most once, with the authenticated peer it came
   from.
-- Order holds within one stream on one connection, and only there: a
-  redial can reorder across the old and new connections.
+- Order holds within one id on one connection, and only there: a redial
+  can reorder across the old and new connections.
 - A send never waits: a queue past its budget refuses, and `ready` says
   when it has room again. A full arrival queue holds its stream's reader,
   and so the sender, as flow control.
+- No age bound but Liveness's: a frame queued through an outage is sent
+  when the peer is reached again, however late.
+
+## Bounds against peers
+
+What a sender can make a node spend, over QUIC (`quic::Config`):
+
+- **Handshakes.** A sender proves its address (a QUIC retry) before the
+  node runs its side of a handshake. Handshakes under way are bounded per
+  address (8, times the configured peers at that address; an IPv6
+  address counts by its /64) and, for addresses no configured peer has,
+  64 in all. A handshake has 10 s; one that fails keeps its place for 1 s,
+  so a stranger's address costs the node at most 8 handshakes a second,
+  and every stranger together 64, on the thread that carries the peers'
+  frames. A peer's own address is never crowded out by strangers.
+- **One inbound connection per key:** a newer one replaces the older.
+  A peer removed from the table, or given another number, loses it at
+  once.
+- **Frames being assembled:** each class's frames from one peer take
+  their bytes from a budget of 4 of that class's largest frames before
+  they are read; past it a stream waits unread.
+- **Frames waiting for the consumer:** each class's queue holds at most
+  4 of its largest frames' bytes (and 1,024 frames, 16 for Bulk), from
+  every peer; a frame counts until the consumer drops it.
+- **Protocol violations:** the first is logged; past 16 on one
+  connection, it is closed.
+
+Limits that stay:
+
+- What quinn buffers for a peer's streams not being read is bounded by
+  `quic::Config::streams` times a stream's window (1 MiB): 8 GiB at the
+  default of 8,192 streams. A finite connection window would bound it
+  lower but would let unread streams of one class stall a peer's
+  heartbeats; a node sets `streams` to what its traffic needs.
+- A peer's frames of one class share that class's queue with every other
+  peer's, so a peer that floods takes most of its places.
+- A configured peer can still spend the node's thread on what it sends;
+  vos-net bounds memory and handshakes, not a peer's well-formed traffic.
+- A frame queued before its peer was removed may still be read after.
 
 ## Tests
 
@@ -52,11 +97,13 @@ partitions, losses, delays, restarts, the peer list); `tests/quic.rs`
 configured refused on either side, oversized frames, removed and
 unreachable peers, quiet streams); `tests/restart.rs` (a peer killed and
 started again in a child process); `tests/head_of_line.rs` (consensus
-frames' latency beside bulk frames to the same peer).
+frames' latency beside bulk frames to the same peer); `tests/hostile.rs`
+(the bounds above, against peers and strangers running code of their
+own).
 
 ## Users
 
-On the `vos-core` branch: the node (`node/host`: `src/peer.rs`,
+The node (`node/host`: `src/peer.rs`,
 `src/liveness.rs`, `src/dispatch.rs`, `src/api/quic.rs`, `src/tls.rs`,
 `src/client/api.rs`), the HTTP front (`node/http/src/tls.rs`), the
 gateway (`node/gateway/src/upstream.rs`), the scale harness
