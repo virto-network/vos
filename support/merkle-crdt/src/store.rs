@@ -6,7 +6,8 @@ use core::fmt::Debug;
 /// Where a replica keeps its scope: the applied nodes, the nodes held until
 /// their parents arrive, the index of nodes by author and sequence number,
 /// the heads, the cursor, the nodes not yet pushed, and the rows its
-/// operations wrote.
+/// operations wrote. One replica a store: two replicas over one store each
+/// write the store's state from their own memory.
 ///
 /// Every change of one ingest or one local operation reaches the store as
 /// one [`Changes`], which [`commit`](Store::commit) writes atomically: a
@@ -21,15 +22,15 @@ pub trait Store<H: Hasher> {
     /// Whether a node is applied.
     fn contains(&self, cid: &Cid<H>) -> Result<bool, Self::Error>;
 
-    /// Every applied node's CID: for audits.
-    fn nodes(&self) -> Result<Vec<Cid<H>>, Self::Error>;
-
     /// A held node's bytes.
     fn held(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error>;
 
-    /// The applied nodes `author` signed at `seq`: one, or more for an
-    /// equivocation.
-    fn authored(&self, author: &Author, seq: u64) -> Result<Vec<Cid<H>>, Self::Error>;
+    /// An applied node `author` signed at `seq`, if there is one (any one,
+    /// for an equivocation).
+    fn authored(&self, author: &Author, seq: u64) -> Result<Option<Cid<H>>, Self::Error>;
+
+    /// Whether `cid` is an applied node `author` signed at `seq`.
+    fn is_authored(&self, author: &Author, seq: u64, cid: &Cid<H>) -> Result<bool, Self::Error>;
 
     /// A row the applied operations wrote.
     fn row(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
@@ -37,14 +38,18 @@ pub trait Store<H: Hasher> {
     /// What a replica keeps in memory, read once when it opens.
     fn load(&self) -> Result<Loaded<H>, Self::Error>;
 
-    /// Write `changes`, all of them or, on an error, none.
+    /// Write `changes`, all of them or none. After an error it is not
+    /// known which until the store is opened again: a store may have
+    /// written the batch before it failed (fjall's journal does), so a
+    /// caller reopens before it retries an operation.
     fn commit(&mut self, changes: Changes<H>) -> Result<(), Self::Error>;
 }
 
 /// What a replica reads from its store when it opens.
 pub struct Loaded<H: Hasher> {
-    /// The applied nodes no applied node names as a parent.
-    pub heads: BTreeSet<Cid<H>>,
+    /// The applied nodes no applied node names as a parent, each with its
+    /// author and sequence number.
+    pub heads: BTreeMap<Cid<H>, (Author, u64)>,
     /// Each author's highest sequence number applied, and a node at it.
     pub latest: BTreeMap<Author, (u64, Cid<H>)>,
     /// The (author, sequence number) pairs with more than one applied node.
@@ -53,14 +58,15 @@ pub struct Loaded<H: Hasher> {
     pub cursor: Option<u64>,
     /// The local nodes not yet pushed, by author and sequence number.
     pub outbox: BTreeMap<(Author, u64), Cid<H>>,
-    /// The held nodes and their bytes.
-    pub held: Vec<(Cid<H>, Vec<u8>)>,
+    /// The held nodes: their bytes are read one at a time when the replica
+    /// opens.
+    pub held: Vec<Cid<H>>,
 }
 
 impl<H: Hasher> Default for Loaded<H> {
     fn default() -> Self {
         Self {
-            heads: BTreeSet::new(),
+            heads: BTreeMap::new(),
             latest: BTreeMap::new(),
             equivocations: BTreeSet::new(),
             cursor: None,
@@ -90,8 +96,10 @@ pub struct Changes<H: Hasher> {
     pub held: Vec<(Cid<H>, Vec<u8>)>,
     /// Held nodes released: applied or refused.
     pub released: Vec<Cid<H>>,
-    /// The heads after the batch, when they moved.
-    pub heads: Option<BTreeSet<Cid<H>>>,
+    /// Nodes that became heads, each with its author and sequence number.
+    pub heads_added: Vec<(Cid<H>, Author, u64)>,
+    /// Heads the batch's nodes name, no longer heads.
+    pub heads_removed: Vec<Cid<H>>,
     /// Authors whose highest sequence number moved, with a node at it.
     pub latest: Vec<(Author, u64, Cid<H>)>,
     /// Equivocations found.
@@ -112,7 +120,8 @@ impl<H: Hasher> Default for Changes<H> {
             applied: Vec::new(),
             held: Vec::new(),
             released: Vec::new(),
-            heads: None,
+            heads_added: Vec::new(),
+            heads_removed: Vec::new(),
             latest: Vec::new(),
             equivocations: Vec::new(),
             cursor: None,
@@ -129,7 +138,10 @@ impl<H: Hasher> Changes<H> {
         self.applied.is_empty()
             && self.held.is_empty()
             && self.released.is_empty()
-            && self.heads.is_none()
+            && self.heads_added.is_empty()
+            && self.heads_removed.is_empty()
+            && self.latest.is_empty()
+            && self.equivocations.is_empty()
             && self.cursor.is_none()
             && self.outbox.is_empty()
             && self.pushed.is_empty()
@@ -141,7 +153,7 @@ impl<H: Hasher> Changes<H> {
 pub struct MemStore<H: Hasher> {
     nodes: BTreeMap<Cid<H>, Vec<u8>>,
     held: BTreeMap<Cid<H>, Vec<u8>>,
-    authored: BTreeMap<(Author, u64), Vec<Cid<H>>>,
+    authored: BTreeMap<(Author, u64), BTreeSet<Cid<H>>>,
     loaded: Loaded<H>,
     rows: BTreeMap<Vec<u8>, Vec<u8>>,
 }
@@ -178,6 +190,11 @@ impl<H: Hasher> MemStore<H> {
     pub fn rows(&self) -> &BTreeMap<Vec<u8>, Vec<u8>> {
         &self.rows
     }
+
+    /// The applied nodes' bytes, by CID.
+    pub fn nodes(&self) -> &BTreeMap<Cid<H>, Vec<u8>> {
+        &self.nodes
+    }
 }
 
 impl<H: Hasher> Store<H> for MemStore<H> {
@@ -191,20 +208,22 @@ impl<H: Hasher> Store<H> for MemStore<H> {
         Ok(self.nodes.contains_key(cid))
     }
 
-    fn nodes(&self) -> Result<Vec<Cid<H>>, Self::Error> {
-        Ok(self.nodes.keys().cloned().collect())
-    }
-
     fn held(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {
         Ok(self.held.get(cid).cloned())
     }
 
-    fn authored(&self, author: &Author, seq: u64) -> Result<Vec<Cid<H>>, Self::Error> {
+    fn authored(&self, author: &Author, seq: u64) -> Result<Option<Cid<H>>, Self::Error> {
         Ok(self
             .authored
             .get(&(*author, seq))
-            .cloned()
-            .unwrap_or_default())
+            .and_then(|cids| cids.first().cloned()))
+    }
+
+    fn is_authored(&self, author: &Author, seq: u64, cid: &Cid<H>) -> Result<bool, Self::Error> {
+        Ok(self
+            .authored
+            .get(&(*author, seq))
+            .is_some_and(|cids| cids.contains(cid)))
     }
 
     fn row(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
@@ -218,11 +237,7 @@ impl<H: Hasher> Store<H> for MemStore<H> {
             equivocations: self.loaded.equivocations.clone(),
             cursor: self.loaded.cursor,
             outbox: self.loaded.outbox.clone(),
-            held: self
-                .held
-                .iter()
-                .map(|(cid, bytes)| (cid.clone(), bytes.clone()))
-                .collect(),
+            held: self.held.keys().cloned().collect(),
         })
     }
 
@@ -232,15 +247,18 @@ impl<H: Hasher> Store<H> for MemStore<H> {
             self.authored
                 .entry((node.author, node.seq))
                 .or_default()
-                .push(node.cid.clone());
+                .insert(node.cid.clone());
             self.nodes.insert(node.cid, node.bytes);
         }
         for cid in changes.released {
             self.held.remove(&cid);
         }
         self.held.extend(changes.held);
-        if let Some(heads) = changes.heads {
-            loaded.heads = heads;
+        for cid in changes.heads_removed {
+            loaded.heads.remove(&cid);
+        }
+        for (cid, author, seq) in changes.heads_added {
+            loaded.heads.insert(cid, (author, seq));
         }
         for (author, seq, cid) in changes.latest {
             loaded.latest.insert(author, (seq, cid));

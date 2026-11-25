@@ -1,15 +1,16 @@
 //! What the suites share: a hasher, a CRDT whose result does not depend on
 //! the order concurrent nodes arrive in and that catches a node applied
-//! twice, and a generator of signed DAGs.
+//! twice, a generator of signed DAGs, and the full replay of a set of
+//! nodes an incremental replica is checked against.
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 use ed25519_dalek::SigningKey;
-use merkle_crdt::{Author, Cid, Event, Hasher, Node, Rows, Scope};
+use merkle_crdt::{Author, Cid, Event, Hasher, MAX_PARENTS, Node, Rows, Scope};
 
 pub struct Blake2b256;
 
@@ -114,6 +115,7 @@ pub fn generate(authors: u8, steps: &[Step]) -> Dag {
                     .enumerate()
                     .filter(|(i, _)| pick >> (i % 64) & 1 == 1)
                     .map(|(_, c)| c)
+                    .take(MAX_PARENTS - 1)
                     .collect();
                 let seq = match &latest[a] {
                     Some((seq, previous)) => {
@@ -225,4 +227,178 @@ pub fn deliveries(items: &[Vec<u8>], seed: u64) -> Vec<Vec<Vec<u8>>> {
         batches.push(all.drain(..take).collect());
     }
     batches
+}
+
+/// A key of its own for each `index`, beyond the 256 of [`key`].
+pub fn wide_key(index: u32) -> SigningKey {
+    let mut seed = [0xa5; 32];
+    seed[..4].copy_from_slice(&index.to_le_bytes());
+    SigningKey::from_bytes(&seed)
+}
+
+/// What a whole set of nodes yields, replayed from nothing.
+#[derive(Debug)]
+pub struct Replayed {
+    /// The rows the CRDT wrote.
+    pub rows: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// The heads, each with its author and sequence number.
+    pub heads: BTreeMap<Cid<H>, (Author, u64)>,
+    /// The (author, sequence number) pairs signed more than once.
+    pub equivocations: BTreeSet<(Author, u64)>,
+    /// Each author's highest sequence number.
+    pub latest: BTreeMap<Author, u64>,
+    /// The number of nodes replayed.
+    pub nodes: usize,
+}
+
+/// Rows in memory, starting empty.
+#[derive(Default)]
+struct Fresh(BTreeMap<Vec<u8>, Option<Vec<u8>>>);
+
+impl Rows for Fresh {
+    fn read(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.get(key).cloned().flatten()
+    }
+    fn write(&mut self, key: &[u8], value: Option<&[u8]>) {
+        self.0.insert(key.to_vec(), value.map(<[u8]>::to_vec));
+    }
+}
+
+/// The full validation and replay of `nodes`, the applied nodes of a
+/// store: each checked as an ingest would (canonical bytes, signature in
+/// [`SCOPE`], every parent among them, its author's chain), all applied in
+/// causal order onto empty rows. Panics on a node a replica should not
+/// have applied.
+pub fn replay(
+    nodes: impl IntoIterator<Item = Vec<u8>>,
+    crdt: &mut impl FnMut(Event<'_, H, Ops>, &mut dyn Rows),
+) -> Replayed {
+    let mut all = BTreeMap::new();
+    for bytes in nodes {
+        let (cid, node) = merkle_crdt::validate::<H, Ops>(&SCOPE, &bytes).expect("a valid node");
+        all.insert(cid, node);
+    }
+    let mut remaining: BTreeMap<Cid<H>, usize> = BTreeMap::new();
+    let mut children: BTreeMap<Cid<H>, Vec<Cid<H>>> = BTreeMap::new();
+    for (cid, node) in &all {
+        for parent in &node.parents {
+            assert!(all.contains_key(parent), "a parent is missing");
+            children
+                .entry(parent.clone())
+                .or_default()
+                .push(cid.clone());
+        }
+        remaining.insert(cid.clone(), node.parents.len());
+    }
+    let mut ready: VecDeque<Cid<H>> = remaining
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(cid, _)| cid.clone())
+        .collect();
+    let mut rows = Fresh::default();
+    let mut authored: BTreeMap<(Author, u64), Vec<Cid<H>>> = BTreeMap::new();
+    let mut replayed = Replayed {
+        rows: BTreeMap::new(),
+        heads: BTreeMap::new(),
+        equivocations: BTreeSet::new(),
+        latest: BTreeMap::new(),
+        nodes: 0,
+    };
+    while let Some(cid) = ready.pop_front() {
+        let node = &all[&cid];
+        let signed = &node.payload;
+        if signed.seq > 0 {
+            let previous = authored.get(&(signed.author, signed.seq - 1));
+            assert!(
+                previous
+                    .into_iter()
+                    .flatten()
+                    .any(|cid| node.parents.contains(cid)),
+                "a broken chain"
+            );
+        }
+        let same = authored.entry((signed.author, signed.seq)).or_default();
+        let equivocation = !same.is_empty();
+        if equivocation {
+            replayed.equivocations.insert((signed.author, signed.seq));
+        }
+        same.push(cid.clone());
+        let at = replayed.latest.entry(signed.author).or_insert(signed.seq);
+        *at = (*at).max(signed.seq);
+        for parent in &node.parents {
+            replayed.heads.remove(parent);
+        }
+        replayed
+            .heads
+            .insert(cid.clone(), (signed.author, signed.seq));
+        let event = Event {
+            cid: &cid,
+            author: &signed.author,
+            seq: signed.seq,
+            parents: &node.parents,
+            ops: &signed.ops,
+            equivocation,
+        };
+        crdt(event, &mut rows);
+        replayed.nodes += 1;
+        for child in children.get(&cid).into_iter().flatten() {
+            let count = remaining.get_mut(child).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                ready.push_back(child.clone());
+            }
+        }
+    }
+    assert_eq!(replayed.nodes, all.len(), "a cycle");
+    replayed.rows = rows
+        .0
+        .into_iter()
+        .filter_map(|(key, value)| Some((key, value?)))
+        .collect();
+    replayed
+}
+
+/// A server that numbers nodes as it accepted them and serves a page of
+/// at most `page` after a position.
+pub struct Server {
+    pub items: Vec<(u64, Vec<u8>)>,
+    pub page: usize,
+    pub trips: usize,
+}
+
+impl Server {
+    /// The page after `position`, and whether more follow.
+    pub fn since(&mut self, position: Option<u64>) -> (Vec<(u64, Vec<u8>)>, bool) {
+        self.trips += 1;
+        let start = self
+            .items
+            .iter()
+            .position(|(at, _)| position.is_none_or(|p| *at > p))
+            .unwrap_or(self.items.len());
+        let end = (start + self.page).min(self.items.len());
+        (self.items[start..end].to_vec(), end < self.items.len())
+    }
+}
+
+/// Read `server` from `replica`'s cursor to its end, a page a commit.
+pub fn read<S: merkle_crdt::Store<H>>(
+    replica: &mut merkle_crdt::Replica<H, Ops, S>,
+    server: &mut Server,
+) {
+    loop {
+        let (items, more) = server.since(replica.cursor());
+        let Some(last) = items.last().map(|(position, _)| *position) else {
+            return;
+        };
+        replica
+            .ingest(
+                items.into_iter().map(|(_, bytes)| bytes),
+                Some(last),
+                &mut crdt,
+            )
+            .unwrap();
+        if !more {
+            return;
+        }
+    }
 }

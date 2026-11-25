@@ -1,6 +1,6 @@
 [package]
 name = "merkle-crdt"
-description = "Generic no_std Merkle-CRDTs: a DAG of signed, authored nodes per sync scope, applied incrementally in causal order, fetched in batches from a peer that walks the DAG or from a cursor over a server that cannot. Used by VOS for the Merge lane."
+description = "Generic no_std Merkle-CRDTs: a DAG of signed, authored nodes per sync scope, applied incrementally in causal order onto a storage-backed CRDT, from batches the caller fetches in any order. Used by VOS for the Merge lane."
 keywords = ["crdt", "merkle", "no-std", "p2p", "vos"]
 categories = ["data-structures", "no-std", "algorithms"]
 version.workspace = true

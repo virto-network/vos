@@ -129,12 +129,12 @@ fn measure<S: Store<H>>(
     let (mut one, mut hundred, mut checks, mut locals) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for _ in 0..100 {
-        let batch = peer.peer(replica.heads(), 1);
+        let batch = peer.peer(&replica.heads().keys().cloned().collect(), 1);
         let started = Instant::now();
         replica.ingest(batch, None, &mut lww).unwrap();
         one.push(started.elapsed());
 
-        let batch = peer.peer(replica.heads(), 100);
+        let batch = peer.peer(&replica.heads().keys().cloned().collect(), 100);
         let started = Instant::now();
         for bytes in &batch {
             validate::<H, Op>(&SCOPE, bytes).unwrap();

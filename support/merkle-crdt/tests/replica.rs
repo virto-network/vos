@@ -1,16 +1,18 @@
-//! The incremental replica against the full rebuild, over random DAGs and
-//! random deliveries; equivocations, refusals, fetching, and failed
-//! commits.
+//! The incremental replica against the full replay, over random DAGs and
+//! random deliveries; equivocations, refusals, a cursor, the bounds on
+//! parents and held nodes, and failed commits.
 
 mod common;
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 
-use common::{H, Ops, Rng, SCOPE, Step, crdt, deliveries, generate, key};
-use merkle_crdt::sync::{Feed, Page, Source, Want, serve};
+use common::{
+    H, Ops, Rng, SCOPE, Server, Step, crdt, deliveries, generate, key, read, replay, wide_key,
+};
 use merkle_crdt::{
-    Author, Changes, Cid, DagNode, Error, Loaded, MemStore, Node, Refusal, Replica, Scope, Signed,
-    Store, rebuild,
+    Author, Changes, Cid, Error, Event, Loaded, MAX_HELD, MAX_HELD_PER_AUTHOR, MAX_PARENTS,
+    MemStore, Node, Refusal, Replica, Rows, Scope, Store,
 };
 use proptest::prelude::*;
 
@@ -35,7 +37,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
     /// Any delivery order, with duplicates and any batching, ends in the
-    /// rows, heads and equivocations of the full rebuild; and two replicas
+    /// rows, heads and equivocations of the full replay; and two replicas
     /// fed different orders agree.
     #[test]
     fn incremental_apply_equals_full_rebuild(
@@ -56,7 +58,7 @@ proptest! {
             }
             prop_assert_eq!(replica.held(), 0);
             prop_assert_eq!(&refused, &dag.refused);
-            let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &SCOPE, &mut crdt).unwrap();
+            let rebuilt = replay(replica.store().nodes().values().cloned(), &mut crdt);
             prop_assert_eq!(replica.store().rows(), &rebuilt.rows);
             prop_assert_eq!(replica.heads(), &rebuilt.heads);
             prop_assert_eq!(replica.equivocations(), &rebuilt.equivocations);
@@ -72,7 +74,7 @@ proptest! {
     }
 
     /// A replica that records its own operations between ingests ends
-    /// where the rebuild of its store does.
+    /// where the replay of its store does.
     #[test]
     fn local_records_between_ingests_equal_full_rebuild(
         steps in prop::collection::vec(step(), 1..40),
@@ -94,7 +96,7 @@ proptest! {
             replica.record(&own, vec![op], &mut crdt).unwrap();
         }
         replica.record(&own, vec![(0, 0)], &mut crdt).unwrap();
-        let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &SCOPE, &mut crdt).unwrap();
+        let rebuilt = replay(replica.store().nodes().values().cloned(), &mut crdt);
         prop_assert_eq!(replica.store().rows(), &rebuilt.rows);
         prop_assert_eq!(replica.heads(), &rebuilt.heads);
         prop_assert_eq!(replica.heads().len(), 1);
@@ -132,8 +134,7 @@ fn equivocation_is_detected_kept_and_reported_once() {
 }
 
 /// The apply of a node is told it equivocates: the first node at a number
-/// is not, every later one is, whichever batch brings it, and a rebuild
-/// tells it alike.
+/// is not, every later one is, whichever batch brings it.
 #[test]
 fn an_equivocating_node_is_marked_at_its_apply() {
     let author = key(0);
@@ -157,16 +158,6 @@ fn an_equivocating_node_is_marked_at_its_apply() {
             (next.cid(), false)
         ]
     );
-    let mut rebuilt = Vec::new();
-    rebuild::<H, Ops, _, _>(
-        replica.store(),
-        &SCOPE,
-        &mut |event: merkle_crdt::Event<'_, H, Ops>, _: &mut dyn merkle_crdt::Rows| {
-            rebuilt.push(event.equivocation);
-        },
-    )
-    .unwrap();
-    assert_eq!(rebuilt.iter().filter(|marked| **marked).count(), 1);
 }
 
 #[test]
@@ -259,110 +250,6 @@ fn a_broken_chain_is_refused_with_its_descendants() {
     );
 }
 
-/// A peer serving its store through [`serve`], counting round trips.
-struct Peer<'a> {
-    store: &'a MemStore<H>,
-    budget: usize,
-    trips: usize,
-}
-
-impl Source<H> for Peer<'_> {
-    type Error = std::convert::Infallible;
-    fn fetch(&mut self, want: &Want<H>) -> Result<Vec<Vec<u8>>, Self::Error> {
-        self.trips += 1;
-        serve(self.store, want, self.budget)
-    }
-}
-
-fn history(replica: &mut Mem, authors: u8, count: u64) {
-    for i in 0..count {
-        replica
-            .record(
-                &key((i % authors as u64) as u8),
-                vec![(i % 5, i)],
-                &mut crdt,
-            )
-            .unwrap();
-    }
-}
-
-#[test]
-fn a_dag_walk_fetches_a_budget_a_round_trip() {
-    let mut remote = replica();
-    history(&mut remote, 3, 300);
-    let mut local = replica();
-    let mut peer = Peer {
-        store: remote.store(),
-        budget: 64 << 10,
-        trips: 0,
-    };
-    let report = local
-        .sync(remote.heads().clone(), &mut peer, &mut crdt)
-        .unwrap();
-    assert_eq!(report.applied.len(), 300);
-    assert_eq!(peer.trips, 1, "300 small nodes fit one budget");
-    assert_eq!(local.store().rows(), remote.store().rows());
-
-    // A budget of about 20 nodes: the walk comes back newest first, the
-    // replica holds those and asks for their parents.
-    let mut local = replica();
-    let mut peer = Peer {
-        store: remote.store(),
-        budget: 20 * 200,
-        trips: 0,
-    };
-    local
-        .sync(remote.heads().clone(), &mut peer, &mut crdt)
-        .unwrap();
-    assert_eq!(local.store().rows(), remote.store().rows());
-    assert!(
-        (10..=40).contains(&peer.trips),
-        "{} round trips",
-        peer.trips
-    );
-
-    // A peer ahead by a few nodes sends only those: `have` skips the rest.
-    for i in 0..5 {
-        remote.record(&key(1), vec![(i, i)], &mut crdt).unwrap();
-    }
-    let mut peer = Peer {
-        store: remote.store(),
-        budget: 64 << 10,
-        trips: 0,
-    };
-    let report = local
-        .sync(remote.heads().clone(), &mut peer, &mut crdt)
-        .unwrap();
-    assert_eq!(report.applied.len(), 5);
-    assert_eq!(report.duplicates, 0, "nothing the replica had was sent");
-    assert_eq!(local.store().rows(), remote.store().rows());
-}
-
-/// A server that numbers nodes as it accepted them, serving a page of at
-/// most `page` items.
-struct Server {
-    items: Vec<(u64, Vec<u8>)>,
-    page: usize,
-    trips: usize,
-}
-
-impl Feed for Server {
-    type Error = std::convert::Infallible;
-    fn since(&mut self, position: Option<u64>) -> Result<Page, Self::Error> {
-        self.trips += 1;
-        let start = self
-            .items
-            .iter()
-            .position(|(at, _)| position.is_none_or(|p| *at > p))
-            .unwrap_or(self.items.len());
-        let end = (start + self.page).min(self.items.len());
-        Ok(Page {
-            items: self.items[start..end].to_vec(),
-            more: end < self.items.len(),
-        })
-    }
-}
-
 #[test]
 fn a_cursor_catches_up_out_of_causal_order_and_resumes() {
     let dag = generate(
@@ -396,49 +283,44 @@ fn a_cursor_catches_up_out_of_causal_order_and_resumes() {
         trips: 0,
     };
     let mut local = replica();
-    // Read only the first pages, then reopen the replica from its store.
-    let first = server.since(None).unwrap();
+    // Read only the first page, then reopen the replica from its store.
+    let (first, _) = server.since(None);
     local
         .ingest(
-            first.items.iter().map(|(_, b)| b.clone()),
-            Some(first.items.last().unwrap().0),
+            first.iter().map(|(_, b)| b.clone()),
+            Some(first.last().unwrap().0),
             &mut crdt,
         )
         .unwrap();
     let held = local.held();
+    assert!(held > 0, "a page out of causal order holds nodes");
     let mut local = Mem::open(local.into_store(), SCOPE).unwrap();
     assert_eq!(local.held(), held, "held nodes survive reopening");
-    local.catch_up(&mut server, &mut crdt).unwrap();
+    read(&mut local, &mut server);
     assert_eq!(local.cursor(), Some(last));
     assert_eq!(local.held(), 0);
-    let rebuilt = rebuild::<H, Ops, _, _>(local.store(), &SCOPE, &mut crdt).unwrap();
+    let rebuilt = replay(local.store().nodes().values().cloned(), &mut crdt);
     assert_eq!(local.store().rows(), &rebuilt.rows);
+    assert_eq!(local.heads(), &rebuilt.heads);
     assert_eq!(rebuilt.nodes, dag.nodes.len());
 
-    // Nothing new: one round trip, nothing applied.
+    // Nothing new: one round trip, nothing to ingest.
     let trips = server.trips;
-    let report = local.catch_up(&mut server, &mut crdt).unwrap();
-    assert!(report.applied.is_empty());
+    read(&mut local, &mut server);
     assert_eq!(server.trips, trips + 1);
 }
 
-#[test]
-fn a_feed_going_backwards_is_refused() {
-    struct Backwards;
-    impl Feed for Backwards {
-        type Error = ();
-        fn since(&mut self, _: Option<u64>) -> Result<Page, ()> {
-            Ok(Page {
-                items: vec![(5, vec![]), (4, vec![])],
-                more: false,
-            })
-        }
+/// `count` local nodes, recorded in turn by `authors` authors.
+fn history(replica: &mut Mem, authors: u8, count: u64) {
+    for i in 0..count {
+        replica
+            .record(
+                &key((i % authors as u64) as u8),
+                vec![(i % 5, i)],
+                &mut crdt,
+            )
+            .unwrap();
     }
-    let mut local = replica();
-    assert!(matches!(
-        local.catch_up(&mut Backwards, &mut crdt),
-        Err(Error::Disordered)
-    ));
 }
 
 /// A store whose commits fail while `fail` is set.
@@ -455,14 +337,14 @@ impl Store<H> for Flaky {
     fn contains(&self, cid: &Cid<H>) -> Result<bool, Self::Error> {
         Ok(self.inner.contains(cid).unwrap())
     }
-    fn nodes(&self) -> Result<Vec<Cid<H>>, Self::Error> {
-        Ok(self.inner.nodes().unwrap())
-    }
     fn held(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {
         Ok(self.inner.held(cid).unwrap())
     }
-    fn authored(&self, author: &Author, seq: u64) -> Result<Vec<Cid<H>>, Self::Error> {
+    fn authored(&self, author: &Author, seq: u64) -> Result<Option<Cid<H>>, Self::Error> {
         Ok(self.inner.authored(author, seq).unwrap())
+    }
+    fn is_authored(&self, author: &Author, seq: u64, cid: &Cid<H>) -> Result<bool, Self::Error> {
+        Ok(self.inner.is_authored(author, seq, cid).unwrap())
     }
     fn row(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
         Ok(self.inner.row(key).unwrap())
@@ -555,8 +437,8 @@ fn the_outbox_holds_local_nodes_until_pushed() {
         vec![2, 3]
     );
     // Each local node names its author's previous one.
-    let node: DagNode<H, Signed<Ops>> =
-        DagNode::from_bytes(&local.outbox().unwrap()[0].bytes).unwrap();
+    let (_, node) =
+        merkle_crdt::validate::<H, Ops>(&SCOPE, &local.outbox().unwrap()[0].bytes).unwrap();
     assert_eq!(node.payload.seq, 2);
     assert!(node.parents.contains(&outbox[1].cid));
 }
@@ -609,4 +491,314 @@ fn a_node_signed_for_another_scope_is_refused() {
         report.refused,
         vec![(Some(node.cid()), Refusal::BadSignature)]
     );
+}
+
+/// `count` nodes of `author`, each at sequence number 0 with no parents:
+/// as many forks as it likes.
+fn forks(author: u8, count: u64) -> Vec<Node<H, Ops>> {
+    (0..count)
+        .map(|i| Node::<H, Ops>::sign(&key(author), &SCOPE, 0, vec![(0, i)], BTreeSet::new()))
+        .collect()
+}
+
+/// One author's forks do not decide the size of the next local node: it
+/// names its author's previous node and the heads of authors that never
+/// equivocated first, [`MAX_PARENTS`] in all. The heads it leaves are
+/// still heads, applied alike everywhere, and the next local nodes name
+/// them.
+#[test]
+fn a_local_node_stays_small_whatever_one_author_forks() {
+    let forks = forks(77, 2_000);
+    let other = Node::<H, Ops>::sign(&key(2), &SCOPE, 0, vec![(2, 2)], BTreeSet::new());
+    let mut honest = replica();
+    let all = forks.iter().chain([&other]).map(|node| node.to_bytes());
+    let report = honest.ingest(all, None, &mut crdt).unwrap();
+    assert_eq!(report.applied.len(), 2_001);
+    assert_eq!(honest.heads().len(), 2_001);
+
+    honest.record(&key(1), vec![(1, 1)], &mut crdt).unwrap();
+    let local = honest.outbox().unwrap().pop().unwrap();
+    assert!(local.bytes.len() <= 4_096, "{} bytes", local.bytes.len());
+    let (_, node) = merkle_crdt::validate::<H, Ops>(&SCOPE, &local.bytes).unwrap();
+    assert_eq!(node.parents.len(), MAX_PARENTS);
+    assert!(node.parents.contains(&other.cid()), "an honest head first");
+    assert_eq!(honest.heads().len(), 2_001 - MAX_PARENTS + 1);
+
+    // A peer that has the same nodes has the same heads and rows: a head
+    // no node names converges like any other.
+    let mut peer = replica();
+    let all = forks.iter().chain([&other]).map(|node| node.to_bytes());
+    peer.ingest(all.chain([local.bytes.clone()]), None, &mut crdt)
+        .unwrap();
+    assert_eq!(peer.heads(), honest.heads());
+    assert_eq!(peer.store().rows(), honest.store().rows());
+
+    // The next local node names the first, a head, and merges more.
+    let before = honest.heads().len();
+    honest.record(&key(1), vec![(1, 2)], &mut crdt).unwrap();
+    assert_eq!(honest.heads().len(), before - MAX_PARENTS + 1);
+    let rebuilt = replay(honest.store().nodes().values().cloned(), &mut crdt);
+    assert_eq!(honest.heads(), &rebuilt.heads);
+    assert_eq!(honest.store().rows(), &rebuilt.rows);
+}
+
+#[test]
+fn a_node_naming_more_than_max_parents_is_malformed() {
+    let parents = |count: usize| -> BTreeSet<Cid<H>> {
+        (0..count as u32)
+            .map(|i| {
+                let mut cid = [0; 32];
+                cid[..4].copy_from_slice(&i.to_le_bytes());
+                Cid(cid)
+            })
+            .collect()
+    };
+    let at_most = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![], parents(MAX_PARENTS));
+    assert!(merkle_crdt::validate::<H, Ops>(&SCOPE, &at_most.to_bytes()).is_ok());
+    let past = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![], parents(MAX_PARENTS + 1));
+    assert_eq!(
+        merkle_crdt::validate::<H, Ops>(&SCOPE, &past.to_bytes()).err(),
+        Some((None, Refusal::Malformed))
+    );
+    assert!(merkle_crdt::Header::<H>::read(&past.to_bytes()).is_none());
+}
+
+/// A node of `key` at seq 0 naming a parent that does not exist.
+fn orphan(key: &ed25519_dalek::SigningKey, index: u32) -> Node<H, Ops> {
+    let mut parent = [0; 32];
+    parent[..4].copy_from_slice(&index.to_le_bytes());
+    Node::<H, Ops>::sign(key, &SCOPE, 0, vec![], BTreeSet::from([Cid(parent)]))
+}
+
+/// Nodes whose parents never arrive are held up to a bound, per author and
+/// in all; past it they are dropped, not refused, and the caller can drop
+/// the held ones too.
+#[test]
+fn held_nodes_are_bounded_and_can_be_dropped() {
+    let mut local = replica();
+    let one = key(66);
+    let report = local
+        .ingest(
+            (0..1_000).map(|i| orphan(&one, i).to_bytes()),
+            None,
+            &mut crdt,
+        )
+        .unwrap();
+    assert_eq!(local.held(), MAX_HELD_PER_AUTHOR);
+    assert_eq!(report.held.len(), MAX_HELD_PER_AUTHOR);
+    assert_eq!(report.dropped.len(), 1_000 - MAX_HELD_PER_AUTHOR);
+    assert!(report.refused.is_empty());
+
+    // Many authors: the bound in all.
+    let authors = (MAX_HELD / MAX_HELD_PER_AUTHOR + 2) as u32;
+    let many = (0..authors).flat_map(|author| {
+        let key = wide_key(author);
+        (0..MAX_HELD_PER_AUTHOR as u32).map(move |i| orphan(&key, 10_000 + i).to_bytes())
+    });
+    let report = local.ingest(many, None, &mut crdt).unwrap();
+    assert_eq!(local.held(), MAX_HELD);
+    assert!(!report.dropped.is_empty());
+
+    // Reopened, the store holds what memory did; dropped, none.
+    let mut local = Mem::open(local.into_store(), SCOPE).unwrap();
+    assert_eq!(local.held(), MAX_HELD);
+    assert_eq!(
+        local.drop_held(Some(&Author::from(&one))).unwrap(),
+        MAX_HELD_PER_AUTHOR
+    );
+    assert_eq!(local.held(), MAX_HELD - MAX_HELD_PER_AUTHOR);
+    local.drop_held(None).unwrap();
+    assert_eq!(local.held(), 0);
+    assert!(local.wanted().is_empty());
+    let local = Mem::open(local.into_store(), SCOPE).unwrap();
+    assert_eq!(local.held(), 0);
+}
+
+/// A node dropped past the bound, delivered again once its parent is
+/// applied, applies: a drop is not a refusal.
+#[test]
+fn a_dropped_node_applies_when_delivered_again() {
+    let one = key(66);
+    let parent = Node::<H, Ops>::sign(&key(5), &SCOPE, 0, vec![(5, 5)], BTreeSet::new());
+    let child = Node::<H, Ops>::sign(&one, &SCOPE, 0, vec![], BTreeSet::from([parent.cid()]));
+    let mut local = replica();
+    local
+        .ingest(
+            (0..MAX_HELD_PER_AUTHOR as u32).map(|i| orphan(&one, i).to_bytes()),
+            None,
+            &mut crdt,
+        )
+        .unwrap();
+    let report = local.ingest([child.to_bytes()], None, &mut crdt).unwrap();
+    assert_eq!(report.dropped, vec![child.cid()]);
+    let report = local
+        .ingest([parent.to_bytes(), child.to_bytes()], None, &mut crdt)
+        .unwrap();
+    assert_eq!(report.applied, vec![parent.cid(), child.cid()]);
+}
+
+/// A row key no store takes fails the batch in every store, before
+/// anything is committed.
+#[test]
+fn a_row_no_store_takes_fails_the_batch() {
+    let long = vec![1; merkle_crdt::MAX_ROW_KEY + 1];
+    for bad in [Vec::new(), long] {
+        let mut write = |_: Event<'_, H, Ops>, rows: &mut dyn Rows| rows.write(&bad, Some(b"x"));
+        let node = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![], BTreeSet::new());
+        let mut local = replica();
+        assert!(matches!(
+            local.ingest([node.to_bytes()], None, &mut write),
+            Err(Error::Row)
+        ));
+        assert!(matches!(
+            local.record(&key(2), vec![], &mut write),
+            Err(Error::Row)
+        ));
+        assert!(local.store().is_empty());
+        assert!(local.heads().is_empty());
+    }
+}
+
+/// A local node that does not decode, its operations past what decoding
+/// takes, is refused before anything is written: no other replica could
+/// apply it, nor anything the author signs after it.
+#[test]
+fn a_node_that_does_not_decode_is_not_recorded() {
+    type Bytes = Vec<u8>;
+    let mut nop = |_: Event<'_, H, Bytes>, _: &mut dyn Rows| {};
+    let mut local = Replica::<H, Bytes, _>::open(MemStore::new(), SCOPE).unwrap();
+    let ops = vec![0; merkle_crdt::MAX_DECODE_ITEMS + 1];
+    assert!(matches!(
+        local.record(&key(0), ops, &mut nop),
+        Err(Error::Unencodable)
+    ));
+    assert!(local.outbox().unwrap().is_empty());
+    assert!(local.store().is_empty());
+    let cid = local.record(&key(0), vec![0; 16], &mut nop).unwrap();
+    let outbox = local.outbox().unwrap();
+    assert_eq!((outbox[0].cid.clone(), outbox[0].seq), (cid, 0));
+}
+
+/// A store counting the index lookups a replica makes.
+struct Counting {
+    inner: MemStore<H>,
+    lookups: Cell<usize>,
+}
+
+impl Store<H> for Counting {
+    type Error = std::convert::Infallible;
+    fn node(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.inner.node(cid)
+    }
+    fn contains(&self, cid: &Cid<H>) -> Result<bool, Self::Error> {
+        self.inner.contains(cid)
+    }
+    fn held(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.inner.held(cid)
+    }
+    fn authored(&self, author: &Author, seq: u64) -> Result<Option<Cid<H>>, Self::Error> {
+        self.lookups.set(self.lookups.get() + 1);
+        self.inner.authored(author, seq)
+    }
+    fn is_authored(&self, author: &Author, seq: u64, cid: &Cid<H>) -> Result<bool, Self::Error> {
+        self.lookups.set(self.lookups.get() + 1);
+        self.inner.is_authored(author, seq, cid)
+    }
+    fn row(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.inner.row(key)
+    }
+    fn load(&self) -> Result<Loaded<H>, Self::Error> {
+        self.inner.load()
+    }
+    fn commit(&mut self, changes: Changes<H>) -> Result<(), Self::Error> {
+        self.inner.commit(changes)
+    }
+}
+
+/// Applying a node after an author's forks costs a lookup a parent and one
+/// more, however many forks there are.
+#[test]
+fn a_node_after_many_forks_costs_what_one_after_none_does() {
+    let forks = forks(77, 500);
+    let mut replica = Replica::<H, Ops, _>::open(
+        Counting {
+            inner: MemStore::new(),
+            lookups: Cell::new(0),
+        },
+        SCOPE,
+    )
+    .unwrap();
+    replica
+        .ingest(forks.iter().map(|node| node.to_bytes()), None, &mut crdt)
+        .unwrap();
+    replica.store().lookups.set(0);
+    let next = Node::<H, Ops>::sign(
+        &key(77),
+        &SCOPE,
+        1,
+        vec![],
+        BTreeSet::from([forks[0].cid()]),
+    );
+    let report = replica.ingest([next.to_bytes()], None, &mut crdt).unwrap();
+    assert_eq!(report.applied, vec![next.cid()]);
+    assert!(
+        replica.store().lookups.get() <= 2,
+        "{} index lookups",
+        replica.store().lookups.get()
+    );
+}
+
+/// A store whose row reads fail.
+struct Unreadable(MemStore<H>);
+
+impl Store<H> for Unreadable {
+    type Error = &'static str;
+    fn node(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.0.node(cid).unwrap())
+    }
+    fn contains(&self, cid: &Cid<H>) -> Result<bool, Self::Error> {
+        Ok(self.0.contains(cid).unwrap())
+    }
+    fn held(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.0.held(cid).unwrap())
+    }
+    fn authored(&self, author: &Author, seq: u64) -> Result<Option<Cid<H>>, Self::Error> {
+        Ok(self.0.authored(author, seq).unwrap())
+    }
+    fn is_authored(&self, author: &Author, seq: u64, cid: &Cid<H>) -> Result<bool, Self::Error> {
+        Ok(self.0.is_authored(author, seq, cid).unwrap())
+    }
+    fn row(&self, _: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        Err("unreadable")
+    }
+    fn load(&self) -> Result<Loaded<H>, Self::Error> {
+        Ok(self.0.load().unwrap())
+    }
+    fn commit(&mut self, changes: Changes<H>) -> Result<(), Self::Error> {
+        self.0.commit(changes).unwrap();
+        Ok(())
+    }
+}
+
+/// A read the store fails is the store's error, even where the CRDT took
+/// the missing row for its own error.
+#[test]
+fn a_failed_read_is_the_stores_error() {
+    struct Strict;
+    impl merkle_crdt::Apply<H, Ops> for Strict {
+        type Error = &'static str;
+        fn apply(&mut self, _: Event<'_, H, Ops>, rows: &mut dyn Rows) -> Result<(), &'static str> {
+            rows.read(b"k").ok_or("missing row").map(drop)
+        }
+    }
+    let mut replica = Replica::<H, Ops, _>::open(Unreadable(MemStore::new()), SCOPE).unwrap();
+    let node = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![], BTreeSet::new());
+    let result = replica.ingest([node.to_bytes()], None, &mut Strict);
+    assert!(
+        matches!(result, Err(Error::Store("unreadable"))),
+        "{:?}",
+        result.err()
+    );
+    let result = replica.record(&key(2), vec![], &mut Strict);
+    assert!(matches!(result, Err(Error::Store("unreadable"))));
 }

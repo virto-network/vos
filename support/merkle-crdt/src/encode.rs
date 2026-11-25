@@ -1,6 +1,11 @@
 use alloc::{string::String, vec::Vec};
 
-const MAX_DECODE_ITEMS: usize = 1_000_000;
+/// The most items a vector or a set decodes: a longer one is refused.
+pub const MAX_DECODE_ITEMS: usize = 1_000_000;
+
+/// The most items a vector decodes before it has read them: a count from
+/// the bytes reserves no more, the vector growing as its items decode.
+const RESERVE_ITEMS: usize = 1024;
 
 /// Deterministic serialization for CID computation.
 ///
@@ -10,6 +15,11 @@ const MAX_DECODE_ITEMS: usize = 1_000_000;
 /// second CID.
 /// Variable-length types should be length-prefixed to ensure unambiguous encoding
 /// when composed (e.g. in tuples).
+///
+/// Encoding has no limit, decoding has: a vector or a set of more than
+/// [`MAX_DECODE_ITEMS`] items encodes and does not decode. A replica
+/// refuses to record operations whose node does not decode
+/// ([`Error::Unencodable`](crate::Error::Unencodable)).
 pub trait Encode {
     /// Serialize this value into the buffer.
     fn encode_to(&self, buf: &mut Vec<u8>);
@@ -199,7 +209,7 @@ impl Decode for String {
 impl<T: Decode> Decode for Vec<T> {
     fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
         let count = read_count(buf, pos)?;
-        let mut v = Vec::with_capacity(count.min(buf.len().saturating_sub(*pos)));
+        let mut v = Vec::with_capacity(count.min(RESERVE_ITEMS));
         for _ in 0..count {
             v.push(T::decode_from(buf, pos)?);
         }
