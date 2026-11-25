@@ -3,11 +3,11 @@
 //! one term, a term without a successor, and numbers past its own log.
 
 use vos_raft::core::{Core, Recovered};
-use vos_raft::{AppendResult, Config, Message, Meta, Role};
+use vos_raft::{AppendResult, Config, Message, Role};
 
 use crate::common::{
-    LEADER_A, LEADER_B, ME, acked_at, append, config, follower, leader_of_two, matched, persist,
-    pre_vote, sent, vote, vote_answer, writes,
+    LEADER_A, LEADER_B, ME, acked_at, append, config, follower, leader_of_two, matched,
+    persist_last, pre_vote, recovered, sent, vote, vote_answer, writes,
 };
 
 /// A node the host authenticated that is in no configuration this
@@ -60,7 +60,7 @@ fn an_append_past_the_commit_is_taken() {
     let mut core = committed_follower();
     core.receive(LEADER_A, append(2, LEADER_A, (2, 1), 4, &[(3, 1), (4, 2)]));
     let actions = core.take_actions();
-    persist(&mut core, writes(&actions).last().unwrap());
+    persist_last(&mut core, &actions);
     let status = core.status();
     assert_eq!((status.current_term, status.last_log_index), (2, 4));
     assert_eq!(status.leader_hint, Some(LEADER_A));
@@ -112,7 +112,7 @@ fn a_replica_with_no_leader_answers_a_candidate_it_does_not_know() {
     let mut core = committed_follower();
     core.receive(OUTSIDER, vote(2, OUTSIDER, (5, 1)));
     let actions = core.take_actions();
-    persist(&mut core, writes(&actions).last().unwrap());
+    persist_last(&mut core, &actions);
     assert!(sent(&core.take_actions()).contains(&vote_answer(2, true)));
 }
 
@@ -132,7 +132,7 @@ fn a_replica_not_yet_in_its_configuration_answers_the_members_it_does_not_know()
     core.take_actions();
     core.receive(OUTSIDER, vote(3, OUTSIDER, (5, 2)));
     let actions = core.take_actions();
-    persist(&mut core, writes(&actions).last().unwrap());
+    persist_last(&mut core, &actions);
     assert!(sent(&core.take_actions()).contains(&vote_answer(3, true)));
     // It never campaigns: it is no member as it knows them.
     core.tick(10_000);
@@ -188,14 +188,7 @@ fn a_replica_at_the_last_term_stays_a_follower() {
     for pre_vote in [true, false] {
         let mut cfg = config();
         cfg.pre_vote = pre_vote;
-        let recovered = Recovered {
-            meta: Meta {
-                current_term: u64::MAX,
-                ..Meta::default()
-            },
-            ..Recovered::default()
-        };
-        let mut core = Core::new(cfg, recovered, 0, 3);
+        let mut core = Core::new(cfg, recovered(u64::MAX, 0, Vec::new()), 0, 3);
         for at in 1..=5 {
             core.tick(at * 1_000);
             core.take_actions();
@@ -206,14 +199,7 @@ fn a_replica_at_the_last_term_stays_a_follower() {
     // A group of one too.
     let mut cfg = config();
     cfg.members = vec![ME];
-    let recovered = Recovered {
-        meta: Meta {
-            current_term: u64::MAX,
-            ..Meta::default()
-        },
-        ..Recovered::default()
-    };
-    let mut core = Core::new(cfg, recovered, 0, 3);
+    let mut core = Core::new(cfg, recovered(u64::MAX, 0, Vec::new()), 0, 3);
     core.tick(0);
     core.take_actions();
     assert_eq!(core.role(), Role::Follower);
@@ -263,7 +249,7 @@ fn a_follower_whose_leader_fell_silent_answers_a_candidate_it_does_not_know() {
     core.defer_campaign(low, u64::MAX);
     core.receive(OUTSIDER, vote);
     let actions = core.take_actions();
-    persist(&mut core, writes(&actions).last().unwrap());
+    persist_last(&mut core, &actions);
     assert!(sent(&core.take_actions()).contains(&vote_answer(2, true)));
 }
 
@@ -286,14 +272,7 @@ fn a_term_far_past_the_replicas_is_refused() {
 fn a_replica_that_reaches_the_last_term_stops_campaigning() {
     let mut cfg = config();
     cfg.members = vec![ME];
-    let recovered = Recovered {
-        meta: Meta {
-            current_term: u64::MAX - 1,
-            ..Meta::default()
-        },
-        ..Recovered::default()
-    };
-    let mut core = Core::new(cfg, recovered, 0, 3);
+    let mut core = Core::new(cfg, recovered(u64::MAX - 1, 0, Vec::new()), 0, 3);
     core.tick(0);
     crate::common::persist_all(&mut core);
     assert_eq!(core.role(), Role::Leader);
@@ -302,14 +281,7 @@ fn a_replica_that_reaches_the_last_term_stops_campaigning() {
     // last term, after its timeout, is a follower.
     let mut cfg = config();
     cfg.pre_vote = false;
-    let recovered = Recovered {
-        meta: Meta {
-            current_term: u64::MAX - 1,
-            ..Meta::default()
-        },
-        ..Recovered::default()
-    };
-    let mut core = Core::new(cfg, recovered, 0, 3);
+    let mut core = Core::new(cfg, recovered(u64::MAX - 1, 0, Vec::new()), 0, 3);
     core.tick(1_000);
     crate::common::persist_all(&mut core);
     assert_eq!(core.role(), Role::Candidate);

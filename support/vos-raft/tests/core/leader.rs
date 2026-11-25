@@ -6,8 +6,8 @@ use vos_raft::{AppendResult, LogEntry, Message, Role};
 
 use crate::common::{
     LEADER_A, LEADER_B, ME, acked_at, append, appends, committed, config, entries_to, follower,
-    idle_leader_of_three, lead, leader_of_two, leader_of_two_with, loads, matched, persist,
-    persist_into, pre_vote, recovered, sent, vote_answer, writes,
+    idle_leader_of_three, last_write, lead, leader_of_two, leader_of_two_with, loads, matched,
+    persist, persist_into, persist_last, pre_vote, recovered, sent, vote_answer, writes,
 };
 
 fn proposals_refused(actions: &[Action<u16>]) -> usize {
@@ -47,7 +47,7 @@ fn a_leader_sends_each_peer_a_commit_it_has_acknowledged() {
     for n in 0..4u8 {
         core.propose(u64::from(n), vec![n]);
     }
-    let write = writes(&core.take_actions()).last().unwrap().clone();
+    let write = last_write(&mut core);
     persist(&mut core, &write);
     // A holds everything, B only through 2: the leader commits 5.
     core.receive(LEADER_A, matched(5));
@@ -84,7 +84,7 @@ fn followers_learn_a_commit_at_once_without_a_heartbeat() {
     let mut core = Core::new(cfg, Recovered::default(), 0, 5);
     core.take_actions();
     let actions = lead(&mut core, 1_000);
-    persist(&mut core, writes(&actions).last().unwrap());
+    persist_last(&mut core, &actions);
     core.take_actions();
     // A holds the no-op: it commits, and A is told at once, in the round of
     // the leader's first heartbeat, opening none; B, with the no-op still
@@ -101,7 +101,7 @@ fn followers_learn_a_commit_at_once_without_a_heartbeat() {
     // A later entry: its append carries the old commit, and the new one
     // follows each acknowledgement, never above what the peer holds.
     core.propose(1, vec![1]);
-    let write = writes(&core.take_actions()).last().unwrap().clone();
+    let write = last_write(&mut core);
     persist(&mut core, &write);
     core.take_actions();
     core.receive(LEADER_A, matched(2));
@@ -211,7 +211,7 @@ fn a_transfer_hands_over_once_the_target_holds_everything() {
     let mut core = leader_of_two();
     core.receive(LEADER_A, matched(1));
     core.propose(1, vec![1]);
-    let write = writes(&core.take_actions()).last().unwrap().clone();
+    let write = last_write(&mut core);
     persist(&mut core, &write);
     core.transfer_leadership(Some(LEADER_A));
     let actions = core.take_actions();
