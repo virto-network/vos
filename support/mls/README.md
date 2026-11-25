@@ -48,7 +48,6 @@ messaging comes later.
 - **The confirmation hash** (`confirmation`): Blake2b-256 over a domain,
   the agent, the epoch and the epoch's authenticator, which each device of
   the confirming set posts, signed by its caller.
-
 - **At rest:** every row is plaintext in the caller's keyspace: the leaf's
   signing key, the group state (the epoch's secrets and private tree), key
   packages' private keys and a held commit (the whole next epoch). Only
@@ -81,7 +80,9 @@ messaging comes later.
   key package it adds: a compromised one can add a leaf of its own under
   another device's credential.
 - **Clocks.** A key package is valid from an hour before its maker's clock:
-  devices whose clocks are more than an hour apart cannot add each other.
+  one whose maker's clock is more than an hour ahead of the committer's,
+  or of the log's time a receiver and the joiner check it at, is not yet
+  valid there.
 - **A key package's year.** A key package is valid for 365 days, and a
   joiner checks every leaf that still comes from one: a member added over
   a year ago that has not committed since bars every new join until it
