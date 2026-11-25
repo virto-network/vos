@@ -1,7 +1,7 @@
 //! `vos-mls`: VOS's one MLS layer, over mls-rs (`light-node.md` §3.4). The
 //! user's device group is its first user; member messaging later.
 //!
-//! - **Storage** ([`storage`]): a group's state and its key packages'
+//! - **Storage:** a group's state and its key packages'
 //!   secrets as rows of a fjall keyspace under a namespace, every write
 //!   staged and committed with the caller's rows in one synced batch.
 //! - **Copy and swap:** mls-rs applies a received commit at once, and a
@@ -30,7 +30,7 @@
 //!   at most 1024 generations ahead, so a member's commits voided more
 //!   than 1024 times in one epoch are refused until another member's
 //!   commit moves the epoch.
-//! - **The policy** ([`policy`]): the device group's allow-list and its
+//! - **The policy:** the device group's allow-list and its
 //!   identities, a candidate checked against its logged effect.
 //! - **The confirmation hash** ([`confirmation`]).
 //!
@@ -39,8 +39,8 @@
 //! unsupported. Every time is in seconds since the Unix epoch, as mls-rs
 //! counts.
 
-pub mod policy;
-pub mod storage;
+mod policy;
+mod storage;
 
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
@@ -62,7 +62,8 @@ use mls_rs_core::crypto::SignatureSecretKey;
 use mls_rs_core::error::IntoAnyError;
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 
-pub use policy::{Expected, Identity, Refused, Rules};
+use policy::Rules;
+pub use policy::{Expected, Identity, Refused};
 pub use storage::{Namespace, Store, Writes};
 
 /// Ciphersuite 1: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`.
@@ -88,7 +89,7 @@ fn provider() -> RustCryptoProvider {
 
 /// The client configuration: the namespace's storage, the device group's
 /// identities and rules, RustCrypto.
-pub type Config = IntoConfigOutput<
+type Config = IntoConfigOutput<
     WithMlsRules<
         Rules,
         WithCryptoProvider<
@@ -113,7 +114,7 @@ const NEXT: &[u8] = b"next";
 /// Why an operation failed. A failed operation writes nothing: the
 /// current state stays as the last batch left it. Two exceptions, both a
 /// store's failure: a batch whose sync failed may be found applied after a
-/// reopen ([`Store::commit`]), and an error reading the group back after
+/// reopen, and an error reading the group back after
 /// a written batch leaves that batch written.
 #[derive(Debug)]
 pub enum Error {
@@ -456,8 +457,7 @@ impl Mls {
     /// Write the staged rows and `rows` in one batch; on a failure, discard
     /// what was staged and read the group back as the store holds it.
     fn flush(&mut self, rows: Writes) -> Result<(), Error> {
-        let store = self.namespace.store().clone();
-        match store.commit(&self.namespace, rows) {
+        match self.namespace.commit(rows) {
             Ok(()) => self.reload(),
             Err(error) => self.discard(error),
         }

@@ -2,7 +2,7 @@
 //! packages' secrets as rows of one keyspace under a namespace's prefix.
 //!
 //! **Nothing mls-rs writes reaches the disk by itself.** A namespace
-//! stages its writes, and [`Store::commit`] writes them and the caller's
+//! stages its writes, and its commit writes them and the caller's
 //! own rows in one synced batch: a group's state, a held commit and the
 //! caller's record of either land together or not at all.
 //!
@@ -46,44 +46,12 @@ impl Store {
         Self { db, keyspace }
     }
 
-    pub fn keyspace(&self) -> &Keyspace {
-        &self.keyspace
-    }
-
     /// Row `key` as committed: none for a key the store cannot hold.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, fjall::Error> {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, fjall::Error> {
         if !holds(key) {
             return Ok(None);
         }
         Ok(self.keyspace.get(key)?.map(|value| value.to_vec()))
-    }
-
-    /// Write `namespace`'s staged rows and `rows` in one synced batch: all
-    /// of them, or, on an error, none, the staged rows kept for the next.
-    /// A row the store cannot hold is [`Error::Unstorable`]. A failed sync
-    /// is [`Error::Store`], and fjall then takes no more writes; its
-    /// journal may hold the batch, so a reopen can find it applied.
-    pub fn commit(&self, namespace: &Namespace, rows: Writes) -> Result<(), Error> {
-        let mut staged = lock(&namespace.staged);
-        let fits = |(key, value): (&Vec<u8>, &Option<Vec<u8>>)| {
-            holds(key)
-                && value
-                    .as_ref()
-                    .is_none_or(|value| u32::try_from(value.len()).is_ok())
-        };
-        if !staged.iter().chain(&rows).all(fits) {
-            return Err(Error::Unstorable);
-        }
-        let mut batch = self.db.batch();
-        for (key, value) in staged.iter().chain(&rows) {
-            match value {
-                Some(value) => batch.insert(&self.keyspace, key, value),
-                None => batch.remove(&self.keyspace, key),
-            }
-        }
-        batch.durability(Some(PersistMode::SyncAll)).commit()?;
-        staged.clear();
-        Ok(())
     }
 }
 
@@ -133,12 +101,8 @@ impl Namespace {
         }
     }
 
-    pub fn store(&self) -> &Store {
-        &self.store
-    }
-
     /// The full key of the namespace's row `name`.
-    pub fn key(&self, name: &[u8]) -> Vec<u8> {
+    fn key(&self, name: &[u8]) -> Vec<u8> {
         [&self.prefix[..], name].concat()
     }
 
@@ -158,10 +122,38 @@ impl Namespace {
     }
 
     /// Set (`Some`) or delete (`None`) row `name`: staged, or a copy's.
-    pub fn put(&self, name: &[u8], value: Option<Vec<u8>>) {
+    pub(crate) fn put(&self, name: &[u8], value: Option<Vec<u8>>) {
         let key = self.key(name);
         let target = self.copy.as_ref().unwrap_or(&self.staged);
         lock(target).insert(key, value);
+    }
+
+    /// Write the staged rows and `rows` in one synced batch: all
+    /// of them, or, on an error, none, the staged rows kept for the next.
+    /// A row the store cannot hold is [`Error::Unstorable`]. A failed sync
+    /// is [`Error::Store`], and fjall then takes no more writes; its
+    /// journal may hold the batch, so a reopen can find it applied.
+    pub(crate) fn commit(&self, rows: Writes) -> Result<(), Error> {
+        let mut staged = lock(&self.staged);
+        let fits = |(key, value): (&Vec<u8>, &Option<Vec<u8>>)| {
+            holds(key)
+                && value
+                    .as_ref()
+                    .is_none_or(|value| u32::try_from(value.len()).is_ok())
+        };
+        if !staged.iter().chain(&rows).all(fits) {
+            return Err(Error::Unstorable);
+        }
+        let mut batch = self.store.db.batch();
+        for (key, value) in staged.iter().chain(&rows) {
+            match value {
+                Some(value) => batch.insert(&self.store.keyspace, key, value),
+                None => batch.remove(&self.store.keyspace, key),
+            }
+        }
+        batch.durability(Some(PersistMode::SyncAll)).commit()?;
+        staged.clear();
+        Ok(())
     }
 
     /// Delete every row whose name starts with `name`, committed or
