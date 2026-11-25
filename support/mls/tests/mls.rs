@@ -41,7 +41,7 @@ fn member(n: u8) -> Member {
         .keyspace("group", fjall::KeyspaceCreateOptions::default)
         .unwrap();
     let namespace = Namespace::current(Store::new(db, keyspace), b"mls/".to_vec());
-    let mls = Mls::open(namespace.clone(), &credential(n), BTreeMap::new()).unwrap();
+    let mls = Mls::open(namespace.clone(), &credential(n)).unwrap();
     Member {
         mls,
         namespace,
@@ -50,7 +50,7 @@ fn member(n: u8) -> Member {
 }
 
 fn reopen(member: &Member, n: u8) -> Mls {
-    Mls::open(member.namespace.clone(), &credential(n), BTreeMap::new()).unwrap()
+    Mls::open(member.namespace.clone(), &credential(n)).unwrap()
 }
 
 fn expected(committer: u8, adds: &[u8], removes: &[u8]) -> Expected {
@@ -69,10 +69,7 @@ fn three() -> (Member, Member, Member) {
     let mut b = member(2);
     let mut c = member(3);
     a.mls.create(T, BTreeMap::new()).unwrap();
-    let packages = [
-        b.mls.key_package(T, BTreeMap::new()).unwrap(),
-        c.mls.key_package(T, BTreeMap::new()).unwrap(),
-    ];
+    let packages = [b.mls.key_package(T).unwrap(), c.mls.key_package(T).unwrap()];
     let commit = a
         .mls
         .commit(&packages, &[], T, |_| BTreeMap::new())
@@ -212,11 +209,7 @@ fn a_held_commit_survives_a_reopen_and_matches_only_its_handshake() {
         "the caller's rows are the held commit's batch"
     );
     let mut reopened = reopen(&a, 1);
-    let (hash, epoch) = reopened.held().unwrap().expect("held across the reopen");
-    assert_eq!(
-        (hash, epoch),
-        (vos_mls::handshake_hash(&commit.handshake), 2)
-    );
+    assert_eq!(reopened.held().unwrap(), Some(2), "held across the reopen");
     let other = b.mls.commit(&[], &[], T + 1, |_| BTreeMap::new()).unwrap();
     assert!(matches!(
         reopened.own(&other.handshake),
@@ -369,7 +362,7 @@ fn the_policy_refuses_what_the_device_group_does_not_allow() {
     ));
 
     let mut d = member(4);
-    let package = d.mls.key_package(T, BTreeMap::new()).unwrap();
+    let package = d.mls.key_package(T).unwrap();
     let mut group = loose(
         &b,
         Loose {
@@ -508,11 +501,7 @@ fn a_leafs_credential_is_renewed_only_as_expected() {
         .process(&update.handshake, T + 1, expecting.clone())
         .unwrap();
     let on_c = c.mls.process(&update.handshake, T + 1, expecting).unwrap();
-    assert!(
-        on_a.credentials()
-            .iter()
-            .any(|(_, credential)| *credential == renewed)
-    );
+    assert!(on_a.credentials().contains(&renewed));
     let own = b.mls.own(&update.handshake).unwrap();
     a.mls.swap(on_a, BTreeMap::new()).unwrap();
     c.mls.swap(on_c, BTreeMap::new()).unwrap();
@@ -637,7 +626,7 @@ fn a_welcome_into_a_group_with_an_overlong_id_is_refused() {
         )
         .unwrap();
     let mut b = member(2);
-    let package = b.mls.key_package(T, BTreeMap::new()).unwrap();
+    let package = b.mls.key_package(T).unwrap();
     let commit = group
         .commit_builder()
         .commit_time(MlsTime::from(T))
@@ -690,7 +679,7 @@ fn a_welcome_of_another_suite_is_unsupported() {
     let mut a = member(1);
     let mut d = member(4);
     a.mls.create(T, BTreeMap::new()).unwrap();
-    let package = d.mls.key_package(T, BTreeMap::new()).unwrap();
+    let package = d.mls.key_package(T).unwrap();
     let commit = a
         .mls
         .commit(&[package], &[], T, |_| BTreeMap::new())
@@ -711,7 +700,7 @@ fn a_welcome_of_another_suite_is_unsupported() {
 #[test]
 fn a_key_package_names_one_suite() {
     let mut b = member(2);
-    let package = b.mls.key_package(T, BTreeMap::new()).unwrap();
+    let package = b.mls.key_package(T).unwrap();
     let package = mls_rs::MlsMessage::from_bytes(&package)
         .unwrap()
         .into_key_package()
@@ -726,7 +715,7 @@ fn a_key_package_names_one_suite() {
 fn a_key_package_from_a_clock_ahead_is_added() {
     let (mut a, b, _c) = three();
     let mut d = member(4);
-    let package = d.mls.key_package(T + 120, BTreeMap::new()).unwrap();
+    let package = d.mls.key_package(T + 120).unwrap();
     let commit = a
         .mls
         .commit(&[package], &[], T + 1, |_| BTreeMap::new())
@@ -746,7 +735,7 @@ fn a_leaf_past_its_key_packages_year_bars_a_join_until_it_commits() {
     let (mut a, mut b, mut c) = three();
     let later = T + 400 * 24 * 3600;
     let mut d = member(4);
-    let package = d.mls.key_package(later, BTreeMap::new()).unwrap();
+    let package = d.mls.key_package(later).unwrap();
     let commit = a
         .mls
         .commit(&[package], &[], later, |_| BTreeMap::new())
@@ -760,7 +749,7 @@ fn a_leaf_past_its_key_packages_year_bars_a_join_until_it_commits() {
     a.mls.void(BTreeMap::new()).unwrap();
     update(&mut b, 2, &mut [&mut a, &mut c], later);
     update(&mut c, 3, &mut [&mut a, &mut b], later);
-    let package = d.mls.key_package(later, BTreeMap::new()).unwrap();
+    let package = d.mls.key_package(later).unwrap();
     let commit = a
         .mls
         .commit(&[package], &[], later, |_| BTreeMap::new())
@@ -899,7 +888,7 @@ fn a_key_package_row_that_does_not_read_is_corrupt() {
     let mut a = member(1);
     let mut d = member(4);
     a.mls.create(T, BTreeMap::new()).unwrap();
-    let package = d.mls.key_package(T, BTreeMap::new()).unwrap();
+    let package = d.mls.key_package(T).unwrap();
     let commit = a
         .mls
         .commit(&[package], &[], T, |_| BTreeMap::new())
@@ -923,8 +912,8 @@ fn unused_key_packages_go_when_the_device_joins() {
     let mut a = member(1);
     let mut d = member(4);
     a.mls.create(T, BTreeMap::new()).unwrap();
-    d.mls.key_package(T, BTreeMap::new()).unwrap();
-    let package = d.mls.key_package(T, BTreeMap::new()).unwrap();
+    d.mls.key_package(T).unwrap();
+    let package = d.mls.key_package(T).unwrap();
     assert_eq!(count(&d, b"mls/package/"), 2);
     let commit = a
         .mls
@@ -948,7 +937,7 @@ fn a_member_of_a_credential_of_another_length_is_not_made() {
     let namespace = Namespace::current(store.clone(), b"mls/".to_vec());
     for length in [0, 63, 65] {
         assert!(matches!(
-            Mls::open(namespace.clone(), &vec![1; length], BTreeMap::new()),
+            Mls::open(namespace.clone(), &vec![1; length]),
             Err(Error::Credential)
         ));
     }
