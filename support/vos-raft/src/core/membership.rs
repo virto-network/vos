@@ -313,10 +313,15 @@ impl<N: NodeId> Core<N> {
         {
             return None;
         }
+        // The configuration the snapshot carries takes effect when it was
+        // established at or below the snapshot, with no configuration
+        // entry above it in the log kept.
+        let live_above = keeps_suffix && self.log.config_after(index);
+        let carried = configuration.filter(|configuration| {
+            !live_above && configuration.log_index.is_some_and(|at| at <= index)
+        });
         Some(SnapshotSwitch {
-            index,
-            term,
-            carried: self.carried(index, keeps_suffix, configuration).is_some(),
+            carried: carried.is_some(),
             truncate_after: (!keeps_suffix).then_some(index),
             // The term and vote in memory are at least as new as any write
             // queued before the switch, and persisting them early is safe;
@@ -328,7 +333,9 @@ impl<N: NodeId> Core<N> {
                 snap_last_index: index,
                 snap_last_term: term,
             },
-            active_config: self.snapshot_record(index, keeps_suffix, configuration),
+            active_config: carried
+                .cloned()
+                .unwrap_or_else(|| self.snapshot_record(live_above)),
             log_start_config: self.start_after_snapshot(index, configuration),
         })
     }
@@ -350,14 +357,13 @@ impl<N: NodeId> Core<N> {
     /// this replica now starts from the snapshot.
     pub fn snapshot_installed(&mut self, switch: SnapshotSwitch<N>) {
         let SnapshotSwitch {
-            index,
-            term,
             truncate_after,
+            meta,
             active_config: record,
             log_start_config,
             carried,
-            ..
         } = switch;
+        let (index, term) = (meta.snap_last_index, meta.snap_last_term);
         if index <= self.log.snap_index() {
             return;
         }
@@ -394,36 +400,11 @@ impl<N: NodeId> Core<N> {
         }
     }
 
-    /// The configuration a snapshot at `index` carries, when it takes
-    /// effect: established at or below the snapshot, with no configuration
-    /// entry above it in the log kept.
-    fn carried<'a>(
-        &self,
-        index: u64,
-        keeps_suffix: bool,
-        configuration: Option<&'a ActiveConfigRecord<N>>,
-    ) -> Option<&'a ActiveConfigRecord<N>> {
-        let live_above = keeps_suffix && self.log.config_after(index);
-        configuration.filter(|configuration| {
-            !live_above && configuration.log_index.is_some_and(|at| at <= index)
-        })
-    }
-
-    /// The membership record after a snapshot at `index`: the configuration
-    /// it carries, if that takes effect ([`Self::carried`]), else the
-    /// current view, whose provenance survives only if a configuration
-    /// entry above the snapshot is kept or it was committed before the
-    /// install.
-    fn snapshot_record(
-        &self,
-        index: u64,
-        keeps_suffix: bool,
-        configuration: Option<&ActiveConfigRecord<N>>,
-    ) -> ActiveConfigRecord<N> {
-        if let Some(carried) = self.carried(index, keeps_suffix, configuration) {
-            return carried.clone();
-        }
-        let live_above = keeps_suffix && self.log.config_after(index);
+    /// The membership record after a snapshot that carries no
+    /// configuration that takes effect: the current view, whose provenance
+    /// survives only if a configuration entry above the snapshot is kept
+    /// (`live_above`) or it was committed before the install.
+    fn snapshot_record(&self, live_above: bool) -> ActiveConfigRecord<N> {
         ActiveConfigRecord {
             log_index: if live_above {
                 self.active.log_index
@@ -434,7 +415,7 @@ impl<N: NodeId> Core<N> {
         }
     }
 
-    /// Adopt `record`, from [`Self::snapshot_record`] before the install:
+    /// Adopt `record`, from [`Self::snapshot_switch`] before the install:
     /// the configuration the snapshot `carried`, or the current view.
     fn adopt_snapshot_configuration(
         &mut self,
