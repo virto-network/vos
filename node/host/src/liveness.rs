@@ -522,6 +522,7 @@ impl Inner {
             from,
             stream,
             frame,
+            ..
         } = incoming;
         let message = match peer::decode(&frame) {
             Ok(message) => message,

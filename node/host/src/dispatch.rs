@@ -104,6 +104,7 @@ impl Inner {
             from,
             stream,
             frame,
+            ..
         } = incoming;
         // A peer on other lanes is refused whole, its warning logged once
         // by the pair heartbeat, which keeps hearing it.
