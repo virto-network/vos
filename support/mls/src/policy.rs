@@ -13,11 +13,6 @@
 //!   credential, and the credentials it adds and removes, exactly; and the
 //!   committer's renewed credential when the device set replaced its
 //!   admin key, which its leaf must then take.
-//! - **Identities:** a credential is a label, the device's sync key and
-//!   admin key as bytes. Nothing binds a leaf's MLS keys to them: that a
-//!   key package is the device's it names is the caller's to establish
-//!   (where it took the key package from), and a committer that may add a
-//!   device is trusted for the key package it adds.
 //! - **Handshakes** are `PrivateMessage`s, padded (Padmé); a Welcome
 //!   carries the ratchet tree, one for every new member.
 
@@ -55,10 +50,11 @@ pub enum Refused {
 
 impl mls_rs_core::error::IntoAnyError for Refused {}
 
-/// A commit's logged effect, which a received commit must be exactly: its
-/// committer's credential, the credentials it adds and removes, and the
-/// credential its committer's leaf takes, if another (`renewed`: the leaf
-/// must take it; with none, the leaf keeps `committer`).
+/// A commit's logged effect, which a received commit must be exactly: an
+/// encrypted commit with a path by `committer`, adding and removing
+/// exactly the credentials of `adds` and `removes`, its committer's leaf
+/// taking `renewed` if one is expected and keeping `committer` otherwise,
+/// and keeping its signature key.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Expected {
     pub committer: Vec<u8>,
@@ -177,7 +173,10 @@ impl MlsRules for Rules {
 /// renewal that follows a matured replacement. A leaf's signature key is
 /// not compared here; [`crate::Mls::process`] requires a committer to
 /// keep it. Every check against the device set is the caller's, through
-/// [`Expected`].
+/// [`Expected`]. A credential is a label: nothing binds a leaf's MLS keys
+/// to the device keys it names, so that a key package is the device's it
+/// names is the caller's to establish, and a committer that may add a
+/// device is trusted for the key package it adds.
 #[derive(Clone, Debug, Default)]
 pub struct Identity {
     renewal: Option<(Vec<u8>, Vec<u8>)>,

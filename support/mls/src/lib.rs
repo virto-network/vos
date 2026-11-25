@@ -1,38 +1,25 @@
 //! `vos-mls`: VOS's one MLS layer, over mls-rs (`light-node.md` §3.4). The
 //! user's device group is its first user; member messaging later.
 //!
-//! - **Storage:** a group's state and its key packages'
-//!   secrets as rows of a fjall keyspace under a namespace, every write
-//!   staged and committed with the caller's rows in one synced batch.
-//! - **Copy and swap:** mls-rs applies a received commit at once, and a
-//!   commit's confirmation needs it processed. So a candidate is processed
-//!   on a copy of the group state ([`Mls::process`], [`Mls::join`]), the
-//!   current state kept, and swapped in on confirmation ([`Mls::swap`]) or
-//!   dropped. A copy reads the current rows and writes to memory alone, so
-//!   it never writes through the current namespace.
-//! - **A device's own commit** is built detached ([`Mls::commit`]) and held:
-//!   building it spends a handshake-key generation of the current state, so
-//!   the current state and the held commit are one batch, written before
-//!   the call that posts it returns to the caller. On confirmation the held
-//!   commit is applied on a copy ([`Mls::own`]), only if the confirmed
-//!   candidate's hash is the held commit's and the current epoch is the one
-//!   before, mls-rs's `apply_detached_commit` checking nothing; a void
-//!   deletes it ([`Mls::void`]).
-//! - **Received commits** are processed at the log's batch time, so
-//!   processing is deterministic (after a crash the logged candidate is
-//!   processed again) and leaf and key-package lifetimes are checked. A
-//!   key package is valid from an hour before its maker's clock
-//!   ([`Mls::key_package`]) for 365 days; a joiner checks every leaf of
-//!   the tree that still comes from a key package, so a member added over
-//!   a year ago bars new joins until it commits.
-//! - **Generations:** each held commit spends a handshake-key generation
-//!   of its epoch, and a void does not give it back; a receiver ratchets
-//!   at most 1024 generations ahead, so a member's commits voided more
-//!   than 1024 times in one epoch are refused until another member's
-//!   commit moves the epoch.
-//! - **The policy:** the device group's allow-list and its
-//!   identities, a candidate checked against its logged effect.
+//! - **Storage:** a group's state and its key packages' secrets as rows
+//!   of a fjall keyspace under a [`Namespace`], written with the caller's
+//!   rows in one synced batch.
+//! - **Copy and swap:** a candidate is processed on a copy of the group
+//!   state ([`Mls::process`], [`Mls::join`]), which never writes through
+//!   the current one, and swapped in on confirmation ([`Mls::swap`]).
+//! - **A device's own commit** is built detached and held ([`Mls::commit`]),
+//!   in one batch with the state it spent a generation of; it is applied
+//!   on a copy on confirmation ([`Mls::own`]) and deleted on a void
+//!   ([`Mls::void`]).
+//! - **The policy:** the device group's allow-list and identities, a
+//!   candidate checked against its logged effect ([`Expected`]).
 //! - **The confirmation hash** ([`confirmation`]).
+//!
+//! Two limits: a member added over a year ago that has not committed since
+//! bars new joins until it commits (a key package's lifetime, which a
+//! joiner checks for every leaf); a member whose commits are voided more
+//! than 1024 times in one epoch is refused until another member's commit
+//! moves the epoch (a receiver ratchets at most 1024 generations ahead).
 //!
 //! The suite is 1 (X25519, AES-128-GCM, SHA-256, Ed25519), the only one
 //! the provider is built with: a Welcome or a stored group of any other is
@@ -74,7 +61,8 @@ pub const SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
 const EPOCH_MAX: u64 = u64::MAX / 2;
 
 /// How far a key package's lifetime starts before its maker's clock, the
-/// skew between devices this layer tolerates: an hour.
+/// skew between devices this layer tolerates: an hour, so the devices that
+/// add it, process its add and join with it may be that far behind.
 const CLOCK_MARGIN: u64 = 3600;
 
 /// RustCrypto with suite 1 alone: a message naming any other suite is
@@ -98,9 +86,9 @@ type Config = IntoConfigOutput<
     >,
 >;
 
-/// A namespace's rows beside mls-rs's: the leaf's signing key and
-/// identity, the identity a held commit renews it to, the group's id, the
-/// held commit, and the id of the new group a held restart starts.
+// A namespace's rows beside mls-rs's: the leaf's signing key and
+// identity, the identity a held commit renews it to, the group's id, the
+// held commit, and the id of the new group a held restart starts.
 const SIGNER: &[u8] = b"signer";
 const RENEWED: &[u8] = b"renewed";
 const GROUP: &[u8] = b"group";
@@ -606,8 +594,7 @@ impl Mls {
 
     /// A key package for a device that adds this one, made at `time` by
     /// this device's clock, its secrets written. It is valid from an hour
-    /// before `time`, so the devices that add it, process its add and join
-    /// with it may be that far behind, and for 365 days from then.
+    /// before `time` and for 365 days from then.
     pub fn key_package(&mut self, time: u64) -> Result<Vec<u8>, Error> {
         let not_before = MlsTime::from(time.saturating_sub(CLOCK_MARGIN));
         self.staged(
@@ -863,12 +850,9 @@ impl Mls {
     }
 
     /// Another member's commit `handshake` processed on a copy at `time`
-    /// (the log's batch time), under its logged effect `expected`: an
-    /// encrypted commit with a path, by the expected committer, adding and
-    /// removing exactly the expected credentials, its committer's leaf
-    /// taking exactly the expected renewed credential if one is expected
-    /// and keeping its credential otherwise, and keeping its signature key.
-    /// A refusal is [`Error::Refused`].
+    /// (the log's batch time, so processing it again gives the same
+    /// candidate), under its logged effect [`Expected`]. A refusal is
+    /// [`Error::Refused`].
     pub fn process(
         &self,
         handshake: &[u8],

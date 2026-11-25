@@ -1,6 +1,6 @@
 [package]
 name = "vos-mls"
-description = "VOS's one MLS layer, over mls-rs: storage providers over fjall whose writes join the caller's batch, candidates processed on a copy of the group state and swapped in on confirmation, a device's own commit held until then, the confirmation hash, and the device group's proposal policy."
+description = "VOS's MLS layer over mls-rs: fjall storage, candidates on a copy, held commits, the device group's policy."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
