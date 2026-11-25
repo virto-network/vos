@@ -252,9 +252,10 @@ fn scope_error(error: merkle_crdt::Error<FjallError, Halt>) -> Halt {
             Halt::Error(Error::Scope(merkle_crdt::Error::Store(error)))
         }
         merkle_crdt::Error::Corrupt => Halt::Error(Error::Scope(merkle_crdt::Error::Corrupt)),
-        merkle_crdt::Error::Stalled => Halt::Error(Error::Scope(merkle_crdt::Error::Stalled)),
-        merkle_crdt::Error::Disordered => Halt::Error(Error::Scope(merkle_crdt::Error::Disordered)),
-        merkle_crdt::Error::Source(never) => match never {},
+        merkle_crdt::Error::Row => Halt::Error(Error::Scope(merkle_crdt::Error::Row)),
+        merkle_crdt::Error::Unencodable => {
+            Halt::Error(Error::Scope(merkle_crdt::Error::Unencodable))
+        }
     }
 }
 

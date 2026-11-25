@@ -346,16 +346,16 @@ impl Store<Blake2b256> for ScopeStore {
         Store::<Blake2b256>::contains(&self.inner, cid)
     }
 
-    fn nodes(&self) -> Result<Vec<Cid>, FjallError> {
-        self.inner.nodes()
-    }
-
     fn held(&self, cid: &Cid) -> Result<Option<Vec<u8>>, FjallError> {
         self.inner.held(cid)
     }
 
-    fn authored(&self, author: &Author, seq: u64) -> Result<Vec<Cid>, FjallError> {
+    fn authored(&self, author: &Author, seq: u64) -> Result<Option<Cid>, FjallError> {
         self.inner.authored(author, seq)
+    }
+
+    fn is_authored(&self, author: &Author, seq: u64, cid: &Cid) -> Result<bool, FjallError> {
+        self.inner.is_authored(author, seq, cid)
     }
 
     fn row(&self, key: &[u8]) -> Result<Option<Vec<u8>>, FjallError> {

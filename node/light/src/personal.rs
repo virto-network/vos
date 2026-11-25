@@ -304,6 +304,7 @@ impl Caught {
             Some(report) => {
                 report.applied.extend(ingested.applied);
                 report.held.extend(ingested.held);
+                report.dropped.extend(ingested.dropped);
                 report.refused.extend(ingested.refused);
                 report.equivocations.extend(ingested.equivocations);
                 report.duplicates += ingested.duplicates;
