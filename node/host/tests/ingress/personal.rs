@@ -201,10 +201,15 @@ impl Personal {
         ))
     }
 
-    /// `arguments` placed at the log's head as `key` reads it, as an admin
-    /// call names it first.
+    /// `arguments` placed at the log's head as `key` reads it once its
+    /// replica applied its admission, as an admin call names it first.
     pub(super) fn placed(&mut self, key: &SigningKey, arguments: &[u8]) -> Vec<u8> {
-        let overview: Overview = self.query(key, "overview", ()).unwrap();
+        let mut read = None;
+        wait_until("the admission applied", || {
+            read = self.query::<Overview>(key, "overview", ()).ok();
+            read.is_some()
+        });
+        let overview = read.expect("the overview");
         Place {
             next: overview.next,
             chain: overview.chain,
