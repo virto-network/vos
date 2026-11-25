@@ -34,7 +34,7 @@ use mls_rs_core::identity::{IdentityProvider, MemberValidationContext};
 
 /// A device's credential: its sync key and its admin key, the leaf's
 /// identity its sync key.
-pub const CREDENTIAL_BYTES: usize = 64;
+pub(crate) const CREDENTIAL_BYTES: usize = 64;
 
 /// What the policy refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,13 +85,13 @@ pub struct Expected {
 /// The device group's rules: the allow-list on what a device sends and
 /// receives, and, for a candidate, its logged effect.
 #[derive(Clone, Debug, Default)]
-pub struct Rules {
+pub(crate) struct Rules {
     pub(crate) expected: Option<Expected>,
 }
 
 impl Rules {
     /// The rules a candidate is processed under.
-    pub fn expecting(expected: Expected) -> Self {
+    pub(crate) fn expecting(expected: Expected) -> Self {
         Self {
             expected: Some(expected),
         }
@@ -202,7 +202,7 @@ pub struct Identity {
 impl Identity {
     /// The identities allowing one leaf's credential `before` to be
     /// succeeded by `after`.
-    pub fn renewing(before: Vec<u8>, after: Vec<u8>) -> Self {
+    pub(crate) fn renewing(before: Vec<u8>, after: Vec<u8>) -> Self {
         Self {
             renewal: Some((before, after)),
         }

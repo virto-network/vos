@@ -25,6 +25,8 @@ const T: u64 = 1_800_000_000;
 struct Member {
     mls: Mls,
     namespace: Namespace,
+    store: Store,
+    keyspace: fjall::Keyspace,
     _dir: tempfile::TempDir,
 }
 
@@ -34,19 +36,35 @@ fn credential(n: u8) -> Vec<u8> {
     credential
 }
 
-fn member(n: u8) -> Member {
+/// An empty store in a temporary directory, and its keyspace.
+fn store() -> (tempfile::TempDir, fjall::Keyspace, Store) {
     let dir = tempfile::tempdir().unwrap();
     let db = fjall::Database::builder(dir.path()).open().unwrap();
     let keyspace = db
         .keyspace("group", fjall::KeyspaceCreateOptions::default)
         .unwrap();
-    let namespace = Namespace::current(Store::new(db, keyspace), b"mls/".to_vec());
+    (dir, keyspace.clone(), Store::new(db, keyspace))
+}
+
+fn member(n: u8) -> Member {
+    let (dir, keyspace, store) = store();
+    let namespace = Namespace::current(store.clone(), b"mls/".to_vec());
     let mls = Mls::open(namespace.clone(), &credential(n)).unwrap();
     Member {
         mls,
         namespace,
+        store,
+        keyspace,
         _dir: dir,
     }
+}
+
+/// Row `key` of `member`'s store as committed, read through a namespace
+/// of no prefix.
+fn committed(member: &Member, key: &[u8]) -> Option<Vec<u8>> {
+    Namespace::current(member.store.clone(), Vec::new())
+        .get(key)
+        .unwrap()
 }
 
 fn reopen(member: &Member, n: u8) -> Mls {
@@ -160,7 +178,7 @@ fn commits_move_every_member_only_when_swapped() {
 #[test]
 fn a_copy_never_writes_the_current_state() {
     let (a, mut b, mut c) = three();
-    let before = a.namespace.store().keyspace().iter().count();
+    let before = rows(&a).len();
     let state = a.mls.state_bytes().unwrap();
     let rival = c.mls.commit(&[], &[], T + 1, |_| BTreeMap::new()).unwrap();
     let update = b.mls.commit(&[], &[], T + 1, |_| BTreeMap::new()).unwrap();
@@ -172,7 +190,7 @@ fn a_copy_never_writes_the_current_state() {
     drop(on_copy);
     assert_eq!(a.mls.epoch().unwrap(), 1);
     assert_eq!(a.mls.state_bytes().unwrap(), state);
-    assert_eq!(a.namespace.store().keyspace().iter().count(), before);
+    assert_eq!(rows(&a).len(), before);
     let reopened = reopen(&a, 1);
     assert_eq!(reopened.epoch().unwrap(), 1);
     let next = a
@@ -200,11 +218,7 @@ fn a_held_commit_survives_a_reopen_and_matches_only_its_handshake() {
         Err(Error::Held)
     ));
     assert_eq!(
-        a.namespace
-            .store()
-            .get(b"caller/record")
-            .unwrap()
-            .as_deref(),
+        committed(&a, b"caller/record").as_deref(),
         Some(&b"commit 2"[..]),
         "the caller's rows are the held commit's batch"
     );
@@ -427,12 +441,12 @@ fn the_confirmation_hash_binds_its_parts() {
 #[test]
 fn a_restart_starts_a_new_group_and_leaves_the_old() {
     let (mut a, b, c) = three();
-    let old = a.namespace.store().keyspace().iter().count();
+    let old = rows(&a).len();
     let void = a.mls.restart(T + 1, |_| BTreeMap::new()).unwrap();
     assert!(a.mls.commit(&[], &[], T + 1, |_| BTreeMap::new()).is_err());
     assert_eq!(a.mls.own(&void.handshake).unwrap().kind(), Kind::Started);
     a.mls.void(BTreeMap::new()).unwrap();
-    assert_eq!(a.namespace.store().keyspace().iter().count(), old);
+    assert_eq!(rows(&a).len(), old);
     agree(&[&a, &b, &c], 1);
 
     let restart = a.mls.restart(T + 2, |_| BTreeMap::new()).unwrap();
@@ -444,17 +458,11 @@ fn a_restart_starts_a_new_group_and_leaves_the_old() {
     assert_eq!(own.kind(), Kind::Started);
     a.mls.swap(own, BTreeMap::new()).unwrap();
     assert_eq!(a.mls.credentials().unwrap().len(), 1);
-    let states = |member: &Member| {
-        member
-            .namespace
-            .store()
-            .keyspace()
-            .iter()
-            .map(|row| row.into_inner().unwrap().0)
-            .filter(|key| key.starts_with(b"mls/state/"))
-            .count()
-    };
-    assert_eq!(states(&a), 1, "the old group's state is deleted");
+    assert_eq!(
+        count(&a, b"mls/state/"),
+        1,
+        "the old group's state is deleted"
+    );
 }
 
 /// A leaf's credential renewed by its own commit: received only under an
@@ -551,9 +559,7 @@ fn welcome_for(reference: &[u8]) -> Vec<u8> {
 /// The rows of `member`'s store, keys and values.
 fn rows(member: &Member) -> Vec<(Vec<u8>, Vec<u8>)> {
     member
-        .namespace
-        .store()
-        .keyspace()
+        .keyspace
         .iter()
         .map(|row| {
             let (key, value) = row.into_inner().unwrap();
@@ -614,7 +620,10 @@ fn a_welcome_into_a_group_with_an_overlong_id_is_refused() {
     let creator = Client::builder()
         .identity_provider(Identity::default())
         .crypto_provider(RustCryptoProvider::default())
-        .mls_rules(vos_mls::Rules::default())
+        .mls_rules(Loose {
+            path: true,
+            encrypt: true,
+        })
         .signing_identity(identity, secret, vos_mls::SUITE)
         .build();
     let mut group = creator
@@ -655,7 +664,7 @@ fn a_row_the_store_cannot_hold_is_an_error() {
         bad.insert(key.clone(), Some(b"row".to_vec()));
         assert!(matches!(a.mls.write(bad), Err(Error::Unstorable)));
         assert_eq!(rows(&a), before);
-        assert_eq!(a.namespace.store().get(&key).unwrap(), None);
+        assert_eq!(committed(&a, &key), None);
     }
     assert_eq!(a.namespace.get(&[0x6b; 70_000]).unwrap(), None);
     let mut bad = BTreeMap::new();
@@ -928,18 +937,13 @@ fn unused_key_packages_go_when_the_device_joins() {
 /// written for another.
 #[test]
 fn a_member_of_a_credential_of_another_length_is_not_made() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = fjall::Database::builder(dir.path()).open().unwrap();
-    let keyspace = db
-        .keyspace("group", fjall::KeyspaceCreateOptions::default)
-        .unwrap();
-    let store = Store::new(db, keyspace);
-    let namespace = Namespace::current(store.clone(), b"mls/".to_vec());
+    let (_dir, keyspace, store) = store();
+    let namespace = Namespace::current(store, b"mls/".to_vec());
     for length in [0, 63, 65] {
         assert!(matches!(
             Mls::open(namespace.clone(), &vec![1; length]),
             Err(Error::Credential)
         ));
     }
-    assert_eq!(store.keyspace().iter().count(), 0);
+    assert_eq!(keyspace.iter().count(), 0);
 }
