@@ -2,8 +2,7 @@ use crate::apply::Overlay;
 use crate::signed::{self, validate};
 use crate::store::{Applied, Changes};
 use crate::{
-    Apply, Author, Cid, Decode, Encode, Hasher, Header, MAX_PARENTS, Node, Refusal, Scope, Signed,
-    Store,
+    Apply, Author, Cid, Decode, Encode, Hasher, Header, MAX_PARENTS, Node, Refusal, Scope, Store,
 };
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
@@ -571,8 +570,8 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
             }
             batch.applied.push(Applied {
                 cid: cid.clone(),
-                author: node.payload.author,
-                seq: node.payload.seq,
+                author: node.author,
+                seq: node.seq,
                 bytes,
             });
             batch.report.applied.push(cid);
@@ -728,7 +727,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
     /// one of its parents is its author's node at the number before, one
     /// point lookup a parent.
     fn follows(&self, batch: &Batch<H>, node: &Node<H, O>) -> Result<bool, S::Error> {
-        let Signed { author, seq, .. } = node.payload;
+        let (author, seq) = (node.author, node.seq);
         let Some(before) = seq.checked_sub(1) else {
             return Ok(true);
         };
@@ -752,7 +751,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
         cid: &Cid<H>,
         node: &Node<H, O>,
     ) -> Result<bool, S::Error> {
-        let Signed { author, seq, .. } = node.payload;
+        let (author, seq) = (node.author, node.seq);
         // The batch's earlier node is reported only while it is the one:
         // a third at the number finds the pair reported.
         let earlier = self.store.authored(&author, seq)?.or_else(|| {
@@ -809,7 +808,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
             if batch.refused.contains(&cid) {
                 continue;
             }
-            let author = node.payload.author;
+            let author = node.author;
             let theirs = by.entry(author).or_default();
             if count >= MAX_HELD
                 || *theirs >= MAX_HELD_PER_AUTHOR

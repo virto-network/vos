@@ -167,10 +167,10 @@ fn signatures_are_refused_unless_the_authors() {
 
     // Operations changed after signing.
     let mut tampered = node.clone();
-    tampered.payload.ops = vec![(1, 2)];
+    tampered.ops = vec![(1, 2)];
     // Another author's key over the same signature.
     let mut stolen = node.clone();
-    stolen.payload.author = Author::from(&key(1));
+    stolen.author = Author::from(&key(1));
     // Parents changed after signing.
     let mut moved = node.clone();
     moved.parents.insert(Cid([7; 32]));
@@ -182,7 +182,7 @@ fn signatures_are_refused_unless_the_authors() {
         0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
     ];
     let mut carry = 0u16;
-    for (s, l) in malleated.payload.signature[32..].iter_mut().zip(order) {
+    for (s, l) in malleated.signature[32..].iter_mut().zip(order) {
         let sum = *s as u16 + l as u16 + carry;
         *s = sum as u8;
         carry = sum >> 8;
@@ -438,7 +438,7 @@ fn the_outbox_holds_local_nodes_until_pushed() {
     // Each local node names its author's previous one.
     let (_, node) =
         merkle_crdt::validate::<H, Ops>(&SCOPE, &local.outbox().unwrap()[0].bytes).unwrap();
-    assert_eq!(node.payload.seq, 2);
+    assert_eq!(node.seq, 2);
     assert!(node.parents.contains(&outbox[1].cid));
 }
 
@@ -446,7 +446,7 @@ fn the_outbox_holds_local_nodes_until_pushed() {
 fn a_forged_parent_releases_its_held_children_refused() {
     let honest = node(&key(0), 0, vec![], []);
     let mut forged = node(&key(1), 0, vec![(1, 1)], []);
-    forged.payload.ops = vec![(1, 2)];
+    forged.ops = vec![(1, 2)];
     let other = node(&key(2), 0, vec![], []);
     // Waits on the forged node and on one that never comes.
     let child = node(&key(3), 0, vec![], [forged.cid(), other.cid()]);

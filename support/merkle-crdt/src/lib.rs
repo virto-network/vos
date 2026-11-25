@@ -5,9 +5,9 @@
 //! signed by its author, applied to a storage-backed CRDT in causal order.
 //!
 //! - **Nodes** ([`Node`]) are content-addressed: a node's [`Cid`] is the
-//!   hash of its bytes, and it names its parents by theirs. Its payload
-//!   ([`Signed`]) carries its author's key, the author's sequence number
-//!   and an ed25519 signature over the operations and the parents.
+//!   hash of its bytes, and it names its parents by theirs. It carries its
+//!   author's key, the author's sequence number and an ed25519 signature
+//!   over the operations and the parents.
 //! - **A replica** ([`Replica`]) applies only the nodes it has not applied,
 //!   in causal order, onto the rows it already has; a node whose parents
 //!   are missing is held until they arrive. A local operation is applied
@@ -85,11 +85,11 @@ pub use apply::{Apply, Event, MAX_ROW_KEY, MAX_ROW_VALUE, Rows};
 pub use cid::Cid;
 pub use encode::{Decode, Encode, MAX_DECODE_ITEMS};
 pub use hasher::Hasher;
-pub use node::{DagNode, Header, MAX_PARENTS};
+pub use node::{Header, MAX_PARENTS, Node};
 pub use replica::{
     Equivocation, Error, Ingested, MAX_HELD, MAX_HELD_BYTES, MAX_HELD_PER_AUTHOR, Outgoing, Replica,
 };
-pub use signed::{Author, Node, Refusal, Scope, Signed, Validated, message, validate};
+pub use signed::{Author, Refusal, Scope, Validated, message, validate};
 pub use store::{Applied, Changes, Loaded, MemStore, Store};
 
 #[cfg(feature = "fjall")]

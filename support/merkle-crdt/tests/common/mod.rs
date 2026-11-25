@@ -159,7 +159,7 @@ pub fn generate(authors: u8, steps: &[Step]) -> Dag {
             }
             Step::Forge { value } => {
                 let mut forged = node(&key(200), 0, vec![(3, *value)], []);
-                forged.payload.ops.push((4, 4));
+                forged.ops.push((4, 4));
                 let forged = add(&mut dag, forged, &mut parents_of);
                 let after = node(&key(201), 0, vec![(5, *value)], [forged.clone()]);
                 let after = add(&mut dag, after, &mut parents_of);
@@ -303,9 +303,8 @@ pub fn replay(
     };
     while let Some(cid) = ready.pop_front() {
         let node = &all[&cid];
-        let signed = &node.payload;
-        if signed.seq > 0 {
-            let previous = authored.get(&(signed.author, signed.seq - 1));
+        if node.seq > 0 {
+            let previous = authored.get(&(node.author, node.seq - 1));
             assert!(
                 previous
                     .into_iter()
@@ -314,26 +313,24 @@ pub fn replay(
                 "a broken chain"
             );
         }
-        let same = authored.entry((signed.author, signed.seq)).or_default();
+        let same = authored.entry((node.author, node.seq)).or_default();
         let equivocation = !same.is_empty();
         if equivocation {
-            replayed.equivocations.insert((signed.author, signed.seq));
+            replayed.equivocations.insert((node.author, node.seq));
         }
         same.push(cid.clone());
-        let at = replayed.latest.entry(signed.author).or_insert(signed.seq);
-        *at = (*at).max(signed.seq);
+        let at = replayed.latest.entry(node.author).or_insert(node.seq);
+        *at = (*at).max(node.seq);
         for parent in &node.parents {
             replayed.heads.remove(parent);
         }
-        replayed
-            .heads
-            .insert(cid.clone(), (signed.author, signed.seq));
+        replayed.heads.insert(cid.clone(), (node.author, node.seq));
         let event = Event {
             cid: &cid,
-            author: &signed.author,
-            seq: signed.seq,
+            author: &node.author,
+            seq: node.seq,
             parents: &node.parents,
-            ops: &signed.ops,
+            ops: &node.ops,
             equivocation,
         };
         crdt(event, &mut rows);

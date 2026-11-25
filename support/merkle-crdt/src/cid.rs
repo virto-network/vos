@@ -3,8 +3,8 @@ use core::{cmp, fmt, hash};
 
 /// Content identifier: a hash digest that uniquely identifies a DAG node.
 ///
-/// Two nodes with the same CID are guaranteed to have identical content
-/// (payload and parents), assuming a collision-resistant hash function.
+/// Two nodes with the same CID are guaranteed to have identical bytes,
+/// assuming a collision-resistant hash function.
 pub struct Cid<H: Hasher>(pub H::Output);
 
 impl<H: Hasher> Clone for Cid<H> {
