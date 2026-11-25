@@ -94,7 +94,7 @@ pub struct Changes<H: Hasher> {
     pub applied: Vec<Applied<H>>,
     /// Nodes held until their parents arrive.
     pub held: Vec<(Cid<H>, Vec<u8>)>,
-    /// Held nodes released: applied or refused.
+    /// Held nodes released: applied, refused or dropped.
     pub released: Vec<Cid<H>>,
     /// Nodes that became heads, each with its author and sequence number.
     pub heads_added: Vec<(Cid<H>, Author, u64)>,

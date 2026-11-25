@@ -265,17 +265,19 @@ impl Rows for Fresh {
 }
 
 /// The full validation and replay of `nodes`, the applied nodes of a
-/// store: each checked as an ingest would (canonical bytes, signature in
+/// store by CID: each checked as an ingest would (its CID the hash of its
+/// bytes, canonical bytes, signature in
 /// [`SCOPE`], every parent among them, its author's chain), all applied in
 /// causal order onto empty rows. Panics on a node a replica should not
 /// have applied.
 pub fn replay(
-    nodes: impl IntoIterator<Item = Vec<u8>>,
+    nodes: impl IntoIterator<Item = (Cid<H>, Vec<u8>)>,
     crdt: &mut impl FnMut(Event<'_, H, Ops>, &mut dyn Rows),
 ) -> Replayed {
     let mut all = BTreeMap::new();
-    for bytes in nodes {
+    for (stored, bytes) in nodes {
         let (cid, node) = merkle_crdt::validate::<H, Ops>(&SCOPE, &bytes).expect("a valid node");
+        assert_eq!(cid, stored, "a node stored under another CID");
         all.insert(cid, node);
     }
     let mut remaining: BTreeMap<Cid<H>, usize> = BTreeMap::new();

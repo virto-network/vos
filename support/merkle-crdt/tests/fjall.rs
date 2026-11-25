@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use common::{H, Ops, Replayed, Rng, SCOPE, Server, Step, crdt, generate, read, replay};
 use fjall::{Database, KeyspaceCreateOptions};
-use merkle_crdt::{Error, Event, FjallError, FjallStore, Node, Replica, Rows, Store};
+use merkle_crdt::{Cid, Error, Event, FjallError, FjallStore, Node, Replica, Rows, Store};
 
 type Fjall = Replica<H, Ops, FjallStore>;
 
@@ -38,7 +38,10 @@ fn replayed(db: &Database) -> Replayed {
         .keyspace("scope.nodes", KeyspaceCreateOptions::default)
         .unwrap();
     replay(
-        nodes.iter().map(|row| row.value().unwrap().to_vec()),
+        nodes.iter().map(|row| {
+            let (key, value) = row.into_inner().unwrap();
+            (Cid(key.as_ref().try_into().unwrap()), value.to_vec())
+        }),
         &mut crdt,
     )
 }

@@ -55,16 +55,18 @@ costing a replica without limit.
 - **Parents.** A node names at most `MAX_PARENTS`; one naming more does not
   decode. `record` names the author's previous node, then heads of authors
   that never equivocated, then the other heads, up to the bound. The heads it
-  leaves stay heads and the next local nodes name them, `MAX_PARENTS - 1` a
-  node. So an author that signs thousands of forks makes the heads many but
+  leaves stay heads, and later local nodes may name them, up to
+  `MAX_PARENTS - 1` a node. So an author that signs thousands of forks makes the heads many but
   no local node large.
 - **Forks and convergence.** Whether a node is applied depends only on its
   bytes and its ancestors (signature, chain, parents applied), never on
-  whether a later node names it. Every replica given the same nodes applies
-  the same set and so has the same heads, rows and equivocations, whichever
-  heads its own nodes named: a head no node names converges like any other,
-  since nodes reach a replica by delivery (a feed, or a peer), not by being
-  reachable from a head. What naming changes is causal order: a local node
+  whether a later node names it. Every replica that is delivered the same
+  nodes (and delivered again any it dropped at a held bound) applies the
+  same set and so has the same heads, rows and equivocations, whichever
+  heads its own nodes named. A head no node names converges like any
+  other, as long as every node reaches every replica by delivery (a feed of
+  all of them): a fetch that follows only the heads, or each author's
+  highest number (`have`), misses a fork no node names. What naming changes is causal order: a local node
   is after the heads it names and concurrent with the rest, and a CRDT must
   accept either. Forks come last, so a local node names the other honest
   authors' latest nodes before an equivocating author's, and a CRDT that
@@ -85,7 +87,9 @@ costing a replica without limit.
 ## Limits
 
 - Nothing is pruned: applied nodes, the author index, each author's latest
-  number, the equivocations and the CRDT's rows grow with the history. A
+  number, the equivocations and the CRDT's rows grow with the history, and
+  in memory so do the heads (with forks, or new authors) and the
+  equivocations. A
   caller bounds what its writers may send.
 - A compromised author key can filter that author's whole past: a second
   node at its number 0 is an equivocation at 0.
@@ -95,6 +99,10 @@ costing a replica without limit.
 - One replica a store.
 
 ## Stores
+
+The layout is not versioned: a store written by an earlier layout of this
+crate (one row of all heads, before heads were a row each) does not open,
+and is made again from its peers.
 
 | Store | |
 |---|---|

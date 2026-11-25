@@ -26,8 +26,9 @@ pub const MAX_HELD_BYTES: usize = 32 << 20;
 /// held, within the bounds above, as a node whose parent has not arrived.
 const MAX_REFUSED: usize = 4096;
 
-/// Why a replica's operation failed. The replica's memory and store are
-/// as they were before it.
+/// Why a replica's operation failed. The replica's memory is as it was
+/// before it, and so is its store but after [`Error::Store`] from a commit,
+/// when it is not known until the store is opened again.
 #[derive(Debug)]
 pub enum Error<S, A = Infallible> {
     /// The store failed.
@@ -175,7 +176,8 @@ pub struct Replica<H: Hasher, O, S: Store<H>> {
 impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
     /// Open the replica of `scope` its store holds; an empty store is an
     /// empty scope. The held nodes are read one at a time, for their
-    /// headers.
+    /// headers; a replica holds no more than its bounds, so neither does a
+    /// store only replicas wrote.
     pub fn open(store: S, scope: Scope) -> Result<Self, Error<S::Error>> {
         let loaded = store.load().map_err(Error::Store)?;
         let mut replica = Self {
@@ -824,8 +826,8 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
 }
 
 /// The outcome of one node's apply: the store's error first, which the
-/// CRDT may have seen as a missing row, then the CRDT's, then a row no
-/// store takes.
+/// CRDT may have seen as a missing row, then a row no store takes (whose
+/// write the CRDT may have read back as missing), then the CRDT's.
 fn settle<H: Hasher, S: Store<H>, A>(
     rows: &mut Overlay<'_, H, S>,
     result: Result<(), A>,
@@ -833,9 +835,8 @@ fn settle<H: Hasher, S: Store<H>, A>(
     if let Some(error) = rows.error.take() {
         return Err(Error::Store(error));
     }
-    result.map_err(Error::Apply)?;
     if rows.unfit {
         return Err(Error::Row);
     }
-    Ok(())
+    result.map_err(Error::Apply)
 }
