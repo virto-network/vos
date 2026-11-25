@@ -39,7 +39,7 @@ struct State {
     /// Directed links that lose every frame of one class.
     class_cut: HashSet<(NodeNumber, NodeNumber, Class)>,
     /// Frames sent through the hub, by class, lost or not.
-    sent: HashMap<Class, u64>,
+    sent: [u64; 4],
     random: u64,
     delay: Duration,
     limits: Limits,
@@ -79,7 +79,7 @@ impl Hub {
                 loss: 0,
                 link_loss: HashMap::new(),
                 class_cut: HashSet::new(),
-                sent: HashMap::new(),
+                sent: [0; 4],
                 random: seed | 1,
                 delay: Duration::ZERO,
                 limits: Limits::default(),
@@ -161,7 +161,7 @@ impl Hub {
 
     /// The frames of `class` sent through the hub so far, lost or not.
     pub fn sent(&self, class: Class) -> u64 {
-        self.state().sent.get(&class).copied().unwrap_or(0)
+        self.state().sent[class as usize]
     }
 
     /// Lose `per_million` of every million frames, at random.
@@ -292,7 +292,7 @@ impl Network for Endpoint {
             return Err(Refused::TooLarge);
         }
         let incoming = Incoming::new(self.number, stream, frame);
-        *state.sent.entry(class).or_insert(0) += 1;
+        state.sent[class as usize] += 1;
         if let Some(tap) = &state.tap {
             tap(self.number, to, class, &incoming.frame);
         }
