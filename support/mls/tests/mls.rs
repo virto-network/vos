@@ -3,7 +3,11 @@
 //! as it was; a held commit across a reopen, matched by its handshake and
 //! deleted on a void; the device group's policy refusing what it does not
 //! allow, from a member running other rules; a removed member; a leaf's
-//! credential renewed; and a restart into a new group.
+//! credential renewed; a restart into a new group; Welcomes of another
+//! suite, of an over-long key-package reference or group id, and rows the
+//! store cannot hold, refused without a write; stale candidates refused;
+//! a key package from a clock ahead; and the limit of a key package's
+//! year.
 
 use std::collections::BTreeMap;
 
@@ -527,4 +531,383 @@ fn a_leafs_credential_is_renewed_only_as_expected() {
     let own = b.mls.own(&next.handshake).unwrap();
     b.mls.swap(own, BTreeMap::new()).unwrap();
     agree(&[&a, &b], 3);
+}
+
+/// MLS varint (RFC 9420 §2.1.2).
+fn varint(out: &mut Vec<u8>, n: usize) {
+    if n < 1 << 6 {
+        out.push(n as u8);
+    } else if n < 1 << 14 {
+        out.extend_from_slice(&(0x4000u16 | n as u16).to_be_bytes());
+    } else {
+        out.extend_from_slice(&(0x8000_0000u32 | n as u32).to_be_bytes());
+    }
+}
+
+/// A suite-1 Welcome of one encrypted secret for the key package
+/// `reference`, its KEM output, ciphertext and group info empty.
+fn welcome_for(reference: &[u8]) -> Vec<u8> {
+    let mut secret = Vec::new();
+    varint(&mut secret, reference.len());
+    secret.extend_from_slice(reference);
+    varint(&mut secret, 0);
+    varint(&mut secret, 0);
+    let mut welcome = vec![0, 1, 0, 3, 0, 1];
+    varint(&mut welcome, secret.len());
+    welcome.extend_from_slice(&secret);
+    varint(&mut welcome, 0);
+    welcome
+}
+
+/// The rows of `member`'s store, keys and values.
+fn rows(member: &Member) -> Vec<(Vec<u8>, Vec<u8>)> {
+    member
+        .namespace
+        .store()
+        .keyspace()
+        .iter()
+        .map(|row| {
+            let (key, value) = row.into_inner().unwrap();
+            (key.to_vec(), value.to_vec())
+        })
+        .collect()
+}
+
+/// How many of `member`'s rows start with `prefix`.
+fn count(member: &Member, prefix: &[u8]) -> usize {
+    rows(member)
+        .iter()
+        .filter(|(key, _)| key.starts_with(prefix))
+        .count()
+}
+
+/// A Welcome naming a key package by a reference of any length is
+/// refused, and refused again after a reopen, writing nothing.
+#[test]
+fn a_welcome_naming_an_overlong_key_package_is_refused() {
+    let member = member(2);
+    let before = rows(&member);
+    for length in [60_000, 70_000] {
+        let welcome = welcome_for(&vec![0x41; length]);
+        assert!(matches!(
+            member.mls.join(&welcome, T),
+            Err(Error::Refused(Refusal::Rejected(_)))
+        ));
+        assert!(matches!(
+            reopen(&member, 2).join(&welcome, T),
+            Err(Error::Refused(Refusal::Rejected(_)))
+        ));
+    }
+    assert_eq!(rows(&member), before);
+}
+
+/// A Welcome into a group whose id is longer than the suite's hash is
+/// refused before its state is staged.
+#[test]
+fn a_welcome_into_a_group_with_an_overlong_id_is_refused() {
+    use mls_rs::identity::SigningIdentity;
+    use mls_rs::identity::basic::BasicCredential;
+    use mls_rs::time::MlsTime;
+    use mls_rs::{CipherSuiteProvider, CryptoProvider};
+    let suite = RustCryptoProvider::default()
+        .cipher_suite_provider(vos_mls::SUITE)
+        .unwrap();
+    let (secret, public) = suite.signature_key_generate().unwrap();
+    let identity = SigningIdentity::new(
+        BasicCredential::new(credential(1)).into_credential(),
+        public,
+    );
+    let creator = Client::builder()
+        .identity_provider(Identity::default())
+        .crypto_provider(RustCryptoProvider::default())
+        .mls_rules(vos_mls::Rules::default())
+        .signing_identity(identity, secret, vos_mls::SUITE)
+        .build();
+    let mut group = creator
+        .create_group_with_id(
+            vec![0x47; 70_000],
+            ExtensionList::new(),
+            ExtensionList::new(),
+            Some(MlsTime::from(T)),
+        )
+        .unwrap();
+    let mut b = member(2);
+    let package = b.mls.key_package(T, BTreeMap::new()).unwrap();
+    let commit = group
+        .commit_builder()
+        .commit_time(MlsTime::from(T))
+        .add_member(mls_rs::MlsMessage::from_bytes(&package).unwrap())
+        .unwrap()
+        .build()
+        .unwrap();
+    let welcome = commit.welcome_messages[0].to_bytes().unwrap();
+    let before = rows(&b);
+    assert!(matches!(
+        b.mls.join(&welcome, T),
+        Err(Error::Refused(Refusal::Group))
+    ));
+    assert_eq!(rows(&b), before);
+}
+
+/// A row the store cannot hold (an empty key, a key over 65,535 bytes)
+/// is an error, its batch written as none, and no read of one fails.
+#[test]
+fn a_row_the_store_cannot_hold_is_an_error() {
+    let (mut a, _b, _c) = three();
+    let before = rows(&a);
+    for key in [Vec::new(), vec![0x6b; 70_000]] {
+        let mut bad = BTreeMap::new();
+        bad.insert(b"caller/fine".to_vec(), Some(b"row".to_vec()));
+        bad.insert(key.clone(), Some(b"row".to_vec()));
+        assert!(matches!(a.mls.write(bad), Err(Error::Unstorable)));
+        assert_eq!(rows(&a), before);
+        assert_eq!(a.namespace.store().get(&key).unwrap(), None);
+    }
+    assert_eq!(a.namespace.get(&[0x6b; 70_000]).unwrap(), None);
+    let mut bad = BTreeMap::new();
+    bad.insert(vec![0x6b; 70_000], None);
+    assert!(matches!(
+        a.mls.commit(&[], &[], T + 1, |_| bad),
+        Err(Error::Unstorable)
+    ));
+    assert!(a.mls.held().unwrap().is_none());
+    a.mls.write(BTreeMap::new()).unwrap();
+    assert!(a.mls.held().unwrap().is_none(), "nothing staged is left");
+    assert_eq!(reopen(&a, 1).epoch().unwrap(), 1);
+    a.mls.commit(&[], &[], T + 1, |_| BTreeMap::new()).unwrap();
+}
+
+/// A Welcome naming another suite is unsupported: no key of this member
+/// is used under it.
+#[test]
+fn a_welcome_of_another_suite_is_unsupported() {
+    use mls_rs::error::MlsError;
+    let mut a = member(1);
+    let mut d = member(4);
+    a.mls.create(T, BTreeMap::new()).unwrap();
+    let package = d.mls.key_package(T, BTreeMap::new()).unwrap();
+    let commit = a
+        .mls
+        .commit(&[package], &[], T, |_| BTreeMap::new())
+        .unwrap();
+    let mut welcome = commit.welcome.unwrap();
+    // MLSMessage: version (2 bytes), wire format (2), then the suite (2).
+    assert_eq!(welcome[2..6], [0, 3, 0, 1], "a Welcome of suite 1");
+    for suite in [2u8, 3, 7] {
+        welcome[5] = suite;
+        match d.mls.join(&welcome, T) {
+            Err(Error::Refused(Refusal::Rejected(MlsError::UnsupportedCipherSuite(_)))) => {}
+            other => panic!("suite {suite}: {:?}", other.map(|c| c.kind())),
+        }
+    }
+}
+
+/// A key package names the one suite its member runs.
+#[test]
+fn a_key_package_names_one_suite() {
+    let mut b = member(2);
+    let package = b.mls.key_package(T, BTreeMap::new()).unwrap();
+    let package = mls_rs::MlsMessage::from_bytes(&package)
+        .unwrap()
+        .into_key_package()
+        .unwrap();
+    let leaf = format!("{package:?}");
+    assert!(leaf.contains("cipher_suites: [CipherSuite(1)]"), "{leaf}");
+}
+
+/// A key package made by a device whose clock is ahead of the others'
+/// (within the margin) is added, processed and joined with.
+#[test]
+fn a_key_package_from_a_clock_ahead_is_added() {
+    let (mut a, b, _c) = three();
+    let mut d = member(4);
+    let package = d.mls.key_package(T + 120, BTreeMap::new()).unwrap();
+    let commit = a
+        .mls
+        .commit(&[package], &[], T + 1, |_| BTreeMap::new())
+        .unwrap();
+    b.mls
+        .process(&commit.handshake, T + 1, expected(1, &[4], &[]))
+        .unwrap();
+    d.mls.join(&commit.welcome.unwrap(), T + 1).unwrap();
+}
+
+/// The limit of a key package's year: a member added over a year ago that
+/// has not committed since keeps a leaf a joiner refuses, until its own
+/// commit gives it a leaf of its own.
+#[test]
+fn a_leaf_past_its_key_packages_year_bars_a_join_until_it_commits() {
+    use mls_rs::error::MlsError;
+    let (mut a, mut b, mut c) = three();
+    let later = T + 400 * 24 * 3600;
+    let mut d = member(4);
+    let package = d.mls.key_package(later, BTreeMap::new()).unwrap();
+    let commit = a
+        .mls
+        .commit(&[package], &[], later, |_| BTreeMap::new())
+        .unwrap();
+    assert!(matches!(
+        d.mls.join(&commit.welcome.unwrap(), later),
+        Err(Error::Refused(Refusal::Rejected(
+            MlsError::InvalidLifetime { .. }
+        )))
+    ));
+    a.mls.void(BTreeMap::new()).unwrap();
+    update(&mut b, 2, &mut [&mut a, &mut c], later);
+    update(&mut c, 3, &mut [&mut a, &mut b], later);
+    let package = d.mls.key_package(later, BTreeMap::new()).unwrap();
+    let commit = a
+        .mls
+        .commit(&[package], &[], later, |_| BTreeMap::new())
+        .unwrap();
+    d.mls.join(&commit.welcome.unwrap(), later).unwrap();
+}
+
+/// `committer`'s update at `time`, processed and swapped in by `others`
+/// and by itself.
+fn update(committer: &mut Member, n: u8, others: &mut [&mut Member], time: u64) {
+    let update = committer
+        .mls
+        .commit(&[], &[], time, |_| BTreeMap::new())
+        .unwrap();
+    for other in others {
+        let on = other
+            .mls
+            .process(&update.handshake, time, expected(n, &[], &[]))
+            .unwrap();
+        other.mls.swap(on, BTreeMap::new()).unwrap();
+    }
+    let own = committer.mls.own(&update.handshake).unwrap();
+    committer.mls.swap(own, BTreeMap::new()).unwrap();
+}
+
+/// An expected renewal is required, not only allowed.
+#[test]
+fn an_expected_renewal_is_required() {
+    let (a, mut b, _c) = three();
+    let update = b.mls.commit(&[], &[], T + 1, |_| BTreeMap::new()).unwrap();
+    let expecting = Expected {
+        renewed: Some(credential(0x22)),
+        ..expected(2, &[], &[])
+    };
+    assert!(matches!(
+        a.mls.process(&update.handshake, T + 1, expecting),
+        Err(Error::Refused(Refusal::Leaf))
+    ));
+}
+
+/// A committer keeps its leaf's signature key.
+#[test]
+fn a_committer_keeps_its_signature_key() {
+    use mls_rs::identity::SigningIdentity;
+    use mls_rs::identity::basic::BasicCredential;
+    use mls_rs::{CipherSuiteProvider, CryptoProvider};
+    let (a, b, _c) = three();
+    let mut group = loose(
+        &b,
+        Loose {
+            path: true,
+            encrypt: true,
+        },
+    );
+    let suite = RustCryptoProvider::default()
+        .cipher_suite_provider(vos_mls::SUITE)
+        .unwrap();
+    let (secret, public) = suite.signature_key_generate().unwrap();
+    let identity = SigningIdentity::new(
+        BasicCredential::new(credential(2)).into_credential(),
+        public,
+    );
+    let rotated = group
+        .commit_builder()
+        .set_new_signing_identity(secret, identity)
+        .build()
+        .unwrap();
+    let bytes = rotated.commit_message.to_bytes().unwrap();
+    assert!(matches!(
+        a.mls.process(&bytes, T + 1, expected(2, &[], &[])),
+        Err(Error::Refused(Refusal::Leaf))
+    ));
+}
+
+/// A rival swapped in over a held restart deletes the restart's new
+/// group.
+#[test]
+fn a_held_restarts_group_goes_when_a_rival_is_swapped_in() {
+    let (mut a, mut b, _c) = three();
+    a.mls.restart(T + 1, |_| BTreeMap::new()).unwrap();
+    assert_eq!(count(&a, b"mls/state/"), 2);
+    let update = b.mls.commit(&[], &[], T + 1, |_| BTreeMap::new()).unwrap();
+    let on_a = a
+        .mls
+        .process(&update.handshake, T + 1, expected(2, &[], &[]))
+        .unwrap();
+    a.mls.swap(on_a, BTreeMap::new()).unwrap();
+    assert!(a.mls.held().unwrap().is_none());
+    assert_eq!(count(&a, b"mls/state/"), 1);
+}
+
+/// A candidate of the group a restart left is not swapped over the new
+/// one.
+#[test]
+fn a_candidate_of_the_group_left_is_not_swapped_in() {
+    let (mut a, mut b, _c) = three();
+    let update = b.mls.commit(&[], &[], T + 1, |_| BTreeMap::new()).unwrap();
+    let stale = a
+        .mls
+        .process(&update.handshake, T + 1, expected(2, &[], &[]))
+        .unwrap();
+    let restart = a.mls.restart(T + 2, |_| BTreeMap::new()).unwrap();
+    let own = a.mls.own(&restart.handshake).unwrap();
+    a.mls.swap(own, BTreeMap::new()).unwrap();
+    assert_eq!(a.mls.epoch().unwrap(), 1);
+    assert!(matches!(
+        a.mls.swap(stale, BTreeMap::new()),
+        Err(Error::Stale)
+    ));
+    assert_eq!(a.mls.credentials().unwrap().len(), 1);
+}
+
+/// A device's own candidate kept across a void is not swapped in over the
+/// commit held after it.
+#[test]
+fn an_own_candidate_kept_across_a_void_is_not_swapped_in() {
+    let (_a, mut b, _c) = three();
+    let first = b.mls.commit(&[], &[], T + 1, |_| BTreeMap::new()).unwrap();
+    let kept = b.mls.own(&first.handshake).unwrap();
+    b.mls.void(BTreeMap::new()).unwrap();
+    b.mls
+        .renew(&credential(0x22), &[], &[], T + 1, |_| BTreeMap::new())
+        .unwrap();
+    assert!(matches!(
+        b.mls.swap(kept, BTreeMap::new()),
+        Err(Error::Stale)
+    ));
+    assert_eq!(b.mls.credential(), credential(2));
+    assert_eq!(b.mls.epoch().unwrap(), 1);
+}
+
+/// A key package's row that does not decode is a corrupt store, not a
+/// Welcome for a key package this member never made.
+#[test]
+fn a_key_package_row_that_does_not_read_is_corrupt() {
+    let mut a = member(1);
+    let mut d = member(4);
+    a.mls.create(T, BTreeMap::new()).unwrap();
+    let package = d.mls.key_package(T, BTreeMap::new()).unwrap();
+    let commit = a
+        .mls
+        .commit(&[package], &[], T, |_| BTreeMap::new())
+        .unwrap();
+    let (key, _) = rows(&d)
+        .into_iter()
+        .find(|(key, _)| key.starts_with(b"mls/package/"))
+        .unwrap();
+    let mut garbled = BTreeMap::new();
+    garbled.insert(key, Some(b"not a key package".to_vec()));
+    d.mls.write(garbled).unwrap();
+    assert!(matches!(
+        d.mls.join(&commit.welcome.unwrap(), T),
+        Err(Error::Corrupt)
+    ));
 }
