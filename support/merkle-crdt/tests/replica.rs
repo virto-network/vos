@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use common::{
-    H, Ops, Rng, SCOPE, Server, Step, crdt, deliveries, generate, key, read, replay, wide_key,
+    H, Ops, Rng, SCOPE, Server, Step, crdt, deliveries, generate, key, node, read, replay, wide_key,
 };
 use merkle_crdt::{
     Author, Changes, Cid, Error, Event, Loaded, MAX_HELD, MAX_HELD_PER_AUTHOR, MAX_PARENTS,
@@ -106,9 +106,9 @@ proptest! {
 #[test]
 fn equivocation_is_detected_kept_and_reported_once() {
     let author = key(0);
-    let first = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![(1, 1)], BTreeSet::new());
-    let twin = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![(1, 2)], BTreeSet::new());
-    let third = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![(1, 3)], BTreeSet::new());
+    let first = node(&author, 0, vec![(1, 1)], []);
+    let twin = node(&author, 0, vec![(1, 2)], []);
+    let third = node(&author, 0, vec![(1, 3)], []);
     let mut replica = replica();
     let report = replica.ingest([first.to_bytes()], None, &mut crdt).unwrap();
     assert!(report.equivocations.is_empty());
@@ -128,7 +128,7 @@ fn equivocation_is_detected_kept_and_reported_once() {
     );
 
     // A node after one twin is still applied: other authors may cite either.
-    let other = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![], BTreeSet::from([twin.cid()]));
+    let other = node(&key(1), 0, vec![], [twin.cid()]);
     let report = replica.ingest([other.to_bytes()], None, &mut crdt).unwrap();
     assert_eq!(report.applied, vec![other.cid()]);
 }
@@ -138,9 +138,9 @@ fn equivocation_is_detected_kept_and_reported_once() {
 #[test]
 fn an_equivocating_node_is_marked_at_its_apply() {
     let author = key(0);
-    let first = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![(1, 1)], BTreeSet::new());
-    let twin = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![(1, 2)], BTreeSet::new());
-    let next = Node::<H, Ops>::sign(&author, &SCOPE, 1, vec![], BTreeSet::from([twin.cid()]));
+    let first = node(&author, 0, vec![(1, 1)], []);
+    let twin = node(&author, 0, vec![(1, 2)], []);
+    let next = node(&author, 1, vec![], [twin.cid()]);
     let mut marked = Vec::new();
     let mut mark = |event: merkle_crdt::Event<'_, H, Ops>, _: &mut dyn merkle_crdt::Rows| {
         marked.push((event.cid.clone(), event.equivocation));
@@ -163,7 +163,7 @@ fn an_equivocating_node_is_marked_at_its_apply() {
 #[test]
 fn signatures_are_refused_unless_the_authors() {
     let author = key(0);
-    let node = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![(1, 1)], BTreeSet::new());
+    let node = node(&author, 0, vec![(1, 1)], []);
 
     // Operations changed after signing.
     let mut tampered = node.clone();
@@ -203,7 +203,7 @@ fn signatures_are_refused_unless_the_authors() {
     let mut trailing = node.to_bytes();
     trailing.push(0);
     let parents = BTreeSet::from([Cid([1; 32]), Cid([2; 32])]);
-    let two = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![], parents);
+    let two = common::node(&author, 0, vec![], parents);
     let mut swapped = two.to_bytes();
     let end = swapped.len();
     let (front, back) = swapped[end - 64..].split_at_mut(32);
@@ -222,9 +222,9 @@ fn signatures_are_refused_unless_the_authors() {
 #[test]
 fn a_broken_chain_is_refused_with_its_descendants() {
     let author = key(0);
-    let first = Node::<H, Ops>::sign(&author, &SCOPE, 0, vec![], BTreeSet::new());
-    let gap = Node::<H, Ops>::sign(&author, &SCOPE, 2, vec![], BTreeSet::from([first.cid()]));
-    let child = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![], BTreeSet::from([gap.cid()]));
+    let first = node(&author, 0, vec![], []);
+    let gap = node(&author, 2, vec![], [first.cid()]);
+    let child = node(&key(1), 0, vec![], [gap.cid()]);
     let mut replica = replica();
     // The child arrives first and is held; the gap's refusal releases it.
     let report = replica.ingest([child.to_bytes()], None, &mut crdt).unwrap();
@@ -242,7 +242,7 @@ fn a_broken_chain_is_refused_with_its_descendants() {
     );
     assert_eq!(replica.held(), 0);
     // Later arrivals naming a refused node are refused at once.
-    let late = Node::<H, Ops>::sign(&key(2), &SCOPE, 0, vec![], BTreeSet::from([gap.cid()]));
+    let late = node(&key(2), 0, vec![], [gap.cid()]);
     let report = replica.ingest([late.to_bytes()], None, &mut crdt).unwrap();
     assert_eq!(
         report.refused,
@@ -277,11 +277,7 @@ fn a_cursor_catches_up_out_of_causal_order_and_resumes() {
         .map(|(i, b)| (10 + 3 * i as u64, b))
         .collect();
     let last = items.last().unwrap().0;
-    let mut server = Server {
-        items,
-        page: 16,
-        trips: 0,
-    };
+    let mut server = Server::new(&items, 16);
     let mut local = replica();
     // Read only the first page, then reopen the replica from its store.
     let (first, _) = server.since(None);
@@ -310,26 +306,27 @@ fn a_cursor_catches_up_out_of_causal_order_and_resumes() {
     assert_eq!(server.trips, trips + 1);
 }
 
-/// `count` local nodes, recorded in turn by `authors` authors.
-fn history(replica: &mut Mem, authors: u8, count: u64) {
+/// `count` local nodes of one author.
+fn history(replica: &mut Mem, count: u64) {
     for i in 0..count {
         replica
-            .record(
-                &key((i % authors as u64) as u8),
-                vec![(i % 5, i)],
-                &mut crdt,
-            )
+            .record(&key(0), vec![(i % 5, i)], &mut crdt)
             .unwrap();
     }
 }
 
-/// A store whose commits fail while `fail` is set.
-struct Flaky {
+/// A store whose commits or row reads fail when told to, and which counts
+/// the index rows a replica reads: a node found at a number, or a node
+/// confirmed there.
+#[derive(Default)]
+struct Probe {
     inner: MemStore<H>,
-    fail: bool,
+    fail_commits: bool,
+    fail_rows: bool,
+    index_reads: Cell<usize>,
 }
 
-impl Store<H> for Flaky {
+impl Store<H> for Probe {
     type Error = &'static str;
     fn node(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {
         Ok(self.inner.node(cid).unwrap())
@@ -341,19 +338,28 @@ impl Store<H> for Flaky {
         Ok(self.inner.held(cid).unwrap())
     }
     fn authored(&self, author: &Author, seq: u64) -> Result<Option<Cid<H>>, Self::Error> {
-        Ok(self.inner.authored(author, seq).unwrap())
+        let found = self.inner.authored(author, seq).unwrap();
+        self.index_reads
+            .set(self.index_reads.get() + usize::from(found.is_some()));
+        Ok(found)
     }
     fn is_authored(&self, author: &Author, seq: u64, cid: &Cid<H>) -> Result<bool, Self::Error> {
-        Ok(self.inner.is_authored(author, seq, cid).unwrap())
+        let found = self.inner.is_authored(author, seq, cid).unwrap();
+        self.index_reads
+            .set(self.index_reads.get() + usize::from(found));
+        Ok(found)
     }
     fn row(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        if self.fail_rows {
+            return Err("unreadable");
+        }
         Ok(self.inner.row(key).unwrap())
     }
     fn load(&self) -> Result<Loaded<H>, Self::Error> {
         Ok(self.inner.load().unwrap())
     }
     fn commit(&mut self, changes: Changes<H>) -> Result<(), Self::Error> {
-        if self.fail {
+        if self.fail_commits {
             return Err("injected");
         }
         self.inner.commit(changes).unwrap();
@@ -364,21 +370,14 @@ impl Store<H> for Flaky {
 #[test]
 fn a_failed_commit_moves_nothing_and_a_retry_completes() {
     let mut remote = replica();
-    history(&mut remote, 1, 10);
+    history(&mut remote, 10);
     let bytes: Vec<Vec<u8>> = remote
         .outbox()
         .unwrap()
         .into_iter()
         .map(|node| node.bytes)
         .collect();
-    let mut local = Replica::<H, Ops, _>::open(
-        Flaky {
-            inner: MemStore::new(),
-            fail: false,
-        },
-        SCOPE,
-    )
-    .unwrap();
+    let mut local = Replica::<H, Ops, _>::open(Probe::default(), SCOPE).unwrap();
     // Hold the last five, then fail the batch that would release them.
     local
         .ingest(bytes[5..].to_vec(), Some(1), &mut crdt)
@@ -386,7 +385,7 @@ fn a_failed_commit_moves_nothing_and_a_retry_completes() {
     assert_eq!(local.held(), 5);
     let heads = local.heads().clone();
     let mut inner = local.into_store();
-    inner.fail = true;
+    inner.fail_commits = true;
     let mut failing = Replica::<H, Ops, _>::open(inner, SCOPE).unwrap();
     assert!(matches!(
         failing.ingest(bytes[..5].to_vec(), Some(2), &mut crdt),
@@ -403,7 +402,7 @@ fn a_failed_commit_moves_nothing_and_a_retry_completes() {
     assert!(failing.outbox().unwrap().is_empty());
 
     let mut inner = failing.into_store();
-    inner.fail = false;
+    inner.fail_commits = false;
     let mut retry = Replica::<H, Ops, _>::open(inner, SCOPE).unwrap();
     let report = retry
         .ingest(bytes[..5].to_vec(), Some(2), &mut crdt)
@@ -445,18 +444,12 @@ fn the_outbox_holds_local_nodes_until_pushed() {
 
 #[test]
 fn a_forged_parent_releases_its_held_children_refused() {
-    let honest = Node::<H, Ops>::sign(&key(0), &SCOPE, 0, vec![], BTreeSet::new());
-    let mut forged = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![(1, 1)], BTreeSet::new());
+    let honest = node(&key(0), 0, vec![], []);
+    let mut forged = node(&key(1), 0, vec![(1, 1)], []);
     forged.payload.ops = vec![(1, 2)];
-    let other = Node::<H, Ops>::sign(&key(2), &SCOPE, 0, vec![], BTreeSet::new());
+    let other = node(&key(2), 0, vec![], []);
     // Waits on the forged node and on one that never comes.
-    let child = Node::<H, Ops>::sign(
-        &key(3),
-        &SCOPE,
-        0,
-        vec![],
-        BTreeSet::from([forged.cid(), other.cid()]),
-    );
+    let child = node(&key(3), 0, vec![], [forged.cid(), other.cid()]);
     let mut replica = replica();
     let report = replica
         .ingest([child.to_bytes(), honest.to_bytes()], None, &mut crdt)
@@ -497,7 +490,7 @@ fn a_node_signed_for_another_scope_is_refused() {
 /// as many forks as it likes.
 fn forks(author: u8, count: u64) -> Vec<Node<H, Ops>> {
     (0..count)
-        .map(|i| Node::<H, Ops>::sign(&key(author), &SCOPE, 0, vec![(0, i)], BTreeSet::new()))
+        .map(|i| node(&key(author), 0, vec![(0, i)], []))
         .collect()
 }
 
@@ -509,7 +502,7 @@ fn forks(author: u8, count: u64) -> Vec<Node<H, Ops>> {
 #[test]
 fn a_local_node_stays_small_whatever_one_author_forks() {
     let forks = forks(77, 2_000);
-    let other = Node::<H, Ops>::sign(&key(2), &SCOPE, 0, vec![(2, 2)], BTreeSet::new());
+    let other = node(&key(2), 0, vec![(2, 2)], []);
     let mut honest = replica();
     let all = forks.iter().chain([&other]).map(|node| node.to_bytes());
     let report = honest.ingest(all, None, &mut crdt).unwrap();
@@ -553,9 +546,9 @@ fn a_node_naming_more_than_max_parents_is_malformed() {
             })
             .collect()
     };
-    let at_most = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![], parents(MAX_PARENTS));
+    let at_most = node(&key(1), 0, vec![], parents(MAX_PARENTS));
     assert!(merkle_crdt::validate::<H, Ops>(&SCOPE, &at_most.to_bytes()).is_ok());
-    let past = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![], parents(MAX_PARENTS + 1));
+    let past = node(&key(1), 0, vec![], parents(MAX_PARENTS + 1));
     assert_eq!(
         merkle_crdt::validate::<H, Ops>(&SCOPE, &past.to_bytes()).err(),
         Some((None, Refusal::Malformed))
@@ -563,16 +556,11 @@ fn a_node_naming_more_than_max_parents_is_malformed() {
     assert!(merkle_crdt::Header::<H>::read(&past.to_bytes()).is_none());
 }
 
-/// A node of `key` at seq 0 naming a parent that does not exist.
-fn orphan(key: &ed25519_dalek::SigningKey, index: u32) -> Node<H, Ops> {
-    orphan_of(key, index, vec![])
-}
-
 /// A node of `ops` by `key` at seq 0 naming a parent that does not exist.
-fn orphan_of(key: &ed25519_dalek::SigningKey, index: u32, ops: Ops) -> Node<H, Ops> {
+fn orphan(key: &ed25519_dalek::SigningKey, index: u32, ops: Ops) -> Node<H, Ops> {
     let mut parent = [0; 32];
     parent[..4].copy_from_slice(&index.to_le_bytes());
-    Node::<H, Ops>::sign(key, &SCOPE, 0, ops, BTreeSet::from([Cid(parent)]))
+    node(key, 0, ops, [Cid(parent)])
 }
 
 /// Nodes whose parents never arrive are held up to a bound, per author and
@@ -584,7 +572,7 @@ fn held_nodes_are_bounded_and_can_be_dropped() {
     let one = key(66);
     let report = local
         .ingest(
-            (0..1_000).map(|i| orphan(&one, i).to_bytes()),
+            (0..1_000).map(|i| orphan(&one, i, vec![]).to_bytes()),
             None,
             &mut crdt,
         )
@@ -598,7 +586,7 @@ fn held_nodes_are_bounded_and_can_be_dropped() {
     let authors = (MAX_HELD / MAX_HELD_PER_AUTHOR + 2) as u32;
     let many = (0..authors).flat_map(|author| {
         let key = wide_key(author);
-        (0..MAX_HELD_PER_AUTHOR as u32).map(move |i| orphan(&key, 10_000 + i).to_bytes())
+        (0..MAX_HELD_PER_AUTHOR as u32).map(move |i| orphan(&key, 10_000 + i, vec![]).to_bytes())
     });
     let report = local.ingest(many, None, &mut crdt).unwrap();
     assert_eq!(local.held(), MAX_HELD);
@@ -625,30 +613,13 @@ fn held_nodes_are_bounded_and_can_be_dropped() {
 fn released_held_nodes_free_their_room() {
     let one = key(66);
     let parents: Vec<Node<H, Ops>> = (0..MAX_HELD_PER_AUTHOR as u64)
-        .map(|i| {
-            Node::<H, Ops>::sign(
-                &wide_key(i as u32),
-                &SCOPE,
-                0,
-                vec![(5, i)],
-                BTreeSet::new(),
-            )
-        })
+        .map(|i| node(&wide_key(i as u32), 0, vec![(5, i)], []))
         .collect();
     let mut local = replica();
     let waiting: Vec<Vec<u8>> = parents
         .iter()
         .enumerate()
-        .map(|(i, parent)| {
-            Node::<H, Ops>::sign(
-                &one,
-                &SCOPE,
-                0,
-                vec![(6, i as u64)],
-                BTreeSet::from([parent.cid()]),
-            )
-            .to_bytes()
-        })
+        .map(|(i, parent)| node(&one, 0, vec![(6, i as u64)], [parent.cid()]).to_bytes())
         .collect();
     let report = local.ingest(waiting, None, &mut crdt).unwrap();
     assert_eq!(report.held.len(), MAX_HELD_PER_AUTHOR);
@@ -657,7 +628,7 @@ fn released_held_nodes_free_their_room() {
         .unwrap();
     assert_eq!(report.applied.len(), 2 * MAX_HELD_PER_AUTHOR);
     assert_eq!(local.held(), 0);
-    let again = (0..MAX_HELD_PER_AUTHOR as u32).map(|i| orphan(&one, i).to_bytes());
+    let again = (0..MAX_HELD_PER_AUTHOR as u32).map(|i| orphan(&one, i, vec![]).to_bytes());
     let report = local.ingest(again, None, &mut crdt).unwrap();
     assert!(report.dropped.is_empty());
     assert_eq!(local.held(), MAX_HELD_PER_AUTHOR);
@@ -669,7 +640,7 @@ fn held_bytes_are_bounded() {
     let big = vec![(0, 0); 64 << 10];
     let authors = (merkle_crdt::MAX_HELD_BYTES >> 20) as u32 + 2;
     let nodes: Vec<Vec<u8>> = (0..authors)
-        .map(|author| orphan_of(&wide_key(author), author, big.clone()).to_bytes())
+        .map(|author| orphan(&wide_key(author), author, big.clone()).to_bytes())
         .collect();
     assert!(nodes[0].len() >= 1 << 20);
     let mut local = replica();
@@ -683,12 +654,12 @@ fn held_bytes_are_bounded() {
 #[test]
 fn a_dropped_node_applies_when_delivered_again() {
     let one = key(66);
-    let parent = Node::<H, Ops>::sign(&key(5), &SCOPE, 0, vec![(5, 5)], BTreeSet::new());
-    let child = Node::<H, Ops>::sign(&one, &SCOPE, 0, vec![], BTreeSet::from([parent.cid()]));
+    let parent = node(&key(5), 0, vec![(5, 5)], []);
+    let child = node(&one, 0, vec![], [parent.cid()]);
     let mut local = replica();
     local
         .ingest(
-            (0..MAX_HELD_PER_AUTHOR as u32).map(|i| orphan(&one, i).to_bytes()),
+            (0..MAX_HELD_PER_AUTHOR as u32).map(|i| orphan(&one, i, vec![]).to_bytes()),
             None,
             &mut crdt,
         )
@@ -708,7 +679,7 @@ fn a_row_no_store_takes_fails_the_batch() {
     let long = vec![1; merkle_crdt::MAX_ROW_KEY + 1];
     for bad in [Vec::new(), long] {
         let mut write = |_: Event<'_, H, Ops>, rows: &mut dyn Rows| rows.write(&bad, Some(b"x"));
-        let node = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![], BTreeSet::new());
+        let node = node(&key(1), 0, vec![], []);
         let mut local = replica();
         assert!(matches!(
             local.ingest([node.to_bytes()], None, &mut write),
@@ -743,109 +714,24 @@ fn a_node_that_does_not_decode_is_not_recorded() {
     assert_eq!((outbox[0].cid.clone(), outbox[0].seq), (cid, 0));
 }
 
-/// A store counting the index rows a replica reads: a node found at a
-/// number, or a node confirmed there.
-struct Counting {
-    inner: MemStore<H>,
-    rows: Cell<usize>,
-}
-
-impl Store<H> for Counting {
-    type Error = std::convert::Infallible;
-    fn node(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.inner.node(cid)
-    }
-    fn contains(&self, cid: &Cid<H>) -> Result<bool, Self::Error> {
-        self.inner.contains(cid)
-    }
-    fn held(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.inner.held(cid)
-    }
-    fn authored(&self, author: &Author, seq: u64) -> Result<Option<Cid<H>>, Self::Error> {
-        let found = self.inner.authored(author, seq)?;
-        self.rows
-            .set(self.rows.get() + usize::from(found.is_some()));
-        Ok(found)
-    }
-    fn is_authored(&self, author: &Author, seq: u64, cid: &Cid<H>) -> Result<bool, Self::Error> {
-        let found = self.inner.is_authored(author, seq, cid)?;
-        self.rows.set(self.rows.get() + usize::from(found));
-        Ok(found)
-    }
-    fn row(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.inner.row(key)
-    }
-    fn load(&self) -> Result<Loaded<H>, Self::Error> {
-        self.inner.load()
-    }
-    fn commit(&mut self, changes: Changes<H>) -> Result<(), Self::Error> {
-        self.inner.commit(changes)
-    }
-}
-
 /// Applying a node after an author's forks reads an index row for its
 /// chain and at most one at its number, however many forks there are.
 #[test]
 fn a_node_after_many_forks_costs_what_one_after_none_does() {
     let forks = forks(77, 500);
-    let mut replica = Replica::<H, Ops, _>::open(
-        Counting {
-            inner: MemStore::new(),
-            rows: Cell::new(0),
-        },
-        SCOPE,
-    )
-    .unwrap();
+    let mut replica = Replica::<H, Ops, _>::open(Probe::default(), SCOPE).unwrap();
     replica
         .ingest(forks.iter().map(|node| node.to_bytes()), None, &mut crdt)
         .unwrap();
-    replica.store().rows.set(0);
-    let next = Node::<H, Ops>::sign(
-        &key(77),
-        &SCOPE,
-        1,
-        vec![],
-        BTreeSet::from([forks[0].cid()]),
-    );
+    replica.store().index_reads.set(0);
+    let next = node(&key(77), 1, vec![], [forks[0].cid()]);
     let report = replica.ingest([next.to_bytes()], None, &mut crdt).unwrap();
     assert_eq!(report.applied, vec![next.cid()]);
     assert!(
-        replica.store().rows.get() <= 2,
+        replica.store().index_reads.get() <= 2,
         "{} index rows read",
-        replica.store().rows.get()
+        replica.store().index_reads.get()
     );
-}
-
-/// A store whose row reads fail.
-struct Unreadable(MemStore<H>);
-
-impl Store<H> for Unreadable {
-    type Error = &'static str;
-    fn node(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {
-        Ok(self.0.node(cid).unwrap())
-    }
-    fn contains(&self, cid: &Cid<H>) -> Result<bool, Self::Error> {
-        Ok(self.0.contains(cid).unwrap())
-    }
-    fn held(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {
-        Ok(self.0.held(cid).unwrap())
-    }
-    fn authored(&self, author: &Author, seq: u64) -> Result<Option<Cid<H>>, Self::Error> {
-        Ok(self.0.authored(author, seq).unwrap())
-    }
-    fn is_authored(&self, author: &Author, seq: u64, cid: &Cid<H>) -> Result<bool, Self::Error> {
-        Ok(self.0.is_authored(author, seq, cid).unwrap())
-    }
-    fn row(&self, _: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        Err("unreadable")
-    }
-    fn load(&self) -> Result<Loaded<H>, Self::Error> {
-        Ok(self.0.load().unwrap())
-    }
-    fn commit(&mut self, changes: Changes<H>) -> Result<(), Self::Error> {
-        self.0.commit(changes).unwrap();
-        Ok(())
-    }
 }
 
 /// A read the store fails is the store's error, even where the CRDT took
@@ -859,8 +745,12 @@ fn a_failed_read_is_the_stores_error() {
             rows.read(b"k").ok_or("missing row").map(drop)
         }
     }
-    let mut replica = Replica::<H, Ops, _>::open(Unreadable(MemStore::new()), SCOPE).unwrap();
-    let node = Node::<H, Ops>::sign(&key(1), &SCOPE, 0, vec![], BTreeSet::new());
+    let unreadable = Probe {
+        fail_rows: true,
+        ..Probe::default()
+    };
+    let mut replica = Replica::<H, Ops, _>::open(unreadable, SCOPE).unwrap();
+    let node = node(&key(1), 0, vec![], []);
     let result = replica.ingest([node.to_bytes()], None, &mut Strict);
     assert!(
         matches!(result, Err(Error::Store("unreadable"))),

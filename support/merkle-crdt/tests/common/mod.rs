@@ -31,6 +31,16 @@ pub fn key(index: u8) -> SigningKey {
     SigningKey::from_bytes(&[index.wrapping_add(1); 32])
 }
 
+/// A node of `ops` at `seq` in `key`'s chain of [`SCOPE`], after `parents`.
+pub fn node(
+    key: &SigningKey,
+    seq: u64,
+    ops: Ops,
+    parents: impl IntoIterator<Item = Cid<H>>,
+) -> Node<H, Ops> {
+    Node::sign(key, &SCOPE, seq, ops, parents.into_iter().collect())
+}
+
 /// The CRDT: per key, the sum of every value (so a node applied twice
 /// shows) and the last writer by (seq, author, index, value), the value
 /// ordering an equivocation's two writes; and a row per node
@@ -124,7 +134,7 @@ pub fn generate(authors: u8, steps: &[Step]) -> Dag {
                     }
                     None => 0,
                 };
-                let node = Node::<H, Ops>::sign(&keys[a], &SCOPE, seq, ops.clone(), parents);
+                let node = node(&keys[a], seq, ops.clone(), parents);
                 let cid = add(&mut dag, node, &mut parents_of);
                 views[a].insert(cid.clone());
                 latest[a] = Some((seq, cid));
@@ -140,7 +150,7 @@ pub fn generate(authors: u8, steps: &[Step]) -> Dag {
                     continue;
                 };
                 let parents = parents_of[&cid].clone();
-                let node = Node::<H, Ops>::sign(&keys[a], &SCOPE, seq, vec![(0, *value)], parents);
+                let node = node(&keys[a], seq, vec![(0, *value)], parents);
                 let twin = add(&mut dag, node, &mut parents_of);
                 if twin != cid {
                     views[a].insert(twin);
@@ -148,17 +158,10 @@ pub fn generate(authors: u8, steps: &[Step]) -> Dag {
                 }
             }
             Step::Forge { value } => {
-                let mut forged =
-                    Node::<H, Ops>::sign(&key(200), &SCOPE, 0, vec![(3, *value)], BTreeSet::new());
+                let mut forged = node(&key(200), 0, vec![(3, *value)], []);
                 forged.payload.ops.push((4, 4));
                 let forged = add(&mut dag, forged, &mut parents_of);
-                let after = Node::<H, Ops>::sign(
-                    &key(201),
-                    &SCOPE,
-                    0,
-                    vec![(5, *value)],
-                    BTreeSet::from([forged.clone()]),
-                );
+                let after = node(&key(201), 0, vec![(5, *value)], [forged.clone()]);
                 let after = add(&mut dag, after, &mut parents_of);
                 dag.refused.insert(forged);
                 dag.refused.insert(after);
@@ -168,21 +171,13 @@ pub fn generate(authors: u8, steps: &[Step]) -> Dag {
                 // second node names no previous node, and a node after it
                 // descends from a refused node.
                 let rogue = key(100 + *author);
-                let first = Node::<H, Ops>::sign(&rogue, &SCOPE, 0, vec![(9, 9)], BTreeSet::new());
-                let first = add(&mut dag, first, &mut parents_of);
-                let broken = Node::<H, Ops>::sign(&rogue, &SCOPE, 1, vec![(9, 1)], BTreeSet::new());
+                add(&mut dag, node(&rogue, 0, vec![(9, 9)], []), &mut parents_of);
+                let broken = node(&rogue, 1, vec![(9, 1)], []);
                 let broken = add(&mut dag, broken, &mut parents_of);
-                let after = Node::<H, Ops>::sign(
-                    &rogue,
-                    &SCOPE,
-                    2,
-                    vec![(9, 2)],
-                    BTreeSet::from([broken.clone()]),
-                );
+                let after = node(&rogue, 2, vec![(9, 2)], [broken.clone()]);
                 let after = add(&mut dag, after, &mut parents_of);
                 dag.refused.insert(broken);
                 dag.refused.insert(after);
-                let _ = first;
             }
         }
     }
@@ -369,6 +364,14 @@ pub struct Server {
 }
 
 impl Server {
+    pub fn new(items: &[(u64, Vec<u8>)], page: usize) -> Self {
+        Server {
+            items: items.to_vec(),
+            page,
+            trips: 0,
+        }
+    }
+
     /// The page after `position`, and whether more follow.
     pub fn since(&mut self, position: Option<u64>) -> (Vec<(u64, Vec<u8>)>, bool) {
         self.trips += 1;
