@@ -924,8 +924,9 @@ impl Mls {
     /// the current namespace, any held commit deleted (its epoch is
     /// decided), with a held restart's new group unless it is the
     /// candidate's. A candidate that removes this member deletes the group;
-    /// a new group's deletes the group it leaves. [`Error::Stale`] for a
-    /// candidate made from another state than the current one.
+    /// a new group's deletes the group it leaves, and a Welcome's every key
+    /// package this member made. [`Error::Stale`] for a candidate made
+    /// from another state than the current one.
     pub fn swap(&mut self, candidate: Candidate, rows: Writes) -> Result<(), Error> {
         let Candidate {
             mut group,
@@ -956,6 +957,9 @@ impl Mls {
                             && let Some(renewed) = member.namespace.get(RENEWED)?
                         {
                             member.namespace.put(SIGNER, Some(renewed));
+                        }
+                        if kind == Kind::Joined {
+                            member.namespace.delete_all(storage::PACKAGES)?;
                         }
                         group.write_to_storage()?;
                         member.namespace.stage(namespace.take_copy());

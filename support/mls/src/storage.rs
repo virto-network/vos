@@ -164,6 +164,26 @@ impl Namespace {
         lock(target).insert(key, value);
     }
 
+    /// Delete every row whose name starts with `name`, committed or
+    /// staged: staged, or a copy's.
+    pub(crate) fn delete_all(&self, name: &[u8]) -> Result<(), fjall::Error> {
+        let prefix = self.key(name);
+        let mut keys: Vec<Vec<u8>> = lock(&self.staged)
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for row in self.store.keyspace.prefix(&prefix) {
+            keys.push(row.into_inner()?.0.to_vec());
+        }
+        let target = self.copy.as_ref().unwrap_or(&self.staged);
+        let mut target = lock(target);
+        for key in keys {
+            target.insert(key, None);
+        }
+        Ok(())
+    }
+
     /// A copy's writes, taken out of it.
     pub(crate) fn take_copy(&self) -> Writes {
         self.copy
@@ -199,9 +219,12 @@ pub(crate) fn state_row(group: &[u8]) -> Vec<u8> {
     [b"state/".as_slice(), group].concat()
 }
 
+/// The rows of key packages' secrets, by reference.
+pub(crate) const PACKAGES: &[u8] = b"package/";
+
 /// A key package's secrets, by its reference.
 fn package_row(id: &[u8]) -> Vec<u8> {
-    [b"package/".as_slice(), id].concat()
+    [PACKAGES, id].concat()
 }
 
 /// A key package reference's length: the suite's hash, SHA-256.

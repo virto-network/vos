@@ -911,3 +911,21 @@ fn a_key_package_row_that_does_not_read_is_corrupt() {
         Err(Error::Corrupt)
     ));
 }
+
+/// The key packages a device made and did not join with go when it joins.
+#[test]
+fn unused_key_packages_go_when_the_device_joins() {
+    let mut a = member(1);
+    let mut d = member(4);
+    a.mls.create(T, BTreeMap::new()).unwrap();
+    d.mls.key_package(T, BTreeMap::new()).unwrap();
+    let package = d.mls.key_package(T, BTreeMap::new()).unwrap();
+    assert_eq!(count(&d, b"mls/package/"), 2);
+    let commit = a
+        .mls
+        .commit(&[package], &[], T, |_| BTreeMap::new())
+        .unwrap();
+    let joined = d.mls.join(&commit.welcome.unwrap(), T).unwrap();
+    d.mls.swap(joined, BTreeMap::new()).unwrap();
+    assert_eq!(count(&d, b"mls/package/"), 0);
+}
