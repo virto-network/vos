@@ -307,12 +307,34 @@ impl<N: Ord + Copy, G: Ord + Copy, T: Ord + Copy> PeerTable<N, G, T> {
         let mut changed = cleared;
         let applies =
             listing.since == 0 || peer.whole.is_some_and(|(taken, _)| listing.since <= taken);
+        // The listing this frame leaves: a listing whole counts only what
+        // its round names, as it drops the rest once whole; the table
+        // never holds more than twice the bound, old and new together.
+        let kept = |group: &G| match peer.leading.get(group) {
+            Some(&(_, named)) => listing.since != 0 || named == round,
+            None => false,
+        };
         let added = listing
+            .leading
+            .iter()
+            .filter(|(group, _)| !kept(group))
+            .count();
+        let held = if listing.since == 0 {
+            peer.leading
+                .values()
+                .filter(|&&(_, named)| named == round)
+                .count()
+        } else {
+            peer.leading.len()
+        };
+        let fresh = listing
             .leading
             .iter()
             .filter(|(group, _)| !peer.leading.contains_key(group))
             .count();
-        let refused = applies && peer.leading.len().saturating_add(added) > self.limit;
+        let refused = applies
+            && (held.saturating_add(added) > self.limit
+                || peer.leading.len().saturating_add(fresh) > self.limit.saturating_mul(2));
         if !applies || refused {
             peer.taking = None;
         } else {
@@ -542,6 +564,33 @@ mod tests {
         }
         let listed = table.peers[&2].leading.len();
         assert!(listed <= LISTED, "{listed} groups listed");
+    }
+
+    /// A listing whole that replaces every group listed before stays
+    /// within the bound, and is taken.
+    #[test]
+    fn a_listing_replaced_whole_within_the_bound_is_taken() {
+        let mut table = PeerTable::<u8, u32, u64>::with_limit(4);
+        table.heard(2, 10, frame(1, 1, (0, 1), whole(&[(1, 1), (2, 1), (3, 1)])));
+        let heard = table
+            .heard(2, 20, frame(1, 2, (0, 1), whole(&[(4, 1), (5, 1), (6, 1)])))
+            .unwrap();
+        assert!(!heard.refused);
+        assert_eq!(table.listed(2, &4, 1), Some(20));
+        assert_eq!(table.listed(2, &1, 1), None);
+        let heard = table
+            .heard(
+                2,
+                30,
+                frame(
+                    1,
+                    3,
+                    (0, 1),
+                    whole(&[(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]),
+                ),
+            )
+            .unwrap();
+        assert!(heard.refused, "five groups past a bound of four");
     }
 
     /// A copy of a frame of a round already taken whole, delivered again

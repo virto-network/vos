@@ -120,7 +120,7 @@ impl<N: NodeId> Core<N> {
     /// follows it.
     fn start_pre_election(&mut self) {
         let Some(next_term) = self.term.checked_add(1) else {
-            self.reset_election_timer();
+            self.step_down();
             return;
         };
         if !self.is_member() || self.short_of_floor() {
@@ -145,7 +145,7 @@ impl<N: NodeId> Core<N> {
 
     fn start_election(&mut self) {
         let Some(term) = self.term.checked_add(1) else {
-            self.reset_election_timer();
+            self.step_down();
             return;
         };
         if !self.is_member() || self.short_of_floor() {
@@ -185,6 +185,7 @@ impl<N: NodeId> Core<N> {
 
     fn become_leader(&mut self) {
         self.role = Role::Leader;
+        self.led = Some(self.term);
         self.votes.clear();
         self.seen_leader = Some(self.cfg.me);
         self.leading = Some(LeaderState::new());

@@ -97,11 +97,12 @@ The core then:
   removal cannot depose a live leader, and a replica whose vote a member
   it does not know needs still gives it when no leader is left;
 - ignores answers from outside its configuration, and the terms they
-  name: it counts votes and acknowledgements from members only, and
+  name (`Status::refused` counts these drops too): it counts votes and acknowledgements from members only, and
   nothing it asked a non-member needs one;
 - refuses, from anyone, what no correct peer sends: a term with no
-  successor (`u64::MAX`; a replica at the last term no longer
-  campaigns), a second leader of a term it leads or follows, and an
+  successor (`u64::MAX`), or more than 2^32 past its own (a replica that
+  reaches the last term no longer campaigns), a second leader of a term
+  it leads, led or follows, and an
   append whose first entry differing from its log is at or below its
   commit index. A refused message changes nothing and gets no answer, as
   if it were lost; `Status::refused` counts them. A member's claim past
@@ -112,7 +113,8 @@ The core then:
 - **A voter that lies.** Raft tolerates crashes, not lies. A voter of a
   group can name itself leader at a higher term and have followers take
   its entries and commit index, acknowledge what it does not hold,
-  grant two candidates, burn terms one at a time, install a
+  grant two candidates, burn terms (at most 2^32 a message, so wedging
+  a group at the last term takes billions of them), install a
   configuration of its choice on followers, and as leader send a
   snapshot. The checks above bound what a node outside the group can do,
   not what a member can.
