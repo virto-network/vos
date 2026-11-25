@@ -13,15 +13,15 @@ messaging comes later.
   only one RustCrypto's provider is built with: a Welcome or a stored group
   naming another suite is refused as unsupported before any key is used.
   Every time is in seconds since the Unix epoch, as mls-rs counts.
-- **Storage** (`storage`): mls-rs's group-state and key-package storage
-  providers over one fjall keyspace, each group's rows under a namespace's
-  prefix. Nothing mls-rs writes reaches the disk by itself: a namespace
-  stages its writes, and `Store::commit` writes them and the caller's own
-  rows in one synced batch. Keys are bounded before they reach fjall: a
-  key package is looked up only by a 32-byte reference, a Welcome into a
-  group whose id is longer than 32 bytes is refused, and a batch holding a
-  row fjall cannot hold is an error (`Error::Unstorable`) that writes
-  nothing.
+- **Storage:** mls-rs's group-state and key-package storage providers over
+  one fjall keyspace, each group's rows under a namespace's prefix
+  (`Namespace`). Nothing mls-rs writes reaches the disk by itself: a
+  namespace stages its writes, and each operation writes them and the
+  caller's own rows in one synced batch. Keys are bounded before they
+  reach fjall: a key package is looked up only by a 32-byte reference, a
+  Welcome into a group whose id is longer than 32 bytes is refused, and a
+  batch holding a row fjall cannot hold is an error (`Error::Unstorable`)
+  that writes nothing.
 - **Copy and swap:** mls-rs applies a received commit at once, but a commit
   is confirmed only after it is processed. So a candidate (`Mls::process`,
   `Mls::join`) is processed on a copy of the group state, which reads the
@@ -37,7 +37,7 @@ messaging comes later.
   group at once, beside the current one, and holds its commit; `Mls::own`
   matches it by its handshake alone. A void deletes either (`Mls::void`),
   and so does the swap of any other candidate.
-- **The policy** (`policy`): the device group's allow-list (Add and Remove
+- **The policy:** the device group's allow-list (Add and Remove
   by value in a commit with a path, a device's update as its own commit
   with a path; no ReInit, external commit, PSK or group-context change),
   its identities (64-byte basic credentials), and a candidate checked
@@ -98,19 +98,7 @@ messaging comes later.
 ## Tests
 
 `cargo test -p vos-mls` (`tests/mls.rs`, over a fjall store in a temporary
-directory): a group of three moved through commits held and confirmed on
-copies; a copy leaving the current state as it was; a held commit across a
-reopen, matched by its handshake and deleted on a void; a candidate refused
-unless it is its logged effect exactly (committer, adds, removes, the
-renewal, the signature key); the policy refusing what it does not allow,
-from a member running other rules; the confirmation hash moved by each of
-its parts; a restart into a new group, and its group deleted when another
-candidate wins; a leaf's credential renewed only as expected; Welcomes
-naming another suite, an over-long key-package reference or an over-long
-group id refused, and rows fjall cannot hold refused without a write;
-stale candidates refused; a key package from a clock ahead added; the
-key package's year; unused key packages deleted on a join. `just check`
-runs them.
+directory; each test's doc says what it shows). `just check` runs it.
 
 ## Users
 
