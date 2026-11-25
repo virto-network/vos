@@ -3,8 +3,8 @@ use alloc::{string::String, vec::Vec};
 /// The most items a vector or a set decodes: a longer one is refused.
 pub const MAX_DECODE_ITEMS: usize = 1_000_000;
 
-/// The most items a vector decodes before it has read them: a count from
-/// the bytes reserves no more, the vector growing as its items decode.
+/// The most items a vector reserves room for before decoding them: a count
+/// from the bytes reserves no more, the vector growing as its items decode.
 const RESERVE_ITEMS: usize = 1024;
 
 /// Deterministic serialization for CID computation.
@@ -13,6 +13,7 @@ const RESERVE_ITEMS: usize = 1024;
 /// [`Decode`] must accept only that output: a node is refused unless its
 /// bytes re-encode to themselves, so no second encoding of one node gets a
 /// second CID.
+///
 /// Variable-length types should be length-prefixed to ensure unambiguous encoding
 /// when composed (e.g. in tuples).
 ///
@@ -37,7 +38,7 @@ pub trait Decode: Sized {
     /// Decode from a byte cursor. Returns the value and advances `pos`.
     fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self>;
 
-    /// Convenience: decode from a full byte slice.
+    /// Decode from a whole byte slice, refusing bytes left over.
     fn decode(buf: &[u8]) -> Option<Self> {
         let mut pos = 0;
         let value = Self::decode_from(buf, &mut pos)?;
@@ -135,8 +136,6 @@ macro_rules! impl_encode_tuple {
 impl_encode_tuple!(0 A, 1 B);
 impl_encode_tuple!(0 A, 1 B, 2 C);
 impl_encode_tuple!(0 A, 1 B, 2 C, 3 D);
-
-// ── Decode impls ────────────────────────────────────────────────────
 
 fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
     let end = pos.checked_add(n)?;

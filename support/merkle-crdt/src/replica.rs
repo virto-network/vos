@@ -130,22 +130,15 @@ struct Holding<H: Hasher> {
     waits: Vec<Cid<H>>,
 }
 
-/// One scope's replica: its DAG applied onto its CRDT, incrementally.
+/// One scope's replica: its DAG applied onto its CRDT, incrementally, by
+/// [`ingest`](Self::ingest) and [`record`](Self::record).
 ///
 /// It keeps in memory the heads, each author's latest sequence number, the
 /// equivocations, the cursor, the outbox, the held nodes' missing parents
 /// (at most [`MAX_HELD`] nodes) and the latest refused nodes' CIDs; the
-/// nodes and the CRDT's rows stay in the store. One replica a store.
-///
-/// - [`ingest`](Self::ingest) validates and applies only the nodes it is
-///   given, in causal order, onto the current rows; a node whose parents
-///   have not arrived is held, durably, and applied in the batch that
-///   brings its last parent. The heads move by the applied nodes'
-///   parents alone.
-/// - [`record`](Self::record) applies a local operation in place.
-///
-/// Every method that writes commits one [`Changes`] batch, and moves
-/// the replica's memory only once it is committed.
+/// nodes and the CRDT's rows stay in the store. One replica a store. Every
+/// method that writes commits one [`Changes`] batch, and moves the
+/// replica's memory only once it is committed.
 pub struct Replica<H: Hasher, O, S: Store<H>> {
     store: S,
     heads: BTreeMap<Cid<H>, (Author, u64)>,
@@ -341,9 +334,8 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
         }
     }
 
-    /// The parents of a local node after `previous`, its author's previous
-    /// node: it, then the heads whose authors never equivocated, then the
-    /// others, [`MAX_PARENTS`] in all.
+    /// The parents `record` names after `previous`, its author's previous
+    /// node.
     fn parents_after(&self, previous: Option<&Cid<H>>) -> BTreeSet<Cid<H>> {
         let mut parents: BTreeSet<Cid<H>> = previous.into_iter().cloned().collect();
         let forked = |author: &Author| {

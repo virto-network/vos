@@ -1,5 +1,5 @@
 //! A [`Store`] over fjall: one scope in five keyspaces of a database the
-//! caller opens and may share, each commit one synced batch.
+//! caller opens and may share.
 //!
 //! A commit's batch is whole or absent after a crash. Two things are the
 //! caller's, before it opens the database after one: a database whose
@@ -77,8 +77,7 @@ impl std::error::Error for FjallError {
 ///
 /// Every [`commit`](Store::commit) is one batch, synced before it returns;
 /// [`commit_with`](FjallStore::commit_with) adds the caller's writes to it.
-/// One store a scope name: two over one name each write its state from
-/// their own replica's memory.
+/// One store a scope name.
 pub struct FjallStore {
     db: Database,
     nodes: Keyspace,

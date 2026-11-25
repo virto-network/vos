@@ -100,9 +100,7 @@ costing a replica without limit.
 
 ## Stores
 
-The layout is not versioned: a store written by an earlier layout of this
-crate (one row of all heads, before heads were a row each) does not open,
-and is made again from its peers.
+The layout is not versioned.
 
 | Store | |
 |---|---|
