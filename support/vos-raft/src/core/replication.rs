@@ -63,7 +63,9 @@ impl<N: NodeId> Core<N> {
             return;
         }
         let another = term == self.term
-            && (self.role == Role::Leader || self.seen_leader.is_some_and(|seen| seen != from));
+            && (self.role == Role::Leader
+                || self.led == Some(term)
+                || self.seen_leader.is_some_and(|seen| seen != from));
         if another {
             self.refused += 1;
             return;

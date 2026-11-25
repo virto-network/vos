@@ -33,7 +33,8 @@
 //!   answers, which nothing it asked needs, and with them the terms they
 //!   name;
 //! - from anyone, it refuses what no correct peer sends: a term with no
-//!   successor (`u64::MAX`), a second leader of a term it follows or leads,
+//!   successor (`u64::MAX`) or more than 2^32 past its own, a second leader
+//!   of a term it follows or leads (or led),
 //!   and an append that would replace an entry at or below its commit
 //!   index. A refused message changes nothing and is answered with
 //!   nothing, as if lost; [`Status::refused`] counts them.
@@ -66,6 +67,12 @@ mod membership;
 mod replication;
 
 pub use membership::ActiveConfigRecord;
+
+/// The most a message may raise a replica's term by: no correct group
+/// moves that far past one of its replicas, and a sender that names a term
+/// near the last there is can then burn the group's terms only this many
+/// at a time.
+const TERM_LEAP: u64 = 1 << 32;
 
 /// Why a proposal was not appended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,8 +265,9 @@ pub struct Status<N: NodeId> {
     pub joint_old: Option<Vec<N>>,
     pub active_config_index: Option<u64>,
     pub leader_hint: Option<N>,
-    /// Messages refused since the replica started: what no correct peer
-    /// sends, and answers from outside its configuration.
+    /// Messages dropped since the replica started: what no correct peer
+    /// sends, and what it does not take from outside its configuration
+    /// (answers, and vote requests while it hears a leader).
     pub refused: u64,
 }
 
@@ -424,6 +432,9 @@ pub struct Core<N: NodeId> {
     actions: Vec<Action<N>>,
     announced: Option<(u64, Role, Option<N>)>,
     refused: u64,
+    /// The last term this replica led: no other node leads it, after it
+    /// steps down too.
+    led: Option<u64>,
 }
 
 impl<N: NodeId> Core<N> {
@@ -517,6 +528,7 @@ impl<N: NodeId> Core<N> {
             actions: Vec::new(),
             announced: None,
             refused: 0,
+            led: None,
         };
         // A record recovery does not adopt (its entry is gone, or a newer
         // one is live) is written again, so no later restart brings it
@@ -672,11 +684,11 @@ impl<N: NodeId> Core<N> {
     /// `TimeoutNow` (which counts only from the leader followed), and a
     /// vote request or a pre-vote only while no leader is heard.
     fn takes(&self, from: N, message: &Message<N>) -> bool {
-        let last_term = match message {
-            Message::PreVote { next_term, .. } => *next_term == u64::MAX,
-            message => message.term() == u64::MAX,
+        let named = match message {
+            Message::PreVote { next_term, .. } => *next_term,
+            message => message.term(),
         };
-        if last_term {
+        if named == u64::MAX || named > self.term.saturating_add(TERM_LEAP) {
             return false;
         }
         if self.active.contains(from) {

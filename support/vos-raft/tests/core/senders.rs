@@ -296,3 +296,89 @@ fn an_acknowledgement_past_the_log_counts_for_the_log() {
     core.take_actions();
     assert_eq!(core.role(), Role::Leader);
 }
+
+/// A follower whose leader fell silent for the election timeout's lower
+/// end hears no leader: it answers a candidate it does not know, which a
+/// change it lags may have made a member.
+#[test]
+fn a_follower_whose_leader_fell_silent_answers_a_candidate_it_does_not_know() {
+    let mut core = following_a();
+    let vote = Message::Vote {
+        term: 2,
+        candidate: OUTSIDER,
+        last_index: 5,
+        last_term: 1,
+    };
+    core.receive(OUTSIDER, vote.clone());
+    core.take_actions();
+    assert_eq!(core.status().current_term, 1, "a leader is heard");
+    let low = config().election_timeout_ms.0;
+    core.defer_campaign(low, u64::MAX);
+    core.receive(OUTSIDER, vote);
+    let actions = core.take_actions();
+    persist(&mut core, writes(&actions).last().unwrap());
+    assert!(sent(&core.take_actions()).contains(&Message::VoteAnswer {
+        term: 2,
+        granted: true,
+    }));
+}
+
+/// A term far past this replica's is refused: one message cannot take a
+/// group to the last term there is.
+#[test]
+fn a_term_far_past_the_replicas_is_refused() {
+    let mut core = following_a();
+    core.receive(LEADER_A, append(u64::MAX - 1, LEADER_A, (3, 1), 3, &[]));
+    core.receive(
+        LEADER_B,
+        Message::PreVote {
+            next_term: 1 << 40,
+            candidate: LEADER_B,
+            last_index: 9,
+            last_term: 1,
+        },
+    );
+    let actions = core.take_actions();
+    assert!(sent(&actions).is_empty(), "{actions:?}");
+    assert_eq!(core.status().current_term, 1);
+    assert_eq!(core.status().refused, 2);
+}
+
+/// A replica one term short of the last campaigns into it, and then, with
+/// no term to follow, stays a follower.
+#[test]
+fn a_replica_that_reaches_the_last_term_stops_campaigning() {
+    let mut cfg = config();
+    cfg.members = vec![ME];
+    let recovered = Recovered {
+        meta: Meta {
+            current_term: u64::MAX - 1,
+            ..Meta::default()
+        },
+        ..Recovered::default()
+    };
+    let mut core = Core::new(cfg, recovered, 0, 3);
+    core.tick(0);
+    crate::common::persist_all(&mut core);
+    assert_eq!(core.role(), Role::Leader);
+    assert_eq!(core.status().current_term, u64::MAX);
+    // Deposed by nothing it takes, it leads on; a replica of three at the
+    // last term, after its timeout, is a follower.
+    let mut cfg = config();
+    cfg.pre_vote = false;
+    let recovered = Recovered {
+        meta: Meta {
+            current_term: u64::MAX - 1,
+            ..Meta::default()
+        },
+        ..Recovered::default()
+    };
+    let mut core = Core::new(cfg, recovered, 0, 3);
+    core.tick(1_000);
+    crate::common::persist_all(&mut core);
+    assert_eq!(core.role(), Role::Candidate);
+    core.tick(10_000);
+    core.take_actions();
+    assert_eq!(core.role(), Role::Follower);
+    assert!(!core.campaign_due(20_000));
+}

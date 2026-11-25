@@ -325,19 +325,14 @@ fn a_grant_counts_only_for_the_log_it_was_made_to() {
         to(&votes, 3).is_empty(),
         "it asks for votes before its term and log are durable: {votes:?}"
     );
-    for message in to(&votes, 3) {
-        nodes.get_mut(&3).unwrap().core.receive(me, message);
-    }
-    let delayed = to(&nodes.get_mut(&3).unwrap().run(true), me);
-    // ME crashes, and campaigns again without e; 5 grants, and the delayed
-    // answer from 3 arrives.
+    // ME crashes, and campaigns again without e: what it asks now, every
+    // peer answers, and those that hold e refuse it.
     nodes.get_mut(&me).unwrap().restart();
     assert_eq!(nodes[&me].core.status().last_log_index, 1);
     nodes.get_mut(&me).unwrap().core.tick(1_000);
     let votes = nodes.get_mut(&me).unwrap().run(true);
-    exchange(&mut nodes, me, &votes, 5);
-    for message in delayed {
-        nodes.get_mut(&me).unwrap().core.receive(3, message);
+    for peer in [3u16, 4, 5] {
+        exchange(&mut nodes, me, &votes, peer);
     }
     assert_ne!(
         nodes[&me].core.role(),
