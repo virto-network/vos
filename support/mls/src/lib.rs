@@ -72,6 +72,10 @@ pub const SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
 /// mls-rs draws.
 const GROUP_ID_BYTES: usize = 32;
 
+/// The highest epoch a Welcome may name: far below the last a `u64`
+/// counts, which mls-rs's own epoch steps would overflow past.
+const EPOCH_MAX: u64 = u64::MAX / 2;
+
 /// How far a key package's lifetime starts before its maker's clock, the
 /// skew between devices this layer tolerates: an hour.
 const CLOCK_MARGIN: u64 = 3600;
@@ -115,7 +119,7 @@ const NEXT: &[u8] = b"next";
 pub enum Error {
     Store(fjall::Error),
     /// A row the store cannot hold: an empty key, a key over 65,535 bytes
-    /// or a value over 4 GiB.
+    /// or a value of 4 GiB or more.
     Unstorable,
     Mls(MlsError),
     /// A candidate refused: it is not a commit this group's rules and
@@ -186,7 +190,7 @@ pub enum Refusal {
     /// A ReInit.
     ReInit,
     /// A Welcome into a group this layer does not keep: its id longer than
-    /// the suite's hash, or its epoch the last a `u64` counts.
+    /// the suite's hash, or its epoch past half of what a `u64` counts.
     Group,
     /// A commit whose committer's leaf is not the one its log entry names:
     /// another credential than the expected one (the renewed one, when a
@@ -916,7 +920,7 @@ impl Mls {
                 return Err(Error::Refused(Refusal::Rejected(error)));
             }
         };
-        if group.group_id().len() > GROUP_ID_BYTES || group.current_epoch() == u64::MAX {
+        if group.group_id().len() > GROUP_ID_BYTES || group.current_epoch() > EPOCH_MAX {
             return Err(Error::Refused(Refusal::Group));
         }
         Ok(Candidate {
