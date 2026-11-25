@@ -521,7 +521,7 @@ impl DeviceGroup {
             assigned: None,
             leaving: false,
         };
-        let mut mls = Mls::open(mls_namespace(store), &credential(&me), BTreeMap::new())?;
+        let mut mls = Mls::open(mls_namespace(store), &credential(&me))?;
         mls.create(now / 1000, rows(&state, None))?;
         Ok(Self {
             store: store.clone(),
@@ -539,8 +539,8 @@ impl DeviceGroup {
     /// store that has a group.
     pub fn key_package(store: &Store, me: &NewDevice, now: u64) -> Result<Vec<u8>, GroupError> {
         ungrouped(store)?;
-        let mut mls = Mls::open(mls_namespace(store), &credential(me), BTreeMap::new())?;
-        Ok(mls.key_package(now / 1000, BTreeMap::new())?)
+        let mut mls = Mls::open(mls_namespace(store), &credential(me))?;
+        Ok(mls.key_package(now / 1000)?)
     }
 
     /// The paired device's group, from `pairing`: it follows the log from
@@ -612,7 +612,7 @@ impl DeviceGroup {
             assigned,
             leaving: false,
         };
-        let mut mls = Mls::open(mls_namespace(store), &credential(&me), BTreeMap::new())?;
+        let mut mls = Mls::open(mls_namespace(store), &credential(&me))?;
         let mut writes = rows(&state, Some(&archive));
         writes.extend(extra);
         mls.write(writes)?;
@@ -708,7 +708,7 @@ impl DeviceGroup {
             assigned: Some(0),
             leaving: false,
         };
-        let mut mls = Mls::open(mls_namespace(store), &credential(&me), BTreeMap::new())?;
+        let mut mls = Mls::open(mls_namespace(store), &credential(&me))?;
         mls.create(read.time / 1000, rows(&state, Some(&archive)))?;
         Ok(Self {
             store: store.clone(),
@@ -727,11 +727,7 @@ impl DeviceGroup {
             return Ok(None);
         };
         let state = State::decode_exact(&bytes).ok_or(GroupError::Corrupt)?;
-        let mls = Mls::open(
-            mls_namespace(store),
-            &credential(&state.me),
-            BTreeMap::new(),
-        )?;
+        let mls = Mls::open(mls_namespace(store), &credential(&state.me))?;
         Ok(Some(Self {
             store: store.clone(),
             mls,
@@ -1300,12 +1296,7 @@ impl DeviceGroup {
     /// numbers, and the leaf credentials of those in the MLS group.
     fn removals(&self) -> Result<(Vec<DeviceId>, Vec<Vec<u8>>), GroupError> {
         let remove = self.state.owed();
-        let members: Vec<Vec<u8>> = self
-            .mls
-            .credentials()?
-            .into_iter()
-            .map(|(_, credential)| credential)
-            .collect();
+        let members = self.mls.credentials()?;
         let removes = remove
             .iter()
             .filter_map(|device| self.state.known(*device))

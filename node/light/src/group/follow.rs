@@ -786,11 +786,7 @@ impl DeviceGroup {
             })
             .chain(pending.effect.add.iter().map(super::credential))
             .collect();
-        let mut got: Vec<Vec<u8>> = candidate
-            .credentials()
-            .into_iter()
-            .map(|(_, credential)| credential)
-            .collect();
+        let mut got = candidate.credentials();
         want.sort();
         got.sort();
         want == got
@@ -825,13 +821,7 @@ impl DeviceGroup {
         }
         // The removals of devices in the group: a restore's new group has
         // none of those before it.
-        let members: Vec<Vec<u8>> = self
-            .mls
-            .credentials()
-            .ok()?
-            .into_iter()
-            .map(|(_, credential)| credential)
-            .collect();
+        let members = self.mls.credentials().ok()?;
         let removes = named
             .iter()
             .filter_map(|device| state.known(*device))
