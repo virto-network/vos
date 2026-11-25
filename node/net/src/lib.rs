@@ -51,7 +51,7 @@ pub struct Peer {
 }
 
 /// A class of traffic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Class {
     /// Pair heartbeats, sent ahead of every other class.
