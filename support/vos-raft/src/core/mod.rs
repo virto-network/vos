@@ -271,15 +271,11 @@ pub struct Status<N: NodeId> {
 
 // ── Internal state ─────────────────────────────────────────
 
+/// An append or a snapshot on its way to a peer: the last index it
+/// carries, and when the leader stops waiting for its acknowledgement.
 #[derive(Debug, Clone, Copy)]
-struct InFlight {
+struct Sending {
     last: u64,
-    deadline: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Snapshotting {
-    index: u64,
     deadline: u64,
 }
 
@@ -288,9 +284,9 @@ struct LeaderState<N: NodeId> {
     next_index: BTreeMap<N, u64>,
     match_index: BTreeMap<N, u64>,
     /// One append in flight per peer.
-    in_flight: BTreeMap<N, InFlight>,
+    in_flight: BTreeMap<N, Sending>,
     /// Peers receiving a snapshot: no appends until they acknowledge it.
-    snapshotting: BTreeMap<N, Snapshotting>,
+    snapshotting: BTreeMap<N, Sending>,
     /// Peers waiting for entries the cache had to load.
     loading: BTreeSet<N>,
     /// Heartbeat rounds at this term, numbered from 1.

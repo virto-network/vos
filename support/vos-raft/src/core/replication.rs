@@ -5,9 +5,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use super::{
-    Action, Answer, Core, InFlight, Load, PendingAck, PendingRead, ReadIndexError, Snapshotting,
-};
+use super::{Action, Answer, Core, Load, PendingAck, PendingRead, ReadIndexError, Sending};
 use crate::config::NodeId;
 use crate::log_entry::LogEntry;
 use crate::message::{AppendResult, Message};
@@ -18,14 +16,10 @@ use crate::role::Role;
 const STALLED_HANDOVERS: u32 = 3;
 
 /// Take the peers whose deadline in `slots` passed by `now`, in order.
-fn expired<N: NodeId, T>(
-    slots: &mut BTreeMap<N, T>,
-    now: u64,
-    deadline: impl Fn(&T) -> u64,
-) -> Vec<N> {
+fn expired<N: NodeId>(slots: &mut BTreeMap<N, Sending>, now: u64) -> Vec<N> {
     let mut expired = Vec::new();
     slots.retain(|&peer, slot| {
-        let live = deadline(slot) > now;
+        let live = slot.deadline > now;
         if !live {
             expired.push(peer);
         }
@@ -239,7 +233,7 @@ impl<N: NodeId> Core<N> {
                 if leading
                     .snapshotting
                     .get(&from)
-                    .is_some_and(|snapshotting| matched >= snapshotting.index)
+                    .is_some_and(|snapshotting| matched >= snapshotting.last)
                 {
                     leading.snapshotting.remove(&from);
                 }
@@ -363,8 +357,8 @@ impl<N: NodeId> Core<N> {
             let deadline = self.now + self.cfg.snapshot_timeout_ms;
             leading.snapshotting.insert(
                 peer,
-                Snapshotting {
-                    index: snap,
+                Sending {
+                    last: snap,
                     deadline,
                 },
             );
@@ -418,7 +412,7 @@ impl<N: NodeId> Core<N> {
         if leading.in_flight.contains_key(&peer) || leading.snapshotting.contains_key(&peer) {
             return;
         }
-        leading.in_flight.insert(peer, InFlight { last, deadline });
+        leading.in_flight.insert(peer, Sending { last, deadline });
         let round = leading.round;
         self.append_to(peer, round, entries);
     }
@@ -504,10 +498,8 @@ impl<N: NodeId> Core<N> {
         let Some(leading) = self.leading.as_mut() else {
             return;
         };
-        let resends = expired(&mut leading.in_flight, now, |in_flight| in_flight.deadline);
-        let snapshots = expired(&mut leading.snapshotting, now, |snapshotting| {
-            snapshotting.deadline
-        });
+        let resends = expired(&mut leading.in_flight, now);
+        let snapshots = expired(&mut leading.snapshotting, now);
         // A transfer that did not finish in time is given up, and the
         // leader takes proposals again.
         let dropped = leading.transfer.take_if(|&mut (_, at)| at <= now).is_some();
