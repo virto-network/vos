@@ -11,11 +11,14 @@ authors.workspace = true
 [dependencies]
 # Encrypted handshakes alone: no std, rayon, x509, psk, by-reference
 # proposals, out-of-order or prior-epoch secrets, custom proposals or tree
-# index. The one pinned mls-rs for VOS.
+# index. The one pinned mls-rs for VOS. Cargo unifies features: no other
+# crate of the workspace may enable these (with `std` a missing time is
+# "now", with `prior_epoch` the storage here would drop epoch records).
 mls-rs = { version = "=0.57.0", default-features = false, features = ["private_message"] }
 mls-rs-core = { version = "=0.27.0", default-features = false }
-# 0.22, the provider the facility's size was measured with
-# (light-node.md); 0.23 builds beside russh, both on curve25519-dalek 5.
+# 0.22, on curve25519-dalek 4 (0.23 takes 5 and p256 0.14). Built with
+# suite 1 alone (`src/lib.rs`), its P-256/P-384 code (elliptic-curve 0.13,
+# crypto-bigint 0.5) is compiled in and not reached from this crate.
 mls-rs-crypto-rustcrypto = { version = "=0.22.1", default-features = false }
 fjall = { workspace = true }
 # The confirmation hash and a held commit's handshake hash.

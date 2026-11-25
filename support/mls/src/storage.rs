@@ -12,6 +12,12 @@
 //! a candidate processed on a copy cannot touch the current state, and
 //! swapping it in moves the copy's writes into the current namespace's
 //! batch.
+//!
+//! **Every key is bounded before it reaches fjall**, which takes a key of
+//! 1 to 65,535 bytes and a value of up to 4 GiB and panics on any other: a
+//! read of a key it cannot hold finds no row, a batch holding one is an
+//! error and writes nothing, and a key package is looked up only by a
+//! reference of the suite's hash length.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -21,6 +27,8 @@ use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
 use mls_rs_core::group::{EpochRecord, GroupState, GroupStateStorage};
 use mls_rs_core::key_package::{KeyPackageData, KeyPackageStorage};
 use zeroize::Zeroizing;
+
+use crate::Error;
 
 /// Rows a write sets (`Some`) or deletes (`None`), by key.
 pub type Writes = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
@@ -42,15 +50,30 @@ impl Store {
         &self.keyspace
     }
 
-    /// Row `key` as committed.
+    /// Row `key` as committed: none for a key the store cannot hold.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, fjall::Error> {
+        if !holds(key) {
+            return Ok(None);
+        }
         Ok(self.keyspace.get(key)?.map(|value| value.to_vec()))
     }
 
     /// Write `namespace`'s staged rows and `rows` in one synced batch: all
     /// of them, or, on an error, none, the staged rows kept for the next.
-    pub fn commit(&self, namespace: &Namespace, rows: Writes) -> Result<(), fjall::Error> {
+    /// A row the store cannot hold is [`Error::Unstorable`]. A failed sync
+    /// is [`Error::Store`], and fjall then takes no more writes; its
+    /// journal may hold the batch, so a reopen can find it applied.
+    pub fn commit(&self, namespace: &Namespace, rows: Writes) -> Result<(), Error> {
         let mut staged = lock(&namespace.staged);
+        let fits = |(key, value): (&Vec<u8>, &Option<Vec<u8>>)| {
+            holds(key)
+                && value
+                    .as_ref()
+                    .is_none_or(|value| u32::try_from(value.len()).is_ok())
+        };
+        if !staged.iter().chain(&rows).all(fits) {
+            return Err(Error::Unstorable);
+        }
         let mut batch = self.db.batch();
         for (key, value) in staged.iter().chain(&rows) {
             match value {
@@ -62,6 +85,11 @@ impl Store {
         staged.clear();
         Ok(())
     }
+}
+
+/// Whether fjall can hold `key`: 1 to 65,535 bytes.
+fn holds(key: &[u8]) -> bool {
+    !key.is_empty() && u16::try_from(key.len()).is_ok()
 }
 
 fn lock(writes: &Mutex<Writes>) -> MutexGuard<'_, Writes> {
@@ -80,7 +108,7 @@ pub struct Namespace {
     copy: Option<Arc<Mutex<Writes>>>,
     /// A read that failed under mls-rs, whose errors carry nothing of a
     /// provider's: [`crate::Mls`] takes it after each call.
-    failed: Arc<Mutex<Option<fjall::Error>>>,
+    failed: Arc<Mutex<Option<Error>>>,
 }
 
 impl Namespace {
@@ -149,8 +177,10 @@ impl Namespace {
         lock(&self.staged).extend(writes);
     }
 
-    /// The read that failed under mls-rs since the last take, if one did.
-    pub(crate) fn take_failure(&self) -> Option<fjall::Error> {
+    /// The read that failed under mls-rs since the last take, if one did:
+    /// [`Error::Store`], or [`Error::Corrupt`] for a row that does not
+    /// decode.
+    pub(crate) fn take_failure(&self) -> Option<Error> {
         self.failed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -174,6 +204,9 @@ fn package_row(id: &[u8]) -> Vec<u8> {
     [b"package/".as_slice(), id].concat()
 }
 
+/// A key package reference's length: the suite's hash, SHA-256.
+const REFERENCE_BYTES: usize = 32;
+
 /// A storage read failed: what mls-rs sees. The error itself is kept in
 /// the namespace.
 #[derive(Debug)]
@@ -181,14 +214,20 @@ pub struct StorageError;
 
 impl mls_rs_core::error::IntoAnyError for StorageError {}
 
+/// `error` kept in `namespace` for [`crate::Mls`] to take; what mls-rs
+/// sees.
+fn failed(namespace: &Namespace, error: Error) -> StorageError {
+    *namespace
+        .failed
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(error);
+    StorageError
+}
+
 fn read(namespace: &Namespace, name: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-    namespace.get(name).map_err(|error| {
-        *namespace
-            .failed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(error);
-        StorageError
-    })
+    namespace
+        .get(name)
+        .map_err(|error| failed(namespace, Error::Store(error)))
 }
 
 /// The group state alone: the device group keeps no prior epoch's secrets
@@ -224,7 +263,9 @@ impl KeyPackageStorage for Namespace {
     type Error = StorageError;
 
     fn delete(&mut self, id: &[u8]) -> Result<(), StorageError> {
-        self.put(&package_row(id), None);
+        if id.len() == REFERENCE_BYTES {
+            self.put(&package_row(id), None);
+        }
         Ok(())
     }
 
@@ -234,8 +275,17 @@ impl KeyPackageStorage for Namespace {
         Ok(())
     }
 
+    /// None for a reference that is not the suite's hash length; a row
+    /// that does not decode is [`Error::Corrupt`].
     fn get(&self, id: &[u8]) -> Result<Option<KeyPackageData>, StorageError> {
-        Ok(read(self, &package_row(id))?
-            .and_then(|bytes| KeyPackageData::mls_decode(&mut &*bytes).ok()))
+        if id.len() != REFERENCE_BYTES {
+            return Ok(None);
+        }
+        match read(self, &package_row(id))? {
+            Some(bytes) => KeyPackageData::mls_decode(&mut &*bytes)
+                .map(Some)
+                .map_err(|_| failed(self, Error::Corrupt)),
+            None => Ok(None),
+        }
     }
 }

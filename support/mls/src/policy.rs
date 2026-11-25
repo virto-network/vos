@@ -12,10 +12,16 @@
 //!   A candidate is processed under [`Expected`]: its committer's
 //!   credential, and the credentials it adds and removes, exactly; and the
 //!   committer's renewed credential when the device set replaced its
-//!   admin key.
+//!   admin key, which its leaf must then take.
+//! - **Identities:** a credential is a label, the device's sync key and
+//!   admin key as bytes. Nothing binds a leaf's MLS keys to them: that a
+//!   key package is the device's it names is the caller's to establish
+//!   (where it took the key package from), and a committer that may add a
+//!   device is trusted for the key package it adds.
 //! - **Handshakes** are `PrivateMessage`s, padded (Padmé); a Welcome
 //!   carries the ratchet tree, one for every new member.
 
+use mls_rs::client_builder::PaddingMode;
 use mls_rs::group::proposal::BorrowedProposal;
 use mls_rs::group::{GroupContext, Roster};
 use mls_rs::identity::{Credential, CredentialType, SigningIdentity};
@@ -25,8 +31,6 @@ use mls_rs::mls_rules::{
 use mls_rs::time::MlsTime;
 use mls_rs::{ExtensionList, MlsRules};
 use mls_rs_core::identity::{IdentityProvider, MemberValidationContext};
-
-use mls_rs::client_builder::PaddingMode;
 
 /// A device's credential: its sync key and its admin key, the leaf's
 /// identity its sync key.
@@ -68,7 +72,8 @@ impl mls_rs_core::error::IntoAnyError for Refused {}
 
 /// A commit's logged effect, which a received commit must be exactly: its
 /// committer's credential, the credentials it adds and removes, and the
-/// credential its committer's leaf takes, if another.
+/// credential its committer's leaf takes, if another (`renewed`: the leaf
+/// must take it; with none, the leaf keeps `committer`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Expected {
     pub committer: Vec<u8>,
@@ -183,10 +188,12 @@ impl MlsRules for Rules {
 
 /// The device group's identities: a basic credential of a device's sync
 /// key and admin key, the leaf's identity its sync key, a successor the
-/// same credential, or the one renewal allowed: a leaf's keys change by
-/// its device's removal and a new add, and its admin key by the renewal
-/// that follows a matured replacement. Every check against the device set
-/// is the caller's, through [`Expected`].
+/// same credential, or the one renewal allowed: a leaf's device keys
+/// change by its device's removal and a new add, and its admin key by the
+/// renewal that follows a matured replacement. A leaf's signature key is
+/// not compared here; [`crate::Mls::process`] requires a committer to
+/// keep it. Every check against the device set is the caller's, through
+/// [`Expected`].
 #[derive(Clone, Debug, Default)]
 pub struct Identity {
     renewal: Option<(Vec<u8>, Vec<u8>)>,

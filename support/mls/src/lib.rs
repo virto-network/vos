@@ -20,13 +20,24 @@
 //!   deletes it ([`Mls::void`]).
 //! - **Received commits** are processed at the log's batch time, so
 //!   processing is deterministic (after a crash the logged candidate is
-//!   processed again) and leaf and key-package lifetimes are checked.
+//!   processed again) and leaf and key-package lifetimes are checked. A
+//!   key package is valid from an hour before its maker's clock
+//!   ([`Mls::key_package`]) for 365 days; a joiner checks every leaf of
+//!   the tree that still comes from a key package, so a member added over
+//!   a year ago bars new joins until it commits.
+//! - **Generations:** each held commit spends a handshake-key generation
+//!   of its epoch, and a void does not give it back; a receiver ratchets
+//!   at most 1024 generations ahead, so a member's commits voided more
+//!   than 1024 times in one epoch are refused until another member's
+//!   commit moves the epoch.
 //! - **The policy** ([`policy`]): the device group's allow-list and its
 //!   identities, a candidate checked against its logged effect.
 //! - **The confirmation hash** ([`confirmation`]).
 //!
-//! The suite is 1 (X25519, AES-128-GCM, SHA-256, Ed25519). Every time is in
-//! seconds since the Unix epoch, as mls-rs counts.
+//! The suite is 1 (X25519, AES-128-GCM, SHA-256, Ed25519), the only one
+//! the provider is built with: a Welcome or a stored group of any other is
+//! unsupported. Every time is in seconds since the Unix epoch, as mls-rs
+//! counts.
 
 pub mod policy;
 pub mod storage;
@@ -38,7 +49,7 @@ use mls_rs::client_builder::{
     WithKeyPackageRepo, WithMlsRules,
 };
 use mls_rs::error::MlsError;
-use mls_rs::group::{CommitEffect, LeafNode, LeafNodeSource, Node, ReceivedMessage};
+use mls_rs::group::{CommitEffect, CommitSecrets, LeafNode, LeafNodeSource, Node, ReceivedMessage};
 use mls_rs::identity::SigningIdentity;
 use mls_rs::identity::basic::BasicCredential;
 use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
@@ -54,10 +65,22 @@ use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 pub use policy::{Expected, Identity, Refused, Rules};
 pub use storage::{Namespace, Store, Writes};
 
-use mls_rs::group::CommitSecrets;
-
 /// Ciphersuite 1: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`.
 pub const SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
+
+/// The longest group id a Welcome may name: the suite's hash, the length
+/// mls-rs draws.
+const GROUP_ID_BYTES: usize = 32;
+
+/// How far a key package's lifetime starts before its maker's clock, the
+/// skew between devices this layer tolerates: an hour.
+const CLOCK_MARGIN: u64 = 3600;
+
+/// RustCrypto with suite 1 alone: a message naming any other suite is
+/// unsupported before any key is used under it.
+fn provider() -> RustCryptoProvider {
+    RustCryptoProvider::with_enabled_cipher_suites(vec![SUITE])
+}
 
 /// The client configuration: the namespace's storage, the device group's
 /// identities and rules, RustCrypto.
@@ -84,10 +107,16 @@ const HELD: &[u8] = b"held";
 const NEXT: &[u8] = b"next";
 
 /// Why an operation failed. A failed operation writes nothing: the
-/// current state stays as the last batch left it.
+/// current state stays as the last batch left it. Two exceptions, both a
+/// store's failure: a batch whose sync failed may be found applied after a
+/// reopen ([`Store::commit`]), and an error reading the group back after
+/// a written batch leaves that batch written.
 #[derive(Debug)]
 pub enum Error {
     Store(fjall::Error),
+    /// A row the store cannot hold: an empty key, a key over 65,535 bytes
+    /// or a value over 4 GiB.
+    Unstorable,
     Mls(MlsError),
     /// A candidate refused: it is not a commit this group's rules and
     /// state accept. Its committer's to answer for.
@@ -99,8 +128,12 @@ pub enum Error {
     /// A commit is held already: confirm or void it first.
     Held,
     /// No commit held, or not the candidate's, or not for the epoch after
-    /// the current one; or a candidate swapped over another epoch.
+    /// the current one.
     NotHeld,
+    /// A candidate swapped over a state it was not made from: another
+    /// group or epoch than the current one, or, for the device's own, a
+    /// commit held since.
+    Stale,
     /// A namespace row that does not read.
     Corrupt,
 }
@@ -121,12 +154,14 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Store(error) => write!(f, "the MLS store: {error}"),
+            Error::Unstorable => f.write_str("a row the MLS store cannot hold"),
             Error::Mls(error) => write!(f, "MLS: {error:?}"),
             Error::Refused(refusal) => write!(f, "a candidate refused: {refusal:?}"),
             Error::NoGroup => f.write_str("no group"),
             Error::Grouped => f.write_str("a group already"),
             Error::Held => f.write_str("a commit is held already"),
             Error::NotHeld => f.write_str("not the commit held"),
+            Error::Stale => f.write_str("a candidate of a state no longer current"),
             Error::Corrupt => f.write_str("an MLS row does not read"),
         }
     }
@@ -147,6 +182,13 @@ pub enum Refusal {
     NoPath,
     /// A ReInit.
     ReInit,
+    /// A Welcome into a group this layer does not keep: its id longer than
+    /// the suite's hash, or its epoch the last a `u64` counts.
+    Group,
+    /// A commit whose committer's leaf is not the one its log entry names:
+    /// another credential than the expected one (the renewed one, when a
+    /// renewal is expected), or another signature key.
+    Leaf,
     /// mls-rs refused it: its framing, its signature, its secrets, or the
     /// group's rules.
     Rejected(MlsError),
@@ -168,11 +210,15 @@ pub enum Kind {
 }
 
 /// A candidate's group state, on a copy: swapped in on confirmation
-/// ([`Mls::swap`]), or dropped.
+/// ([`Mls::swap`]), or dropped. It is bound to the state it was made from:
+/// the current group's id and epoch then, and, for the device's own, the
+/// commit held.
 pub struct Candidate {
     group: Group<Config>,
     namespace: Namespace,
     kind: Kind,
+    base: Option<(Vec<u8>, u64)>,
+    held: Option<[u8; 32]>,
 }
 
 impl Candidate {
@@ -180,7 +226,8 @@ impl Candidate {
         self.kind
     }
 
-    /// The epoch it moves to.
+    /// The epoch it moves to; for a commit that removes this device, the
+    /// current one, which mls-rs does not advance.
     pub fn epoch(&self) -> u64 {
         self.group.current_epoch()
     }
@@ -194,7 +241,8 @@ impl Candidate {
         Ok(Some(self.group.epoch_authenticator()?.to_vec()))
     }
 
-    /// Its members' credentials, by leaf.
+    /// Its members' credentials, by leaf; for a commit that removes this
+    /// device, the current ones.
     pub fn credentials(&self) -> Vec<(u32, Vec<u8>)> {
         credentials(&self.group)
     }
@@ -228,7 +276,9 @@ pub struct Commit {
 /// The confirmation hash of an epoch: `BLAKE2b-256(domain ‖ agent ‖
 /// epoch ‖ epoch_authenticator)`, the epoch little-endian. A device posts
 /// it, signed, once it processed the epoch's candidate; one hash from
-/// every device of the confirming set confirms it.
+/// every device of the confirming set confirms it. Neither `domain` nor
+/// the authenticator is framed: the input is unambiguous only for one
+/// fixed domain, and suite 1's authenticator is always 32 bytes.
 pub fn confirmation(domain: &[u8], agent: &[u8; 32], epoch: u64, authenticator: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2b::<U32>::new();
     hasher.update(domain);
@@ -316,10 +366,12 @@ pub struct Mls {
 /// An mls-rs error as this layer's: `namespace`'s store read's failure if
 /// one happened under it.
 fn failure(namespace: &Namespace, error: MlsError) -> Error {
-    match namespace.take_failure() {
-        Some(error) => Error::Store(error),
-        None => Error::Mls(error),
-    }
+    namespace.take_failure().unwrap_or(Error::Mls(error))
+}
+
+/// A group's id and epoch, which a candidate made from it is bound to.
+fn base(group: &Group<Config>) -> (Vec<u8>, u64) {
+    (group.group_id().to_vec(), group.current_epoch())
 }
 
 fn client(
@@ -332,7 +384,7 @@ fn client(
         .group_state_storage(namespace.clone())
         .key_package_repo(namespace.clone())
         .identity_provider(identity)
-        .crypto_provider(RustCryptoProvider::default())
+        .crypto_provider(provider())
         .mls_rules(rules);
     match signer {
         Some((secret, identity)) => builder.signing_identity(identity, secret, SUITE).build(),
@@ -348,7 +400,7 @@ impl Mls {
         let signer = match namespace.get(SIGNER)? {
             Some(bytes) => decode_signer(&bytes)?,
             None => {
-                let suite = RustCryptoProvider::default()
+                let suite = provider()
                     .cipher_suite_provider(SUITE)
                     .ok_or(Error::Corrupt)?;
                 let (secret, public) = suite.signature_key_generate().map_err(|error| {
@@ -387,11 +439,32 @@ impl Mls {
         let store = self.namespace.store().clone();
         match store.commit(&self.namespace, rows) {
             Ok(()) => self.reload(),
-            Err(error) => {
-                self.namespace.unstage();
-                self.reload()?;
-                Err(Error::Store(error))
+            Err(error) => self.discard(error),
+        }
+    }
+
+    /// `error`, after discarding what was staged and reading the group
+    /// back as the store holds it; the read's error if that fails too, the
+    /// group in memory then being one the store may not hold.
+    fn discard<T>(&mut self, error: Error) -> Result<T, Error> {
+        self.namespace.unstage();
+        self.reload()?;
+        Err(error)
+    }
+
+    /// `operation`, which stages rows, and then the batch of them and of
+    /// the `rows` its outcome gives; on a failure of either, nothing.
+    fn staged<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, Error>,
+        rows: impl FnOnce(&T) -> Writes,
+    ) -> Result<T, Error> {
+        match operation(self) {
+            Ok(outcome) => {
+                self.flush(rows(&outcome))?;
+                Ok(outcome)
             }
+            Err(error) => self.discard(error),
         }
     }
 
@@ -464,20 +537,27 @@ impl Mls {
         Ok(state.map_or(0, |state| state.len()))
     }
 
-    /// A key package for a device that adds this one, at `time`: its
-    /// secrets written in one batch with `rows`.
+    /// A key package for a device that adds this one, made at `time` by
+    /// this device's clock: its secrets written in one batch with `rows`.
+    /// It is valid from an hour before `time`, so the devices
+    /// that add it, process its add and join with it may be that far
+    /// behind, and for 365 days from then.
     pub fn key_package(&mut self, time: u64, rows: Writes) -> Result<Vec<u8>, Error> {
-        let message = self
-            .client
-            .generate_key_package_message(
-                ExtensionList::new(),
-                ExtensionList::new(),
-                Some(MlsTime::from(time)),
-            )
-            .map_err(|error| self.failure(error))?;
-        let bytes = message.to_bytes()?;
-        self.flush(rows)?;
-        Ok(bytes)
+        let not_before = MlsTime::from(time.saturating_sub(CLOCK_MARGIN));
+        self.staged(
+            |member| {
+                let message = member
+                    .client
+                    .generate_key_package_message(
+                        ExtensionList::new(),
+                        ExtensionList::new(),
+                        Some(not_before),
+                    )
+                    .map_err(|error| member.failure(error))?;
+                Ok(message.to_bytes()?)
+            },
+            |_| rows,
+        )
     }
 
     /// Make a group of this member alone at epoch 0, written in one batch
@@ -486,17 +566,22 @@ impl Mls {
         if self.group.is_some() {
             return Err(Error::Grouped);
         }
-        let mut group = self
-            .client
-            .create_group(
-                ExtensionList::new(),
-                ExtensionList::new(),
-                Some(MlsTime::from(time)),
-            )
-            .map_err(|error| self.failure(error))?;
-        group.write_to_storage()?;
-        self.namespace.put(GROUP, Some(group.group_id().to_vec()));
-        self.flush(rows)
+        self.staged(
+            |member| {
+                let mut group = member
+                    .client
+                    .create_group(
+                        ExtensionList::new(),
+                        ExtensionList::new(),
+                        Some(MlsTime::from(time)),
+                    )
+                    .map_err(|error| member.failure(error))?;
+                group.write_to_storage()?;
+                member.namespace.put(GROUP, Some(group.group_id().to_vec()));
+                Ok(())
+            },
+            |_| rows,
+        )
     }
 
     /// The commit held, if one is: its handshake's hash and its epoch.
@@ -522,7 +607,7 @@ impl Mls {
         time: u64,
         rows: impl FnOnce(&Commit) -> Writes,
     ) -> Result<Commit, Error> {
-        self.commit_as(None, adds, removes, time, rows)
+        self.hold(|member| member.held_commit(None, adds, removes, time), rows)
     }
 
     /// [`Mls::commit`], the leaf's credential renewed to `credential` (its
@@ -535,19 +620,8 @@ impl Mls {
         time: u64,
         rows: impl FnOnce(&Commit) -> Writes,
     ) -> Result<Commit, Error> {
-        self.commit_as(Some(credential), adds, removes, time, rows)
-    }
-
-    fn commit_as(
-        &mut self,
-        renewed: Option<&[u8]>,
-        adds: &[Vec<u8>],
-        removes: &[Vec<u8>],
-        time: u64,
-        rows: impl FnOnce(&Commit) -> Writes,
-    ) -> Result<Commit, Error> {
         self.hold(
-            |member| member.held_commit(renewed, adds, removes, time),
+            |member| member.held_commit(Some(credential), adds, removes, time),
             rows,
         )
     }
@@ -564,17 +638,7 @@ impl Mls {
         if self.held_row()?.is_some() {
             return Err(Error::Held);
         }
-        match build(self) {
-            Ok(commit) => {
-                self.flush(rows(&commit))?;
-                Ok(commit)
-            }
-            Err(error) => {
-                self.namespace.unstage();
-                self.reload()?;
-                Err(error)
-            }
-        }
+        self.staged(build, rows)
     }
 
     /// The commit built detached, and the current state and the held
@@ -635,7 +699,10 @@ impl Mls {
             Some(welcome) => Some(welcome.to_bytes()?),
             None => None,
         };
-        let epoch = group.current_epoch() + 1;
+        let epoch = group
+            .current_epoch()
+            .checked_add(1)
+            .ok_or(Error::Mls(MlsError::InvalidEpoch))?;
         let held = Held {
             hash: handshake_hash(&handshake),
             epoch,
@@ -708,10 +775,11 @@ impl Mls {
     /// is the held commit's and the current epoch is the one before it.
     pub fn own(&self, handshake: &[u8]) -> Result<Candidate, Error> {
         let held = self.held_row()?.ok_or(Error::NotHeld)?;
+        if held.hash != handshake_hash(handshake) {
+            return Err(Error::NotHeld);
+        }
+        let base = self.group.as_ref().map(base);
         if let Some(next) = self.namespace.get(NEXT)? {
-            if held.hash != handshake_hash(handshake) {
-                return Err(Error::NotHeld);
-            }
             let namespace = self.namespace.copy();
             let group = client(&namespace, Rules::default(), None, Identity::default())
                 .load_group(&next)
@@ -720,34 +788,34 @@ impl Mls {
                 group,
                 namespace,
                 kind: Kind::Started,
+                base,
+                held: Some(held.hash),
             });
         }
-        if held.hash != handshake_hash(handshake) || held.epoch != self.epoch()? + 1 {
+        if self.epoch()?.checked_add(1) != Some(held.epoch) {
             return Err(Error::NotHeld);
         }
-        let identity = match self.namespace.get(RENEWED)? {
-            Some(bytes) => {
-                let (_, renewed) = decode_signer(&bytes)?;
-                let after = renewed.credential.as_basic().ok_or(Error::Corrupt)?;
-                Identity::renewing(self.credential(), after.identifier.clone())
-            }
-            None => Identity::default(),
-        };
-        let (mut group, namespace) = self.copy(Rules::default(), identity)?;
+        // `apply_detached_commit` validates nothing: the identities the
+        // copy is loaded with are not used.
+        let (mut group, namespace) = self.copy(Rules::default(), Identity::default())?;
         let secrets = CommitSecrets::from_bytes(&held.secrets).map_err(|_| Error::Corrupt)?;
         group.apply_detached_commit(secrets)?;
         Ok(Candidate {
             group,
             namespace,
             kind: Kind::Own,
+            base,
+            held: Some(held.hash),
         })
     }
 
     /// Another member's commit `handshake` processed on a copy at `time`
     /// (the log's batch time), under its logged effect `expected`: an
     /// encrypted commit with a path, by the expected committer, adding and
-    /// removing exactly the expected credentials. A refusal is
-    /// [`Error::Refused`].
+    /// removing exactly the expected credentials, its committer's leaf
+    /// taking exactly the expected renewed credential if one is expected
+    /// and keeping its credential otherwise, and keeping its signature key.
+    /// A refusal is [`Error::Refused`].
     pub fn process(
         &self,
         handshake: &[u8],
@@ -766,13 +834,17 @@ impl Mls {
             Some(after) => Identity::renewing(expected.committer.clone(), after.clone()),
             None => Identity::default(),
         };
+        let leaf_credential = expected
+            .renewed
+            .clone()
+            .unwrap_or_else(|| expected.committer.clone());
         let (mut group, namespace) = self.copy(Rules::expecting(expected), identity)?;
         let received = match group.process_incoming_message_with_time(message, MlsTime::from(time))
         {
             Ok(received) => received,
             Err(error) => {
                 if let Some(error) = namespace.take_failure() {
-                    return Err(Error::Store(error));
+                    return Err(error);
                 }
                 return refused(Refusal::Rejected(error));
             }
@@ -786,23 +858,30 @@ impl Mls {
             CommitEffect::ReInit(_) => return refused(Refusal::ReInit),
         };
         if kind == Kind::Received {
-            let before = leaf(current, description.committer);
-            let after = leaf(&group, description.committer);
-            let renewed = match (before, after) {
-                (Some(before), Some(after)) => {
-                    matches!(after.leaf_node_source, LeafNodeSource::Commit(_))
-                        && after.public_key != before.public_key
-                }
-                _ => false,
-            };
-            if !renewed {
+            let (Some(before), Some(after)) = (
+                leaf(current, description.committer),
+                leaf(&group, description.committer),
+            ) else {
                 return refused(Refusal::NoPath);
+            };
+            if !matches!(after.leaf_node_source, LeafNodeSource::Commit(_))
+                || after.public_key == before.public_key
+            {
+                return refused(Refusal::NoPath);
+            }
+            let credential = after.signing_identity.credential.as_basic();
+            if credential.is_none_or(|basic| basic.identifier != leaf_credential)
+                || after.signing_identity.signature_key != before.signing_identity.signature_key
+            {
+                return refused(Refusal::Leaf);
             }
         }
         Ok(Candidate {
             group,
             namespace,
             kind,
+            base: Some(base(current)),
+            held: None,
         })
     }
 
@@ -824,58 +903,73 @@ impl Mls {
             Ok((group, _)) => group,
             Err(error) => {
                 if let Some(error) = namespace.take_failure() {
-                    return Err(Error::Store(error));
+                    return Err(error);
                 }
                 return Err(Error::Refused(Refusal::Rejected(error)));
             }
         };
+        if group.group_id().len() > GROUP_ID_BYTES || group.current_epoch() == u64::MAX {
+            return Err(Error::Refused(Refusal::Group));
+        }
         Ok(Candidate {
             group,
             namespace,
             kind: Kind::Joined,
+            base: self.group.as_ref().map(base),
+            held: None,
         })
     }
 
     /// Make `candidate` current, in one batch with `rows`: its state into
     /// the current namespace, any held commit deleted (its epoch is
-    /// decided). A candidate that removes this member deletes the group; a
-    /// new group's deletes the group it leaves.
+    /// decided), with a held restart's new group unless it is the
+    /// candidate's. A candidate that removes this member deletes the group;
+    /// a new group's deletes the group it leaves. [`Error::Stale`] for a
+    /// candidate made from another state than the current one.
     pub fn swap(&mut self, candidate: Candidate, rows: Writes) -> Result<(), Error> {
         let Candidate {
             mut group,
             namespace,
             kind,
+            base: made_from,
+            held,
         } = candidate;
-        match kind {
-            Kind::Removed => {
-                let id = self.group()?.group_id().to_vec();
-                self.namespace.put(&storage::state_row(&id), None);
-                self.namespace.put(GROUP, None);
-            }
-            Kind::Own | Kind::Received if group.current_epoch() != self.epoch()? + 1 => {
-                return Err(Error::NotHeld);
-            }
-            Kind::Joined | Kind::Own | Kind::Received | Kind::Started => {
-                if kind == Kind::Own
-                    && let Some(renewed) = self.namespace.get(RENEWED)?
-                {
-                    self.namespace.put(SIGNER, Some(renewed));
-                }
-                if let Some(current) = &self.group
-                    && current.group_id() != group.group_id()
-                {
-                    let id = current.group_id().to_vec();
-                    self.namespace.put(&storage::state_row(&id), None);
-                }
-                group.write_to_storage()?;
-                self.namespace.stage(namespace.take_copy());
-                self.namespace.put(GROUP, Some(group.group_id().to_vec()));
-            }
+        let current_held = self.held()?.map(|(hash, _)| hash);
+        if made_from != self.group.as_ref().map(base)
+            || held.is_some_and(|hash| current_held != Some(hash))
+        {
+            return Err(Error::Stale);
         }
-        self.namespace.put(HELD, None);
-        self.namespace.put(NEXT, None);
-        self.namespace.put(RENEWED, None);
-        self.flush(rows)
+        self.staged(
+            |member| {
+                let next = member.namespace.get(NEXT)?;
+                let current = member.group.as_ref().map(|group| group.group_id().to_vec());
+                let kept = (kind != Kind::Removed).then(|| group.group_id().to_vec());
+                for id in [next, current].into_iter().flatten() {
+                    if Some(&id) != kept.as_ref() {
+                        member.namespace.put(&storage::state_row(&id), None);
+                    }
+                }
+                match kept {
+                    Some(id) => {
+                        if kind == Kind::Own
+                            && let Some(renewed) = member.namespace.get(RENEWED)?
+                        {
+                            member.namespace.put(SIGNER, Some(renewed));
+                        }
+                        group.write_to_storage()?;
+                        member.namespace.stage(namespace.take_copy());
+                        member.namespace.put(GROUP, Some(id));
+                    }
+                    None => member.namespace.put(GROUP, None),
+                }
+                member.namespace.put(HELD, None);
+                member.namespace.put(NEXT, None);
+                member.namespace.put(RENEWED, None);
+                Ok(())
+            },
+            |_| rows,
+        )
     }
 
     /// Delete the held commit, its candidate void, in one batch with
