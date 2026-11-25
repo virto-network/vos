@@ -291,6 +291,15 @@ The scale results are in `core-model.md` §14, "The scale test".
 - **The non-repudiation side store:** a space that wants evidence keeps the
   proofs an ingress verified. Not built; ingress logs the proven origin
   only.
+- **A space node can announce a placement** [known limit, the owner,
+  2026-11-25]: an agent's placement after its creation is taken from any
+  node the placement names (`node/host/src/peer.rs`,
+  `PeerMessage::Directory`), so a node of the space that lies can name
+  itself a replica of any agent and lead its group. The space trusts its
+  nodes for integrity (`node/SECURITY.md`, "Who is trusted"), so this
+  stays. A signed placement chain closes it when a space spans several
+  operators: the creation signed by the agent's creator, each change
+  signed by a member of the configuration before it.
 - **Ingress without the prover:** a node computes each device release's
   program from its kernel and reference run
   (`vos_pvm_device::Program::from_kernel`), the installing node at the
