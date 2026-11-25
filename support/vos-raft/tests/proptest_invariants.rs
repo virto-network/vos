@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use vos_raft::core::{Action, Core, Recovered};
-use vos_raft::{AppendResult, Config, LogEntry, Message, Role};
+use vos_raft::{AppendResult, Config, LogEntry, Message};
 
 const ME: u16 = 0xAAAA;
 const PEERS: [u16; 2] = [0xBBBB, 0xCCCC];
@@ -142,10 +142,8 @@ impl Replica {
             }
             Op::Install(from, term, (index, index_term)) => {
                 let status = self.core.status();
-                if self.core.role() == Role::Follower
-                    && status.leader_hint == Some(from)
+                if status.leader_hint == Some(from)
                     && status.current_term == term
-                    && index > status.snap_last_index
                     && let Some(switch) = self.core.snapshot_switch(index, index_term, None)
                 {
                     let after = switch.truncate_after.unwrap_or(u64::MAX);

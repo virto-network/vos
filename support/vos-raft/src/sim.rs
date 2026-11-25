@@ -949,10 +949,8 @@ impl Cluster {
             return;
         };
         let status = core.status();
-        if core.role() != Role::Follower
-            || status.leader_hint != Some(from)
+        if status.leader_hint != Some(from)
             || status.current_term != term
-            || index <= status.snap_last_index
             || !self.stores[&to].unsynced.is_empty()
         {
             return;
