@@ -122,13 +122,11 @@ struct Replica {
 impl Replica {
     fn new() -> Self {
         let cfg = Config::new(ME, vec![ME, PEERS[0], PEERS[1]]);
-        let core = Core::new(cfg, Recovered::default(), 0, 7);
-        let (hard, log, sent) = ((0, None), BTreeMap::new(), Vec::new());
         Self {
-            core,
-            hard,
-            log,
-            sent,
+            core: Core::new(cfg, Recovered::default(), 0, 7),
+            hard: (0, None),
+            log: BTreeMap::new(),
+            sent: Vec::new(),
             now: 0,
         }
     }

@@ -414,8 +414,6 @@ impl Cluster {
         adjust: impl FnOnce(&mut Config<u16>),
     ) -> Self {
         let mut cfg = Config::new(nodes[0], nodes.to_vec());
-        cfg.election_timeout_ms = (150, 300);
-        cfg.heartbeat_interval_ms = 50;
         cfg.resend_timeout_ms = 100;
         cfg.snapshot_timeout_ms = 1_000;
         adjust(&mut cfg);
