@@ -373,8 +373,8 @@ fn a_removed_voter_campaigns_only_in_the_configuration_it_holds() {
     assert_eq!(granted(vec![no_op, joint, last]), Some(false));
 }
 
-/// A membership change starts only at a leader, with members, and while no
-/// other change is in progress.
+/// A membership change starts only at a leader, with members each named
+/// once, and while no other change is in progress.
 #[test]
 fn change_membership_is_refused_off_a_leader_empty_or_in_progress() {
     let change = |core: &mut Core<u16>, token, members| {
@@ -396,6 +396,10 @@ fn change_membership_is_refused_off_a_leader_empty_or_in_progress() {
     assert_eq!(
         change(&mut leader, 2, Vec::new()),
         Err(ChangeMembershipError::EmptyConfig)
+    );
+    assert_eq!(
+        change(&mut leader, 5, vec![ME, LEADER_A, ME]),
+        Err(ChangeMembershipError::DuplicateMember)
     );
     assert!(change(&mut leader, 3, vec![ME, LEADER_A, LEADER_B]).is_ok());
     assert_eq!(
