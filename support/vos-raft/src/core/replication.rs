@@ -81,15 +81,17 @@ impl<N: NodeId> Core<N> {
         let matches = self.log.term_at(prev_index) == Some(prev_term);
         let mut conflict_at = None;
         let mut present = 0usize;
-        for (offset, entry) in entries.iter().enumerate().take_while(|_| matches) {
-            let index = prev_index + 1 + offset as u64;
-            match self.log.term_at(index) {
-                Some(term) if term == entry.term => present += 1,
-                Some(_) => {
-                    conflict_at = Some(index);
-                    break;
+        if matches {
+            for (offset, entry) in entries.iter().enumerate() {
+                let index = prev_index + 1 + offset as u64;
+                match self.log.term_at(index) {
+                    Some(term) if term == entry.term => present += 1,
+                    Some(_) => {
+                        conflict_at = Some(index);
+                        break;
+                    }
+                    None => break,
                 }
-                None => break,
             }
         }
         if conflict_at.is_some_and(|index| index <= self.commit) {
