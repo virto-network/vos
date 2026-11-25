@@ -11,29 +11,21 @@
 //!   bounded queue per peer and class, and those already handed to the
 //!   dropped connection are lost with it.
 //! - **Handshakes.** A sender proves its address (a retry) before the
-//!   node spends a handshake on it. Handshakes under way are bounded per
-//!   address, and in total for addresses no configured peer has; one
-//!   that fails keeps its place a while, so the places bound handshakes a
-//!   second too; each has a deadline.
-//! - **Restarts.** Stateless resets are keyed by the node's secret, so a
-//!   restarted node resets at once the connections its last run held. The
-//!   name a node dials with carries its incarnation: a peer dialing in as
-//!   a new incarnation also closes this node's connection to the old one,
-//!   which redials.
-//! - **Streams** are unidirectional. One opens with its class and id, then
-//!   carries frames, each a length (u32, big-endian) and its bytes.
-//!   Liveness, Consensus and Requests keep a stream per id for the
-//!   connection's life; Bulk opens one per frame. Streams are sent by
-//!   class priority, Liveness first.
+//!   node spends a handshake on it, and handshakes are bounded per address
+//!   and in all (`Handshakes`).
+//! - **Restarts.** The name a node dials with carries its incarnation: a
+//!   peer dialing in as a new incarnation also closes this node's
+//!   connection to the old one, which redials.
+//! - **Streams** are unidirectional, sent by class priority. One opens
+//!   with its class and id, then carries frames, each a length (u32,
+//!   big-endian) and its bytes.
 //! - **Flow control.** The connection's receive window is unlimited, so a
 //!   few unread streams cannot stall the rest: what quinn buffers for a
 //!   peer's streams not being read is bounded by [`Config::streams`] times
-//!   a stream's window (1 MiB).
-//! - **Frames are bounded on receipt,** per class, and a frame takes its
-//!   bytes from its peer's budget for that class ([`Config::assembling`])
-//!   before it is read: past the budget, a stream waits unread, which flow
-//!   control pushes back to the sender. Frames waiting for the consumer
-//!   are bounded in bytes per class.
+//!   a stream's window (`STREAM_WINDOW`). A frame takes its bytes from its
+//!   peer's budget for its class ([`Config::assembling`]) before it is
+//!   read: past it, a stream waits unread, which flow control pushes back
+//!   to the sender.
 //! - No keepalives: the node's own liveness messages carry that. An idle
 //!   connection closes after [`IDLE`], and the next send redials.
 
@@ -121,7 +113,8 @@ mod code {
 /// A node's endpoint.
 pub struct Config {
     pub number: NodeNumber,
-    /// The node's secret seed: its key, and its stateless-reset key.
+    /// The node's secret seed: its key, and what its stateless-reset and
+    /// connection-id keys are derived from.
     pub secret: [u8; 32],
     pub listen: SocketAddr,
     pub peers: Vec<Peer>,
@@ -137,8 +130,8 @@ pub struct Config {
     /// A connection quiet for this long closes: [`IDLE`] by default.
     pub idle: Duration,
     /// The bytes of one class's frames a peer may have this node assemble
-    /// at once, in that class's largest frames (1 MiB at least): 4 by
-    /// default. A budget under its bound takes one frame more.
+    /// at once, in that class's largest frames (and `BUDGET_FLOOR` at
+    /// least): `ASSEMBLING` by default.
     pub assembling: usize,
 }
 
@@ -203,7 +196,7 @@ impl Config {
 }
 
 /// The network over QUIC. Dropping it closes every connection, waits up
-/// to 100 ms for the peers to hear it (blocking the thread that drops
+/// to `CLOSING` for the peers to hear it (blocking the thread that drops
 /// it), and stops every task.
 pub struct Quic {
     inner: Arc<Inner>,
