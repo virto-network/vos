@@ -40,7 +40,7 @@ proptest! {
     /// rows, heads and equivocations of the full replay; and two replicas
     /// fed different orders agree.
     #[test]
-    fn incremental_apply_equals_full_rebuild(
+    fn incremental_apply_equals_full_replay(
         authors in 1u8..5,
         steps in prop::collection::vec(step(), 1..60),
         first in any::<u64>(),
@@ -58,7 +58,7 @@ proptest! {
             }
             prop_assert_eq!(replica.held(), 0);
             prop_assert_eq!(&refused, &dag.refused);
-            let rebuilt = replay(replica.store().nodes().values().cloned(), &mut crdt);
+            let rebuilt = replay(replica.store().nodes().clone(), &mut crdt);
             prop_assert_eq!(replica.store().rows(), &rebuilt.rows);
             prop_assert_eq!(replica.heads(), &rebuilt.heads);
             prop_assert_eq!(replica.equivocations(), &rebuilt.equivocations);
@@ -76,7 +76,7 @@ proptest! {
     /// A replica that records its own operations between ingests ends
     /// where the replay of its store does.
     #[test]
-    fn local_records_between_ingests_equal_full_rebuild(
+    fn local_records_between_ingests_equal_full_replay(
         steps in prop::collection::vec(step(), 1..40),
         locals in prop::collection::vec((0..8u64, any::<u64>()), 1..20),
         seed in any::<u64>(),
@@ -96,7 +96,7 @@ proptest! {
             replica.record(&own, vec![op], &mut crdt).unwrap();
         }
         replica.record(&own, vec![(0, 0)], &mut crdt).unwrap();
-        let rebuilt = replay(replica.store().nodes().values().cloned(), &mut crdt);
+        let rebuilt = replay(replica.store().nodes().clone(), &mut crdt);
         prop_assert_eq!(replica.store().rows(), &rebuilt.rows);
         prop_assert_eq!(replica.heads(), &rebuilt.heads);
         prop_assert_eq!(replica.heads().len(), 1);
@@ -299,7 +299,7 @@ fn a_cursor_catches_up_out_of_causal_order_and_resumes() {
     read(&mut local, &mut server);
     assert_eq!(local.cursor(), Some(last));
     assert_eq!(local.held(), 0);
-    let rebuilt = replay(local.store().nodes().values().cloned(), &mut crdt);
+    let rebuilt = replay(local.store().nodes().clone(), &mut crdt);
     assert_eq!(local.store().rows(), &rebuilt.rows);
     assert_eq!(local.heads(), &rebuilt.heads);
     assert_eq!(rebuilt.nodes, dag.nodes.len());
@@ -537,7 +537,7 @@ fn a_local_node_stays_small_whatever_one_author_forks() {
     let before = honest.heads().len();
     honest.record(&key(1), vec![(1, 2)], &mut crdt).unwrap();
     assert_eq!(honest.heads().len(), before - MAX_PARENTS + 1);
-    let rebuilt = replay(honest.store().nodes().values().cloned(), &mut crdt);
+    let rebuilt = replay(honest.store().nodes().clone(), &mut crdt);
     assert_eq!(honest.heads(), &rebuilt.heads);
     assert_eq!(honest.store().rows(), &rebuilt.rows);
 }
@@ -565,9 +565,14 @@ fn a_node_naming_more_than_max_parents_is_malformed() {
 
 /// A node of `key` at seq 0 naming a parent that does not exist.
 fn orphan(key: &ed25519_dalek::SigningKey, index: u32) -> Node<H, Ops> {
+    orphan_of(key, index, vec![])
+}
+
+/// A node of `ops` by `key` at seq 0 naming a parent that does not exist.
+fn orphan_of(key: &ed25519_dalek::SigningKey, index: u32, ops: Ops) -> Node<H, Ops> {
     let mut parent = [0; 32];
     parent[..4].copy_from_slice(&index.to_le_bytes());
-    Node::<H, Ops>::sign(key, &SCOPE, 0, vec![], BTreeSet::from([Cid(parent)]))
+    Node::<H, Ops>::sign(key, &SCOPE, 0, ops, BTreeSet::from([Cid(parent)]))
 }
 
 /// Nodes whose parents never arrive are held up to a bound, per author and
@@ -612,6 +617,65 @@ fn held_nodes_are_bounded_and_can_be_dropped() {
     assert!(local.wanted().is_empty());
     let local = Mem::open(local.into_store(), SCOPE).unwrap();
     assert_eq!(local.held(), 0);
+}
+
+/// Held nodes released by their parents free their room: as many of the
+/// author's held again are kept.
+#[test]
+fn released_held_nodes_free_their_room() {
+    let one = key(66);
+    let parents: Vec<Node<H, Ops>> = (0..MAX_HELD_PER_AUTHOR as u64)
+        .map(|i| {
+            Node::<H, Ops>::sign(
+                &wide_key(i as u32),
+                &SCOPE,
+                0,
+                vec![(5, i)],
+                BTreeSet::new(),
+            )
+        })
+        .collect();
+    let mut local = replica();
+    let waiting: Vec<Vec<u8>> = parents
+        .iter()
+        .enumerate()
+        .map(|(i, parent)| {
+            Node::<H, Ops>::sign(
+                &one,
+                &SCOPE,
+                0,
+                vec![(6, i as u64)],
+                BTreeSet::from([parent.cid()]),
+            )
+            .to_bytes()
+        })
+        .collect();
+    let report = local.ingest(waiting, None, &mut crdt).unwrap();
+    assert_eq!(report.held.len(), MAX_HELD_PER_AUTHOR);
+    let report = local
+        .ingest(parents.iter().map(|node| node.to_bytes()), None, &mut crdt)
+        .unwrap();
+    assert_eq!(report.applied.len(), 2 * MAX_HELD_PER_AUTHOR);
+    assert_eq!(local.held(), 0);
+    let again = (0..MAX_HELD_PER_AUTHOR as u32).map(|i| orphan(&one, i).to_bytes());
+    let report = local.ingest(again, None, &mut crdt).unwrap();
+    assert!(report.dropped.is_empty());
+    assert_eq!(local.held(), MAX_HELD_PER_AUTHOR);
+}
+
+/// Held nodes are bounded in bytes too.
+#[test]
+fn held_bytes_are_bounded() {
+    let big = vec![(0, 0); 64 << 10];
+    let authors = (merkle_crdt::MAX_HELD_BYTES >> 20) as u32 + 2;
+    let nodes: Vec<Vec<u8>> = (0..authors)
+        .map(|author| orphan_of(&wide_key(author), author, big.clone()).to_bytes())
+        .collect();
+    assert!(nodes[0].len() >= 1 << 20);
+    let mut local = replica();
+    let report = local.ingest(nodes, None, &mut crdt).unwrap();
+    assert!(!report.dropped.is_empty());
+    assert!(report.held.len() << 20 <= merkle_crdt::MAX_HELD_BYTES);
 }
 
 /// A node dropped past the bound, delivered again once its parent is
@@ -679,10 +743,11 @@ fn a_node_that_does_not_decode_is_not_recorded() {
     assert_eq!((outbox[0].cid.clone(), outbox[0].seq), (cid, 0));
 }
 
-/// A store counting the index lookups a replica makes.
+/// A store counting the index rows a replica reads: a node found at a
+/// number, or a node confirmed there.
 struct Counting {
     inner: MemStore<H>,
-    lookups: Cell<usize>,
+    rows: Cell<usize>,
 }
 
 impl Store<H> for Counting {
@@ -697,12 +762,15 @@ impl Store<H> for Counting {
         self.inner.held(cid)
     }
     fn authored(&self, author: &Author, seq: u64) -> Result<Option<Cid<H>>, Self::Error> {
-        self.lookups.set(self.lookups.get() + 1);
-        self.inner.authored(author, seq)
+        let found = self.inner.authored(author, seq)?;
+        self.rows
+            .set(self.rows.get() + usize::from(found.is_some()));
+        Ok(found)
     }
     fn is_authored(&self, author: &Author, seq: u64, cid: &Cid<H>) -> Result<bool, Self::Error> {
-        self.lookups.set(self.lookups.get() + 1);
-        self.inner.is_authored(author, seq, cid)
+        let found = self.inner.is_authored(author, seq, cid)?;
+        self.rows.set(self.rows.get() + usize::from(found));
+        Ok(found)
     }
     fn row(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
         self.inner.row(key)
@@ -715,15 +783,15 @@ impl Store<H> for Counting {
     }
 }
 
-/// Applying a node after an author's forks costs a lookup a parent and one
-/// more, however many forks there are.
+/// Applying a node after an author's forks reads an index row for its
+/// chain and at most one at its number, however many forks there are.
 #[test]
 fn a_node_after_many_forks_costs_what_one_after_none_does() {
     let forks = forks(77, 500);
     let mut replica = Replica::<H, Ops, _>::open(
         Counting {
             inner: MemStore::new(),
-            lookups: Cell::new(0),
+            rows: Cell::new(0),
         },
         SCOPE,
     )
@@ -731,7 +799,7 @@ fn a_node_after_many_forks_costs_what_one_after_none_does() {
     replica
         .ingest(forks.iter().map(|node| node.to_bytes()), None, &mut crdt)
         .unwrap();
-    replica.store().lookups.set(0);
+    replica.store().rows.set(0);
     let next = Node::<H, Ops>::sign(
         &key(77),
         &SCOPE,
@@ -742,9 +810,9 @@ fn a_node_after_many_forks_costs_what_one_after_none_does() {
     let report = replica.ingest([next.to_bytes()], None, &mut crdt).unwrap();
     assert_eq!(report.applied, vec![next.cid()]);
     assert!(
-        replica.store().lookups.get() <= 2,
-        "{} index lookups",
-        replica.store().lookups.get()
+        replica.store().rows.get() <= 2,
+        "{} index rows read",
+        replica.store().rows.get()
     );
 }
 

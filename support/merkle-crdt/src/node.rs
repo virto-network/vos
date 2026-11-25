@@ -109,8 +109,8 @@ fn distinct<H: Hasher>(parents: impl Iterator<Item = Option<Cid<H>>>) -> Option<
 }
 
 /// What a node's bytes say in clear without decoding its operations: its
-/// author, sequence number and parents. A peer serving the DAG reads only
-/// this; the operations and the signature are its reader's to check.
+/// author, sequence number and parents. A caller that admits only some
+/// authors reads it after [`validate`](crate::validate), before an ingest.
 #[derive(Debug)]
 pub struct Header<H: Hasher> {
     /// The author's key.

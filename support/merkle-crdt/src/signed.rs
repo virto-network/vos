@@ -152,7 +152,9 @@ impl<H: Hasher, O: Encode> DagNode<H, Signed<O>> {
 }
 
 /// Why a node is refused. A refused node is never stored or applied; a
-/// node naming a refused node among its parents is refused too.
+/// node naming a refused node among its parents is refused too while the
+/// replica remembers the refusal (the latest few thousand, since it
+/// opened), and held as waiting on it after.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// Its bytes do not decode, or are not the canonical encoding of what
