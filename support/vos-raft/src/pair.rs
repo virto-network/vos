@@ -593,6 +593,89 @@ mod tests {
         assert!(heard.refused, "five groups past a bound of four");
     }
 
+    /// The bound refuses a frame exactly past it: a round of changes by
+    /// the groups it adds to what is listed, a listing whole by the groups
+    /// its round names, and either by twice the bound with what an
+    /// unfinished round left; a group named twice counts twice.
+    #[test]
+    fn the_bound_refuses_exactly_past_it() {
+        let refused = |table: &mut PeerTable<u8, u32, u64>, round, part, listing| {
+            table
+                .heard(2, round, frame(1, round, part, listing))
+                .expect("taken")
+                .refused
+        };
+        let changes = |since, leading: &[(u32, u64)]| Round {
+            since,
+            leading: leading.to_vec(),
+            unlisted: Vec::new(),
+        };
+        let groups = |range: core::ops::Range<u32>| -> Vec<(u32, u64)> {
+            range.map(|group| (group, 1)).collect()
+        };
+
+        // A round of changes: what is listed and the groups it adds.
+        let mut table = PeerTable::<u8, u32, u64>::with_limit(4);
+        assert!(!refused(&mut table, 1, (0, 1), whole(&groups(0..2))));
+        assert!(!refused(
+            &mut table,
+            2,
+            (0, 1),
+            changes(1, &[(0, 2), (2, 1), (3, 1)])
+        ));
+        assert!(
+            !refused(&mut table, 3, (0, 1), changes(2, &[(0, 3)])),
+            "none added"
+        );
+        assert!(
+            refused(&mut table, 4, (0, 1), changes(3, &[(4, 1)])),
+            "five"
+        );
+        assert_eq!(table.listed(2, &4, 1), None);
+        let mut table = PeerTable::<u8, u32, u64>::with_limit(4);
+        table.heard(2, 1, frame(1, 1, (0, 1), whole(&groups(0..3))));
+        assert!(
+            refused(&mut table, 2, (0, 1), changes(1, &[(3, 1), (3, 2)])),
+            "named twice"
+        );
+        assert!(!refused(&mut table, 3, (0, 1), changes(1, &[(3, 1)])));
+
+        // A listing whole, in one part and in several: the groups its
+        // round names.
+        let mut table = PeerTable::<u8, u32, u64>::with_limit(4);
+        assert!(!refused(&mut table, 1, (0, 1), whole(&groups(0..4))));
+        assert!(refused(&mut table, 2, (0, 1), whole(&groups(0..5))));
+        assert!(!refused(&mut table, 3, (0, 2), whole(&groups(4..7))));
+        assert!(
+            !refused(&mut table, 3, (1, 2), whole(&groups(6..8))),
+            "one named again"
+        );
+        assert_eq!(table.listed(2, &7, 1), Some(3));
+        assert!(!refused(&mut table, 4, (0, 2), whole(&groups(0..3))));
+        assert!(refused(&mut table, 4, (1, 2), whole(&groups(3..5))));
+        let mut table = PeerTable::<u8, u32, u64>::with_limit(4);
+        assert!(!refused(&mut table, 1, (0, 2), whole(&groups(0..3))));
+        assert!(
+            refused(&mut table, 1, (1, 2), whole(&[(3, 1), (3, 1)])),
+            "named twice"
+        );
+
+        // Twice the bound, with what an unfinished round left listed.
+        let mut table = PeerTable::<u8, u32, u64>::with_limit(4);
+        assert!(!refused(&mut table, 1, (0, 1), whole(&groups(0..4))));
+        assert!(
+            !refused(&mut table, 2, (0, 2), whole(&groups(4..8))),
+            "eight"
+        );
+        assert!(
+            !refused(&mut table, 3, (0, 2), whole(&groups(2..6))),
+            "none fresh"
+        );
+        assert!(refused(&mut table, 4, (0, 2), whole(&groups(5..9))), "nine");
+        assert!(refused(&mut table, 5, (0, 2), whole(&groups(8..12))));
+        assert_eq!(table.listed(2, &8, 1), None);
+    }
+
     /// A copy of a frame of a round already taken whole, delivered again
     /// later, renews nothing: the listing stays vouched as of the round.
     #[test]
