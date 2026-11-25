@@ -84,7 +84,7 @@ pub enum AppendResult {
 impl<N: NodeId> Message<N> {
     /// The term the message was sent at; a pre-vote's is the sender's
     /// current term, one below the term it asks about.
-    pub fn term(&self) -> u64 {
+    pub(crate) fn term(&self) -> u64 {
         match self {
             Message::Append { term, .. }
             | Message::AppendAnswer { term, .. }

@@ -62,10 +62,6 @@ impl<G> Default for Telling<G> {
 }
 
 impl<G: Ord + Copy> Telling<G> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Round `round`'s listing for the peer, past every round made before:
     /// `listed` the groups led now, at their terms, in group order.
     pub fn round(&mut self, round: u64, listed: Vec<(G, u64)>) -> Round<G> {
@@ -706,7 +702,7 @@ mod tests {
 
     #[test]
     fn a_teller_sends_what_changed_since_the_round_its_peer_took() {
-        let mut telling = Telling::<u32>::new();
+        let mut telling = Telling::<u32>::default();
         assert_eq!(
             telling.round(1, vec![(1, 1), (2, 1), (3, 1)]),
             whole(&[(1, 1), (2, 1), (3, 1)])
@@ -741,7 +737,7 @@ mod tests {
 
     #[test]
     fn a_teller_whose_peer_takes_nothing_lists_everything_again() {
-        let mut telling = Telling::<u32>::new();
+        let mut telling = Telling::<u32>::default();
         telling.round(1, vec![(1, 1), (2, 1), (3, 1)]);
         telling.acked(1);
         for round in 2..=(UNACKED as u64 + 1) {
@@ -763,7 +759,7 @@ mod tests {
     fn a_table_takes_the_tellers_listing_through_losses() {
         for seed in 1..=40 {
             let mut random = Random::new(seed);
-            let mut telling = Telling::<u32>::new();
+            let mut telling = Telling::<u32>::default();
             let mut table = PeerTable::<u8, u32, u64>::new();
             let mut listing: BTreeMap<u32, u64> = BTreeMap::new();
             let mut sent: BTreeMap<u64, BTreeMap<u32, u64>> = BTreeMap::new();

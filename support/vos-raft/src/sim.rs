@@ -4,7 +4,7 @@
 //! - [`Network`] carries any payload between nodes, and drops, delays,
 //!   duplicates, reorders and partitions as configured. Everything is driven
 //!   by one seeded generator, so a failing seed replays exactly.
-//! - [`Store`] is one node's durable state with a queue of unsynced writes
+//! - `Store` is one node's durable state with a queue of unsynced writes
 //!   and compactions; a crash keeps any prefix of them. A snapshot switch
 //!   is durable at once.
 //! - [`Cluster`] runs one [`Core`] per node over both, carries snapshots
@@ -16,7 +16,7 @@ use alloc::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use alloc::vec::Vec;
 use core::cmp::{self, Reverse};
 
-use crate::config::{Config, NodeId};
+use crate::config::Config;
 use crate::core::{Action, ActiveConfigRecord, Answer, Core, Recovered, SnapshotSwitch, Write};
 use crate::log_entry::{EntryKind, LogEntry};
 use crate::message::Message;
@@ -151,39 +151,25 @@ pub enum Packet {
 
 /// A queued store operation.
 #[derive(Debug, Clone)]
-enum Op<N: NodeId> {
-    Write(Write<N>),
+enum Op {
+    Write(Write<u16>),
     Compact {
         through: u64,
-        configuration: Option<ActiveConfigRecord<N>>,
+        configuration: Option<ActiveConfigRecord<u16>>,
     },
 }
 
 /// One node's store: durable state, and operations not yet synced.
-#[derive(Debug, Clone)]
-pub struct Store<N: NodeId> {
-    meta: Meta<N>,
-    log: BTreeMap<u64, LogEntry<N>>,
-    active_config: Option<ActiveConfigRecord<N>>,
-    log_start_config: Option<ActiveConfigRecord<N>>,
+#[derive(Debug, Clone, Default)]
+struct Store {
+    meta: Meta<u16>,
+    log: BTreeMap<u64, LogEntry<u16>>,
+    active_config: Option<ActiveConfigRecord<u16>>,
+    log_start_config: Option<ActiveConfigRecord<u16>>,
     applied: u64,
-    unsynced: VecDeque<Op<N>>,
+    unsynced: VecDeque<Op>,
     /// The last log position held before a retirement wiped the rest.
     vote_floor: Option<(u64, u64)>,
-}
-
-impl<N: NodeId> Default for Store<N> {
-    fn default() -> Self {
-        Self {
-            meta: Meta::default(),
-            log: BTreeMap::new(),
-            active_config: None,
-            log_start_config: None,
-            applied: 0,
-            unsynced: VecDeque::new(),
-            vote_floor: None,
-        }
-    }
 }
 
 /// What one sync made durable.
@@ -193,8 +179,8 @@ struct Synced {
     compacted: Option<u64>,
 }
 
-impl<N: NodeId> Store<N> {
-    fn apply(&mut self, op: &Op<N>, synced: &mut Synced) {
+impl Store {
+    fn apply(&mut self, op: &Op, synced: &mut Synced) {
         match op {
             Op::Write(write) => {
                 if let Some(after) = write.truncate_after {
@@ -251,7 +237,7 @@ impl<N: NodeId> Store<N> {
     }
 
     /// Switch to a snapshot, durably.
-    fn switch(&mut self, switch: &SnapshotSwitch<N>) {
+    fn switch(&mut self, switch: &SnapshotSwitch<u16>) {
         if let Some(after) = switch.truncate_after {
             self.log.retain(|&at, _| at <= after);
         }
@@ -263,7 +249,7 @@ impl<N: NodeId> Store<N> {
         self.applied = self.applied.max(index);
     }
 
-    fn recovered(&self) -> Recovered<N> {
+    fn recovered(&self) -> Recovered<u16> {
         Recovered {
             meta: self.meta.clone(),
             entries: self
@@ -305,7 +291,7 @@ impl<N: NodeId> Store<N> {
     }
 
     /// The entry at `index` as written so far, durable or not.
-    fn written(&self, index: u64) -> Option<LogEntry<N>> {
+    fn written(&self, index: u64) -> Option<LogEntry<u16>> {
         let mut entry = self.log.get(&index).cloned();
         for op in &self.unsynced {
             let Op::Write(write) = op else {
@@ -348,7 +334,7 @@ pub struct Cluster {
     nodes: Vec<u16>,
     /// The cores of the nodes up: a node down or retired has none.
     cores: BTreeMap<u16, Core<u16>>,
-    stores: BTreeMap<u16, Store<u16>>,
+    stores: BTreeMap<u16, Store>,
     cfg: Config<u16>,
     /// Sync delay in milliseconds.
     pub sync_delay: (u64, u64),
@@ -569,10 +555,6 @@ impl Cluster {
         let core = Core::new(cfg, recovered, self.now, seed);
         self.cores.insert(node, core);
         self.process(node);
-    }
-
-    pub fn nodes(&self) -> &[u16] {
-        &self.nodes
     }
 
     pub fn core(&self, node: u16) -> Option<&Core<u16>> {
@@ -1092,7 +1074,7 @@ impl Cluster {
         }
     }
 
-    fn queue(&mut self, node: u16, op: Op<u16>) {
+    fn queue(&mut self, node: u16, op: Op) {
         self.stores
             .get_mut(&node)
             .expect("a node")
