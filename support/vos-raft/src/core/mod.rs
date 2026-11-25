@@ -628,10 +628,8 @@ impl<N: NodeId> Core<N> {
         deadline
     }
 
-    /// A message from `from`, already authenticated by the host, which
-    /// passes a group only the messages of nodes that may speak for it:
-    /// the core takes some from outside the configuration it knows, and
-    /// refuses what no correct peer sends (see the module's doc).
+    /// A message from `from`, already authenticated by the host; the
+    /// module's doc says what the core takes, and from whom.
     pub fn receive(&mut self, from: N, message: Message<N>) {
         if !self.takes(from, &message) {
             self.refused += 1;
@@ -674,12 +672,9 @@ impl<N: NodeId> Core<N> {
         }
     }
 
-    /// Whether to take `message` from `from` at all: never at a term with
-    /// no successor; from outside the configuration (a leader tracks its
-    /// configuration's members only, so a late answer from a replica a
-    /// change removed draws nothing), an append or a
-    /// `TimeoutNow` (which counts only from the leader followed), and a
-    /// vote request or a pre-vote only while no leader is heard.
+    /// Whether to take `message` from `from` at all, as the module's doc
+    /// says: a leader tracks its configuration's members only, so a late
+    /// answer from a replica a change removed draws nothing.
     fn takes(&self, from: N, message: &Message<N>) -> bool {
         let named = match message {
             Message::PreVote { next_term, .. } => *next_term,
