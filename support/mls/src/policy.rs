@@ -53,21 +53,6 @@ pub enum Refused {
     Credential,
 }
 
-impl std::fmt::Display for Refused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Refused::Proposal => "a proposal the device group does not allow",
-            Refused::ByReference => "a proposal by reference",
-            Refused::External => "an external commit",
-            Refused::Committer => "a committer the log does not name",
-            Refused::Effect => "proposals that are not the logged effect",
-            Refused::Credential => "a credential that is not a device's",
-        })
-    }
-}
-
-impl std::error::Error for Refused {}
-
 impl mls_rs_core::error::IntoAnyError for Refused {}
 
 /// A commit's logged effect, which a received commit must be exactly: its
@@ -126,9 +111,8 @@ impl MlsRules for Rules {
         _: &GroupContext,
         proposals: ProposalBundle,
     ) -> Result<ProposalBundle, Refused> {
-        let committer = match &source {
-            CommitSource::ExistingMember(member) => member,
-            CommitSource::NewMember(_) => return Err(Refused::External),
+        let CommitSource::ExistingMember(committer) = &source else {
+            return Err(Refused::External);
         };
         let mut adds = Vec::new();
         let mut removes = Vec::new();

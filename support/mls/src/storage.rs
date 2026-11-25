@@ -60,8 +60,8 @@ fn holds(key: &[u8]) -> bool {
     !key.is_empty() && u16::try_from(key.len()).is_ok()
 }
 
-fn lock(writes: &Mutex<Writes>) -> MutexGuard<'_, Writes> {
-    writes.lock().unwrap_or_else(PoisonError::into_inner)
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// mls-rs's storage, a group's state and key packages, under a prefix of
@@ -121,11 +121,15 @@ impl Namespace {
         self.store.get(&key)
     }
 
+    /// Where this namespace's writes go: a copy's own, or staged.
+    fn target(&self) -> &Mutex<Writes> {
+        self.copy.as_deref().unwrap_or(&self.staged)
+    }
+
     /// Set (`Some`) or delete (`None`) row `name`: staged, or a copy's.
     pub(crate) fn put(&self, name: &[u8], value: Option<Vec<u8>>) {
         let key = self.key(name);
-        let target = self.copy.as_ref().unwrap_or(&self.staged);
-        lock(target).insert(key, value);
+        lock(self.target()).insert(key, value);
     }
 
     /// Write the staged rows and `rows` in one synced batch: all
@@ -168,35 +172,26 @@ impl Namespace {
         for row in self.store.keyspace.prefix(&prefix) {
             keys.push(row.into_inner()?.0.to_vec());
         }
-        let target = self.copy.as_ref().unwrap_or(&self.staged);
-        let mut target = lock(target);
+        let mut target = lock(self.target());
         for key in keys {
             target.insert(key, None);
         }
         Ok(())
     }
 
-    /// A copy's writes, taken out of it.
-    pub(crate) fn take_copy(&self) -> Writes {
-        self.copy
-            .as_ref()
-            .map(|copy| std::mem::take(&mut *lock(copy)))
-            .unwrap_or_default()
-    }
-
-    /// Stage `writes`, a copy's, in the current namespace.
-    pub(crate) fn stage(&self, writes: Writes) {
-        lock(&self.staged).extend(writes);
+    /// Stage `copy`'s writes, taken out of it, in this namespace.
+    pub(crate) fn stage_copy(&self, copy: &Namespace) {
+        if let Some(writes) = &copy.copy {
+            let writes = std::mem::take(&mut *lock(writes));
+            lock(&self.staged).extend(writes);
+        }
     }
 
     /// The read that failed under mls-rs since the last take, if one did:
     /// [`Error::Store`], or [`Error::Corrupt`] for a row that does not
     /// decode.
     pub(crate) fn take_failure(&self) -> Option<Error> {
-        self.failed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+        lock(&self.failed).take()
     }
 
     /// Discard the staged writes: an operation that failed before its
@@ -219,8 +214,9 @@ fn package_row(id: &[u8]) -> Vec<u8> {
     [PACKAGES, id].concat()
 }
 
-/// A key package reference's length: the suite's hash, SHA-256.
-const REFERENCE_BYTES: usize = 32;
+/// The suite's hash length, SHA-256: a key package reference's, and the
+/// longest group id a Welcome may name (the length mls-rs draws).
+pub(crate) const HASH_BYTES: usize = 32;
 
 /// A storage read failed: what mls-rs sees. The error itself is kept in
 /// the namespace.
@@ -232,10 +228,7 @@ impl mls_rs_core::error::IntoAnyError for StorageError {}
 /// `error` kept in `namespace` for [`crate::Mls`] to take; what mls-rs
 /// sees.
 fn failed(namespace: &Namespace, error: Error) -> StorageError {
-    *namespace
-        .failed
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = Some(error);
+    *lock(&namespace.failed) = Some(error);
     StorageError
 }
 
@@ -278,7 +271,7 @@ impl KeyPackageStorage for Namespace {
     type Error = StorageError;
 
     fn delete(&mut self, id: &[u8]) -> Result<(), StorageError> {
-        if id.len() == REFERENCE_BYTES {
+        if id.len() == HASH_BYTES {
             self.put(&package_row(id), None);
         }
         Ok(())
@@ -293,14 +286,13 @@ impl KeyPackageStorage for Namespace {
     /// None for a reference that is not the suite's hash length; a row
     /// that does not decode is [`Error::Corrupt`].
     fn get(&self, id: &[u8]) -> Result<Option<KeyPackageData>, StorageError> {
-        if id.len() != REFERENCE_BYTES {
+        if id.len() != HASH_BYTES {
             return Ok(None);
         }
-        match read(self, &package_row(id))? {
-            Some(bytes) => KeyPackageData::mls_decode(&mut &*bytes)
-                .map(Some)
-                .map_err(|_| failed(self, Error::Corrupt)),
-            None => Ok(None),
-        }
+        read(self, &package_row(id))?
+            .map(|bytes| {
+                KeyPackageData::mls_decode(&mut &*bytes).map_err(|_| failed(self, Error::Corrupt))
+            })
+            .transpose()
     }
 }
