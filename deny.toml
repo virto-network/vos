@@ -13,7 +13,7 @@ yanked = "warn"
 # crate that pulls it accepts. Reviewed 2026-11-17.
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 (Marvin timing): arti's tor-llcrypto and ssh-key verify RSA identity keys of relays, public data; VOS signs nothing with RSA. No fixed 0.9." },
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 (timing): through elliptic-curve 0.13 (mls-rs's P-256/P-384 suites, arti) and through starknet-ff under Stwo, the prover; the device group's suite is CURVE25519_AES128 (`vos-mls`). Fixed in 0.7 only, which neither takes." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 (timing): through elliptic-curve 0.13 under mls-rs-crypto-rustcrypto's P-256/P-384 code, compiled in and not reached: vos-mls builds the provider with suite 1 (X25519, Ed25519) alone, so a message naming another suite is refused before any key is used (`support/mls/src/lib.rs`). Also in the lock under starknet-ff (Stwo's `poseidon252`), which no workspace feature builds. Fixed in 0.7 only, which elliptic-curve 0.13 does not take." },
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.38 (SQLite CVE): arti's directory cache through rusqlite 0.40, which pins it; the database holds Tor's public directory, written by arti alone." },
     { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained: heapless 0.7 under postcard 1; no code path on a target without atomics." },
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained: a build-time macro under arti's dependencies and under ark-ff (starknet-ff, Stwo)." },
