@@ -180,14 +180,14 @@ impl core::fmt::Display for Refusal {
     }
 }
 
+/// A node validated, with its CID; or why it was refused, with its CID where
+/// it decodes.
+pub type Validated<H, O> = Result<(Cid<H>, Node<H, O>), (Option<Cid<H>>, Refusal)>;
+
 /// The stateless checks of a node's bytes: they decode, canonically, and the
 /// signature is the author's over it in `scope`. Returns the node and its
 /// CID; the CID is known for a node refused for its signature.
-#[allow(clippy::type_complexity)]
-pub fn validate<H: Hasher, O: Encode + Decode>(
-    scope: &Scope,
-    bytes: &[u8],
-) -> Result<(Cid<H>, Node<H, O>), (Option<Cid<H>>, Refusal)> {
+pub fn validate<H: Hasher, O: Encode + Decode>(scope: &Scope, bytes: &[u8]) -> Validated<H, O> {
     let node = decode::<H, O>(bytes).ok_or((None, Refusal::Malformed))?;
     let cid = Cid(H::hash(bytes));
     if !node.verify(scope) {
