@@ -203,10 +203,8 @@ pub enum Action<N: NodeId> {
 /// [`Core::snapshot_installed`] takes it back once it is durable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotSwitch<N: NodeId> {
-    /// The snapshot's last index and its term.
-    pub index: u64,
-    pub term: u64,
     pub truncate_after: Option<u64>,
+    /// With the snapshot's last index and its term.
     pub meta: Meta<N>,
     pub active_config: ActiveConfigRecord<N>,
     /// The configuration in effect at the snapshot's index, when known,

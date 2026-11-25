@@ -255,11 +255,12 @@ impl<N: NodeId> Store<N> {
         if let Some(after) = switch.truncate_after {
             self.log.retain(|&at, _| at <= after);
         }
-        self.log.retain(|&at, _| at > switch.index);
+        let index = switch.meta.snap_last_index;
+        self.log.retain(|&at, _| at > index);
         self.meta = switch.meta.clone();
         self.active_config = Some(switch.active_config.clone());
         self.log_start_config = switch.log_start_config.clone();
-        self.applied = self.applied.max(switch.index);
+        self.applied = self.applied.max(index);
     }
 
     fn recovered(&self) -> Recovered<N> {
