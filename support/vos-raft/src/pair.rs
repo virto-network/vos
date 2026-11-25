@@ -19,6 +19,9 @@ use alloc::vec::Vec;
 /// none whole: past them, its rounds list everything again.
 const UNACKED: usize = 64;
 
+/// The most groups a [`PeerTable`] holds one peer as leading, by default.
+pub const LISTED: usize = 1 << 16;
+
 /// One round of a listing for one peer: `leading` and `unlisted` change
 /// the listing as of round `since`, the last the peer took whole, or, with
 /// `since` 0, are the listing whole.
@@ -178,20 +181,26 @@ pub struct Frame<G> {
 }
 
 /// What a frame taken says about its sender: whether it began a run not
-/// heard before, when the sender was last heard, if ever, and the groups
-/// whose listing it changed.
+/// heard before, when the sender was last heard, if ever, the groups
+/// whose listing it changed, and whether its listing was refused for
+/// growing the sender's past the table's bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Heard<T, G> {
     pub new_run: bool,
     pub before: Option<T>,
     pub changed: Vec<G>,
+    pub refused: bool,
 }
 
 /// What one node heard from each peer's pair heartbeats: `N` names nodes,
-/// `G` groups, and `T` is the host's clock.
+/// `G` groups, and `T` is the host's clock. It holds at most `limit`
+/// groups per peer: an honest peer lists only the groups it leads that
+/// this node replicates, so the bound is the host's, set above what it
+/// runs.
 #[derive(Debug)]
 pub struct PeerTable<N, G, T> {
     peers: BTreeMap<N, Peer<G, T>>,
+    limit: usize,
 }
 
 #[derive(Debug)]
@@ -211,30 +220,44 @@ struct Peer<G, T> {
 
 impl<N: Ord + Copy, G: Ord, T: Ord + Copy> Default for PeerTable<N, G, T> {
     fn default() -> Self {
+        Self::with_limit(LISTED)
+    }
+}
+
+impl<N: Ord + Copy, G: Ord, T: Ord + Copy> PeerTable<N, G, T> {
+    /// A table holding at most [`LISTED`] groups per peer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A table holding at most `limit` groups per peer.
+    pub fn with_limit(limit: usize) -> Self {
         Self {
             peers: BTreeMap::new(),
+            limit,
         }
     }
 }
 
 impl<N: Ord + Copy, G: Ord + Copy, T: Ord + Copy> PeerTable<N, G, T> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// A frame from `from`, heard at `now`. One older than the last taken
-    /// from `from` is ignored, and `None`: a late frame must not vouch for
-    /// what has changed since. A new run's first frame forgets what the
-    /// old one listed. A frame's changes apply when they run from a round
-    /// taken whole; once every part of its round has arrived, the round
-    /// counts as taken whole then, and a listing whole drops every group
-    /// it did not name.
+    /// from `from`, or a copy of a frame of a round already taken whole, is
+    /// ignored, and `None`: a late frame must not vouch for what has
+    /// changed since. A new run's first frame forgets what the old one
+    /// listed. A frame's changes apply when they run from a round taken
+    /// whole; once every part of its round has arrived, the round counts
+    /// as taken whole then, and a listing whole drops every group it did
+    /// not name. A frame that would list more groups than the table's
+    /// bound is refused: its changes do not apply, and its round is not
+    /// taken whole.
     pub fn heard(&mut self, from: N, now: T, frame: Frame<G>) -> Option<Heard<T, G>> {
         let at = (frame.incarnation, frame.round);
         let mut cleared = Vec::new();
         let (new_run, before) = match self.peers.get_mut(&from) {
             Some(peer) => {
-                if at < peer.last {
+                let again =
+                    at == peer.last && peer.whole.is_some_and(|(taken, _)| taken == frame.round);
+                if at < peer.last || again {
                     return None;
                 }
                 let new_run = frame.incarnation != peer.last.0;
@@ -284,7 +307,13 @@ impl<N: Ord + Copy, G: Ord + Copy, T: Ord + Copy> PeerTable<N, G, T> {
         let mut changed = cleared;
         let applies =
             listing.since == 0 || peer.whole.is_some_and(|(taken, _)| listing.since <= taken);
-        if !applies {
+        let added = listing
+            .leading
+            .iter()
+            .filter(|(group, _)| !peer.leading.contains_key(group))
+            .count();
+        let refused = applies && peer.leading.len().saturating_add(added) > self.limit;
+        if !applies || refused {
             peer.taking = None;
         } else {
             for (group, term) in listing.leading {
@@ -320,6 +349,7 @@ impl<N: Ord + Copy, G: Ord + Copy, T: Ord + Copy> PeerTable<N, G, T> {
             new_run,
             before,
             changed,
+            refused,
         })
     }
 
@@ -390,7 +420,8 @@ mod tests {
             Some(Heard {
                 new_run: true,
                 before: None,
-                changed: vec![7]
+                changed: vec![7],
+                refused: false,
             })
         );
         assert_eq!(
@@ -477,7 +508,8 @@ mod tests {
             Some(Heard {
                 new_run: true,
                 before: Some(10),
-                changed: vec![7]
+                changed: vec![7],
+                refused: false,
             }),
             "what the last run listed is no longer"
         );
@@ -488,6 +520,41 @@ mod tests {
             None,
             "the old run"
         );
+    }
+
+    /// However many frames a peer sends, the groups it is listed as
+    /// leading stay within the table's bound.
+    #[test]
+    fn a_peers_listing_is_bounded() {
+        let mut table = PeerTable::<u8, u32, u64>::new();
+        table.heard(2, 0, frame(1, 1, (0, 1), whole(&[])));
+        let per_frame = 4_096u32;
+        for at in 0..64u32 {
+            let leading = (0..per_frame)
+                .map(|group| (at * per_frame + group, 1u64))
+                .collect();
+            let changes = Round {
+                since: 1,
+                leading,
+                unlisted: Vec::new(),
+            };
+            table.heard(2, 1, frame(1, 2 + u64::from(at), (0, 1), changes));
+        }
+        let listed = table.peers[&2].leading.len();
+        assert!(listed <= LISTED, "{listed} groups listed");
+    }
+
+    /// A copy of a frame of a round already taken whole, delivered again
+    /// later, renews nothing: the listing stays vouched as of the round.
+    #[test]
+    fn a_duplicate_of_a_round_taken_whole_renews_nothing() {
+        let mut table = PeerTable::<u8, u32, u64>::new();
+        let copy = frame(5, 3, (0, 1), whole(&[(7, 4)]));
+        table.heard(2, 10, copy.clone());
+        assert_eq!(table.listed(2, &7, 4), Some(10));
+        assert_eq!(table.heard(2, 5_000, copy), None);
+        assert_eq!(table.listed(2, &7, 4), Some(10));
+        assert_eq!(table.heard_at(2), Some(10));
     }
 
     #[test]

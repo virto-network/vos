@@ -151,6 +151,13 @@ impl<N: NodeId> Core<N> {
         if members.is_empty() {
             return Err(ChangeMembershipError::EmptyConfig);
         }
+        if members
+            .iter()
+            .enumerate()
+            .any(|(at, member)| members[..at].contains(member))
+        {
+            return Err(ChangeMembershipError::DuplicateMember);
+        }
         let index = self.log.last_index() + 1;
         let old = self.active.current.clone();
         self.write_entries(alloc::vec![LogEntry::config_change(
@@ -277,19 +284,39 @@ impl<N: NodeId> Core<N> {
     /// What switching to a received snapshot at (`index`, `term`) writes
     /// besides the state, all in one atomic batch: a crash then leaves the
     /// old replica or the new one, never a snapshot with a stale membership
-    /// record. The host calls [`Self::snapshot_installed`] once it is durable.
+    /// record. The host makes it durable, then hands it back to
+    /// [`Self::snapshot_installed`], feeding the core nothing in between.
     ///
     /// `configuration`, the one the snapshot carries, counts only with the
     /// index of its entry, at or below `index`: one without, or above, is
     /// ignored, and this replica's own configuration there serves.
+    ///
+    /// `None` when the switch is not this replica's to make: it does not
+    /// follow a leader, the snapshot is no later than its own, one of its
+    /// writes is not yet reported durable (it would land after the switch),
+    /// or the snapshot disagrees with its log at a committed index (no
+    /// correct leader sends that). The host drops the snapshot; the leader
+    /// sends another.
     pub fn snapshot_switch(
         &self,
         index: u64,
         term: u64,
         configuration: Option<&ActiveConfigRecord<N>>,
-    ) -> SnapshotSwitch<N> {
+    ) -> Option<SnapshotSwitch<N>> {
         let keeps_suffix = self.log.term_at(index) == Some(term);
-        SnapshotSwitch {
+        let follows = self.role == Role::Follower && self.seen_leader.is_some();
+        let settled = self.open.is_none() && self.writes.is_empty();
+        if !follows
+            || !settled
+            || index <= self.log.snap_index()
+            || (!keeps_suffix && index <= self.commit)
+        {
+            return None;
+        }
+        Some(SnapshotSwitch {
+            index,
+            term,
+            carried: self.carried(index, keeps_suffix, configuration).is_some(),
             truncate_after: (!keeps_suffix).then_some(index),
             // The term and vote in memory are at least as new as any write
             // queued before the switch, and persisting them early is safe;
@@ -303,7 +330,7 @@ impl<N: NodeId> Core<N> {
             },
             active_config: self.snapshot_record(index, keeps_suffix, configuration),
             log_start_config: self.start_after_snapshot(index, configuration),
-        }
+        })
     }
 
     /// The configuration in effect at an installed snapshot's index: the
@@ -319,24 +346,28 @@ impl<N: NodeId> Core<N> {
             .or_else(|| self.config_at(index))
     }
 
-    /// The host switched this replica to a received snapshot, durably, with
-    /// the rows of [`Self::snapshot_switch`], given the same
-    /// `configuration`, which counts on the same terms.
-    pub fn snapshot_installed(
-        &mut self,
-        index: u64,
-        term: u64,
-        configuration: Option<ActiveConfigRecord<N>>,
-    ) {
+    /// The host made `switch`, from [`Self::snapshot_switch`], durable:
+    /// this replica now starts from the snapshot.
+    pub fn snapshot_installed(&mut self, switch: SnapshotSwitch<N>) {
+        let SnapshotSwitch {
+            index,
+            term,
+            truncate_after,
+            active_config: record,
+            log_start_config,
+            carried,
+            ..
+        } = switch;
         if index <= self.log.snap_index() {
             return;
         }
-        let keeps_suffix = self.log.term_at(index) == Some(term);
-        let carried = self
-            .carried(index, keeps_suffix, configuration.as_ref())
-            .is_some();
-        let record = self.snapshot_record(index, keeps_suffix, configuration.as_ref());
-        self.log_start_config = self.start_after_snapshot(index, configuration.as_ref());
+        // The core was fed something between the switch and now, against
+        // its contract: whatever it did then gives way to the snapshot.
+        if self.role != Role::Follower {
+            self.step_down();
+        }
+        let keeps_suffix = truncate_after.is_none();
+        self.log_start_config = log_start_config;
         self.log.compact_to(index, term);
         self.durable_index = if keeps_suffix {
             self.durable_index.max(index)
@@ -433,16 +464,20 @@ impl<N: NodeId> Core<N> {
             .max(self.log.point_keeping(through, bytes))
     }
 
-    /// The host compacted its log through `through`.
-    pub fn compacted(&mut self, through: u64) {
+    /// The host compacted its log through `through`, at most the last
+    /// [`super::Action::CompactBound`]. False, and nothing changes, for any
+    /// other point: the core would then ask for entries the store no
+    /// longer holds.
+    pub fn compacted(&mut self, through: u64) -> bool {
         let Some(term) = self.log.term_at(through) else {
-            return;
+            return false;
         };
         if through <= self.log.snap_index() || through > self.compact_bound {
-            return;
+            return false;
         }
         self.log_start_config = self.config_at(through);
         self.log.compact_to(through, term);
+        true
     }
 
     /// The configuration in effect at `index`, at or after the log's start,
@@ -464,13 +499,17 @@ impl<N: NodeId> Core<N> {
         let Some(latest) = self.log.configs().next_back() else {
             // The later of the persisted record and the configuration at
             // the log's start: a crash can lose the record's update after
-            // a compaction past a newer configuration made it durable.
-            let start = self.log_start_config.clone();
+            // a compaction past a newer configuration made it durable. A
+            // record above the snapshot names an entry the log no longer
+            // holds (a live one would have been found): the host cut the
+            // log at open, and the record is not adopted.
+            let (start, snap) = (self.log_start_config.clone(), self.log.snap_index());
             self.active = match persisted {
                 Some(record)
-                    if start.as_ref().is_none_or(|start| {
-                        record.log_index.unwrap_or(0) >= start.log_index.unwrap_or(0)
-                    }) =>
+                    if record.log_index.is_none_or(|index| index <= snap)
+                        && start.as_ref().is_none_or(|start| {
+                            record.log_index.unwrap_or(0) >= start.log_index.unwrap_or(0)
+                        }) =>
                 {
                     record
                 }

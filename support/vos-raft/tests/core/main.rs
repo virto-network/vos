@@ -3,6 +3,8 @@
 
 mod common;
 mod configuration;
+mod crashes;
 mod durability;
 mod idle;
 mod leader;
+mod senders;

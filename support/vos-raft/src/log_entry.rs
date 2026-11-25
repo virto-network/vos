@@ -4,8 +4,6 @@
 //!
 //! Parameterized over `N: NodeId` so config-change entries can
 //! carry typed member sets alongside the regular data payload.
-//! Pure-data callers don't see the parameter — they just produce
-//! `LogEntry::data(...)`.
 
 use alloc::vec::Vec;
 

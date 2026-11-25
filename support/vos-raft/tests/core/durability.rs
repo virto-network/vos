@@ -4,8 +4,8 @@ use vos_raft::core::{Action, Core, Recovered};
 use vos_raft::{LogEntry, Message, Role};
 
 use crate::common::{
-    LEADER_A, LEADER_B, ME, append, claimed, committed, compact_bounds, config, follower,
-    leader_of_two, matched, persist, recovered, sent, snapshotted, writes,
+    LEADER_A, LEADER_B, ME, append, claimed, committed, compact_bounds, config, follow, follower,
+    leader_of_two, matched, persist, persist_all, recovered, sent, snapshotted, writes,
 };
 
 #[test]
@@ -141,10 +141,10 @@ fn a_lone_member_campaigns_at_once_and_counts_its_vote_once_durable() {
     assert_eq!(committed(&core.take_actions()), Some(1));
 }
 
+/// A switch writes the term and vote in effect, which every write before
+/// it made durable.
 #[test]
 fn a_snapshot_switch_records_the_newest_term_and_vote() {
-    // A vote at term 2 is queued, not yet durable, when a switch is made:
-    // the switch must not write an older term or vote over it.
     let mut core = follower(1, &[1, 1], 2);
     core.receive(
         LEADER_B,
@@ -155,14 +155,43 @@ fn a_snapshot_switch_records_the_newest_term_and_vote() {
             last_term: 1,
         },
     );
-    core.take_actions();
-    let switch = core.snapshot_switch(10, 2, None);
+    persist_all(&mut core);
+    follow(&mut core, LEADER_B, 2);
+    let switch = core.snapshot_switch(10, 2, None).unwrap();
     assert_eq!(switch.meta.current_term, 2);
     assert_eq!(switch.meta.voted_for, Some(LEADER_B));
     assert_eq!(
         (switch.meta.snap_last_index, switch.meta.commit_index),
         (10, 10)
     );
+}
+
+/// A switch is the replica's to make only as a follower of a leader, with
+/// every write before it durable, and never over a committed entry it
+/// holds differently: otherwise there is none to make.
+#[test]
+fn a_snapshot_switch_is_made_only_within_its_contract() {
+    // A leader: whatever sent it a snapshot, it leads.
+    let leader = leader_of_two();
+    assert!(leader.snapshot_switch(50, 9, None).is_none());
+    // A follower that follows no leader.
+    let core = follower(1, &[1, 1], 2);
+    assert!(core.snapshot_switch(10, 1, None).is_none());
+    // A write not yet reported durable would land after the switch.
+    let mut core = follower(1, &[1, 1], 2);
+    follow(&mut core, LEADER_A, 1);
+    core.receive(LEADER_A, append(1, LEADER_A, (2, 1), 2, &[(3, 1)]));
+    assert!(core.snapshot_switch(10, 1, None).is_none(), "an open write");
+    let unreported = core.take_actions();
+    assert!(
+        core.snapshot_switch(10, 1, None).is_none(),
+        "an unreported write"
+    );
+    persist(&mut core, writes(&unreported).last().unwrap());
+    // A snapshot that holds index 2 at another term than the replica's
+    // committed entry there.
+    assert!(core.snapshot_switch(2, 4, None).is_none());
+    assert!(core.snapshot_switch(10, 1, None).is_some());
 }
 
 /// A follower whose entry waits for a blob that never comes (its leader
@@ -494,4 +523,53 @@ fn a_hosts_payload_weight_counts_toward_compaction() {
     );
     core.durably_applied(6);
     assert_eq!(compact_bounds(&core.take_actions()), [6]);
+}
+
+/// A candidate asks for votes, and leads, only once its own term is
+/// durable: one that led on its peers' votes alone could crash, forget the
+/// term, and lead it again with another log.
+#[test]
+fn a_candidate_leads_only_once_its_term_is_durable() {
+    let mut cfg = config();
+    cfg.pre_vote = false;
+    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
+    core.take_actions();
+    core.tick(1_000);
+    let actions = core.take_actions();
+    assert!(
+        !sent(&actions)
+            .iter()
+            .any(|message| matches!(message, Message::Vote { .. })),
+        "it asks for votes before its term is durable"
+    );
+    let vote = writes(&actions).last().unwrap().clone();
+    let term = core.status().current_term;
+    for peer in [LEADER_A, LEADER_B] {
+        core.receive(
+            peer,
+            Message::VoteAnswer {
+                term,
+                granted: true,
+            },
+        );
+    }
+    assert_ne!(
+        core.role(),
+        Role::Leader,
+        "it leads at a term it could forget"
+    );
+    persist(&mut core, &vote);
+    let asked = sent(&core.take_actions())
+        .iter()
+        .filter(|message| matches!(message, Message::Vote { .. }))
+        .count();
+    assert_eq!(asked, 2);
+    core.receive(
+        LEADER_A,
+        Message::VoteAnswer {
+            term,
+            granted: true,
+        },
+    );
+    assert_eq!(core.role(), Role::Leader);
 }

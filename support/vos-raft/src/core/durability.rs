@@ -8,16 +8,14 @@ use super::{Action, Answer, Core, PendingAck, PendingWrite, Write};
 use crate::config::NodeId;
 use crate::log_entry::LogEntry;
 use crate::message::{AppendResult, Message};
-use crate::meta::Meta;
+use crate::meta::HardState;
 
 impl<N: NodeId> Core<N> {
-    fn meta(&self) -> Meta<N> {
-        Meta {
+    fn hard_state(&self) -> HardState<N> {
+        HardState {
             current_term: self.term,
             voted_for: self.vote,
             commit_index: self.commit,
-            snap_last_index: self.log.snap_index(),
-            snap_last_term: self.log.snap_term(),
         }
     }
 
@@ -53,7 +51,7 @@ impl<N: NodeId> Core<N> {
 
     /// Record the hard state; `sync` when the term or vote changed.
     pub(super) fn write_meta(&mut self, sync: bool) {
-        let meta = self.meta();
+        let meta = self.hard_state();
         let write = self.open_write();
         write.meta = Some(meta);
         write.sync |= sync;
@@ -129,6 +127,15 @@ impl<N: NodeId> Core<N> {
             to,
             message: message.clone(),
         }));
+    }
+
+    /// Send `message` to every other member once the write of the current
+    /// term is durable.
+    pub(super) fn broadcast_once_durable(&mut self, message: Message<N>) {
+        let (me, at) = (self.cfg.me, self.term_seq);
+        let peers = self.active.members().filter(|&member| member != me);
+        self.releases
+            .extend(peers.map(|to| (at, to, message.clone())));
     }
 
     /// Send now if the message's term is durable; otherwise once the write

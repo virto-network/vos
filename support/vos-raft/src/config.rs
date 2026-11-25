@@ -16,8 +16,8 @@ pub struct Config<N: NodeId> {
     /// This replica's identity, one of `members`.
     pub me: N,
     /// The group's members while neither its log nor its snapshot names a
-    /// configuration: the same set at every replica. A group of one elects
-    /// itself at once.
+    /// configuration: the same set at every replica, each counted once. A
+    /// group of one elects itself at once.
     pub members: Vec<N>,
     /// The election timeout's range in milliseconds. Default: 150 to 300.
     pub election_timeout_ms: (u64, u64),

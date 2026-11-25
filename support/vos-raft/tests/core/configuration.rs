@@ -5,9 +5,9 @@ use vos_raft::core::{Action, Answer, ChangeMembershipError, Core, Recovered};
 use vos_raft::{ActiveConfigRecord, AppendResult, Config, EntryKind, LogEntry, Message};
 
 use crate::common::{
-    LEADER_A, LEADER_B, ME, append, committed, compact_bounds, config, entries_to, follower, lead,
-    leader_of_three_with, leader_of_two, loads, matched, persist, persist_into, recovered, sent,
-    snapshotted, writes,
+    LEADER_A, LEADER_B, ME, append, committed, compact_bounds, config, entries_to, follow,
+    follower, lead, leader_of_three_with, leader_of_two, loads, matched, persist, persist_all,
+    persist_into, recovered, sent, snapshotted, writes,
 };
 
 const JOINER: u16 = 4;
@@ -160,9 +160,12 @@ fn a_replica_given_a_joint_snapshot_finalizes_it_when_it_leads() {
     cfg.pre_vote = false;
     let mut core = Core::new(cfg, Recovered::default(), 0, 5);
     core.take_actions();
+    follow(&mut core, LEADER_B, 1);
     let (members, old) = joint();
-    core.snapshot_installed(20, 1, Some(record(Some(15), members.clone(), Some(old))));
-    core.take_actions();
+    let carried = record(Some(15), members.clone(), Some(old));
+    let switch = core.snapshot_switch(20, 1, Some(&carried)).unwrap();
+    core.snapshot_installed(switch);
+    persist_all(&mut core);
     assert!(core.status().joint_old.is_some());
     let actions = lead_with_a(&mut core, 1_000);
     assert_eq!(finals(&actions), vec![members]);
@@ -446,14 +449,16 @@ fn a_snapshot_switch_records_the_membership_in_effect() {
         active_config: Some(record(Some(5), three.clone(), None)),
         ..snapshotted(recovered(1, 6, entries), (4, 1))
     };
-    let core = Core::new(cfg.clone(), committed, 0, 7);
-    let switch = core.snapshot_switch(10, 5, None);
+    let mut core = Core::new(cfg.clone(), committed, 0, 7);
+    follow(&mut core, LEADER_A, 1);
+    let switch = core.snapshot_switch(10, 5, None).unwrap();
     assert_eq!(switch.active_config, record(Some(5), three.clone(), None));
     assert!(switch.meta.commit_index >= 10);
     // A fresh replica takes the snapshot's own.
-    let fresh = Core::new(cfg, Recovered::default(), 0, 7);
+    let mut fresh = Core::new(cfg, Recovered::default(), 0, 7);
+    follow(&mut fresh, LEADER_A, 1);
     let carried = record(Some(37), three.clone(), None);
-    let switch = fresh.snapshot_switch(100, 6, Some(&carried));
+    let switch = fresh.snapshot_switch(100, 6, Some(&carried)).unwrap();
     assert_eq!(switch.active_config, record(Some(37), three, None));
     assert!(switch.meta.commit_index >= 100);
     // A joint configuration appended at 5, committed only through 2.
@@ -470,11 +475,146 @@ fn a_snapshot_switch_records_the_membership_in_effect() {
         active_config: Some(record(Some(5), vec![ME, LEADER_A], Some(vec![LEADER_A]))),
         ..recovered(3, 2, entries)
     };
-    let core = Core::new(config(), speculative, 0, 7);
-    let switch = core.snapshot_switch(10, 3, None);
+    let mut core = Core::new(config(), speculative, 0, 7);
+    follow(&mut core, LEADER_A, 3);
+    let switch = core.snapshot_switch(10, 3, None).unwrap();
     assert_eq!(
         switch.active_config,
         record(None, vec![ME, LEADER_A], Some(vec![LEADER_A]))
     );
     assert_eq!(switch.meta.commit_index, 10);
+}
+
+/// A discard that drops an unreported configuration entry drops its
+/// configuration with it, and writes the record again.
+#[test]
+fn a_discard_drops_the_configuration_of_an_entry_it_drops() {
+    let mut core = leader_of_three_with(|_| {});
+    let (members, old) = joint();
+    core.change_membership(1, members);
+    core.take_actions();
+    assert!(core.status().joint_old.is_some());
+    // The joint entry at 2 was never reported: the host gives up on it.
+    core.discard_unreported();
+    let records: Vec<_> = writes(&core.take_actions())
+        .into_iter()
+        .filter_map(|write| write.active_config)
+        .collect();
+    let status = core.status();
+    assert_eq!(status.last_log_index, 1);
+    assert_eq!((status.members, status.joint_old), (old.clone(), None));
+    assert_eq!(records, [record(Some(0), old, None)]);
+}
+
+/// A record naming an entry past the recovered log's end (the host cut
+/// the log at open) is not adopted, and is written again.
+#[test]
+fn recovery_drops_a_record_whose_entry_the_log_no_longer_holds() {
+    let (members, old) = joint();
+    let entries = (1..=8)
+        .map(|index| LogEntry::data(index, 1, vec![]))
+        .collect();
+    let recovered = Recovered {
+        active_config: Some(record(Some(10), members, Some(old.clone()))),
+        ..recovered(1, 8, entries)
+    };
+    let mut core = Core::new(config(), recovered, 0, 5);
+    let status = core.status();
+    assert_eq!(
+        (status.members, status.joint_old, status.active_config_index),
+        (old.clone(), None, Some(0))
+    );
+    let records: Vec<_> = writes(&core.take_actions())
+        .into_iter()
+        .filter_map(|write| write.active_config)
+        .collect();
+    assert_eq!(records, [record(Some(0), old, None)]);
+}
+
+/// Leading with such a record, a replica would append the final
+/// configuration of a change that never committed once its log is
+/// compacted past the missing entry.
+#[test]
+fn a_change_whose_joint_entry_was_cut_is_never_finalized() {
+    let (members, old) = joint();
+    let entries = (1..=8)
+        .map(|index| LogEntry::data(index, 1, vec![]))
+        .collect();
+    let recovered = Recovered {
+        active_config: Some(record(Some(10), members, Some(old))),
+        ..recovered(1, 8, entries)
+    };
+    let mut cfg = config();
+    cfg.pre_vote = false;
+    cfg.compact_hysteresis = 1;
+    let mut core = Core::new(cfg, recovered, 0, 5);
+    persist_all(&mut core);
+    // It leads at term 2 with A's vote; its no-op is entry 9.
+    let mut actions = lead_with_a(&mut core, 1_000);
+    let held = |matched| Message::AppendAnswer {
+        term: 2,
+        round: 0,
+        commit: 0,
+        result: AppendResult::Matched { matched },
+    };
+    let propose = |core: &mut Core<u16>, token: u64| {
+        core.propose(token, vec![token as u8]);
+        let proposed = core.take_actions();
+        persist(core, writes(&proposed).last().unwrap());
+        proposed
+    };
+    // Data at 10 and 11, committed with A.
+    actions.extend(propose(&mut core, 1));
+    actions.extend(propose(&mut core, 2));
+    core.receive(LEADER_A, held(11));
+    actions.extend(core.take_actions());
+    // Applied and compacted through 11, past index 10.
+    core.durably_applied(11);
+    actions.extend(core.take_actions());
+    core.compacted(11);
+    // The next commit.
+    actions.extend(propose(&mut core, 3));
+    core.receive(LEADER_A, held(12));
+    actions.extend(core.take_actions());
+    assert!(
+        finals(&actions).is_empty(),
+        "a change that never committed took effect: {:?}",
+        finals(&actions)
+    );
+}
+
+/// Two appends taken before the host writes either: the second, from a
+/// newer leader, replaces a data entry the first appended with a
+/// configuration entry. The record goes in the write that holds its entry,
+/// so no crash between the two writes leaves a record naming a data entry.
+#[test]
+fn a_record_goes_in_the_write_that_holds_its_entry() {
+    let (members, old) = joint();
+    let mut core = follower(1, &[1], 1);
+    core.receive(LEADER_A, append(1, LEADER_A, (1, 1), 1, &[(2, 1)]));
+    let joint_entry = LogEntry::config_change(2, 2, Some(old), members);
+    core.receive(
+        LEADER_B,
+        Message::Append {
+            term: 2,
+            leader: LEADER_B,
+            prev_index: 1,
+            prev_term: 1,
+            commit: 1,
+            round: 1,
+            entries: vec![joint_entry],
+        },
+    );
+    let written = writes(&core.take_actions());
+    let records: Vec<_> = written
+        .iter()
+        .filter(|write| write.active_config.is_some())
+        .collect();
+    assert_eq!(records.len(), 1, "{written:?}");
+    assert!(
+        records[0].entries.iter().any(|entry| {
+            entry.index == 2 && matches!(entry.kind, EntryKind::ConfigChange { .. })
+        }),
+        "the record naming 2 is written apart from its entry: {written:?}"
+    );
 }

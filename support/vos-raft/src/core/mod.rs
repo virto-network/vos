@@ -10,10 +10,33 @@
 //! What waits for its write, and what goes at once:
 //!
 //! - an answer at a term above the durable term waits for the write of that
-//!   term; a vote grant waits for the write of the vote; a candidate counts
-//!   its own vote only once its term and vote are durable;
+//!   term; a vote grant waits for the write of the vote; a candidate's vote
+//!   requests wait for the write of its term and its own vote, and it
+//!   counts grants, and leads, only at a durable term. A replica that
+//!   crashes before that write never asked anyone at that term, so no
+//!   grant made at a term can meet a second campaign at it;
 //! - pre-votes and their answers, rejections and heartbeat answers at the
 //!   durable term, and a leader's appends go at once.
+//!
+//! Who a replica takes messages from ([`Core::receive`]):
+//!
+//! - the host authenticates the sender, and passes a group only the
+//!   messages of nodes that may speak for it: on VOS, the nodes the
+//!   agent's placement names, and those of the configuration before while
+//!   it is uncommitted. The core cannot do that check: a replica that lags
+//!   a membership change does not know the members it added, and one of
+//!   them may lead;
+//! - from a node outside the configuration it knows, the core takes
+//!   appends (a leader it has not heard of yet may be one), and vote
+//!   requests and pre-votes only while it hears no leader (a member it has
+//!   not heard of may be the candidate the group needs). It ignores their
+//!   answers, which nothing it asked needs, and with them the terms they
+//!   name;
+//! - from anyone, it refuses what no correct peer sends: a term with no
+//!   successor (`u64::MAX`), a second leader of a term it follows or leads,
+//!   and an append that would replace an entry at or below its commit
+//!   index. A refused message changes nothing and is answered with
+//!   nothing, as if lost; [`Status::refused`] counts them.
 //!
 //! What a replica may claim and apply:
 //!
@@ -33,7 +56,7 @@ use crate::config::{Config, NodeId};
 use crate::log_entry::LogEntry;
 use crate::log_view::LogView;
 use crate::message::Message;
-use crate::meta::Meta;
+use crate::meta::{HardState, Meta};
 use crate::random::Random;
 use crate::role::Role;
 
@@ -78,6 +101,8 @@ pub enum ChangeMembershipError {
     /// Another change is still in progress.
     InProgress,
     EmptyConfig,
+    /// A member is named twice: each counts once toward a quorum.
+    DuplicateMember,
     /// The replica's host stopped it. The core never returns it.
     Stopped,
 }
@@ -89,10 +114,9 @@ pub struct Write<N: NodeId> {
     pub seq: u64,
     pub truncate_after: Option<u64>,
     pub entries: Vec<LogEntry<N>>,
-    /// The hard state and commit index. Its snapshot pointer is the core's
-    /// view when the write was made; the host keeps its own, which only
-    /// compaction and a snapshot switch move.
-    pub meta: Option<Meta<N>>,
+    /// The term, vote and commit index; the snapshot pointer is the
+    /// host's, which only a compaction and a snapshot switch move.
+    pub meta: Option<HardState<N>>,
     pub active_config: Option<ActiveConfigRecord<N>>,
     /// Whether the write must be synced before it counts: entries, terms and
     /// votes are; a commit-index move alone is not.
@@ -168,14 +192,21 @@ pub enum Action<N: NodeId> {
 /// The rows a host's snapshot switch writes in the same atomic batch as
 /// the state: drop the log after `truncate_after` (when the log disagrees
 /// at the snapshot's index), then the meta and the membership record.
+/// Only [`Core::snapshot_switch`] makes one, and
+/// [`Core::snapshot_installed`] takes it back once it is durable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotSwitch<N: NodeId> {
+    /// The snapshot's last index and its term.
+    pub index: u64,
+    pub term: u64,
     pub truncate_after: Option<u64>,
     pub meta: Meta<N>,
     pub active_config: ActiveConfigRecord<N>,
     /// The configuration in effect at the snapshot's index, when known,
     /// kept with the log's start.
     pub log_start_config: Option<ActiveConfigRecord<N>>,
+    /// Whether `active_config` is the one the snapshot carried.
+    carried: bool,
 }
 
 /// What a replica recovers from its store.
@@ -227,6 +258,9 @@ pub struct Status<N: NodeId> {
     pub joint_old: Option<Vec<N>>,
     pub active_config_index: Option<u64>,
     pub leader_hint: Option<N>,
+    /// Messages refused since the replica started: what no correct peer
+    /// sends, and answers from outside its configuration.
+    pub refused: u64,
 }
 
 // ── Internal state ─────────────────────────────────────────
@@ -389,12 +423,22 @@ pub struct Core<N: NodeId> {
     rng: Random,
     actions: Vec<Action<N>>,
     announced: Option<(u64, Role, Option<N>)>,
+    refused: u64,
 }
 
 impl<N: NodeId> Core<N> {
     /// A replica recovered from its store, at time `now` (milliseconds on
     /// the host's monotonic clock), with a seed for its election jitter.
-    pub fn new(cfg: Config<N>, recovered: Recovered<N>, now: u64, seed: u64) -> Self {
+    /// The recovered entries continue the log from the snapshot's index
+    /// on, without a gap; a member named twice in `cfg` counts once.
+    pub fn new(mut cfg: Config<N>, recovered: Recovered<N>, now: u64, seed: u64) -> Self {
+        let mut members = Vec::with_capacity(cfg.members.len());
+        for member in cfg.members.drain(..) {
+            if !members.contains(&member) {
+                members.push(member);
+            }
+        }
+        cfg.members = members;
         let meta = recovered.meta;
         let mut log = LogView::new(
             meta.snap_last_index,
@@ -472,8 +516,16 @@ impl<N: NodeId> Core<N> {
             rng: Random::new(seed),
             actions: Vec::new(),
             announced: None,
+            refused: 0,
         };
+        // A record recovery does not adopt (its entry is gone, or a newer
+        // one is live) is written again, so no later restart brings it
+        // back.
+        let persisted = recovered.active_config.clone();
         core.recover_configuration(recovered.active_config);
+        if persisted.is_some_and(|record| record != core.active) {
+            core.write_active_config();
+        }
         core.reset_election_timer();
         // No other member could lead: a lone member elects itself at its
         // first tick, without waiting out a timeout.
@@ -512,6 +564,7 @@ impl<N: NodeId> Core<N> {
             && self.is_member()
             && !self.writer_stalled
             && !self.short_of_floor()
+            && self.term < u64::MAX
     }
 
     /// Put off a campaign due at `now` until `until`: a host that bounds
@@ -568,10 +621,18 @@ impl<N: NodeId> Core<N> {
         deadline
     }
 
-    /// A message from `from`, already authenticated by the host.
+    /// A message from `from`, already authenticated by the host, which
+    /// passes a group only the messages of nodes that may speak for it:
+    /// the core takes some from outside the configuration it knows, and
+    /// refuses what no correct peer sends (see the module's doc).
     pub fn receive(&mut self, from: N, message: Message<N>) {
+        if !self.takes(from, &message) {
+            self.refused += 1;
+            return;
+        }
         if let Some(leading) = self.leading.as_mut()
             && message.term() == self.term
+            && self.active.contains(from)
         {
             leading.recent.insert(from);
             leading.answered.insert(from, self.now);
@@ -604,6 +665,41 @@ impl<N: NodeId> Core<N> {
             } => self.on_pre_vote_answer(from, term, next_term, granted),
             Message::TimeoutNow { term } => self.on_timeout_now(from, term),
         }
+    }
+
+    /// Whether to take `message` from `from` at all: never at a term with
+    /// no successor; from outside the configuration, an append or a
+    /// `TimeoutNow` (which counts only from the leader followed), and a
+    /// vote request or a pre-vote only while no leader is heard.
+    fn takes(&self, from: N, message: &Message<N>) -> bool {
+        let last_term = match message {
+            Message::PreVote { next_term, .. } => *next_term == u64::MAX,
+            message => message.term() == u64::MAX,
+        };
+        if last_term {
+            return false;
+        }
+        if self.active.contains(from) {
+            return true;
+        }
+        match message {
+            Message::Append { .. } | Message::TimeoutNow { .. } => true,
+            Message::Vote { .. } | Message::PreVote { .. } => !self.hears_a_leader(),
+            Message::AppendAnswer { .. }
+            | Message::VoteAnswer { .. }
+            | Message::PreVoteAnswer { .. } => false,
+        }
+    }
+
+    /// Whether this replica leads, or heard its leader within the election
+    /// timeout's lower end.
+    fn hears_a_leader(&self) -> bool {
+        let low = self.cfg.election_timeout_ms.0;
+        self.role == Role::Leader
+            || (self.seen_leader.is_some()
+                && self
+                    .last_heard_leader
+                    .is_some_and(|heard| self.now < heard.saturating_add(low)))
     }
 
     /// Append `payload` to the log; answered with its index.
@@ -649,7 +745,7 @@ impl<N: NodeId> Core<N> {
             token,
             required_index,
             round,
-            deadline: timeout_ms.map(|timeout| self.now + timeout),
+            deadline: timeout_ms.map(|timeout| self.now.saturating_add(timeout)),
         });
         if self.is_solo() {
             self.try_resolve_reads();
@@ -658,7 +754,8 @@ impl<N: NodeId> Core<N> {
         }
     }
 
-    /// Start a membership change to `members` (joint consensus).
+    /// Start a membership change to `members` (joint consensus), each
+    /// named once.
     pub fn change_membership(&mut self, token: u64, members: Vec<N>) {
         let result = self.start_membership_change(members);
         self.answer(Answer::ChangeMembership { token, result });
@@ -694,6 +791,11 @@ impl<N: NodeId> Core<N> {
             self.check_election();
         }
         self.flush_acks();
+        self.leader_progress();
+    }
+
+    /// What a leader does once more of its log or a peer's is durable.
+    fn leader_progress(&mut self) {
         if self.role == Role::Leader {
             self.try_advance_commit();
             self.try_resolve_reads();
@@ -717,11 +819,7 @@ impl<N: NodeId> Core<N> {
         self.durable_index = bound;
         self.forget_written();
         self.flush_acks();
-        if self.role == Role::Leader {
-            self.try_advance_commit();
-            self.try_resolve_reads();
-            self.maybe_send_timeout_now();
-        }
+        self.leader_progress();
     }
 
     /// The host cannot complete the entries it never reported durable (a
@@ -731,7 +829,8 @@ impl<N: NodeId> Core<N> {
     /// by a quorum it can fetch them from. A candidate or a leader steps
     /// down first: its requests advertised the longer log, so no grant
     /// made against it may still count, and a leader counts only a quorum,
-    /// so what it committed is kept.
+    /// so what it committed is kept. A configuration entry dropped drops
+    /// its configuration, as a truncation by a leader does.
     pub fn discard_unreported(&mut self) {
         let keep = self.durable_index.max(self.commit);
         if self.log.last_index() <= keep {
@@ -741,6 +840,7 @@ impl<N: NodeId> Core<N> {
             self.step_down();
         }
         self.write_truncate(keep);
+        self.follow_membership(Some(keep), &[]);
         self.verified = self.verified.min(keep);
     }
 
@@ -957,6 +1057,7 @@ impl<N: NodeId> Core<N> {
             joint_old: self.active.joint_old.clone(),
             active_config_index: self.active.log_index,
             leader_hint: self.seen_leader,
+            refused: self.refused,
         }
     }
 }
