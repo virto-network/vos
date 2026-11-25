@@ -53,12 +53,8 @@ fn frames_arrive_with_their_sender_and_stream() {
     for class in Class::ALL {
         let incoming = queue(&nodes[1].1, class).try_recv().unwrap();
         assert_eq!(
-            incoming,
-            Incoming {
-                from: 1,
-                stream: 5,
-                frame: vec![class as u8]
-            }
+            (incoming.from, incoming.stream, incoming.frame),
+            (1, 5, vec![class as u8])
         );
     }
     assert!(nodes[2].1.consensus.try_recv().is_err());

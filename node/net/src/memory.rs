@@ -1,8 +1,10 @@
 //! Endpoints in one process, joined through a hub, for tests: frames go
 //! through channels, and the hub can cut links, lose frames and delay
 //! them. A delayed frame holds its bytes in its link's queue until it is
-//! delivered, and a queue past its class's budget refuses, as over QUIC. Order holds per pair of endpoints, as it does per stream over
-//! QUIC (and here across streams too, which QUIC does not promise). As
+//! delivered, and a queue past its class's budget refuses, as over QUIC.
+//! Arrival queues are bounded in frames and bytes, as over QUIC. Order
+//! holds per pair of endpoints, as it does per id over QUIC (and here
+//! across ids too, which QUIC does not promise). As
 //! over QUIC, a node takes frames only from the peers it lists.
 
 use std::collections::{HashMap, HashSet};
@@ -12,7 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{
-    Arrivals, Class, Deliver, Incoming, Limits, Network, NodeNumber, Peer, Refused, arrivals,
+    Arrivals, Class, Deliver, Incoming, Limits, Network, NodeNumber, Peer, Refused, WAITING,
+    arrivals,
 };
 
 /// How often a frame waiting for room looks again.
@@ -92,9 +95,9 @@ impl Hub {
     /// Join as node `number`, replacing an endpoint joined before under
     /// it, as a restarted node does.
     pub fn join(&self, number: NodeNumber) -> (Endpoint, Arrivals) {
-        let (deliver, arrivals) = arrivals();
         let peers = Arc::new(Mutex::new(Vec::new()));
         let mut state = self.state();
+        let (deliver, arrivals) = arrivals(&state.limits, WAITING);
         state.generation += 1;
         let generation = state.generation;
         state.endpoints.insert(
@@ -287,11 +290,7 @@ impl Network for Endpoint {
         if frame.len() > state.limits.of(class) {
             return Err(Refused::TooLarge);
         }
-        let incoming = Incoming {
-            from: self.number,
-            stream,
-            frame,
-        };
+        let incoming = Incoming::new(self.number, stream, frame);
         *state.sent.entry(class).or_insert(0) += 1;
         if let Some(tap) = &state.tap {
             tap(self.number, to, class, &incoming.frame);

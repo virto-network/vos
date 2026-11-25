@@ -12,9 +12,9 @@ use smol::stream::StreamExt;
 
 use super::executor::{Spawner, Tasks};
 use super::{
-    BULK_STREAMS, CRYPTO_ERRORS, DIAL, FRAME_COST, HEADER, Inner, MAX_BACKOFF, MIN_BACKOFF, code,
+    BULK_STREAMS, CRYPTO_ERRORS, DIAL, HEADER, Inner, MAX_BACKOFF, MIN_BACKOFF, SETTLED, code,
 };
-use crate::{Class, Limits, Peer};
+use crate::{Class, FRAME_COST, Limits, Peer};
 
 /// Frames waiting for one peer, the bytes they hold per class, and its
 /// connection.
@@ -84,9 +84,7 @@ impl Link {
             incarnation: Mutex::new(None),
         });
         let (frames, queued) = smol::channel::unbounded();
-        let client = inner
-            .identity
-            .client(peer.key, Arc::clone(&inner.transport));
+        let client = inner.identity.client(peer.key, Arc::clone(&inner.dialing));
         let dialing = Dialing {
             endpoint: inner.endpoint.clone(),
             client,
@@ -155,12 +153,16 @@ impl Dialing {
                 }
             };
             *shared.connection.lock().expect("the connection") = Some(connection.clone());
+            let connected = Instant::now();
             self.write(&connection, &mut next, &queued).await;
             *shared.connection.lock().expect("the connection") = None;
             if refused(&connection) {
                 // The peer took the handshake, then refused this node:
                 // dialing again at once would only be refused again.
                 tracing::debug!(%address, "a peer refused this node");
+                back_off(&mut backoff).await;
+            } else if connected.elapsed() < SETTLED {
+                // Closed as soon as made: a handshake a frame would cost.
                 back_off(&mut backoff).await;
             } else {
                 backoff = MIN_BACKOFF;

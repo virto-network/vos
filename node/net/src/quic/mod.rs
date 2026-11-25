@@ -3,9 +3,18 @@
 //!
 //! - **Connections.** Each node dials every peer it sends to and sends
 //!   only on its own connection, so a send never waits for the other side
-//!   to dial; the accepting side only reads. That is two connections per
-//!   pair. A dropped connection is redialed with backoff, and frames wait
-//!   in a bounded queue per peer and class meanwhile.
+//!   to dial; the accepting side only reads, and the dialed side may open
+//!   no stream. That is two connections per pair, and one inbound
+//!   connection per key: a newer one replaces the older. A dropped
+//!   connection is redialed, with backoff when it was refused or lived
+//!   briefly, on the next frame sent; frames sent meanwhile wait in a
+//!   bounded queue per peer and class, and those already handed to the
+//!   dropped connection are lost with it.
+//! - **Handshakes.** A sender proves its address (a retry) before the
+//!   node spends a handshake on it. Handshakes under way are bounded per
+//!   address, and in total for addresses no configured peer has; one
+//!   that fails keeps its place a while, so the places bound handshakes a
+//!   second too; each has a deadline ([`Handshakes`]).
 //! - **Restarts.** Stateless resets are keyed by the node's secret, so a
 //!   restarted node resets at once the connections its last run held. The
 //!   name a node dials with carries its incarnation: a peer dialing in as
@@ -17,10 +26,14 @@
 //!   connection's life; Bulk opens one per frame. Streams are sent by
 //!   class priority, Liveness first.
 //! - **Flow control.** The connection's receive window is unlimited, so a
-//!   few unread streams cannot stall the rest; each stream's window, and
-//!   the cap on concurrent bulk streams, bound what is buffered.
-//! - **Frames are bounded on receipt,** per class, and read as they
-//!   arrive: a length prefix never sizes an allocation by itself.
+//!   few unread streams cannot stall the rest: what quinn buffers for a
+//!   peer's streams not being read is bounded by [`Config::streams`] times
+//!   a stream's window (1 MiB).
+//! - **Frames are bounded on receipt,** per class, and a frame takes its
+//!   bytes from its peer's budget for that class ([`Config::assembling`])
+//!   before it is read: past the budget, a stream waits unread, which flow
+//!   control pushes back to the sender. Frames waiting for the consumer
+//!   are bounded in bytes per class ([`Config::waiting`]).
 //! - No keepalives: the node's own liveness messages carry that. An idle
 //!   connection closes after [`IDLE`], and the next send redials.
 
@@ -36,24 +49,24 @@ use quinn::VarInt;
 use ring::rand::SecureRandom;
 use smol::future::FutureExt;
 
-use crate::tls::{Identity, Table};
+use crate::tls::{ALPN, Identity, Table};
 use crate::{
-    Arrivals, Class, Deliver, Limits, Network, NodeKey, NodeNumber, Peer, Refused, arrivals,
+    Arrivals, Class, Deliver, Limits, Network, NodeKey, NodeNumber, Peer, Refused, WAITING,
+    arrivals,
 };
 
+mod admit;
 pub(crate) mod executor;
 mod receive;
 mod send;
 
+use admit::Admission;
 use executor::{Runner, Runtime, Spawner};
 use receive::accept;
 use send::{Link, Outgoing};
 
 /// An idle connection closes after this long.
 pub const IDLE: Duration = Duration::from_secs(30);
-/// What a queued frame costs beyond its bytes, so empty frames are
-/// bounded too.
-const FRAME_COST: usize = 64;
 /// What one stream may have in flight unread.
 const STREAM_WINDOW: u32 = 1 << 20;
 /// What a connection may have in flight unacknowledged, for every stream:
@@ -70,6 +83,9 @@ const INITIAL_RTT: Duration = Duration::from_millis(100);
 const DIAL: Duration = Duration::from_secs(2);
 const MIN_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_BACKOFF: Duration = Duration::from_secs(1);
+/// A connection that closes sooner than this after it was made is backed
+/// off from, as a refused one is.
+const SETTLED: Duration = Duration::from_secs(1);
 /// The bytes before a stream's frames: its class and id.
 const HEADER: usize = 9;
 /// Streams a peer may hold open at once, unless configured otherwise.
@@ -77,6 +93,9 @@ const STREAMS: u32 = 1 << 13;
 /// How long a long-lived stream stays quiet before it is finished, unless
 /// configured otherwise.
 const QUIET: Duration = Duration::from_secs(10);
+/// Frames of one class a peer may have this node assemble at once, in
+/// that class's largest frames, unless configured otherwise.
+const ASSEMBLING: usize = 4;
 /// How long a network dropped waits for its peers to hear the close.
 const CLOSING: Duration = Duration::from_millis(100);
 /// QUIC's CRYPTO_ERROR codes: 0x100 plus a TLS alert's code.
@@ -93,8 +112,11 @@ mod code {
     pub const UNCONFIGURED: VarInt = VarInt::from_u32(2);
     /// A frame over its class's bound.
     pub const TOO_LARGE: VarInt = VarInt::from_u32(3);
-    /// A stream with no class.
+    /// A stream with no class; or, closing a connection, too many streams
+    /// that broke the protocol.
     pub const MALFORMED: VarInt = VarInt::from_u32(4);
+    /// A newer connection from the same key took this one's place.
+    pub const REPLACED: VarInt = VarInt::from_u32(5);
 }
 
 /// A node's endpoint.
@@ -106,14 +128,51 @@ pub struct Config {
     pub peers: Vec<Peer>,
     pub limits: Limits,
     /// Streams a peer may hold open at once on its connection to this
-    /// node: a long-lived stream per busy group and class, and the bulk
-    /// streams. More wait for one to finish.
+    /// node: a long-lived stream per busy id and class, and the bulk
+    /// streams. More wait for one to finish. Times a stream's window, it
+    /// bounds what a peer's streams not being read hold.
     pub streams: u32,
     /// A long-lived stream quiet for this long is finished, so streams
-    /// held open are those of groups busy lately.
+    /// held open are those of ids busy lately.
     pub quiet: Duration,
     /// A connection quiet for this long closes: [`IDLE`] by default.
     pub idle: Duration,
+    /// The frames of one class a peer may have this node assemble at
+    /// once, in that class's largest frames: 4 by default.
+    pub assembling: usize,
+    /// The frames of one class, from every peer, waiting for the
+    /// consumer, in that class's largest frames: 4 by default (each queue
+    /// also holds 1,024 frames at most, 16 for Bulk).
+    pub waiting: usize,
+    pub handshakes: Handshakes,
+}
+
+/// How the endpoint takes handshakes, each from an address its sender
+/// proved first. An address is an IPv4 address or an IPv6 address's /64.
+#[derive(Clone, Copy, Debug)]
+pub struct Handshakes {
+    /// Handshakes under way at once from addresses no configured peer
+    /// has, in all.
+    pub total: usize,
+    /// Handshakes under way at once from one address, for each
+    /// configured peer at that address (one at least).
+    pub per_address: usize,
+    /// How long a handshake may take.
+    pub deadline: Duration,
+    /// How long a handshake that failed keeps its place: so an address's
+    /// places bound its handshakes a second, not only those under way.
+    pub failed: Duration,
+}
+
+impl Default for Handshakes {
+    fn default() -> Self {
+        Self {
+            total: 64,
+            per_address: 8,
+            deadline: Duration::from_secs(10),
+            failed: Duration::from_secs(1),
+        }
+    }
 }
 
 impl Config {
@@ -127,12 +186,42 @@ impl Config {
             streams: STREAMS,
             quiet: QUIET,
             idle: IDLE,
+            assembling: ASSEMBLING,
+            waiting: WAITING,
+            handshakes: Handshakes::default(),
         }
+    }
+
+    /// Refuse what would panic, stall or never take a frame.
+    fn check(&self) -> io::Result<()> {
+        let refuse = |what: &str| Err(io::Error::new(io::ErrorKind::InvalidInput, what.to_owned()));
+        let limits = &self.limits;
+        if [
+            limits.liveness,
+            limits.consensus,
+            limits.requests,
+            limits.bulk,
+        ]
+        .contains(&0)
+        {
+            return refuse("a class's frame limit is 0");
+        }
+        if self.streams == 0 || self.assembling == 0 || self.waiting == 0 {
+            return refuse("no stream, or no frame, a peer may send");
+        }
+        if self.handshakes.per_address == 0 {
+            return refuse("no handshake from any address");
+        }
+        if quinn::IdleTimeout::try_from(self.idle).is_err() {
+            return refuse("an idle timeout QUIC cannot carry");
+        }
+        Ok(())
     }
 }
 
-/// The network over QUIC. Dropping it closes every connection, waits
-/// briefly for the peers to hear it, and stops every task.
+/// The network over QUIC. Dropping it closes every connection, waits up
+/// to 100 ms for the peers to hear it (blocking the thread that drops
+/// it), and stops every task.
 pub struct Quic {
     inner: Arc<Inner>,
     _accept: smol::Task<()>,
@@ -146,26 +235,34 @@ struct Inner {
     /// The name this run dials with: its incarnation.
     name: String,
     endpoint: quinn::Endpoint,
-    transport: Arc<quinn::TransportConfig>,
+    /// What this node dials with: the dialed side may open no stream.
+    dialing: Arc<quinn::TransportConfig>,
     table: Table,
     links: Mutex<HashMap<NodeNumber, Link>>,
+    /// Each configured key's connection into this node, and the number it
+    /// had then.
+    inbound: Mutex<HashMap<NodeKey, (NodeNumber, quinn::Connection)>>,
+    admission: Arc<Admission>,
     deliver: Deliver,
     limits: Limits,
     quiet: Duration,
+    assembling: usize,
     spawner: Spawner,
 }
 
 impl Quic {
     /// Bind `config.listen` and start accepting the configured peers.
     pub fn bind(config: Config) -> io::Result<(Self, Arrivals)> {
+        config.check()?;
         let identity = Identity::new(&config.secret);
-        let transport = Arc::new(transport(config.streams, config.idle));
+        let accepting = Arc::new(transport(config.streams, config.idle));
+        let dialing = Arc::new(transport(0, config.idle));
         let table = Table::default();
-        let server = identity.server(Arc::clone(&table), Arc::clone(&transport));
+        let server = identity.server(Arc::clone(&table), accepting);
         let socket = std::net::UdpSocket::bind(config.listen)?;
         let runner = Runner::start()?;
         let endpoint = quinn::Endpoint::new(
-            identity.endpoint(),
+            identity.endpoint(ALPN),
             Some(server),
             socket,
             Arc::new(Runtime(runner.spawner())),
@@ -174,18 +271,21 @@ impl Quic {
         ring::rand::SystemRandom::new()
             .fill(&mut incarnation)
             .map_err(|_| io::Error::other("no randomness"))?;
-        let (deliver, arrivals) = arrivals();
+        let (deliver, arrivals) = arrivals(&config.limits, config.waiting);
         let inner = Arc::new(Inner {
             number: config.number,
             identity,
             name: format!("vos-{:016x}", u64::from_be_bytes(incarnation)),
             endpoint,
-            transport,
+            dialing,
             table,
             links: Mutex::new(HashMap::new()),
+            inbound: Mutex::new(HashMap::new()),
+            admission: Arc::new(Admission::new(config.handshakes)),
             deliver,
             limits: config.limits,
             quiet: config.quiet,
+            assembling: config.assembling,
             spawner: runner.spawner(),
         });
         inner.set_peers(config.peers);
@@ -217,7 +317,8 @@ impl Quic {
     }
 
     /// Replace the peer table, without a restart: a peer changed or gone
-    /// loses its connection.
+    /// loses its connections, both ways. Frames it sent that are already
+    /// in the arrival queues stay there.
     pub fn set_peers(&self, peers: Vec<Peer>) {
         self.inner.set_peers(peers);
     }
@@ -248,8 +349,22 @@ impl Inner {
             .filter(|peer| peer.number != self.number)
             .collect();
         let mut links = self.links.lock().expect("the links");
-        *self.table.write().expect("the peer table") =
+        let table: HashMap<NodeKey, NodeNumber> =
             peers.iter().map(|peer| (peer.key, peer.number)).collect();
+        self.admission.set_peers(&peers);
+        *self.table.write().expect("the peer table") = table.clone();
+        // A key gone, or under another number, loses its connection into
+        // this node, and what its readers hold.
+        self.inbound
+            .lock()
+            .expect("the inbound connections")
+            .retain(|key, (number, connection)| {
+                let kept = table.get(key) == Some(number);
+                if !kept {
+                    connection.close(code::UNCONFIGURED, b"");
+                }
+                kept
+            });
         let mut kept = HashMap::new();
         for peer in peers {
             let link = match links.remove(&peer.number) {
@@ -280,6 +395,32 @@ impl Inner {
         *seen = name;
     }
 
+    /// `connection`, just authenticated as `key`'s: the number the key is
+    /// configured for, and the connection takes the place of the key's
+    /// earlier one into this node, which closes. The table is read under
+    /// the inbound connections' lock, so a removal that comes meanwhile
+    /// finds the connection and closes it.
+    fn dialed(&self, key: NodeKey, connection: &quinn::Connection) -> Option<NodeNumber> {
+        let mut inbound = self.inbound.lock().expect("the inbound connections");
+        let from = self.peer_number(&key)?;
+        if let Some((_, earlier)) = inbound.insert(key, (from, connection.clone())) {
+            earlier.close(code::REPLACED, b"");
+        }
+        Some(from)
+    }
+
+    /// `connection`, `key`'s, ended: forget it, unless a newer one took
+    /// its place.
+    fn hung_up(&self, key: &NodeKey, connection: &quinn::Connection) {
+        let mut inbound = self.inbound.lock().expect("the inbound connections");
+        if inbound
+            .get(key)
+            .is_some_and(|(_, held)| held.stable_id() == connection.stable_id())
+        {
+            inbound.remove(key);
+        }
+    }
+
     /// The configured peer whose key is `key`.
     fn peer_number(&self, key: &NodeKey) -> Option<NodeNumber> {
         self.table.read().expect("the peer table").get(key).copied()
@@ -298,7 +439,7 @@ fn transport(streams: u32, idle: Duration) -> quinn::TransportConfig {
         .stream_receive_window(VarInt::from_u32(STREAM_WINDOW))
         .send_window(SEND_WINDOW)
         .max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(idle).expect("an idle timeout QUIC can carry"),
+            quinn::IdleTimeout::try_from(idle).expect("an idle timeout checked at bind"),
         ))
         .initial_rtt(INITIAL_RTT)
         .keep_alive_interval(None)
