@@ -101,13 +101,14 @@ struct Reading {
 impl Reading {
     /// A stream broke the protocol: the first is logged, and past
     /// [`VIOLATIONS`] the connection closes.
-    fn violated(&self, class: Option<Class>, length: Option<usize>) {
+    /// `broken` is the class and length of a frame over its bound.
+    fn violated(&self, broken: Option<(Class, usize)>) {
         let count = self.violations.fetch_add(1, Ordering::Relaxed);
         if count == 0 {
             tracing::warn!(
                 from = self.from,
-                ?class,
-                ?length,
+                class = ?broken.map(|(class, _)| class),
+                length = ?broken.map(|(_, length)| length),
                 "a stream broke the protocol"
             );
         }
@@ -185,7 +186,7 @@ async fn read(peer: Arc<Reading>, mut stream: quinn::RecvStream) {
     }
     let Some(class) = Class::from_u8(header[0]) else {
         let _ = stream.stop(code::MALFORMED);
-        peer.violated(None, None);
+        peer.violated(None);
         return;
     };
     let id = u64::from_be_bytes(header[1..].try_into().expect("eight bytes"));
@@ -208,7 +209,7 @@ async fn frames(peer: &Reading, mut stream: quinn::RecvStream, class: Class, id:
         let length = u32::from_be_bytes(length) as usize;
         if length > limit {
             let _ = stream.stop(code::TOO_LARGE);
-            peer.violated(Some(class), Some(length));
+            peer.violated(Some((class, length)));
             return;
         }
         // Its bytes are taken before any is read or reserved.
