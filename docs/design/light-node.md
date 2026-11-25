@@ -450,9 +450,9 @@ operation and travel inside it.
   set and the device group by the personal agent's log, a payment by the
   space that holds the ledger.
 - **Authorship:** each device signs the DAG nodes it authors with its
-  sync key (§3.5); merkle-crdt's `DagNode` has no author field, so the
-  author's key, sequence number and signature travel inside the payload,
-  which is sealed (§3.6).
+  sync key (§3.5); a merkle-crdt node carries the author's key, sequence
+  number and signature beside its operations, and the whole node is
+  sealed (§3.6).
 - **Operations are versioned** [built]: each operation carries the
   release of its actor the issuing device ran (`release::Package`'s
   `release`, numbered from 1), and an operation of a later release, or of
