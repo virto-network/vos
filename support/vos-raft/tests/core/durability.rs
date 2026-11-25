@@ -278,13 +278,7 @@ fn a_candidate_that_discards_ignores_grants_for_its_longer_log() {
     assert_eq!(core.status().last_log_index, 11);
     let term = core.status().current_term;
     for peer in [LEADER_A, LEADER_B] {
-        core.receive(
-            peer,
-            Message::VoteAnswer {
-                term,
-                granted: true,
-            },
-        );
+        core.receive(peer, vote_answer(term, true));
     }
     core.take_actions();
     assert_ne!(core.role(), Role::Leader);
@@ -401,58 +395,17 @@ fn stale_append_entries_does_not_regress_follower_log() {
     assert_eq!(core.status().last_log_index, 3);
 }
 
-/// A log of large entries makes a compaction due on its bytes before its
-/// length, and the tail a compaction keeps is bounded in bytes too.
-#[test]
-fn large_entries_make_a_compaction_due_by_their_bytes() {
+/// Eight entries weighing 300 bytes each by `weight`, committed through 8
+/// and applied through none, in a log whose compaction is due at 1,000
+/// bytes: a compaction is due by their weight, and the tail it keeps is
+/// bounded by it.
+fn compacted_by_weight(payload: Vec<u8>, weight: fn(&[u8]) -> u64) -> Core<u16> {
     let mut cfg = config();
     cfg.compact_hysteresis = 1_000;
     cfg.compact_bytes = 1_000;
-    // Each entry costs 300 bytes as the cache counts it: 64 beyond its
-    // payload.
+    cfg.payload_weight = weight;
     let entries = (1..=8)
-        .map(|index| LogEntry::data(index, 1, vec![0; 236]))
-        .collect();
-    // Committed through 8, applied through none.
-    let recovered = Recovered {
-        applied: 0,
-        ..recovered(1, 8, entries)
-    };
-    let mut core = Core::new(cfg, recovered, 0, 7);
-    core.take_actions();
-    core.durably_applied(3);
-    assert!(compact_bounds(&core.take_actions()).is_empty(), "900 bytes");
-    core.durably_applied(4);
-    assert_eq!(compact_bounds(&core.take_actions()), [4]);
-    // Entries 3 and 4 take 600 bytes; 2 through 4 more than 700.
-    let point = core.compaction_point(4, 10, 700);
-    assert_eq!(point, 2);
-    core.compacted(point);
-    core.durably_applied(5);
-    assert!(
-        compact_bounds(&core.take_actions()).is_empty(),
-        "the tail and entry 5 take 900 bytes"
-    );
-    core.durably_applied(6);
-    assert_eq!(compact_bounds(&core.take_actions()), [6]);
-    // The tail's entry count bounds it as well.
-    assert_eq!(core.compaction_point(6, 1, 700), 5);
-}
-
-/// Entries whose small payloads name large data the host keeps apart weigh
-/// what the host says: a compaction is due by their weight, and the tail it
-/// keeps is bounded by it.
-#[test]
-fn a_hosts_payload_weight_counts_toward_compaction() {
-    let mut cfg = config();
-    cfg.compact_hysteresis = 1_000;
-    cfg.compact_bytes = 1_000;
-    // A payload's first byte is the hundreds of bytes it stands for.
-    cfg.payload_weight = |payload| payload.len() as u64 + u64::from(payload[0]) * 100;
-    // Each entry weighs 300 bytes: 64 beyond its payload, which stands for
-    // 200 more than its 36 bytes.
-    let entries = (1..=8)
-        .map(|index| LogEntry::data(index, 1, vec![2; 36]))
+        .map(|index| LogEntry::data(index, 1, payload.clone()))
         .collect();
     let recovered = Recovered {
         applied: 0,
@@ -475,6 +428,27 @@ fn a_hosts_payload_weight_counts_toward_compaction() {
     );
     core.durably_applied(6);
     assert_eq!(compact_bounds(&core.take_actions()), [6]);
+    core
+}
+
+/// A log of large entries makes a compaction due on its bytes before its
+/// length, and the tail a compaction keeps is bounded in bytes too. Each
+/// entry costs 300 bytes as the cache counts it: 64 beyond its payload.
+#[test]
+fn large_entries_make_a_compaction_due_by_their_bytes() {
+    let core = compacted_by_weight(vec![0; 236], |payload| payload.len() as u64);
+    // The tail's entry count bounds it as well.
+    assert_eq!(core.compaction_point(6, 1, 700), 5);
+}
+
+/// Entries whose small payloads name large data the host keeps apart weigh
+/// what the host says. A payload's first byte is the hundreds of bytes it
+/// stands for: 36 bytes standing for 200 more weigh 300 with the 64 beyond.
+#[test]
+fn a_hosts_payload_weight_counts_toward_compaction() {
+    compacted_by_weight(vec![2; 36], |payload| {
+        payload.len() as u64 + u64::from(payload[0]) * 100
+    });
 }
 
 /// A candidate asks for votes, and leads, only once its own term is
@@ -494,13 +468,7 @@ fn a_candidate_leads_only_once_its_term_is_durable() {
     let vote = writes(&actions).last().unwrap().clone();
     let term = core.status().current_term;
     for peer in [LEADER_A, LEADER_B] {
-        core.receive(
-            peer,
-            Message::VoteAnswer {
-                term,
-                granted: true,
-            },
-        );
+        core.receive(peer, vote_answer(term, true));
     }
     assert_ne!(
         core.role(),
@@ -513,12 +481,6 @@ fn a_candidate_leads_only_once_its_term_is_durable() {
         .filter(|message| matches!(message, Message::Vote { .. }))
         .count();
     assert_eq!(asked, 2);
-    core.receive(
-        LEADER_A,
-        Message::VoteAnswer {
-            term,
-            granted: true,
-        },
-    );
+    core.receive(LEADER_A, vote_answer(term, true));
     assert_eq!(core.role(), Role::Leader);
 }
