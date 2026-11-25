@@ -136,6 +136,8 @@ pub enum Error {
     Stale,
     /// A namespace row that does not read.
     Corrupt,
+    /// A credential that is not a device's 64 bytes.
+    Credential,
 }
 
 impl From<fjall::Error> for Error {
@@ -163,6 +165,7 @@ impl std::fmt::Display for Error {
             Error::NotHeld => f.write_str("not the commit held"),
             Error::Stale => f.write_str("a candidate of a state no longer current"),
             Error::Corrupt => f.write_str("an MLS row does not read"),
+            Error::Credential => f.write_str("a credential that is not a device's"),
         }
     }
 }
@@ -394,11 +397,16 @@ fn client(
 
 impl Mls {
     /// The member whose leaf credential is `credential`, in `namespace`:
-    /// the one it holds, or, in a namespace holding none, a new one, its
-    /// signing key drawn and written in one batch with `rows`.
+    /// the one it holds, whatever `credential` says, or, in a namespace
+    /// holding none, a new one, its signing key drawn and written in one
+    /// batch with `rows`. [`Error::Credential`] for a new one whose
+    /// `credential` is not 64 bytes.
     pub fn open(namespace: Namespace, credential: &[u8], rows: Writes) -> Result<Self, Error> {
         let signer = match namespace.get(SIGNER)? {
             Some(bytes) => decode_signer(&bytes)?,
+            None if credential.len() != policy::CREDENTIAL_BYTES => {
+                return Err(Error::Credential);
+            }
             None => {
                 let suite = provider()
                     .cipher_suite_provider(SUITE)

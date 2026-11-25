@@ -929,3 +929,20 @@ fn unused_key_packages_go_when_the_device_joins() {
     d.mls.swap(joined, BTreeMap::new()).unwrap();
     assert_eq!(count(&d, b"mls/package/"), 0);
 }
+
+/// A member is made only of a device's credential, 64 bytes; nothing is
+/// written for another.
+#[test]
+fn a_member_of_a_credential_of_another_length_is_not_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fjall::Database::builder(dir.path()).open().unwrap();
+    let keyspace = db
+        .keyspace("group", fjall::KeyspaceCreateOptions::default)
+        .unwrap();
+    let store = Store::new(db, keyspace);
+    let namespace = Namespace::current(store.clone(), b"mls/".to_vec());
+    for length in [0, 63, 65] {
+        assert!(Mls::open(namespace.clone(), &vec![1; length], BTreeMap::new()).is_err());
+    }
+    assert_eq!(store.keyspace().iter().count(), 0);
+}
