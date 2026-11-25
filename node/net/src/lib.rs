@@ -128,8 +128,7 @@ impl Limits {
     }
 
     /// The budget of frames of `class` waiting for one peer: four of the
-    /// largest frames' worth, or one bulk frame's. A queue under its budget
-    /// takes one frame more.
+    /// largest frames' worth, or one bulk frame's.
     fn queue(&self, class: Class) -> usize {
         match class {
             Class::Bulk => self.of(class),
@@ -176,8 +175,9 @@ impl Budgets {
         })
     }
 
-    /// Hold a frame of `bytes` while the class is under its budget: one
-    /// under it takes one frame more, as a peer's send queue does.
+    /// Hold a frame of `bytes` while the class is under its budget: a
+    /// budget under its bound takes one frame more, so it holds less than
+    /// its bound and one frame.
     pub(crate) fn try_hold(self: &Arc<Self>, class: Class, bytes: usize) -> Option<Hold> {
         let cost = bytes.saturating_add(FRAME_COST);
         let budget = self.budgets[class as usize];

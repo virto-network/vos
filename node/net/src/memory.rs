@@ -1,11 +1,10 @@
 //! Endpoints in one process, joined through a hub, for tests: frames go
 //! through channels, and the hub can cut links, lose frames and delay
-//! them. A delayed frame holds its bytes in its link's queue until it is
-//! delivered, and a queue past its class's budget refuses, as over QUIC.
-//! Arrival queues are bounded in frames and bytes, as over QUIC. Order
-//! holds per pair of endpoints, as it does per id over QUIC (and here
-//! across ids too, which QUIC does not promise). As over QUIC, a node
-//! takes frames only from the peers it lists.
+//! them. It keeps what QUIC does of the model: a node takes frames only
+//! from the peers it lists, arrival queues are bounded in frames and
+//! bytes, and a delayed frame holds its bytes in its link's queue until it
+//! is delivered, a queue past its class's budget refusing. Order holds
+//! per pair of endpoints, across ids too, which QUIC does not promise.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -332,7 +331,7 @@ impl Network for Endpoint {
                 .map_err(|_| Refused::Full);
         }
         // A delayed link's queue holds what it has yet to deliver, under its
-        // class's budget: one under it takes one frame more.
+        // class's budget.
         {
             let mut held = self.held.lock().expect("the held bytes");
             let held = held.entry((to, class)).or_insert(0);

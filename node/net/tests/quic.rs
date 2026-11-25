@@ -117,7 +117,8 @@ fn a_peer_shut_down_and_started_again_is_reachable_at_once() {
         send(&a, 2, Class::Consensus, 1, b"before".to_vec()).await;
         drop(b);
 
-        // Node 1 sends first: its old connection is reset, and it redials.
+        // Node 1 sends first: its old connection is closed, or reset, and
+        // it redials.
         let (b, b_arrivals) = rebind(2, address).await;
         b.set_peers(vec![peer_of(1, &a)]);
         let started = Instant::now();
