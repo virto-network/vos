@@ -234,7 +234,8 @@ fn chaos(seed: u64, run: Chaos) -> Exercised {
         let node = nodes[(cluster.random.next_u64() % nodes.len() as u64) as usize];
         match roll {
             0..=29 => {
-                // Crash a node mid-flight; it restarts 5–60 ms later.
+                // Crash a node mid-flight; it restarts 5–59 ms later, or
+                // 5–404 ms with pair heartbeats.
                 if !down.iter().any(|(at, _)| *at == node) {
                     cluster.crash(node);
                     let back = cluster.now + 5 + cluster.random.next_u64() % downtime;

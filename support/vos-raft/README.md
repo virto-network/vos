@@ -97,16 +97,17 @@ The core then:
   removal cannot depose a live leader, and a replica whose vote a member
   it does not know needs still gives it when no leader is left;
 - ignores answers from outside its configuration, and the terms they
-  name (`Status::refused` counts these drops too): it counts votes and acknowledgements from members only, and
+  name: it counts votes and acknowledgements from members only, and
   nothing it asked a non-member needs one;
 - refuses, from anyone, what no correct peer sends: a term with no
   successor (`u64::MAX`), or more than 2^32 past its own (a replica that
   reaches the last term no longer campaigns), a second leader of a term
-  it leads, led or follows, and an
-  append whose first entry differing from its log is at or below its
-  commit index. A refused message changes nothing and gets no answer, as
-  if it were lost; `Status::refused` counts them. A member's claim past
-  the leader's log counts as the leader's last index.
+  it leads, led or follows, and an append whose first entry differing
+  from its log is at or below its commit index. A refused message
+  changes nothing and gets no answer, as if it were lost;
+  `Status::refused` counts them, with the answers and vote requests
+  dropped above. A member's claim past the leader's log counts as the
+  leader's last index.
 
 ## Limits
 

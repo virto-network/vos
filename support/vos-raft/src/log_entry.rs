@@ -1,9 +1,6 @@
 //! One Raft log entry. The payload is opaque to the consensus
 //! layer — the state machine that applies committed entries
 //! decides how to interpret the bytes.
-//!
-//! Parameterized over `N: NodeId` so config-change entries can
-//! carry typed member sets alongside the regular data payload.
 
 use alloc::vec::Vec;
 
@@ -29,17 +26,12 @@ pub enum EntryKind<N: NodeId> {
     /// Application data — the consensus layer doesn't interpret
     /// the payload bytes.
     Data { payload: Vec<u8> },
-    /// Cluster-membership transition (Ongaro thesis §4.3).
-    /// `members` is the configuration the cluster transitions
-    /// *to*. If `joint_old` is `Some`, the cluster is in a
-    /// joint-consensus state — quorum decisions require
-    /// agreement from both `joint_old` AND `members` until a
-    /// follow-up `ConfigChange { joint_old: None, .. }` retires
-    /// the joint phase.
-    ///
-    /// The core appends these for a membership change and takes
-    /// its quorum view from them; an application's apply skips
-    /// entries whose `kind` isn't `Data`.
+    /// Cluster-membership transition (Ongaro thesis §4.3) to
+    /// `members`, joint with `joint_old` while that is set (see
+    /// [`ActiveConfigRecord`](crate::ActiveConfigRecord)). The core
+    /// appends these for a membership change and takes its quorum
+    /// view from them; an application's apply skips entries whose
+    /// `kind` isn't `Data`.
     ConfigChange {
         joint_old: Option<Vec<N>>,
         members: Vec<N>,
@@ -47,8 +39,7 @@ pub enum EntryKind<N: NodeId> {
 }
 
 impl<N: NodeId> LogEntry<N> {
-    /// Construct an `EntryKind::Data` entry. The most common
-    /// constructor — every application-payload entry uses it.
+    /// Construct an `EntryKind::Data` entry.
     pub fn data(index: u64, term: u64, payload: Vec<u8>) -> Self {
         Self {
             index,

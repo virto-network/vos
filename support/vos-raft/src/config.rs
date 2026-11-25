@@ -23,9 +23,9 @@ pub struct Config<N: NodeId> {
     pub election_timeout_ms: (u64, u64),
     /// A leader's heartbeat interval in milliseconds. Default: 50.
     pub heartbeat_interval_ms: u64,
-    /// Entries through the compaction bound, the lower of the commit and
-    /// what the host applied durably, past the log's start that make a
-    /// compaction due. Default: 16.
+    /// A compaction becomes due once this many entries lie between the
+    /// log's start and the compaction bound, the lower of the commit and
+    /// what the host applied durably. Default: 16.
     pub compact_hysteresis: u64,
     /// Bytes those entries weigh ([`Self::payload_weight`]) that make a
     /// compaction due. A host that compacts short of the bound keeps well
