@@ -3,6 +3,19 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
+/// The longest row key a replica writes: fjall's limit.
+pub const MAX_ROW_KEY: usize = 65_535;
+
+/// The longest row value a replica writes: fjall's limit.
+pub const MAX_ROW_VALUE: usize = u32::MAX as usize;
+
+/// Whether a store takes a row with this key and value.
+pub(crate) fn row_fits(key: &[u8], value: Option<&[u8]>) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_ROW_KEY
+        && value.is_none_or(|value| value.len() <= MAX_ROW_VALUE)
+}
+
 /// The rows an [`Apply`] reads and writes: the replica's store under the
 /// writes of the batch being applied. A read sees the batch's own earlier
 /// writes; the writes reach the store in the batch's one commit, or not at
@@ -10,7 +23,12 @@ use core::marker::PhantomData;
 pub trait Rows {
     /// The row `key`.
     fn read(&mut self, key: &[u8]) -> Option<Vec<u8>>;
-    /// Set the row `key`, or delete it (`None`).
+    /// Set the row `key`, or delete it (`None`). A key is 1 to
+    /// [`MAX_ROW_KEY`] bytes, a value at most [`MAX_ROW_VALUE`]: a write
+    /// past either fails the batch with [`Error::Row`](crate::Error::Row),
+    /// in every store. An [`Apply`] that makes keys from a peer's
+    /// operations bounds them itself (a hash, or a refusal it keeps in its
+    /// rows), or that peer's node fails every batch that brings it.
     fn write(&mut self, key: &[u8], value: Option<&[u8]>);
 }
 
@@ -65,21 +83,24 @@ impl<H: Hasher, O, F: FnMut(Event<'_, H, O>, &mut dyn Rows)> Apply<H, O> for F {
     }
 }
 
-/// Rows over a store, or over nothing (a rebuild), under a batch's
-/// writes. A read the store fails is kept, and fails the batch.
+/// Rows over a store under a batch's writes. A read the store fails is
+/// kept, and fails the batch; so does a write no store takes.
 pub(crate) struct Overlay<'a, H: Hasher, S: Store<H>> {
-    pub(crate) store: Option<&'a S>,
+    pub(crate) store: &'a S,
     pub(crate) written: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     pub(crate) error: Option<S::Error>,
+    /// Whether a write was past a store's limits.
+    pub(crate) unfit: bool,
     pub(crate) hasher: PhantomData<H>,
 }
 
 impl<'a, H: Hasher, S: Store<H>> Overlay<'a, H, S> {
-    pub(crate) fn new(store: Option<&'a S>) -> Self {
+    pub(crate) fn new(store: &'a S) -> Self {
         Self {
             store,
             written: BTreeMap::new(),
             error: None,
+            unfit: false,
             hasher: PhantomData,
         }
     }
@@ -90,7 +111,7 @@ impl<H: Hasher, S: Store<H>> Rows for Overlay<'_, H, S> {
         if let Some(value) = self.written.get(key) {
             return value.clone();
         }
-        match self.store?.row(key) {
+        match self.store.row(key) {
             Ok(value) => value,
             Err(error) => {
                 self.error.get_or_insert(error);
@@ -100,6 +121,10 @@ impl<H: Hasher, S: Store<H>> Rows for Overlay<'_, H, S> {
     }
 
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) {
+        if !row_fits(key, value) {
+            self.unfit = true;
+            return;
+        }
         self.written.insert(key.to_vec(), value.map(<[u8]>::to_vec));
     }
 }

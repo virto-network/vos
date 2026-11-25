@@ -15,15 +15,20 @@
 //! - **Authors' chains**: an author numbers its nodes from 0, each naming
 //!   the previous among its parents. Two nodes at one number are an
 //!   [`Equivocation`]: both kept, reported, and filtered by the CRDT's reads.
-//! - **Fetching** is batched ([`sync`]): from a peer that walks the DAG,
-//!   by wanted CIDs and each author's highest number, or from a cursor over
-//!   a server that only numbers what it accepted.
+//! - **Fetching** is the caller's, sans I/O: it delivers nodes' bytes to
+//!   [`Replica::ingest`] in any order and batching, and asks
+//!   [`Replica::wanted`], [`Replica::have`] or [`Replica::cursor`] what to
+//!   fetch next.
 //! - **The CRDT** ([`Apply`]) writes only through [`Rows`], so its state
-//!   commits with the nodes it came from; [`rebuild`] replays a whole DAG
-//!   for recovery and audits.
+//!   commits with the nodes it came from.
 //!
 //! The DAG gives causal delivery, not convergence: [`Apply`] must give the
 //! same rows for every causal order of the same nodes.
+//!
+//! Every ed25519 key is an author: the library admits any node whose
+//! signature checks. A caller whose scope has a set of writers checks a
+//! node's author ([`validate`], then [`Header::read`]) before it hands the
+//! node to [`Replica::ingest`].
 //!
 //! ```
 //! use merkle_crdt::{Event, Hasher, MemStore, Replica, Rows, Scope};
@@ -69,22 +74,21 @@ mod cid;
 mod encode;
 mod hasher;
 mod node;
-mod rebuild;
 mod replica;
 mod signed;
 mod store;
-pub mod sync;
 
 #[cfg(feature = "fjall")]
 mod store_fjall;
 
-pub use apply::{Apply, Event, Rows};
+pub use apply::{Apply, Event, MAX_ROW_KEY, MAX_ROW_VALUE, Rows};
 pub use cid::Cid;
-pub use encode::{Decode, Encode};
+pub use encode::{Decode, Encode, MAX_DECODE_ITEMS};
 pub use hasher::Hasher;
-pub use node::{DagNode, Header};
-pub use rebuild::{Rebuilt, rebuild};
-pub use replica::{Equivocation, Error, Ingested, Outgoing, Replica};
+pub use node::{DagNode, Header, MAX_PARENTS};
+pub use replica::{
+    Equivocation, Error, Ingested, MAX_HELD, MAX_HELD_BYTES, MAX_HELD_PER_AUTHOR, Outgoing, Replica,
+};
 pub use signed::{Author, Node, Refusal, Scope, Signed, message, validate};
 pub use store::{Applied, Changes, Loaded, MemStore, Store};
 

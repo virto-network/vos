@@ -1,7 +1,16 @@
 //! A [`Store`] over fjall: one scope in five keyspaces of a database the
-//! caller opens (and mends after a crash) and may share, each commit one
-//! synced batch.
+//! caller opens and may share, each commit one synced batch.
+//!
+//! A commit's batch is whole or absent after a crash. Two things are the
+//! caller's, before it opens the database after one: a database whose
+//! creation was cut short (fjall writes its `version` file last) does not
+//! open, and is cleared; and a batch the killed process wrote to the page
+//! cache, not yet synced, is read back as committed, so the journals are
+//! synced before the replica relies on what it reads (a power cut would
+//! otherwise lose a node already pushed, and the next one signed at its
+//! number would equivocate).
 
+use crate::apply::row_fits;
 use crate::store::{Changes, Loaded};
 use crate::{Author, Cid, Decode, Hasher, Store};
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -9,7 +18,7 @@ use alloc::format;
 use alloc::vec::Vec;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode};
 
-const HEADS: &[u8] = b"h";
+const HEAD: u8 = b'h';
 const CURSOR: &[u8] = b"c";
 const LATEST: u8 = b'l';
 const EQUIVOCATION: u8 = b'e';
@@ -25,6 +34,9 @@ pub enum FjallError {
     /// The scope's name does not make fjall keyspace names: at most 240
     /// bytes of ASCII letters, digits, `_`, `-`, `.`, `#` or `$`.
     Name,
+    /// A row's key is empty or past [`MAX_ROW_KEY`](crate::MAX_ROW_KEY)
+    /// bytes, or its value past [`MAX_ROW_VALUE`](crate::MAX_ROW_VALUE).
+    Row,
 }
 
 impl From<fjall::Error> for FjallError {
@@ -39,6 +51,7 @@ impl core::fmt::Display for FjallError {
             FjallError::Fjall(error) => write!(f, "the store: {error}"),
             FjallError::Corrupt => f.write_str("a stored row does not read as written"),
             FjallError::Name => f.write_str("the scope's name is not a keyspace name"),
+            FjallError::Row => f.write_str("a row's key or value is past fjall's limits"),
         }
     }
 }
@@ -47,7 +60,7 @@ impl std::error::Error for FjallError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             FjallError::Fjall(error) => Some(error),
-            FjallError::Corrupt | FjallError::Name => None,
+            FjallError::Corrupt | FjallError::Name | FjallError::Row => None,
         }
     }
 }
@@ -57,13 +70,15 @@ impl std::error::Error for FjallError {
 /// - `<name>.nodes`: applied nodes' bytes by CID;
 /// - `<name>.held`: held nodes' bytes by CID;
 /// - `<name>.authored`: `author ‖ seq (BE) ‖ cid`, empty values;
-/// - `<name>.meta`: the heads, the cursor, each author's latest node, the
-///   equivocations and the outbox;
+/// - `<name>.meta`: the heads (a row a head), the cursor, each author's
+///   latest node, the equivocations and the outbox;
 /// - the rows: `<name>.rows`, or a keyspace the caller names, so that a
 ///   light node's agent reads the CRDT's rows with its own.
 ///
 /// Every [`commit`](Store::commit) is one batch, synced before it returns;
 /// [`commit_with`](FjallStore::commit_with) adds the caller's writes to it.
+/// One store a scope name: two over one name each write its state from
+/// their own replica's memory.
 pub struct FjallStore {
     db: Database,
     nodes: Keyspace,
@@ -76,19 +91,14 @@ pub struct FjallStore {
 impl FjallStore {
     /// The scope `name` in `db`, its rows in `<name>.rows`.
     pub fn open(db: &Database, name: &str) -> Result<Self, FjallError> {
-        if name.len() > 240 {
-            return Err(FjallError::Name);
-        }
+        check_name(name)?;
         let rows = db.keyspace(&format!("{name}.rows"), KeyspaceCreateOptions::default)?;
         Self::with_rows(db, name, rows)
     }
 
     /// The scope `name` in `db`, its rows in `rows`.
     pub fn with_rows(db: &Database, name: &str, rows: Keyspace) -> Result<Self, FjallError> {
-        let allowed = |c: u8| c.is_ascii_alphanumeric() || b"_-.#$".contains(&c);
-        if name.is_empty() || name.len() > 240 || !name.bytes().all(allowed) {
-            return Err(FjallError::Name);
-        }
+        check_name(name)?;
         let keyspace =
             |kind: &str| db.keyspace(&format!("{name}.{kind}"), KeyspaceCreateOptions::default);
         Ok(Self {
@@ -105,6 +115,15 @@ impl FjallStore {
     pub fn rows(&self) -> &Keyspace {
         &self.rows
     }
+}
+
+/// A scope's name makes fjall keyspace names `<name>.<kind>`.
+fn check_name(name: &str) -> Result<(), FjallError> {
+    let allowed = |c: u8| c.is_ascii_alphanumeric() || b"_-.#$".contains(&c);
+    if name.is_empty() || name.len() > 240 || !name.bytes().all(allowed) {
+        return Err(FjallError::Name);
+    }
+    Ok(())
 }
 
 fn cid<H: Hasher>(bytes: &[u8]) -> Result<Cid<H>, FjallError> {
@@ -146,20 +165,23 @@ impl<H: Hasher> Store<H> for FjallStore {
         Ok(self.nodes.contains_key(cid)?)
     }
 
-    fn nodes(&self) -> Result<Vec<Cid<H>>, Self::Error> {
-        self.nodes.iter().map(|row| cid(&row.key()?)).collect()
-    }
-
     fn held(&self, cid: &Cid<H>) -> Result<Option<Vec<u8>>, Self::Error> {
         Ok(self.held.get(cid)?.map(|bytes| bytes.to_vec()))
     }
 
-    fn authored(&self, author: &Author, seq: u64) -> Result<Vec<Cid<H>>, Self::Error> {
+    fn authored(&self, author: &Author, seq: u64) -> Result<Option<Cid<H>>, Self::Error> {
         let prefix = authored_key::<H>(author, seq, None);
         self.authored
             .prefix(&prefix)
+            .next()
             .map(|row| cid(&row.key()?[prefix.len()..]))
-            .collect()
+            .transpose()
+    }
+
+    fn is_authored(&self, author: &Author, seq: u64, cid: &Cid<H>) -> Result<bool, Self::Error> {
+        Ok(self
+            .authored
+            .contains_key(authored_key(author, seq, Some(cid)))?)
     }
 
     fn row(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
@@ -167,15 +189,13 @@ impl<H: Hasher> Store<H> for FjallStore {
     }
 
     fn load(&self) -> Result<Loaded<H>, Self::Error> {
-        let width = core::mem::size_of::<H::Output>();
-        let heads = match self.meta.get(HEADS)? {
-            None => BTreeSet::new(),
-            Some(bytes) if bytes.len().is_multiple_of(width) => bytes
-                .chunks_exact(width)
-                .map(cid)
-                .collect::<Result<_, _>>()?,
-            Some(_) => return Err(FjallError::Corrupt),
-        };
+        let mut heads = BTreeMap::new();
+        for row in self.meta.prefix([HEAD]) {
+            let (key, value) = row.into_inner()?;
+            let (author, at) = value.split_at_checked(32).ok_or(FjallError::Corrupt)?;
+            let author = <[u8; 32]>::try_from(author).map_err(|_| FjallError::Corrupt)?;
+            heads.insert(cid(&key[1..])?, (Author(author), seq(at)?));
+        }
         let cursor = self
             .meta
             .get(CURSOR)?
@@ -204,8 +224,7 @@ impl<H: Hasher> Store<H> for FjallStore {
         }
         let mut held = Vec::new();
         for row in self.held.iter() {
-            let (key, value) = row.into_inner()?;
-            held.push((cid(&key)?, value.to_vec()));
+            held.push(cid(&row.key()?)?);
         }
         Ok(Loaded {
             heads,
@@ -225,12 +244,21 @@ impl<H: Hasher> Store<H> for FjallStore {
 impl FjallStore {
     /// Write `changes` and the caller's own writes, which `extra` adds to
     /// the batch, in one synced batch: a store that keeps rows of its own
-    /// beside the scope's commits them with the scope's, or not at all.
+    /// beside the scope's commits them with the scope's, or not at all. A
+    /// row fjall does not take fails the batch with [`FjallError::Row`];
+    /// the caller's own writes are its to keep within fjall's limits.
     pub fn commit_with<H: Hasher>(
         &mut self,
         changes: Changes<H>,
         extra: impl FnOnce(&mut OwnedWriteBatch),
     ) -> Result<(), FjallError> {
+        if !changes
+            .rows
+            .iter()
+            .all(|(key, value)| row_fits(key, value.as_deref()))
+        {
+            return Err(FjallError::Row);
+        }
         let mut batch = self.db.batch();
         extra(&mut batch);
         for node in changes.applied {
@@ -247,9 +275,12 @@ impl FjallStore {
         for (cid, bytes) in changes.held {
             batch.insert(&self.held, cid.as_ref(), bytes);
         }
-        if let Some(heads) = changes.heads {
-            let bytes: Vec<u8> = heads.iter().flat_map(|cid| cid.as_ref().to_vec()).collect();
-            batch.insert(&self.meta, HEADS, bytes);
+        for cid in changes.heads_removed {
+            batch.remove(&self.meta, tagged(HEAD, &[cid.as_ref()]));
+        }
+        for (cid, author, at) in changes.heads_added {
+            let value = [&author.0[..], &at.to_be_bytes()].concat();
+            batch.insert(&self.meta, tagged(HEAD, &[cid.as_ref()]), value);
         }
         for (author, at, cid) in changes.latest {
             let value = [&at.to_be_bytes()[..], cid.as_ref()].concat();

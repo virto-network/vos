@@ -7,10 +7,11 @@ mod common;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use common::{H, Ops, Rng, SCOPE, Step, crdt, generate};
-use fjall::Database;
-use merkle_crdt::sync::{Feed, Page};
-use merkle_crdt::{FjallStore, Replica, Store, rebuild};
+use std::collections::BTreeSet;
+
+use common::{H, Ops, Replayed, Rng, SCOPE, Server, Step, crdt, generate, read, replay};
+use fjall::{Database, KeyspaceCreateOptions};
+use merkle_crdt::{Error, Event, FjallError, FjallStore, Node, Replica, Rows, Store};
 
 type Fjall = Replica<H, Ops, FjallStore>;
 
@@ -29,6 +30,17 @@ fn rows(store: &FjallStore) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
             (key.to_vec(), value.to_vec())
         })
         .collect()
+}
+
+/// The replay of the applied nodes the store `scope` of `db` holds.
+fn replayed(db: &Database) -> Replayed {
+    let nodes = db
+        .keyspace("scope.nodes", KeyspaceCreateOptions::default)
+        .unwrap();
+    replay(
+        nodes.iter().map(|row| row.value().unwrap().to_vec()),
+        &mut crdt,
+    )
 }
 
 /// A shuffled DAG of 3 authors, numbered as a server would accept it.
@@ -63,17 +75,11 @@ fn accepted() -> Vec<(u64, Vec<u8>)> {
         .collect()
 }
 
-struct Server(Vec<(u64, Vec<u8>)>, usize);
-
-impl Feed for Server {
-    type Error = std::convert::Infallible;
-    fn since(&mut self, position: Option<u64>) -> Result<Page, Self::Error> {
-        let start = position.unwrap_or(0) as usize;
-        let end = (start + self.1).min(self.0.len());
-        Ok(Page {
-            items: self.0[start..end].to_vec(),
-            more: end < self.0.len(),
-        })
+fn server(items: &[(u64, Vec<u8>)], page: usize) -> Server {
+    Server {
+        items: items.to_vec(),
+        page,
+        trips: 0,
     }
 }
 
@@ -82,8 +88,7 @@ fn a_reopened_store_is_the_replica_it_was() {
     let dir = tempfile::tempdir().unwrap();
     let items = accepted();
     let (db, mut replica) = open(dir.path());
-    let mut server = Server(items[..300].to_vec(), 32);
-    replica.catch_up(&mut server, &mut crdt).unwrap();
+    read(&mut replica, &mut server(&items[..300], 32));
     replica
         .record(&common::key(7), vec![(1, 1)], &mut crdt)
         .unwrap();
@@ -93,7 +98,7 @@ fn a_reopened_store_is_the_replica_it_was() {
     drop(replica);
     drop(db);
 
-    let (_db, mut replica) = open(dir.path());
+    let (db, mut replica) = open(dir.path());
     assert_eq!(replica.heads(), &heads);
     assert_eq!(replica.held(), held);
     assert_eq!(replica.cursor(), cursor);
@@ -101,10 +106,9 @@ fn a_reopened_store_is_the_replica_it_was() {
     assert_eq!(replica.have(), have);
     assert_eq!(replica.outbox().unwrap().len(), 1);
 
-    let mut server = Server(items.clone(), 32);
-    replica.catch_up(&mut server, &mut crdt).unwrap();
+    read(&mut replica, &mut server(&items, 32));
     assert_eq!(replica.held(), 0);
-    let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &SCOPE, &mut crdt).unwrap();
+    let rebuilt = replayed(&db);
     assert_eq!(rows(replica.store()), rebuilt.rows);
     assert_eq!(replica.heads(), &rebuilt.heads);
     assert!(!rebuilt.equivocations.is_empty());
@@ -144,21 +148,17 @@ fn crash_writer() {
     let (_db, mut replica) = open(dir.as_ref());
     let key = common::key(9);
     let mut i = 0;
+    let mut server = server(&items, 7);
     loop {
-        let mut server = Server(items.clone(), 7);
-        let page = server.since(replica.cursor()).unwrap();
-        if page.items.is_empty() {
+        let (page, _) = server.since(replica.cursor());
+        if page.is_empty() {
             replica.record(&key, vec![(i, i)], &mut crdt).unwrap();
             i += 1;
             continue;
         }
-        let last = page.items.last().unwrap().0;
+        let last = page.last().unwrap().0;
         replica
-            .ingest(
-                page.items.into_iter().map(|(_, b)| b),
-                Some(last),
-                &mut crdt,
-            )
+            .ingest(page.into_iter().map(|(_, b)| b), Some(last), &mut crdt)
             .unwrap();
         replica.record(&key, vec![(i, i)], &mut crdt).unwrap();
         i += 1;
@@ -166,7 +166,7 @@ fn crash_writer() {
 }
 
 /// Kill the writer at random points; after each kill the store reopens to
-/// a replica whose rows are the rebuild of its nodes, whose cursor names
+/// a replica whose rows are the replay of its nodes, whose cursor names
 /// exactly the nodes it applied or holds, and which finishes the catch-up.
 #[test]
 fn a_killed_writer_leaves_whole_batches() {
@@ -175,6 +175,8 @@ fn a_killed_writer_leaves_whole_batches() {
     drop(open(dir.path()));
     let items = accepted();
     let mut rng = Rng(0x5eed);
+    let mut moved = 0;
+    let mut cursor = None;
     for round in 0..12 {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "crash_writer", "--nocapture"])
@@ -187,10 +189,14 @@ fn a_killed_writer_leaves_whole_batches() {
         child.kill().unwrap();
         child.wait().unwrap();
 
-        let (_db, replica) = open(dir.path());
-        let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &SCOPE, &mut crdt).unwrap();
+        let (db, replica) = open(dir.path());
+        let rebuilt = replayed(&db);
         assert_eq!(rows(replica.store()), rebuilt.rows, "round {round}");
         assert_eq!(replica.heads(), &rebuilt.heads, "round {round}");
+        if replica.cursor() != cursor {
+            moved += 1;
+            cursor = replica.cursor();
+        }
         let read = replica.cursor().unwrap_or(0) as usize;
         for (position, bytes) in &items {
             let (cid, _) = merkle_crdt::validate::<H, Ops>(&SCOPE, bytes).unwrap();
@@ -203,9 +209,37 @@ fn a_killed_writer_leaves_whole_batches() {
             );
         }
     }
-    let (_db, mut replica) = open(dir.path());
-    replica.catch_up(&mut Server(items, 64), &mut crdt).unwrap();
+    assert!(moved > 0, "no writer wrote before it was killed");
+    let (db, mut replica) = open(dir.path());
+    read(&mut replica, &mut server(&items, 64));
     assert_eq!(replica.held(), 0);
-    let rebuilt = rebuild::<H, Ops, _, _>(replica.store(), &SCOPE, &mut crdt).unwrap();
+    let rebuilt = replayed(&db);
     assert_eq!(rows(replica.store()), rebuilt.rows);
+}
+
+/// A row key fjall does not take fails the batch with an error, through a
+/// replica and through a commit, and nothing is written.
+#[test]
+fn a_row_fjall_refuses_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_db, mut replica) = open(dir.path());
+    let long = vec![1; merkle_crdt::MAX_ROW_KEY + 1];
+    for bad in [Vec::new(), long] {
+        let mut write = |_: Event<'_, H, Ops>, rows: &mut dyn Rows| rows.write(&bad, Some(b"x"));
+        let node = Node::<H, Ops>::sign(&common::key(1), &SCOPE, 0, vec![], BTreeSet::new());
+        assert!(matches!(
+            replica.ingest([node.to_bytes()], None, &mut write),
+            Err(Error::Row)
+        ));
+        let changes = merkle_crdt::Changes::<H> {
+            rows: [(bad.clone(), Some(b"x".to_vec()))].into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            replica.store_mut().commit_with(changes, |_| {}),
+            Err(FjallError::Row)
+        ));
+    }
+    assert!(replica.heads().is_empty());
+    assert!(rows(replica.store()).is_empty());
 }

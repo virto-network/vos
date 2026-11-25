@@ -2,6 +2,11 @@ use crate::{Author, Cid, Decode, Encode, Hasher};
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
+/// The most parents a node names. A node naming more does not decode, so
+/// no replica applies it; a replica's own node names its author's previous
+/// node and at most this many in all ([`Replica::record`](crate::Replica::record)).
+pub const MAX_PARENTS: usize = 64;
+
 /// A node in the Merkle-DAG: a payload and the CIDs of its parents, the
 /// earlier events it follows.
 ///
@@ -57,9 +62,10 @@ impl<H: Hasher, P: Encode> DagNode<H, P> {
 
 impl<H: Hasher, P: Decode> DagNode<H, P> {
     /// Decode a node from its bytes: the inverse of
-    /// [`to_bytes`](DagNode::to_bytes), refusing trailing bytes and a
-    /// parent named twice.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    /// [`to_bytes`](DagNode::to_bytes), refusing trailing bytes, a parent
+    /// named twice and more than [`MAX_PARENTS`]. Not a check of canonical
+    /// form: that is [`validate`](crate::validate)'s.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let (payload, parents) = split::<H>(bytes)?;
         Some(DagNode {
             payload: P::decode(payload)?,
@@ -68,14 +74,17 @@ impl<H: Hasher, P: Decode> DagNode<H, P> {
     }
 }
 
-/// A node's bytes split into its payload's bytes and its parents, which
-/// are checked for count and order only when collected.
+/// A node's bytes split into its payload's bytes and its parents, at most
+/// [`MAX_PARENTS`], which are checked for order only when collected.
 fn split<H: Hasher>(bytes: &[u8]) -> Option<(&[u8], impl Iterator<Item = Option<Cid<H>>> + '_)> {
     let (len, rest) = bytes.split_first_chunk::<8>()?;
     let len = usize::try_from(u64::from_le_bytes(*len)).ok()?;
     let payload = rest.get(..len)?;
     let (count, parents) = rest[len..].split_first_chunk::<8>()?;
     let count = usize::try_from(u64::from_le_bytes(*count)).ok()?;
+    if count > MAX_PARENTS {
+        return None;
+    }
     let width = core::mem::size_of::<H::Output>();
     if parents.len() != count.checked_mul(width)? {
         return None;
@@ -169,5 +178,12 @@ mod tests {
         huge.extend_from_slice(&7u64.to_le_bytes());
         huge.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(DagNode::<TestHasher, u64>::from_bytes(&huge).is_none());
+
+        let many = DagNode::<TestHasher, u64> {
+            payload: 7,
+            parents: (0..=MAX_PARENTS as u8).map(|i| Cid([i; 32])).collect(),
+        };
+        assert!(DagNode::<TestHasher, u64>::from_bytes(&many.to_bytes()).is_none());
+        assert!(Header::<TestHasher>::read(&many.to_bytes()).is_none());
     }
 }
