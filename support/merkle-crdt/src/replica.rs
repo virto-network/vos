@@ -61,7 +61,7 @@ impl<S: core::fmt::Debug, A: core::fmt::Debug> std::error::Error for Error<S, A>
 /// Two applied nodes of one author at one sequence number. Both stay in
 /// the DAG, since other authors' nodes may name either; the CRDT's reads
 /// filter the author's operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Equivocation<H: Hasher> {
     /// The author.
     pub author: Author,
@@ -82,7 +82,7 @@ struct Admitted<H: Hasher, O> {
 }
 
 /// A local node not yet pushed.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Outgoing<H: Hasher> {
     /// Its author.
     pub author: Author,

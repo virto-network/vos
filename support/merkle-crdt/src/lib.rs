@@ -89,7 +89,7 @@ pub use node::{Header, MAX_PARENTS, Node};
 pub use replica::{
     Equivocation, Error, Ingested, MAX_HELD, MAX_HELD_BYTES, MAX_HELD_PER_AUTHOR, Outgoing, Replica,
 };
-pub use signed::{Author, Refusal, Scope, Validated, message, validate};
+pub use signed::{Author, Refusal, Scope, Validated, validate};
 pub use store::{Applied, Changes, Loaded, MemStore, Store};
 
 #[cfg(feature = "fjall")]
