@@ -1,14 +1,16 @@
 //! One replica under random messages, from peers no real group would
 //! produce, keeps Raft's invariants: its term never goes back, it makes at
 //! most one vote per term durable, an entry it holds changes only for a
-//! leader of a later term, and its snapshot and commit indexes never go
-//! back. Every write is durable as soon as it is made.
+//! leader of a later term and never at or below its commit index, and its
+//! snapshot and commit indexes never go back. Terms and indexes include
+//! the largest a message can name. Every write is durable as soon as it is
+//! made.
 
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use vos_raft::core::{Action, Core, Recovered};
-use vos_raft::{Config, LogEntry, Message, Role};
+use vos_raft::{AppendResult, Config, LogEntry, Message, Role};
 
 const ME: u16 = 0xAAAA;
 const PEERS: [u16; 2] = [0xBBBB, 0xCCCC];
@@ -19,13 +21,15 @@ enum Op {
     /// A snapshot at (index, term) from a peer at a term, switched to only
     /// while that peer leads this replica's term.
     Install(u16, u64, (u64, u64)),
+    /// An election timeout passes.
+    Tick,
 }
 
 /// An append from `leader` at `term`, of `count` entries after `prev`.
 fn append(leader: u16, term: u64, prev: (u64, u64), commit: u64, count: u8) -> Op {
     let (prev_index, prev_term) = prev;
     let entries = (0..count)
-        .map(|n| LogEntry::data(prev_index + 1 + u64::from(n), term, vec![n]))
+        .map(|n| LogEntry::data(prev_index.saturating_add(1 + u64::from(n)), term, vec![n]))
         .collect();
     let message = Message::Append {
         term,
@@ -53,13 +57,55 @@ fn op() -> impl Strategy<Value = Op> {
     // Two peers and few terms, so a snapshot often comes from the leader of
     // the current term.
     let peer = || prop::sample::select(PEERS.to_vec());
-    let (term, index) = (0u64..12, 0u64..30);
+    let term = prop_oneof![8 => 0u64..12, 1 => Just(u64::MAX - 1), 1 => Just(u64::MAX)];
+    let index = prop_oneof![8 => 0u64..30, 1 => Just(u64::MAX)];
     let position = || (index.clone(), term.clone());
     prop_oneof![
         (peer(), term.clone(), position(), index.clone(), 0u8..3)
             .prop_map(|(from, term, prev, commit, count)| append(from, term, prev, commit, count)),
         (peer(), term.clone(), position()).prop_map(|(from, term, last)| vote(from, term, last)),
         (peer(), term.clone(), position()).prop_map(|(from, term, at)| Op::Install(from, term, at)),
+        (
+            peer(),
+            term.clone(),
+            index.clone(),
+            index.clone(),
+            any::<bool>()
+        )
+            .prop_map(|(from, term, round, matched, rejected)| {
+                let result = if rejected {
+                    AppendResult::Rejected {
+                        rejected: matched,
+                        last_index: matched,
+                        conflict_term: 0,
+                        conflict_first: matched,
+                    }
+                } else {
+                    AppendResult::Matched { matched }
+                };
+                Op::Receive(
+                    from,
+                    Message::AppendAnswer {
+                        term,
+                        round,
+                        commit: matched,
+                        result,
+                    },
+                )
+            }),
+        (peer(), term.clone(), any::<bool>()).prop_map(|(from, term, granted)| Op::Receive(
+            from,
+            Message::VoteAnswer { term, granted }
+        )),
+        (peer(), term.clone(), any::<bool>()).prop_map(|(from, term, granted)| Op::Receive(
+            from,
+            Message::PreVoteAnswer {
+                term,
+                next_term: term.saturating_add(1),
+                granted,
+            }
+        )),
+        Just(Op::Tick),
     ]
 }
 
@@ -70,6 +116,7 @@ struct Replica {
     hard: (u64, Option<u16>),
     log: BTreeMap<u64, u64>,
     sent: Vec<Message<u16>>,
+    now: u64,
 }
 
 impl Replica {
@@ -82,24 +129,29 @@ impl Replica {
             hard,
             log,
             sent,
+            now: 0,
         }
     }
 
     fn deliver(&mut self, op: Op) {
         match op {
             Op::Receive(from, message) => self.core.receive(from, message),
+            Op::Tick => {
+                self.now += 1_000;
+                self.core.tick(self.now);
+            }
             Op::Install(from, term, (index, index_term)) => {
                 let status = self.core.status();
                 if self.core.role() == Role::Follower
                     && status.leader_hint == Some(from)
                     && status.current_term == term
                     && index > status.snap_last_index
+                    && let Some(switch) = self.core.snapshot_switch(index, index_term, None)
                 {
-                    let switch = self.core.snapshot_switch(index, index_term, None);
                     let after = switch.truncate_after.unwrap_or(u64::MAX);
                     self.log.retain(|&at, _| at <= after && at > index);
                     self.hard = (switch.meta.current_term, switch.meta.voted_for);
-                    self.core.snapshot_installed(index, index_term, None);
+                    self.core.snapshot_installed(switch);
                 }
             }
         }
@@ -137,6 +189,7 @@ fn invariants_hold(ops: Vec<Op>) -> Result<(), TestCaseError> {
     // The durable vote of each term, and each index's entry term, so far.
     let mut votes: BTreeMap<u64, u16> = BTreeMap::new();
     let mut held: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut committed = 0;
     for op in ops {
         replica.deliver(op);
         let status = replica.core.status();
@@ -156,13 +209,21 @@ fn invariants_hold(ops: Vec<Op>) -> Result<(), TestCaseError> {
                 entry_term <= term,
                 "entry {index} is from term {entry_term}"
             );
-            // Only a leader of a later term than the entry's replaces it.
+            // Only a leader of a later term than the entry's replaces it,
+            // and none an entry this replica held committed.
             let before = held.insert(index, entry_term).unwrap_or(entry_term);
             prop_assert!(
                 before == entry_term || term > before,
                 "entry {index} replaced"
             );
+            prop_assert!(
+                before == entry_term || index > committed,
+                "committed entry {index} replaced"
+            );
         }
+        // An entry is committed once the replica holds it at or below its
+        // commit index.
+        committed = commit.min(replica.log.keys().next_back().copied().unwrap_or(0));
     }
     Ok(())
 }

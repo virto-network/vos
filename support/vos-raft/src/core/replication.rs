@@ -36,6 +36,12 @@ fn expired<N: NodeId, T>(
 
 impl<N: NodeId> Core<N> {
     /// An append from `from`; [`Self::receive`] passes no other message.
+    ///
+    /// Refused whole, before it changes anything: one at this replica's
+    /// term while it leads it or follows another leader at it (a term has
+    /// one leader), and one whose first entry that differs from this log
+    /// is at or below the commit index (no leader replaces a committed
+    /// entry). A correct leader sends neither.
     pub(super) fn on_append(&mut self, from: N, append: Message<N>) {
         let Message::Append {
             term,
@@ -56,36 +62,25 @@ impl<N: NodeId> Core<N> {
             self.reject(from, round, commit, prev_index, (0, 0));
             return;
         }
-        if term > self.term {
-            self.adopt_term(term);
+        let another = term == self.term
+            && (self.role == Role::Leader || self.seen_leader.is_some_and(|seen| seen != from));
+        if another {
+            self.refused += 1;
+            return;
         }
-        if self.role != Role::Follower {
-            self.step_down();
-        }
-        self.reset_election_timer();
-        self.last_heard_leader = Some(self.now);
-        self.seen_leader = Some(leader);
 
         // Entries at or below the snapshot are committed, and so match.
         let snap = self.log.snap_index();
         if prev_index < snap {
-            let skip = (snap - prev_index) as usize;
+            let skip = usize::try_from(snap - prev_index).unwrap_or(usize::MAX);
             entries.drain(..skip.min(entries.len()));
             prev_index = snap;
             prev_term = self.log.snap_term();
         }
-        if self.log.term_at(prev_index) != Some(prev_term) {
-            let conflict = match self.log.term_at(prev_index) {
-                Some(term) => (term, self.log.first_of_term_at(prev_index)),
-                None => (0, self.log.last_index() + 1),
-            };
-            self.reject(from, round, commit, prev_index, conflict);
-            return;
-        }
-
+        let matches = self.log.term_at(prev_index) == Some(prev_term);
         let mut conflict_at = None;
         let mut present = 0usize;
-        for (offset, entry) in entries.iter().enumerate() {
+        for (offset, entry) in entries.iter().enumerate().take_while(|_| matches) {
             let index = prev_index + 1 + offset as u64;
             match self.log.term_at(index) {
                 Some(term) if term == entry.term => present += 1,
@@ -96,6 +91,29 @@ impl<N: NodeId> Core<N> {
                 None => break,
             }
         }
+        if conflict_at.is_some_and(|index| index <= self.commit) {
+            self.refused += 1;
+            return;
+        }
+
+        if term > self.term {
+            self.adopt_term(term);
+        }
+        if self.role != Role::Follower {
+            self.step_down();
+        }
+        self.reset_election_timer();
+        self.last_heard_leader = Some(self.now);
+        self.seen_leader = Some(leader);
+        if !matches {
+            let conflict = match self.log.term_at(prev_index) {
+                Some(term) => (term, self.log.first_of_term_at(prev_index)),
+                None => (0, self.log.last_index() + 1),
+            };
+            self.reject(from, round, commit, prev_index, conflict);
+            return;
+        }
+
         let truncate_after = conflict_at.map(|index| index - 1);
         let last_new = prev_index + entries.len() as u64;
         // What the log lacks, at the indexes the leader's log gives them.
@@ -104,11 +122,14 @@ impl<N: NodeId> Core<N> {
             entry.index = prev_index + 1 + (present + offset) as u64;
         }
 
-        self.follow_membership(truncate_after, &entries);
-
+        // The truncation first: the membership record that falls back, or
+        // that an appended configuration entry sets, goes in the write that
+        // holds the change, never in an earlier one a crash could keep
+        // alone.
         if let Some(after) = truncate_after {
             self.write_truncate(after);
         }
+        self.follow_membership(truncate_after, &entries);
         self.write_entries(entries);
         self.verified = self.verified.max(last_new);
         self.advance_commit(commit.min(self.verified));
@@ -125,12 +146,22 @@ impl<N: NodeId> Core<N> {
             },
         );
         if matched < last_new {
-            self.pending_acks.push(PendingAck {
+            // A resend of the same entries renews the acknowledgement owed
+            // for them, rather than owing another.
+            let ack = PendingAck {
                 leader: from,
                 round,
                 commit,
                 upto: last_new,
-            });
+            };
+            match self
+                .pending_acks
+                .iter_mut()
+                .find(|owed| owed.leader == from && owed.upto == last_new)
+            {
+                Some(owed) => *owed = ack,
+                None => self.pending_acks.push(ack),
+            }
         }
     }
 
@@ -183,20 +214,23 @@ impl<N: NodeId> Core<N> {
         if !self.active.contains(from) {
             return;
         }
+        let last = self.log.last_index();
         let Some(leading) = self.leading.as_mut() else {
             return;
         };
+        // No answer is to a round not yet sent, or holds past this log.
         let acked = leading.acked_round.entry(from).or_insert(0);
-        *acked = (*acked).max(round);
+        *acked = (*acked).max(round.min(leading.round));
         match result {
             AppendResult::Matched { matched } => {
+                let matched = matched.min(last);
                 let acked = leading.acked_commit.entry(from).or_insert(0);
                 *acked = (*acked).max(commit.min(matched));
                 if matched > leading.matched(from) {
                     leading.match_index.insert(from, matched);
                 }
                 let next = leading.next_index.entry(from).or_insert(1);
-                *next = (*next).max(matched + 1);
+                *next = (*next).max(matched.saturating_add(1));
                 if leading
                     .in_flight
                     .get(&from)
@@ -223,11 +257,14 @@ impl<N: NodeId> Core<N> {
                 conflict_first,
             } => {
                 let next = leading.next(from);
-                let floor = leading.matched(from) + 1;
-                // Only a rejection of the current probe moves the probe.
-                if rejected + 1 == next {
+                let floor = leading.matched(from).saturating_add(1);
+                // Only a rejection of the current probe moves the probe,
+                // and is answered at once; one that cannot move it waits
+                // for the resend, so a follower that lost what it
+                // acknowledged is not probed in a loop.
+                if rejected.checked_add(1) == Some(next) {
                     let hint = if conflict_term == 0 {
-                        last_index + 1
+                        last_index.saturating_add(1)
                     } else {
                         let last_of = self.log.last_index_of_term_at_most(conflict_term);
                         if self.log.term_at(last_of) == Some(conflict_term) {
@@ -237,10 +274,11 @@ impl<N: NodeId> Core<N> {
                         }
                     };
                     let leading = self.leading.as_mut().expect("checked above");
-                    leading
-                        .next_index
-                        .insert(from, hint.min(rejected).max(floor).max(1));
-                    leading.in_flight.remove(&from);
+                    let moved = hint.min(rejected).max(floor).max(1);
+                    if moved != next {
+                        leading.next_index.insert(from, moved);
+                        leading.in_flight.remove(&from);
+                    }
                 }
                 self.try_resolve_reads();
                 self.replicate_to(from);

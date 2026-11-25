@@ -62,6 +62,8 @@ impl<N: NodeId> Core<N> {
         self.role = Role::Follower;
         self.votes.clear();
         self.leading = None;
+        // A load asked while leading is answered to no one now.
+        self.loads.clear();
         self.current_term_first_index = None;
         self.pre_candidate_misses = 0;
         self.reset_election_timer();
@@ -114,7 +116,13 @@ impl<N: NodeId> Core<N> {
         })
     }
 
+    /// A replica at the last term there is campaigns no more: no term
+    /// follows it.
     fn start_pre_election(&mut self) {
+        let Some(next_term) = self.term.checked_add(1) else {
+            self.reset_election_timer();
+            return;
+        };
         if !self.is_member() || self.short_of_floor() {
             self.reset_election_timer();
             return;
@@ -127,7 +135,7 @@ impl<N: NodeId> Core<N> {
         self.votes.clear();
         self.votes.insert(self.cfg.me);
         self.broadcast(Message::PreVote {
-            next_term: self.term + 1,
+            next_term,
             candidate: self.cfg.me,
             last_index: self.log.last_index(),
             last_term: self.log.last_term(),
@@ -136,21 +144,26 @@ impl<N: NodeId> Core<N> {
     }
 
     fn start_election(&mut self) {
+        let Some(term) = self.term.checked_add(1) else {
+            self.reset_election_timer();
+            return;
+        };
         if !self.is_member() || self.short_of_floor() {
             self.reset_election_timer();
             return;
         }
         self.role = Role::Candidate;
-        self.term += 1;
+        self.term = term;
         self.vote = Some(self.cfg.me);
         self.seen_leader = None;
         self.verified = self.commit;
         self.pending_acks.clear();
         self.leading = None;
         self.write_meta(true);
-        // The own vote counts once its write is durable.
+        // The requests leave, and the own vote counts, once the term and
+        // vote are durable: a crash before then asked no one at this term.
         self.votes.clear();
-        self.broadcast(Message::Vote {
+        self.broadcast_once_durable(Message::Vote {
             term: self.term,
             candidate: self.cfg.me,
             last_index: self.log.last_index(),
@@ -161,6 +174,7 @@ impl<N: NodeId> Core<N> {
 
     pub(super) fn check_election(&mut self) {
         if self.role == Role::Candidate
+            && self.durable_term == self.term
             && self
                 .active
                 .quorum_holds(|member| self.votes.contains(&member))
@@ -261,7 +275,13 @@ impl<N: NodeId> Core<N> {
             self.adopt_term(term);
             return;
         }
-        if self.role != Role::Candidate || term != self.term || !granted {
+        // Before its term is durable a candidate has asked no one: a grant
+        // then answers no request of this campaign.
+        if self.role != Role::Candidate
+            || term != self.term
+            || !granted
+            || self.durable_term != self.term
+        {
             return;
         }
         if !self.active.contains(from) {
@@ -322,7 +342,10 @@ impl<N: NodeId> Core<N> {
             self.adopt_term(term);
             return;
         }
-        if self.role != Role::PreCandidate || next_term != self.term + 1 || !granted {
+        if self.role != Role::PreCandidate
+            || self.term.checked_add(1) != Some(next_term)
+            || !granted
+        {
             return;
         }
         if !self.active.contains(from) {

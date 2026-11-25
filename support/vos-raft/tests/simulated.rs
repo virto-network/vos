@@ -1,8 +1,9 @@
 //! Groups of protocol cores over a simulated network and stores
 //! (`vos_raft::sim`), checked for Raft's safety properties under faults:
-//! one leader per term, one entry per committed index, no commit past a
-//! replica's log, no compaction past its commit. Every run is seeded; a
-//! failing seed replays exactly.
+//! one leadership per term, one entry per committed index (configuration
+//! entries compared whole), no commit past a replica's log, no compaction
+//! past its commit, no configuration without its entry. Every run is
+//! seeded; a failing seed replays exactly.
 
 use vos_raft::Role;
 use vos_raft::sim::{Cluster, Faults};
@@ -142,6 +143,38 @@ struct Exercised {
     loads: u64,
     reads: u64,
     retirements: u64,
+    cuts: u64,
+}
+
+/// What a chaos run puts the group through, besides its faults.
+#[derive(Clone, Copy)]
+struct Chaos {
+    /// A fourth node, and membership changes between three-node subsets.
+    churn: bool,
+    /// How long after its write an entry is reported durable, as when it
+    /// waits for its blobs; followers give up on such entries at random.
+    entry_lag: (u64, u64),
+    /// Idle heartbeats off, and the hosts' pair heartbeats on.
+    paired: bool,
+    pre_vote: bool,
+    /// Leaders hand over now and then.
+    transfers: bool,
+    /// Restarted hosts cut their logs above the commit, at an entry they
+    /// never reported durable.
+    cuts: bool,
+}
+
+impl Default for Chaos {
+    fn default() -> Self {
+        Self {
+            churn: false,
+            entry_lag: (0, 0),
+            paired: false,
+            pre_vote: true,
+            transfers: false,
+            cuts: false,
+        }
+    }
 }
 
 /// A run under harsh faults: short election timeouts, so leaders change
@@ -156,7 +189,15 @@ struct Exercised {
 /// `paired` turns idle heartbeats off and the hosts' pair heartbeats on:
 /// crashes then last long enough for deadlines to lapse unvouched, and
 /// after healing the group must also go quiet.
-fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercised {
+fn chaos(seed: u64, run: Chaos) -> Exercised {
+    let Chaos {
+        churn,
+        entry_lag,
+        paired,
+        pre_vote,
+        transfers,
+        cuts,
+    } = run;
     // With churn, a fourth node waits outside the group, and the group's
     // membership moves between three-node subsets of the four.
     let nodes: &[u16] = if churn { &[1, 2, 3, 4] } else { &NODES };
@@ -174,7 +215,9 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercis
         cfg.cache_bytes = 64;
         cfg.compact_hysteresis = 4;
         cfg.idle_heartbeats = !paired;
+        cfg.pre_vote = pre_vote;
     });
+    cluster.recovery_cuts = cuts;
     if paired {
         cluster.pair_heartbeats(20);
     }
@@ -215,6 +258,12 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercis
                 }
             }
             576..=590 if lagging => cluster.discard_unreported(node),
+            601..=610 if transfers => {
+                if let Some(leader) = cluster.leader() {
+                    let to = nodes[(cluster.random.next_u64() % nodes.len() as u64) as usize];
+                    cluster.transfer_leadership(leader, Some(to));
+                }
+            }
             591..=600 if paired => {
                 let millis = 100 + cluster.random.next_u64() % 400;
                 cluster.pair_blackout(node, millis);
@@ -280,12 +329,20 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercis
                 .map(|&node| cluster.core(node).map(|core| core.status().current_term))
                 .collect()
         };
-        // A change in flight at the heal may still remove its leader:
-        // wait for a steady configuration led by one of its members.
+        // A change in flight at the heal may still remove its leader, and
+        // a member may still be campaigning at a term its vote requests
+        // have yet to carry: wait for a steady configuration led by one of
+        // its members, every member at the leader's term.
         let steady = |cluster: &Cluster| {
             cluster.leader().is_some_and(|leader| {
                 let status = cluster.core(leader).unwrap().status();
-                status.joint_old.is_none() && status.members.contains(&leader)
+                status.joint_old.is_none()
+                    && status.members.contains(&leader)
+                    && status.members.iter().all(|&member| {
+                        cluster.core(member).is_some_and(|core| {
+                            !core.campaigning() && core.status().current_term == status.current_term
+                        })
+                    })
             })
         };
         for _ in 0..50 {
@@ -355,6 +412,7 @@ fn chaos(seed: u64, churn: bool, entry_lag: (u64, u64), paired: bool) -> Exercis
         cluster.violations
     );
     Exercised {
+        cuts: cluster.cuts,
         retirements: cluster.retirements,
         changes: cluster.changes_started,
         installs: cluster.installs,
@@ -396,7 +454,7 @@ fn directory(cluster: &mut Cluster, nodes: &[u16], chance: u64) {
 fn safety_holds_under_faults() {
     let mut total = Exercised::default();
     for seed in 0..200 {
-        let run = chaos(seed, false, (0, 0), false);
+        let run = chaos(seed, Chaos::default());
         total.installs += run.installs;
         total.compactions += run.compactions;
         total.loads += run.loads;
@@ -421,7 +479,13 @@ fn safety_holds_under_faults() {
 fn safety_holds_under_faults_and_membership_changes() {
     let mut total = Exercised::default();
     for seed in 0..200 {
-        let run = chaos(seed, true, (0, 0), false);
+        let run = chaos(
+            seed,
+            Chaos {
+                churn: true,
+                ..Chaos::default()
+            },
+        );
         total.changes += run.changes;
         total.installs += run.installs;
     }
@@ -436,7 +500,14 @@ fn safety_holds_under_faults_and_membership_changes() {
 fn safety_holds_when_entries_wait_for_blobs() {
     let mut total = Exercised::default();
     for seed in 0..200 {
-        let run = chaos(seed, true, (1, 60), false);
+        let run = chaos(
+            seed,
+            Chaos {
+                churn: true,
+                entry_lag: (1, 60),
+                ..Chaos::default()
+            },
+        );
         total.changes += run.changes;
         total.reads += run.reads;
     }
@@ -456,10 +527,23 @@ fn safety_holds_when_entries_wait_for_blobs() {
 fn safety_holds_with_idle_heartbeats_off_and_the_hosts_vouching() {
     let mut total = Exercised::default();
     for seed in 0..400 {
-        let run = chaos(seed, false, (0, 0), true);
+        let run = chaos(
+            seed,
+            Chaos {
+                paired: true,
+                ..Chaos::default()
+            },
+        );
         total.installs += run.installs;
         total.reads += run.reads;
-        let run = chaos(1_000 + seed, true, (0, 0), true);
+        let run = chaos(
+            1_000 + seed,
+            Chaos {
+                churn: true,
+                paired: true,
+                ..Chaos::default()
+            },
+        );
         total.changes += run.changes;
         total.retirements += run.retirements;
     }
@@ -474,4 +558,46 @@ fn safety_holds_with_idle_heartbeats_off_and_the_hosts_vouching() {
         "retirements: {}",
         total.retirements
     );
+}
+
+/// Pre-votes off, and leaders handing over: a candidate campaigns at a
+/// term it has not yet made durable, and a crash then must not let it
+/// lead that term twice.
+#[test]
+fn safety_holds_with_pre_votes_off_and_handovers() {
+    for seed in 0..200 {
+        chaos(
+            seed,
+            Chaos {
+                churn: seed.is_multiple_of(2),
+                pre_vote: false,
+                transfers: true,
+                ..Chaos::default()
+            },
+        );
+    }
+}
+
+/// Entries wait for their blobs, and a host that restarts cuts its log at
+/// one it never reported durable, as a lost blob makes it, keeping the
+/// membership record: no configuration outlives its entry.
+#[test]
+fn safety_holds_when_restarts_cut_the_log() {
+    let mut total = Exercised::default();
+    for seed in 0..200 {
+        let run = chaos(
+            seed,
+            Chaos {
+                churn: true,
+                entry_lag: (1, 60),
+                transfers: true,
+                cuts: true,
+                ..Chaos::default()
+            },
+        );
+        total.cuts += run.cuts;
+        total.changes += run.changes;
+    }
+    eprintln!("cuts {}, changes started {}", total.cuts, total.changes);
+    assert!(total.cuts >= 500, "cuts: {}", total.cuts);
 }

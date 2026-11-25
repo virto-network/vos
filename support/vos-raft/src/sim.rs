@@ -203,13 +203,10 @@ impl<N: NodeId> Store<N> {
                 for entry in &write.entries {
                     self.log.insert(entry.index, entry.clone());
                 }
-                if let Some(meta) = &write.meta {
-                    // Only compaction and a switch move the snapshot pointer.
-                    self.meta = Meta {
-                        snap_last_index: self.meta.snap_last_index,
-                        snap_last_term: self.meta.snap_last_term,
-                        ..meta.clone()
-                    };
+                if let Some(hard) = &write.meta {
+                    self.meta.current_term = hard.current_term;
+                    self.meta.voted_for = hard.voted_for;
+                    self.meta.commit_index = hard.commit_index;
                 }
                 if let Some(record) = &write.active_config {
                     self.active_config = Some(record.clone());
@@ -253,16 +250,16 @@ impl<N: NodeId> Store<N> {
         self.unsynced.clear();
     }
 
-    /// Switch to a snapshot at (`index`, `term`), durably.
-    fn switch(&mut self, index: u64, switch: SnapshotSwitch<N>) {
+    /// Switch to a snapshot, durably.
+    fn switch(&mut self, switch: &SnapshotSwitch<N>) {
         if let Some(after) = switch.truncate_after {
             self.log.retain(|&at, _| at <= after);
         }
-        self.log.retain(|&at, _| at > index);
-        self.meta = switch.meta;
-        self.active_config = Some(switch.active_config);
-        self.log_start_config = switch.log_start_config;
-        self.applied = self.applied.max(index);
+        self.log.retain(|&at, _| at > switch.index);
+        self.meta = switch.meta.clone();
+        self.active_config = Some(switch.active_config.clone());
+        self.log_start_config = switch.log_start_config.clone();
+        self.applied = self.applied.max(switch.index);
     }
 
     fn recovered(&self) -> Recovered<N> {
@@ -327,7 +324,7 @@ impl<N: NodeId> Store<N> {
 /// A violated safety property.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Violation {
-    /// Two leaders in one term.
+    /// A term led twice: by two nodes, or by one node in two runs.
     TwoLeaders { term: u64 },
     /// Two different entries committed at one index.
     CommitConflict { index: u64 },
@@ -337,6 +334,9 @@ pub enum Violation {
     StaleRead { index: u64, committed: u64 },
     /// A replica compacted past its commit index.
     SnapshotPastCommit { snapshot: u64, commit: u64 },
+    /// A replica's configuration names an entry above its snapshot that
+    /// its log does not hold as a configuration entry.
+    UnbackedConfiguration { node: u16, index: u64 },
 }
 
 /// Replicas of one group over a simulated network and stores.
@@ -363,7 +363,7 @@ pub struct Cluster {
     leaders: BTreeMap<u64, u16>,
     /// The committed entry at each index, as the first replica that
     /// committed it held it.
-    committed: BTreeMap<u64, (u64, Option<Vec<u8>>)>,
+    committed: BTreeMap<u64, (u64, EntryKind<u16>)>,
     /// Each replica's highest index whose committed entry was compared: a
     /// commit that jumps compares every entry it passes, not just its tip.
     checked: BTreeMap<u16, u64>,
@@ -392,6 +392,12 @@ pub struct Cluster {
     /// The hosts' pair heartbeats, when on.
     pair: Option<Pair>,
     next_token: u64,
+    /// Whether a restarted node's host cuts its log above the commit, at a
+    /// random entry it never reported durable, as a host does when an
+    /// entry's blob is lost, keeping the membership record.
+    pub recovery_cuts: bool,
+    /// Logs cut at a restart, across all nodes.
+    pub cuts: u64,
 }
 
 /// Each node's host sending pair heartbeats and vouching with what it
@@ -456,6 +462,8 @@ impl Cluster {
             retired: BTreeSet::new(),
             pair: None,
             next_token: 0,
+            recovery_cuts: false,
+            cuts: 0,
         };
         for &node in nodes {
             cluster.stores.insert(node, Store::default());
@@ -575,7 +583,15 @@ impl Cluster {
     pub fn crash(&mut self, node: u16) {
         let keep = self.random.next_u64() as usize % 4;
         self.stores.get_mut(&node).expect("a node").crash(keep);
-        self.cores.remove(&node);
+        let reported = self
+            .cores
+            .remove(&node)
+            .map(|core| core.status().durable_index);
+        if self.recovery_cuts
+            && let Some(reported) = reported
+        {
+            self.cut_unreported(node, reported);
+        }
         // What it committed but had not synced is gone: once it commits
         // there again, those entries are compared again.
         self.checked.remove(&node);
@@ -584,6 +600,35 @@ impl Cluster {
         // A host starts again with nothing heard.
         if let Some(pair) = self.pair.as_mut() {
             pair.tables.remove(&node);
+        }
+    }
+
+    /// Cut `node`'s durable log at a random entry above its commit, its
+    /// applied index and `reported`, the last it reported durable.
+    fn cut_unreported(&mut self, node: u16, reported: u64) {
+        let store = self.stores.get_mut(&node).expect("a node");
+        let floor = store
+            .meta
+            .commit_index
+            .max(store.applied)
+            .max(store.meta.snap_last_index)
+            .max(reported);
+        let Some(&last) = store.log.keys().next_back() else {
+            return;
+        };
+        if last <= floor {
+            return;
+        }
+        let at = self.random.between(floor + 1, last);
+        store.log.retain(|&index, _| index < at);
+        self.cuts += 1;
+    }
+
+    /// `node` hands its leadership over, if it leads.
+    pub fn transfer_leadership(&mut self, node: u16, to: Option<u16>) {
+        if let Some(core) = self.cores.get_mut(&node) {
+            core.transfer_leadership(to);
+            self.process(node);
         }
     }
 
@@ -912,15 +957,14 @@ impl Cluster {
         {
             return;
         }
-        let switch = core.snapshot_switch(index, index_term, configuration.as_ref());
-        self.stores
-            .get_mut(&to)
-            .expect("a node")
-            .switch(index, switch);
+        let Some(switch) = core.snapshot_switch(index, index_term, configuration.as_ref()) else {
+            return;
+        };
+        self.stores.get_mut(&to).expect("a node").switch(&switch);
         let applied = self.applied.entry(to).or_insert(0);
         *applied = (*applied).max(index);
         self.installs += 1;
-        core.snapshot_installed(index, index_term, configuration);
+        core.snapshot_installed(switch);
         self.process(to);
     }
 
@@ -1014,19 +1058,38 @@ impl Cluster {
                     }
                     Action::Answer(_) => {}
                     Action::Changed { term, role, .. } => {
-                        if role == Role::Leader {
-                            match self.leaders.get(&term) {
-                                Some(&other) if other != node => {
-                                    self.violations.push(Violation::TwoLeaders { term });
-                                }
-                                _ => {
-                                    self.leaders.insert(term, node);
-                                }
-                            }
+                        // A core announces each leadership once: a second
+                        // announcement of a term is a second leadership,
+                        // whichever node makes it.
+                        if role == Role::Leader && self.leaders.insert(term, node).is_some() {
+                            self.violations.push(Violation::TwoLeaders { term });
                         }
                     }
                 }
             }
+        }
+        self.check_configuration(node);
+    }
+
+    /// `node`'s configuration names an entry its snapshot covers, or a
+    /// configuration entry its log holds.
+    fn check_configuration(&mut self, node: u16) {
+        let Some(core) = self.cores.get(&node) else {
+            return;
+        };
+        let status = core.status();
+        let Some(index) = status.active_config_index else {
+            return;
+        };
+        if index <= status.snap_last_index {
+            return;
+        }
+        let backed = self.stores[&node]
+            .written(index)
+            .is_some_and(|entry| matches!(entry.kind, EntryKind::ConfigChange { .. }));
+        if !backed {
+            self.violations
+                .push(Violation::UnbackedConfiguration { node, index });
         }
     }
 
@@ -1061,18 +1124,14 @@ impl Cluster {
             let Some(entry) = store.written(at) else {
                 continue;
             };
-            let payload = match entry.kind {
-                EntryKind::Data { payload } => Some(payload),
-                _ => None,
-            };
             match self.committed.get(&at) {
-                Some((term, held)) if (*term, held) != (entry.term, &payload) => {
+                Some((term, held)) if (*term, held) != (entry.term, &entry.kind) => {
                     self.violations
                         .push(Violation::CommitConflict { index: at });
                 }
                 Some(_) => {}
                 None => {
-                    self.committed.insert(at, (entry.term, payload));
+                    self.committed.insert(at, (entry.term, entry.kind));
                 }
             }
         }
@@ -1082,8 +1141,10 @@ impl Cluster {
     pub fn committed_payloads(&self) -> Vec<Vec<u8>> {
         self.committed
             .values()
-            .filter_map(|(_, payload)| payload.clone())
-            .filter(|payload| !payload.is_empty())
+            .filter_map(|(_, kind)| match kind {
+                EntryKind::Data { payload } if !payload.is_empty() => Some(payload.clone()),
+                _ => None,
+            })
             .collect()
     }
 

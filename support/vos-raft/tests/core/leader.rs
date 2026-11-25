@@ -290,12 +290,7 @@ fn a_stalled_leader_steps_down_and_stays_quiet() {
         now += 400;
         core.tick(now);
         let actions = core.take_actions();
-        assert!(
-            !sent(&actions)
-                .iter()
-                .any(|message| matches!(message, Message::Vote { .. } | Message::PreVote { .. })),
-            "{actions:?}"
-        );
+        assert!(!core.campaigning(), "{actions:?}");
     }
     // Once it recovers, it campaigns again.
     core.writer_health(false);
@@ -303,9 +298,8 @@ fn a_stalled_leader_steps_down_and_stays_quiet() {
     for _ in 0..4 {
         now += 400;
         core.tick(now);
-        campaigned |= sent(&core.take_actions())
-            .iter()
-            .any(|message| matches!(message, Message::Vote { .. } | Message::PreVote { .. }));
+        core.take_actions();
+        campaigned |= core.campaigning();
     }
     assert!(campaigned);
 }

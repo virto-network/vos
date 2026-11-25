@@ -33,7 +33,7 @@
 //! assert_eq!(core.role(), Role::Leader);
 //! ```
 //!
-//! `tests/core.rs` drives the core write by write.
+//! `tests/core/` drives the core write by write.
 
 #![no_std]
 
@@ -54,5 +54,5 @@ pub use crate::core::ActiveConfigRecord;
 pub use config::{Config, NodeId};
 pub use log_entry::{EntryKind, LogEntry};
 pub use message::{AppendResult, Message};
-pub use meta::Meta;
+pub use meta::{HardState, Meta};
 pub use role::Role;

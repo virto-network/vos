@@ -78,6 +78,27 @@ pub fn persist(core: &mut Core<u16>, write: &Write<u16>) {
     core.entries_durable(write.seq);
 }
 
+/// Report every write the core asks for durable, until it asks none.
+pub fn persist_all(core: &mut Core<u16>) {
+    loop {
+        let actions = core.take_actions();
+        if actions.is_empty() {
+            return;
+        }
+        for write in writes(&actions) {
+            persist(core, &write);
+        }
+    }
+}
+
+/// Make `core` follow `leader` at `term`, by a heartbeat, every write
+/// reported durable.
+pub fn follow(core: &mut Core<u16>, leader: u16, term: u64) {
+    core.receive(leader, append(term, leader, (0, 0), 0, &[]));
+    persist_all(core);
+    assert_eq!(core.status().leader_hint, Some(leader));
+}
+
 /// Persist every write in `actions`, keeping its entries in `store`, the
 /// host's log.
 pub fn persist_into(store: &mut Vec<LogEntry<u16>>, core: &mut Core<u16>, actions: &[Action<u16>]) {
