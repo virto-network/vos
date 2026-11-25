@@ -130,11 +130,16 @@ fn a_claim_killed_at_any_step_ends_at_one_agent_with_one_kit() {
         assert_eq!(pool(&world, home), 1, "{at}: one agent given");
         // One kit; or, killed between the words shown and the claim held
         // (a store write after the user's tap), new words that say the
-        // first are void.
+        // first are void. The mark is kept before the words are shown and
+        // the reads behind them start with them, so a kill in those reads
+        // can land before the first words are up: then one kit, saying so.
         let phrases = phone.hand.phrases.lock().unwrap().len();
         let voids = phone.hand.voids.lock().unwrap().clone();
         match phrases {
-            1 => assert!(voids.is_empty(), "{at}: {voids:?}"),
+            1 => assert!(
+                voids.is_empty() || (voids.len() == 1 && voids[0].contains("stopped")),
+                "{at}: {voids:?}"
+            ),
             2 => assert!(
                 voids.len() == 1 && voids[0].contains("stopped"),
                 "{at}: {voids:?}"
