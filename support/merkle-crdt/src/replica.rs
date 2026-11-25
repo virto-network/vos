@@ -2,7 +2,7 @@ use crate::apply::Overlay;
 use crate::signed::{self, validate};
 use crate::store::{Applied, Changes};
 use crate::{
-    Apply, Author, Cid, Decode, Encode, Event, Hasher, Header, MAX_PARENTS, Node, Refusal, Scope,
+    Apply, Author, Cid, Decode, Encode, Hasher, Header, MAX_PARENTS, Node, Refusal, Scope, Signed,
     Store,
 };
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -75,6 +75,13 @@ pub struct Equivocation<H: Hasher> {
 /// The nodes of one ingest not yet applied, with their bytes.
 type Fresh<H, O> = BTreeMap<Cid<H>, (Node<H, O>, Vec<u8>)>;
 
+/// The nodes of one ingest not yet known: those that validate, and the
+/// CIDs of those whose signature is not their author's.
+struct Admitted<H: Hasher, O> {
+    fresh: Fresh<H, O>,
+    forged: BTreeSet<Cid<H>>,
+}
+
 /// A local node not yet pushed.
 #[derive(Debug, Clone)]
 pub struct Outgoing<H: Hasher> {
@@ -122,12 +129,51 @@ impl<H: Hasher> Default for Ingested<H> {
     }
 }
 
-/// A held node: its author, its size, and its parents not applied when it
-/// was held.
+/// A held node: its author, its size, its parents not applied when it was
+/// held, and how many of them are still not applied.
 struct Holding<H: Hasher> {
     author: Author,
     len: usize,
     waits: Vec<Cid<H>>,
+    missing: usize,
+}
+
+impl<H: Hasher> Holding<H> {
+    fn new(author: Author, len: usize, waits: Vec<Cid<H>>) -> Self {
+        let missing = waits.len();
+        Self {
+            author,
+            len,
+            waits,
+            missing,
+        }
+    }
+}
+
+/// What one ingest has done so far, committed at its end.
+struct Batch<H: Hasher> {
+    report: Ingested<H>,
+    /// Each fresh node's parents not applied, and each held node's the
+    /// batch has applied one of.
+    remaining: BTreeMap<Cid<H>, usize>,
+    /// Each fresh node's parents not applied when the batch began.
+    waits: BTreeMap<Cid<H>, Vec<Cid<H>>>,
+    /// For each parent not applied, the fresh nodes naming it.
+    children: BTreeMap<Cid<H>, Vec<Cid<H>>>,
+    /// The nodes whose parents are all applied, to apply.
+    ready: VecDeque<Cid<H>>,
+    /// The nodes refused, fresh or held.
+    refused: BTreeSet<Cid<H>>,
+    /// The held nodes applied or refused.
+    released: BTreeSet<Cid<H>>,
+    applied: Vec<Applied<H>>,
+    held: Vec<(Cid<H>, Vec<u8>)>,
+    /// The nodes the batch applied at each (author, number).
+    authored: BTreeMap<(Author, u64), BTreeSet<Cid<H>>>,
+    heads_added: BTreeMap<Cid<H>, (Author, u64)>,
+    heads_removed: BTreeSet<Cid<H>>,
+    latest: BTreeMap<Author, (u64, Cid<H>)>,
+    equivocations: BTreeSet<(Author, u64)>,
 }
 
 /// One scope's replica: its DAG applied onto its CRDT, incrementally, by
@@ -148,10 +194,7 @@ pub struct Replica<H: Hasher, O, S: Store<H>> {
     outbox: BTreeMap<(Author, u64), Cid<H>>,
     /// The scope the nodes are signed for.
     scope: Scope,
-    /// Each held node's count of parents not applied.
-    missing: BTreeMap<Cid<H>, usize>,
-    /// Each held node's author, size and parents not applied when it was
-    /// held.
+    /// The held nodes.
     holding: BTreeMap<Cid<H>, Holding<H>>,
     /// For each parent not applied, the held nodes waiting on it.
     waiting: BTreeMap<Cid<H>, BTreeSet<Cid<H>>>,
@@ -181,7 +224,6 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
             equivocations: loaded.equivocations,
             cursor: loaded.cursor,
             outbox: loaded.outbox,
-            missing: BTreeMap::new(),
             holding: BTreeMap::new(),
             waiting: BTreeMap::new(),
             held_by: BTreeMap::new(),
@@ -203,14 +245,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
                     waits.push(parent);
                 }
             }
-            replica.hold(
-                cid,
-                Holding {
-                    author: header.author,
-                    len: bytes.len(),
-                    waits,
-                },
-            );
+            replica.hold(cid, Holding::new(header.author, bytes.len(), waits));
         }
         Ok(replica)
     }
@@ -243,7 +278,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
 
     /// The number of nodes held for missing parents.
     pub fn held(&self) -> usize {
-        self.missing.len()
+        self.holding.len()
     }
 
     /// The parents the held nodes wait on that are not held themselves:
@@ -251,7 +286,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
     pub fn wanted(&self) -> Vec<Cid<H>> {
         self.waiting
             .keys()
-            .filter(|cid| !self.missing.contains_key(*cid))
+            .filter(|cid| !self.holding.contains_key(*cid))
             .cloned()
             .collect()
     }
@@ -278,7 +313,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
 
     /// Whether `cid` is applied, held or refused.
     fn known(&self, cid: &Cid<H>) -> Result<bool, S::Error> {
-        Ok(self.missing.contains_key(cid)
+        Ok(self.holding.contains_key(cid)
             || self.refused.contains(cid)
             || self.store.contains(cid)?)
     }
@@ -291,7 +326,6 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
                 .or_default()
                 .insert(cid.clone());
         }
-        self.missing.insert(cid.clone(), holding.waits.len());
         *self.held_by.entry(holding.author).or_default() += 1;
         self.held_bytes += holding.len;
         self.holding.insert(cid, holding);
@@ -299,7 +333,6 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
 
     /// Forget `cid` as held, if it is.
     fn unhold(&mut self, cid: &Cid<H>) {
-        self.missing.remove(cid);
         let Some(holding) = self.holding.remove(cid) else {
             return;
         };
@@ -380,16 +413,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
         }
         let cid = Cid(H::hash(&bytes));
         let mut rows = Overlay::new(&self.store);
-        let event = Event {
-            cid: &cid,
-            author: &author,
-            seq,
-            parents: &node.parents,
-            ops: &node.payload.ops,
-            equivocation: false,
-        };
-        let result = crdt.apply(event, &mut rows);
-        settle(&mut rows, result)?;
+        rows.apply(crdt, &cid, &node, false)?;
         let unheaded: Vec<Cid<H>> = node
             .parents
             .iter()
@@ -408,7 +432,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
                 heads_removed: unheaded.clone(),
                 latest: alloc::vec![(author, seq, cid.clone())],
                 outbox: alloc::vec![(author, seq, cid.clone())],
-                rows: rows.written,
+                rows: rows.into_written(),
                 ..Changes::default()
             })
             .map_err(Error::Store)?;
@@ -503,7 +527,91 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
         crdt: &mut A,
     ) -> Result<Ingested<H>, Error<S::Error, A::Error>> {
         let mut report = Ingested::default();
-        let mut refused = BTreeSet::new();
+        let Admitted { mut fresh, forged } =
+            self.admit(items, &mut report).map_err(Error::Store)?;
+        let mut batch = self.plan(report, &fresh, forged).map_err(Error::Store)?;
+
+        let mut rows = Overlay::new(&self.store);
+        while let Some(cid) = batch.ready.pop_front() {
+            if batch.refused.contains(&cid) {
+                continue;
+            }
+            let (node, bytes) = match fresh.remove(&cid) {
+                Some(entry) => entry,
+                None => {
+                    batch.released.insert(cid.clone());
+                    let bytes = self
+                        .store
+                        .held(&cid)
+                        .map_err(Error::Store)?
+                        .ok_or(Error::Corrupt)?;
+                    let node = signed::decode::<H, O>(&bytes).ok_or(Error::Corrupt)?;
+                    (node, bytes)
+                }
+            };
+            if !self.follows(&batch, &node).map_err(Error::Store)? {
+                self.refuse(&mut batch, cid, Refusal::BrokenChain);
+                continue;
+            }
+            let equivocation = self.place(&mut batch, &cid, &node).map_err(Error::Store)?;
+            rows.apply(crdt, &cid, &node, equivocation)?;
+            for kid in self.kids(&batch.children, &cid) {
+                let count = match batch.remaining.get_mut(kid) {
+                    Some(count) => count,
+                    None => match self.holding.get(kid) {
+                        Some(held) => batch.remaining.entry(kid.clone()).or_insert(held.missing),
+                        // Refused since it waited.
+                        None => continue,
+                    },
+                };
+                *count -= 1;
+                if *count == 0 {
+                    batch.ready.push_back(kid.clone());
+                }
+            }
+            batch.applied.push(Applied {
+                cid: cid.clone(),
+                author: node.payload.author,
+                seq: node.payload.seq,
+                bytes,
+            });
+            batch.report.applied.push(cid);
+        }
+        let held = self.hold_fresh(fresh, &mut batch);
+
+        let changes = Changes {
+            applied: core::mem::take(&mut batch.applied),
+            held: core::mem::take(&mut batch.held),
+            released: batch.released.iter().cloned().collect(),
+            heads_added: batch
+                .heads_added
+                .iter()
+                .map(|(cid, (author, seq))| (cid.clone(), *author, *seq))
+                .collect(),
+            heads_removed: batch.heads_removed.iter().cloned().collect(),
+            latest: batch
+                .latest
+                .iter()
+                .map(|(author, (seq, cid))| (*author, *seq, cid.clone()))
+                .collect(),
+            equivocations: batch.equivocations.iter().copied().collect(),
+            cursor: if cursor != self.cursor { cursor } else { None },
+            rows: rows.into_written(),
+            ..Changes::default()
+        };
+        if !changes.is_empty() {
+            self.store.commit(changes).map_err(Error::Store)?;
+        }
+        Ok(self.settle(batch, held, cursor))
+    }
+
+    /// The nodes of `items` neither known nor repeated; the rest go in
+    /// `report`.
+    fn admit(
+        &self,
+        items: impl IntoIterator<Item = Vec<u8>>,
+        report: &mut Ingested<H>,
+    ) -> Result<Admitted<H, O>, S::Error> {
         let mut forged = BTreeSet::new();
         let mut fresh: Fresh<H, O> = BTreeMap::new();
         for bytes in items {
@@ -515,7 +623,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
                     }
                 }
                 Ok((cid, node)) => {
-                    if fresh.contains_key(&cid) || self.known(&cid).map_err(Error::Store)? {
+                    if fresh.contains_key(&cid) || self.known(&cid)? {
                         report.duplicates += 1;
                     } else {
                         fresh.insert(cid, (node, bytes));
@@ -523,210 +631,179 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
                 }
             }
         }
+        Ok(Admitted { fresh, forged })
+    }
 
-        // Each fresh node's parents not applied, the fresh nodes waiting on
-        // each, and the nodes ready to apply.
-        let mut remaining: BTreeMap<Cid<H>, usize> = BTreeMap::new();
-        let mut children: BTreeMap<Cid<H>, Vec<Cid<H>>> = BTreeMap::new();
-        let mut waits: BTreeMap<Cid<H>, Vec<Cid<H>>> = BTreeMap::new();
-        let mut ready = VecDeque::new();
+    /// The batch that applies `fresh`: the nodes whose parents are all
+    /// applied, held nodes too, ready; the rest waiting on their parents;
+    /// and the forged nodes refused, with every node naming one or a node
+    /// refused before.
+    fn plan(
+        &self,
+        report: Ingested<H>,
+        fresh: &Fresh<H, O>,
+        forged: BTreeSet<Cid<H>>,
+    ) -> Result<Batch<H>, S::Error> {
+        let mut batch = Batch {
+            report,
+            remaining: BTreeMap::new(),
+            waits: BTreeMap::new(),
+            children: BTreeMap::new(),
+            ready: VecDeque::new(),
+            refused: BTreeSet::new(),
+            released: BTreeSet::new(),
+            applied: Vec::new(),
+            held: Vec::new(),
+            authored: BTreeMap::new(),
+            heads_added: BTreeMap::new(),
+            heads_removed: BTreeSet::new(),
+            latest: BTreeMap::new(),
+            equivocations: BTreeSet::new(),
+        };
         let mut dead = Vec::new();
-        for (cid, (node, _)) in &fresh {
+        for (cid, (node, _)) in fresh {
+            let refused =
+                |parent: &Cid<H>| self.refused.contains(parent) || forged.contains(parent);
+            if node.parents.iter().any(refused) {
+                dead.push(cid.clone());
+            }
             let mut count = 0;
             for parent in &node.parents {
-                if self.refused.contains(parent) || forged.contains(parent) {
-                    dead.push(cid.clone());
-                }
-                if !self.store.contains(parent).map_err(Error::Store)? {
-                    children
+                if !self.store.contains(parent)? {
+                    batch
+                        .children
                         .entry(parent.clone())
                         .or_default()
                         .push(cid.clone());
-                    waits.entry(cid.clone()).or_default().push(parent.clone());
+                    batch
+                        .waits
+                        .entry(cid.clone())
+                        .or_default()
+                        .push(parent.clone());
                     count += 1;
                 }
             }
-            remaining.insert(cid.clone(), count);
+            batch.remaining.insert(cid.clone(), count);
             if count == 0 {
-                ready.push_back(cid.clone());
+                batch.ready.push_back(cid.clone());
             }
         }
-        ready.extend(
-            self.missing
+        batch.ready.extend(
+            self.holding
                 .iter()
-                .filter(|(_, count)| **count == 0)
+                .filter(|(_, held)| held.missing == 0)
                 .map(|(cid, _)| cid.clone()),
         );
-
-        let mut changes = Changes::default();
-        let mut heads_added: BTreeMap<Cid<H>, (Author, u64)> = BTreeMap::new();
-        let mut heads_removed: BTreeSet<Cid<H>> = BTreeSet::new();
-        let mut latest: BTreeMap<Author, (u64, Cid<H>)> = BTreeMap::new();
-        // The nodes the batch applies, by author and number: one at each
-        // number, and each.
-        let mut firsts: BTreeMap<(Author, u64), Cid<H>> = BTreeMap::new();
-        let mut authored: BTreeSet<(Author, u64, Cid<H>)> = BTreeSet::new();
-        let mut equivocations = BTreeSet::new();
-        let mut rows = Overlay::new(&self.store);
-        let mut released = BTreeSet::new();
-
-        // A refused node's descendants among the fresh and held nodes are
-        // refused with it.
-        let refuse = |cid: Cid<H>,
-                      refusal: Refusal,
-                      report: &mut Ingested<H>,
-                      refused: &mut BTreeSet<Cid<H>>,
-                      released: &mut BTreeSet<Cid<H>>| {
-            let mut stack = alloc::vec![(cid, refusal)];
-            while let Some((cid, refusal)) = stack.pop() {
-                if !refused.insert(cid.clone()) {
-                    continue;
-                }
-                if self.missing.contains_key(&cid) {
-                    released.insert(cid.clone());
-                }
-                report.refused.push((Some(cid.clone()), refusal));
-                let kids = children.get(&cid).into_iter().flatten();
-                let held = self.waiting.get(&cid).into_iter().flatten();
-                for kid in kids.chain(held) {
-                    stack.push((kid.clone(), Refusal::RefusedParent));
-                }
-            }
-        };
         // A forged node releases the held nodes waiting on it, refused.
         for cid in forged {
-            refuse(
-                cid,
-                Refusal::BadSignature,
-                &mut report,
-                &mut refused,
-                &mut released,
-            );
+            self.refuse(&mut batch, cid, Refusal::BadSignature);
         }
         for cid in dead {
-            refuse(
-                cid,
-                Refusal::RefusedParent,
-                &mut report,
-                &mut refused,
-                &mut released,
-            );
+            self.refuse(&mut batch, cid, Refusal::RefusedParent);
         }
+        Ok(batch)
+    }
 
-        while let Some(cid) = ready.pop_front() {
-            if refused.contains(&cid) {
+    /// The fresh nodes (`children`) and held nodes waiting on `cid`.
+    fn kids<'a>(
+        &'a self,
+        children: &'a BTreeMap<Cid<H>, Vec<Cid<H>>>,
+        cid: &Cid<H>,
+    ) -> impl Iterator<Item = &'a Cid<H>> + use<'a, H, O, S> {
+        let fresh = children.get(cid).into_iter().flatten();
+        let held = self.waiting.get(cid).into_iter().flatten();
+        fresh.chain(held)
+    }
+
+    /// Refuse `cid`, and its descendants among the fresh and held nodes
+    /// with it.
+    fn refuse(&self, batch: &mut Batch<H>, cid: Cid<H>, refusal: Refusal) {
+        let mut stack = alloc::vec![(cid, refusal)];
+        while let Some((cid, refusal)) = stack.pop() {
+            if !batch.refused.insert(cid.clone()) {
                 continue;
             }
-            let (node, bytes) = match fresh.remove(&cid) {
-                Some(entry) => entry,
-                None => {
-                    released.insert(cid.clone());
-                    let bytes = self
-                        .store
-                        .held(&cid)
-                        .map_err(Error::Store)?
-                        .ok_or(Error::Corrupt)?;
-                    let node = signed::decode::<H, O>(&bytes).ok_or(Error::Corrupt)?;
-                    (node, bytes)
-                }
-            };
-            let author = node.payload.author;
-            let seq = node.payload.seq;
-            // One of its parents is its author's node at `seq - 1`: a point
-            // lookup a parent, at most [`MAX_PARENTS`].
-            if seq > 0 {
-                let mut follows = false;
-                for parent in &node.parents {
-                    if authored.contains(&(author, seq - 1, parent.clone()))
-                        || self
-                            .store
-                            .is_authored(&author, seq - 1, parent)
-                            .map_err(Error::Store)?
-                    {
-                        follows = true;
-                        break;
-                    }
-                }
-                if !follows {
-                    refuse(
-                        cid,
-                        Refusal::BrokenChain,
-                        &mut report,
-                        &mut refused,
-                        &mut released,
-                    );
-                    continue;
-                }
+            if self.holding.contains_key(&cid) {
+                batch.released.insert(cid.clone());
             }
-            let same = match self.store.authored(&author, seq).map_err(Error::Store)? {
-                Some(applied) => Some(applied),
-                None => firsts.get(&(author, seq)).cloned(),
-            };
-            let equivocation = same.is_some();
-            if let Some(first) = same
-                && !self.equivocations.contains(&(author, seq))
-                && equivocations.insert((author, seq))
-            {
-                report.equivocations.push(Equivocation {
-                    author,
-                    seq,
-                    nodes: [first, cid.clone()],
-                });
-            }
-            firsts.entry((author, seq)).or_insert_with(|| cid.clone());
-            authored.insert((author, seq, cid.clone()));
-            for parent in &node.parents {
-                if heads_added.remove(parent).is_none() && self.heads.contains_key(parent) {
-                    heads_removed.insert(parent.clone());
-                }
-            }
-            heads_added.insert(cid.clone(), (author, seq));
-            let higher = |known: Option<&(u64, Cid<H>)>| known.is_none_or(|(at, _)| seq > *at);
-            if higher(latest.get(&author)) && higher(self.latest.get(&author)) {
-                latest.insert(author, (seq, cid.clone()));
-            }
-            let event = Event {
-                cid: &cid,
-                author: &author,
-                seq,
-                parents: &node.parents,
-                ops: &node.payload.ops,
-                equivocation,
-            };
-            let result = crdt.apply(event, &mut rows);
-            settle(&mut rows, result)?;
-            changes.applied.push(Applied {
-                cid: cid.clone(),
-                author,
-                seq,
-                bytes,
-            });
-            report.applied.push(cid.clone());
+            batch.report.refused.push((Some(cid.clone()), refusal));
+            let kids = self.kids(&batch.children, &cid);
+            stack.extend(kids.map(|kid| (kid.clone(), Refusal::RefusedParent)));
+        }
+    }
 
-            let kids = children.get(&cid).into_iter().flatten();
-            let held = self.waiting.get(&cid).into_iter().flatten();
-            for kid in kids.chain(held) {
-                let count = match remaining.get_mut(kid) {
-                    Some(count) => count,
-                    None => match self.missing.get(kid) {
-                        Some(count) => remaining.entry(kid.clone()).or_insert(*count),
-                        // Refused since it waited.
-                        None => continue,
-                    },
-                };
-                *count -= 1;
-                if *count == 0 {
-                    ready.push_back(kid.clone());
-                }
+    /// Whether `node` follows its author's previous node: its first, or
+    /// one of its parents is its author's node at the number before, one
+    /// point lookup a parent.
+    fn follows(&self, batch: &Batch<H>, node: &Node<H, O>) -> Result<bool, S::Error> {
+        let Signed { author, seq, .. } = node.payload;
+        let Some(before) = seq.checked_sub(1) else {
+            return Ok(true);
+        };
+        let in_batch = batch.authored.get(&(author, before));
+        for parent in &node.parents {
+            if in_batch.is_some_and(|cids| cids.contains(parent))
+                || self.store.is_authored(&author, before, parent)?
+            {
+                return Ok(true);
             }
         }
+        Ok(false)
+    }
 
-        // The fresh nodes neither applied nor refused are held, within the
-        // bounds the held nodes the batch leaves take up.
-        let mut count = self.missing.len() - released.len();
+    /// Place the applied `cid` among its author's nodes, the heads and the
+    /// latest numbers, reporting an equivocation it is the first to show;
+    /// whether it equivocates.
+    fn place(
+        &self,
+        batch: &mut Batch<H>,
+        cid: &Cid<H>,
+        node: &Node<H, O>,
+    ) -> Result<bool, S::Error> {
+        let Signed { author, seq, .. } = node.payload;
+        // The batch's earlier node is reported only while it is the one:
+        // a third at the number finds the pair reported.
+        let earlier = self.store.authored(&author, seq)?.or_else(|| {
+            let cids = batch.authored.get(&(author, seq))?;
+            cids.first().cloned()
+        });
+        let equivocation = earlier.is_some();
+        if let Some(first) = earlier
+            && !self.equivocations.contains(&(author, seq))
+            && batch.equivocations.insert((author, seq))
+        {
+            batch.report.equivocations.push(Equivocation {
+                author,
+                seq,
+                nodes: [first, cid.clone()],
+            });
+        }
+        batch
+            .authored
+            .entry((author, seq))
+            .or_default()
+            .insert(cid.clone());
+        for parent in &node.parents {
+            if batch.heads_added.remove(parent).is_none() && self.heads.contains_key(parent) {
+                batch.heads_removed.insert(parent.clone());
+            }
+        }
+        batch.heads_added.insert(cid.clone(), (author, seq));
+        let higher = |known: Option<&(u64, Cid<H>)>| known.is_none_or(|(at, _)| seq > *at);
+        if higher(batch.latest.get(&author)) && higher(self.latest.get(&author)) {
+            batch.latest.insert(author, (seq, cid.clone()));
+        }
+        Ok(equivocation)
+    }
+
+    /// Hold the fresh nodes neither applied nor refused, within the bounds
+    /// the held nodes the batch leaves take up, and drop the rest: what to
+    /// hold once the batch commits.
+    fn hold_fresh(&self, fresh: Fresh<H, O>, batch: &mut Batch<H>) -> Vec<(Cid<H>, Holding<H>)> {
+        let mut count = self.holding.len() - batch.released.len();
         let mut bytes = self.held_bytes;
         let mut by = self.held_by.clone();
-        for cid in &released {
+        for cid in &batch.released {
             if let Some(holding) = self.holding.get(cid) {
                 bytes -= holding.len;
                 if let Some(theirs) = by.get_mut(&holding.author) {
@@ -734,9 +811,10 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
                 }
             }
         }
-        let mut kept: BTreeMap<Cid<H>, (Author, usize)> = BTreeMap::new();
+        let applied: BTreeSet<&Cid<H>> = batch.report.applied.iter().collect();
+        let mut held = Vec::new();
         for (cid, (node, node_bytes)) in fresh {
-            if refused.contains(&cid) {
+            if batch.refused.contains(&cid) {
                 continue;
             }
             let author = node.payload.author;
@@ -745,93 +823,52 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
                 || *theirs >= MAX_HELD_PER_AUTHOR
                 || bytes + node_bytes.len() > MAX_HELD_BYTES
             {
-                waits.remove(&cid);
-                report.dropped.push(cid);
+                batch.report.dropped.push(cid);
                 continue;
             }
             count += 1;
             *theirs += 1;
             bytes += node_bytes.len();
-            kept.insert(cid.clone(), (author, node_bytes.len()));
-            report.held.push(cid.clone());
-            changes.held.push((cid, node_bytes));
+            let parents = batch.waits.remove(&cid).into_iter().flatten();
+            let waits = parents.filter(|parent| !applied.contains(parent)).collect();
+            held.push((cid.clone(), Holding::new(author, node_bytes.len(), waits)));
+            batch.report.held.push(cid.clone());
+            batch.held.push((cid, node_bytes));
         }
+        held
+    }
 
-        changes.released = released.iter().cloned().collect();
-        changes.heads_added = heads_added
-            .iter()
-            .map(|(cid, (author, seq))| (cid.clone(), *author, *seq))
-            .collect();
-        changes.heads_removed = heads_removed.iter().cloned().collect();
-        changes.latest = latest
-            .iter()
-            .map(|(author, (seq, cid))| (*author, *seq, cid.clone()))
-            .collect();
-        changes.equivocations = equivocations.iter().copied().collect();
-        if cursor != self.cursor {
-            changes.cursor = cursor;
-        }
-        changes.rows = rows.written;
-        if !changes.is_empty() {
-            self.store.commit(changes).map_err(Error::Store)?;
-        }
-
-        // The commit stands: move the replica's memory.
-        for cid in &heads_removed {
+    /// Move the replica's memory by a committed batch, which holds `held`.
+    fn settle(
+        &mut self,
+        batch: Batch<H>,
+        held: Vec<(Cid<H>, Holding<H>)>,
+        cursor: Option<u64>,
+    ) -> Ingested<H> {
+        for cid in &batch.heads_removed {
             self.heads.remove(cid);
         }
-        self.heads.extend(heads_added);
-        self.latest.extend(latest);
-        self.equivocations.extend(equivocations);
+        self.heads.extend(batch.heads_added);
+        self.latest.extend(batch.latest);
+        self.equivocations.extend(batch.equivocations);
         if cursor.is_some() {
             self.cursor = cursor;
         }
-        for cid in report.applied.iter().chain(&refused) {
+        for cid in batch.report.applied.iter().chain(&batch.refused) {
             self.waiting.remove(cid);
             self.unhold(cid);
         }
-        for (cid, count) in remaining {
-            if self.missing.contains_key(&cid) {
-                self.missing.insert(cid, count);
+        for (cid, count) in batch.remaining {
+            if let Some(holding) = self.holding.get_mut(&cid) {
+                holding.missing = count;
             }
         }
-        let applied: BTreeSet<&Cid<H>> = report.applied.iter().collect();
-        for cid in &report.held {
-            let parents: Vec<Cid<H>> = waits
-                .remove(cid)
-                .into_iter()
-                .flatten()
-                .filter(|parent| !applied.contains(parent))
-                .collect();
-            let (author, len) = kept[cid];
-            self.hold(
-                cid.clone(),
-                Holding {
-                    author,
-                    len,
-                    waits: parents,
-                },
-            );
+        for (cid, holding) in held {
+            self.hold(cid, holding);
         }
-        for cid in refused {
+        for cid in batch.refused {
             self.remember_refused(cid);
         }
-        Ok(report)
+        batch.report
     }
-}
-
-/// The outcome of one node's apply: the store's error first, which the
-/// CRDT may have seen as a missing row, then a row no store takes (whose
-/// write the CRDT may have read back as missing), then the CRDT's.
-fn settle<H: Hasher, S: Store<H>, A>(
-    rows: &mut Overlay<'_, H, S>,
-    result: Result<(), A>,
-) -> Result<(), Error<S::Error, A>> {
-    if let Some(error) = rows.error.take() {
-        return Err(Error::Store(error));
-    }
-    if rows.unfit {
-        return Err(Error::Row);
-    }
-    result.map_err(Error::Apply)
 }
