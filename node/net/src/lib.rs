@@ -187,7 +187,7 @@ impl Budgets {
             })
             .ok()?;
         Some(Hold {
-            budgets: Some(Arc::clone(self)),
+            budgets: Arc::clone(self),
             class,
             cost,
         })
@@ -222,28 +222,16 @@ impl Budgets {
 
 /// A frame's bytes held under a budget, let go when dropped.
 pub(crate) struct Hold {
-    budgets: Option<Arc<Budgets>>,
+    budgets: Arc<Budgets>,
     class: Class,
     cost: usize,
 }
 
-impl Hold {
-    /// Nothing held.
-    pub(crate) fn none() -> Self {
-        Self {
-            budgets: None,
-            class: Class::Liveness,
-            cost: 0,
-        }
-    }
-}
-
 impl Drop for Hold {
     fn drop(&mut self) {
-        if let Some(budgets) = self.budgets.take() {
-            budgets.held[self.class as usize].fetch_sub(self.cost, Ordering::AcqRel);
-            budgets.released[self.class as usize].notify(usize::MAX);
-        }
+        let class = self.class as usize;
+        self.budgets.held[class].fetch_sub(self.cost, Ordering::AcqRel);
+        self.budgets.released[class].notify(usize::MAX);
     }
 }
 
@@ -254,7 +242,7 @@ pub struct Incoming {
     pub from: NodeNumber,
     pub stream: u64,
     pub frame: Vec<u8>,
-    held: Hold,
+    held: Option<Hold>,
 }
 
 impl Incoming {
@@ -263,7 +251,7 @@ impl Incoming {
             from,
             stream,
             frame,
-            held: Hold::none(),
+            held: None,
         }
     }
 }
@@ -331,38 +319,34 @@ impl Deliver {
     pub(crate) async fn deliver(&self, class: Class, mut incoming: Incoming) -> bool {
         let queue = &self.queues[class as usize];
         let bytes = incoming.frame.len();
-        let held = self.waiting.hold(class, bytes).or(async {
+        let held = async { Some(self.waiting.hold(class, bytes).await) }.or(async {
             // The consumer is gone: nothing it would read is held.
             queue.closed().await;
-            Hold::none()
+            None
         });
         incoming.held = held.await;
         queue.send(incoming).await.is_ok()
     }
 
-    pub(crate) fn try_deliver(
-        &self,
-        class: Class,
-        mut incoming: Incoming,
-    ) -> Result<(), smol::channel::TrySendError<Incoming>> {
+    /// Hand an arrival over now, or give it back while its class's queue
+    /// is full. One for a consumer that is gone is lost.
+    pub(crate) fn try_deliver(&self, class: Class, mut incoming: Incoming) -> Result<(), Incoming> {
         let queue = &self.queues[class as usize];
         if queue.is_closed() {
-            return Err(smol::channel::TrySendError::Closed(incoming));
+            return Ok(());
         }
-        match self.waiting.try_hold(class, incoming.frame.len()) {
-            Some(held) => incoming.held = held,
-            None => return Err(smol::channel::TrySendError::Full(incoming)),
-        }
-        queue.try_send(incoming).map_err(|error| {
-            let mut incoming = match error {
-                smol::channel::TrySendError::Full(incoming)
-                | smol::channel::TrySendError::Closed(incoming) => incoming,
-            };
-            incoming.held = Hold::none();
-            match queue.is_closed() {
-                true => smol::channel::TrySendError::Closed(incoming),
-                false => smol::channel::TrySendError::Full(incoming),
+        let Some(held) = self.waiting.try_hold(class, incoming.frame.len()) else {
+            return Err(incoming);
+        };
+        incoming.held = Some(held);
+        queue.try_send(incoming).or_else(|error| {
+            if queue.is_closed() {
+                return Ok(());
             }
+            let mut incoming = error.into_inner();
+            // Let go, so a retry does not hold its bytes twice.
+            incoming.held = None;
+            Err(incoming)
         })
     }
 
