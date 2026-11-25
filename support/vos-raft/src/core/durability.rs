@@ -20,19 +20,19 @@ impl<N: NodeId> Core<N> {
     }
 
     fn open_write(&mut self) -> &mut Write<N> {
-        if self.open.is_none() {
-            let seq = self.next_seq;
-            self.next_seq += 1;
-            self.open = Some(Write {
+        let next_seq = &mut self.next_seq;
+        self.open.get_or_insert_with(|| {
+            let seq = *next_seq;
+            *next_seq += 1;
+            Write {
                 seq,
                 truncate_after: None,
                 entries: Vec::new(),
                 meta: None,
                 active_config: None,
                 sync: false,
-            });
-        }
-        self.open.as_mut().expect("opened above")
+            }
+        })
     }
 
     pub(super) fn close_write(&mut self) {
@@ -55,8 +55,9 @@ impl<N: NodeId> Core<N> {
         let write = self.open_write();
         write.meta = Some(meta);
         write.sync |= sync;
+        let seq = write.seq;
         if sync {
-            self.term_seq = self.open.as_ref().expect("open").seq;
+            self.term_seq = seq;
         }
     }
 
@@ -121,8 +122,7 @@ impl<N: NodeId> Core<N> {
 
     /// Send `message` to every other member.
     pub(super) fn broadcast(&mut self, message: Message<N>) {
-        let me = self.cfg.me;
-        let peers = self.active.members().filter(|&member| member != me);
+        let peers = self.active.others(self.cfg.me);
         self.actions.extend(peers.map(|to| Action::Send {
             to,
             message: message.clone(),
@@ -132,8 +132,8 @@ impl<N: NodeId> Core<N> {
     /// Send `message` to every other member once the write of the current
     /// term is durable.
     pub(super) fn broadcast_once_durable(&mut self, message: Message<N>) {
-        let (me, at) = (self.cfg.me, self.term_seq);
-        let peers = self.active.members().filter(|&member| member != me);
+        let at = self.term_seq;
+        let peers = self.active.others(self.cfg.me);
         self.releases
             .extend(peers.map(|to| (at, to, message.clone())));
     }

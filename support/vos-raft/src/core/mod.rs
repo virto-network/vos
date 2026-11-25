@@ -444,13 +444,8 @@ impl<N: NodeId> Core<N> {
     /// The recovered entries continue the log from the snapshot's index
     /// on, without a gap; a member named twice in `cfg` counts once.
     pub fn new(mut cfg: Config<N>, recovered: Recovered<N>, now: u64, seed: u64) -> Self {
-        let mut members = Vec::with_capacity(cfg.members.len());
-        for member in cfg.members.drain(..) {
-            if !members.contains(&member) {
-                members.push(member);
-            }
-        }
-        cfg.members = members;
+        let mut seen = BTreeSet::new();
+        cfg.members.retain(|&member| seen.insert(member));
         let meta = recovered.meta;
         let mut log = LogView::new(
             meta.snap_last_index,
@@ -598,11 +593,7 @@ impl<N: NodeId> Core<N> {
     /// timeout's lower end.
     pub fn campaign_now(&mut self, now: u64) {
         self.now = self.now.max(now);
-        let low = self.cfg.election_timeout_ms.0;
-        let heard = self
-            .last_heard_leader
-            .is_some_and(|heard| heard + low > self.now);
-        if self.role != Role::Leader && !heard {
+        if self.role != Role::Leader && !self.leader_heard_within(0) {
             self.election_deadline = self.election_deadline.min(self.now);
         }
     }
@@ -707,6 +698,14 @@ impl<N: NodeId> Core<N> {
             | Message::VoteAnswer { .. }
             | Message::PreVoteAnswer { .. } => false,
         }
+    }
+
+    /// Whether the leader was last heard more than `margin` before the
+    /// election timeout's lower end.
+    pub(super) fn leader_heard_within(&self, margin: u64) -> bool {
+        let low = self.cfg.election_timeout_ms.0;
+        self.last_heard_leader
+            .is_some_and(|heard| heard + low > self.now + margin)
     }
 
     /// Whether this replica leads, or heard its leader within the election
@@ -923,7 +922,7 @@ impl<N: NodeId> Core<N> {
         // node is.
         let patience = 3 * high.max(self.cfg.resend_timeout_ms);
         let mut silent = BTreeSet::new();
-        for member in self.active.members().filter(|&member| member != me) {
+        for member in self.active.others(me) {
             if heard(member).is_none_or(|at| at + high <= now) {
                 silent.insert(member);
             } else if leading.matched(member) >= last
@@ -962,11 +961,8 @@ impl<N: NodeId> Core<N> {
         }
         match self.role {
             Role::Follower => {
-                let low = self.cfg.election_timeout_ms.0;
                 self.seen_leader.is_some_and(|leader| leader != self.cfg.me)
-                    && self
-                        .last_heard_leader
-                        .is_some_and(|heard| heard + low > self.now + margin)
+                    && self.leader_heard_within(margin)
             }
             Role::Leader => self.leading.as_ref().is_some_and(|leading| {
                 self.election_deadline == u64::MAX
@@ -1020,11 +1016,7 @@ impl<N: NodeId> Core<N> {
         // append or a snapshot that failed.
         if self.role == Role::Leader && self.election_deadline == u64::MAX {
             let me = self.cfg.me;
-            if self
-                .active
-                .members()
-                .any(|peer| peer != me && !self.caught_up(peer))
-            {
+            if self.active.others(me).any(|peer| !self.caught_up(peer)) {
                 self.election_deadline = self.now + self.cfg.heartbeat_interval_ms;
             }
         }

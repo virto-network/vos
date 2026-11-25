@@ -316,10 +316,7 @@ impl<N: NodeId> Core<N> {
             }
             return;
         }
-        if let Some(heard) = self.last_heard_leader
-            && self.now < heard + self.cfg.election_timeout_ms.0
-            && self.seen_leader != Some(from)
-        {
+        if self.leader_heard_within(0) && self.seen_leader != Some(from) {
             self.send(from, refuse);
             return;
         }

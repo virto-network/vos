@@ -280,8 +280,7 @@ impl<N: NodeId> Core<N> {
     }
 
     pub(super) fn send_heartbeats(&mut self) {
-        let me = self.cfg.me;
-        let peers: Vec<N> = self.active.members().collect();
+        let peers: Vec<N> = self.active.others(self.cfg.me).collect();
         let round = {
             let Some(leading) = self.leading.as_mut() else {
                 return;
@@ -293,7 +292,7 @@ impl<N: NodeId> Core<N> {
         let every = self.cfg.idle_heartbeats || !self.reads.is_empty();
         let mut sent = false;
         for peer in peers {
-            if peer == me || (!every && self.caught_up(peer)) {
+            if !every && self.caught_up(peer) {
                 continue;
             }
             self.heartbeat_to(peer, round);
@@ -334,12 +333,9 @@ impl<N: NodeId> Core<N> {
     }
 
     pub(super) fn replicate_all(&mut self) {
-        let me = self.cfg.me;
-        let peers: Vec<N> = self.active.members().collect();
+        let peers: Vec<N> = self.active.others(self.cfg.me).collect();
         for peer in peers {
-            if peer != me {
-                self.replicate_to(peer);
-            }
+            self.replicate_to(peer);
         }
     }
 
