@@ -62,10 +62,9 @@ impl<N: NodeId> Core<N> {
             self.reject(from, round, commit, prev_index, (0, 0));
             return;
         }
+        // A leader led its term: `led` says so.
         let another = term == self.term
-            && (self.role == Role::Leader
-                || self.led == Some(term)
-                || self.seen_leader.is_some_and(|seen| seen != from));
+            && (self.led == Some(term) || self.seen_leader.is_some_and(|seen| seen != from));
         if another {
             self.refused += 1;
             return;
@@ -208,12 +207,7 @@ impl<N: NodeId> Core<N> {
             self.adopt_term(term);
             return;
         }
-        if self.role != Role::Leader || term != self.term {
-            return;
-        }
-        // A leader tracks its configuration's members only: a late answer
-        // from a replica a change removed draws nothing more.
-        if !self.active.contains(from) {
+        if term != self.term {
             return;
         }
         let last = self.log.last_index();
@@ -247,9 +241,7 @@ impl<N: NodeId> Core<N> {
                 {
                     leading.snapshotting.remove(&from);
                 }
-                self.try_advance_commit();
-                self.try_resolve_reads();
-                self.maybe_send_timeout_now();
+                self.leader_progress();
                 self.replicate_to(from);
             }
             AppendResult::Rejected {
@@ -275,7 +267,6 @@ impl<N: NodeId> Core<N> {
                             conflict_first
                         }
                     };
-                    let leading = self.leading.as_mut().expect("checked above");
                     let moved = hint.min(rejected).max(floor).max(1);
                     if moved != next {
                         leading.next_index.insert(from, moved);
@@ -355,42 +346,37 @@ impl<N: NodeId> Core<N> {
     /// Send `peer`, a member, the entries it lacks, unless an append or a
     /// snapshot is in flight to it.
     pub(super) fn replicate_to(&mut self, peer: N) {
-        if self.role != Role::Leader || peer == self.cfg.me || !self.active.contains(peer) {
+        if peer == self.cfg.me || !self.active.contains(peer) {
             return;
         }
         let (term, last) = (self.term, self.log.last_index());
         let (snap, snap_term) = (self.log.snap_index(), self.log.snap_term());
-        let next = {
-            let Some(leading) = self.leading.as_ref() else {
-                return;
-            };
-            if leading.in_flight.contains_key(&peer)
-                || leading.snapshotting.contains_key(&peer)
-                || leading.loading.contains(&peer)
-            {
-                return;
-            }
-            leading.next(peer)
+        let Some(leading) = self.leading.as_mut() else {
+            return;
         };
+        if leading.in_flight.contains_key(&peer)
+            || leading.snapshotting.contains_key(&peer)
+            || leading.loading.contains(&peer)
+        {
+            return;
+        }
+        let next = leading.next(peer);
         if next <= snap && snap > 0 {
+            let deadline = self.now + self.cfg.snapshot_timeout_ms;
+            leading.snapshotting.insert(
+                peer,
+                Snapshotting {
+                    index: snap,
+                    deadline,
+                },
+            );
             // The snapshot is at the log's start: its configuration is the
             // one in effect there, when known; never a guess.
-            let configuration = self.log_start_config.clone();
-            let deadline = self.now + self.cfg.snapshot_timeout_ms;
-            if let Some(leading) = self.leading.as_mut() {
-                leading.snapshotting.insert(
-                    peer,
-                    Snapshotting {
-                        index: snap,
-                        deadline,
-                    },
-                );
-            }
             self.actions.push(Action::SendSnapshot {
                 to: peer,
                 index: snap,
                 term: snap_term,
-                configuration,
+                configuration: self.log_start_config.clone(),
             });
             return;
         }
@@ -416,9 +402,7 @@ impl<N: NodeId> Core<N> {
                         max_bytes: self.cfg.max_append_bytes,
                     }));
                 }
-                if let Some(leading) = self.leading.as_mut() {
-                    leading.loading.insert(peer);
-                }
+                leading.loading.insert(peer);
             }
         }
     }

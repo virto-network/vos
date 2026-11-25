@@ -680,7 +680,9 @@ impl<N: NodeId> Core<N> {
     }
 
     /// Whether to take `message` from `from` at all: never at a term with
-    /// no successor; from outside the configuration, an append or a
+    /// no successor; from outside the configuration (a leader tracks its
+    /// configuration's members only, so a late answer from a replica a
+    /// change removed draws nothing), an append or a
     /// `TimeoutNow` (which counts only from the leader followed), and a
     /// vote request or a pre-vote only while no leader is heard.
     fn takes(&self, from: N, message: &Message<N>) -> bool {
@@ -735,13 +737,14 @@ impl<N: NodeId> Core<N> {
     /// A linearizable read: answered with an index the reader must apply
     /// through before reading.
     pub fn read_index(&mut self, token: u64, timeout_ms: Option<u64>) {
-        if self.role != Role::Leader {
+        let Some(leading) = &self.leading else {
             self.answer(Answer::ReadIndex {
                 token,
                 result: Err(ReadIndexError::NotLeader),
             });
             return;
-        }
+        };
+        let round = leading.round + 1;
         if self.reads.len() >= self.cfg.max_pending_reads {
             self.answer(Answer::ReadIndex {
                 token,
@@ -752,7 +755,6 @@ impl<N: NodeId> Core<N> {
         // A read is served at an index no lower than this term's no-op, so it
         // never sees state a later leader could revert.
         let required_index = self.commit.max(self.current_term_first_index.unwrap_or(0));
-        let round = self.leading.as_ref().map_or(0, |leading| leading.round) + 1;
         self.reads.push(PendingRead {
             token,
             required_index,
@@ -898,52 +900,48 @@ impl<N: NodeId> Core<N> {
     ) {
         self.now = self.now.max(now);
         let (low, high) = self.cfg.election_timeout_ms;
-        match self.role {
-            Role::Follower => {
-                if let Some(leader) = self.seen_leader
-                    && let Some(at) = listed(leader, self.term)
-                    && at + low > self.now
-                {
-                    self.heard_leader_at(at);
-                }
+        if self.role == Role::Follower {
+            if let Some(leader) = self.seen_leader
+                && let Some(at) = listed(leader, self.term)
+                && at + low > self.now
+            {
+                self.heard_leader_at(at);
             }
-            Role::Leader => {
-                let Some(leading) = self.leading.as_mut() else {
-                    return;
-                };
-                let (me, now, last) = (self.cfg.me, self.now, self.log.last_index());
-                // A member owed entries counts only while it answers over
-                // Raft now and then: a leader whose frames go unanswered for
-                // three times the longer of an election timeout and an
-                // append's resend steps down, however alive the member's
-                // node is.
-                let patience = 3 * high.max(self.cfg.resend_timeout_ms);
-                let mut silent = BTreeSet::new();
-                for member in self.active.members().filter(|&member| member != me) {
-                    if heard(member).is_none_or(|at| at + high <= now) {
-                        silent.insert(member);
-                    } else if leading.matched(member) >= last
-                        || leading
-                            .answered
-                            .get(&member)
-                            .is_some_and(|at| at + patience > now)
-                    {
-                        leading.recent.insert(member);
-                    }
-                }
-                // A host that hears too few to make a quorum may be the one
-                // gone deaf: its leader goes on sending, and lets
-                // check-quorum judge by the answers.
-                if !self
-                    .active
-                    .quorum_holds(|member| member == me || !silent.contains(&member))
-                {
-                    silent.clear();
-                }
-                leading.silent = silent;
-            }
-            _ => {}
+            return;
         }
+        let Some(leading) = self.leading.as_mut() else {
+            return;
+        };
+        let (me, now, last) = (self.cfg.me, self.now, self.log.last_index());
+        // A member owed entries counts only while it answers over
+        // Raft now and then: a leader whose frames go unanswered for
+        // three times the longer of an election timeout and an
+        // append's resend steps down, however alive the member's
+        // node is.
+        let patience = 3 * high.max(self.cfg.resend_timeout_ms);
+        let mut silent = BTreeSet::new();
+        for member in self.active.members().filter(|&member| member != me) {
+            if heard(member).is_none_or(|at| at + high <= now) {
+                silent.insert(member);
+            } else if leading.matched(member) >= last
+                || leading
+                    .answered
+                    .get(&member)
+                    .is_some_and(|at| at + patience > now)
+            {
+                leading.recent.insert(member);
+            }
+        }
+        // A host that hears too few to make a quorum may be the one
+        // gone deaf: its leader goes on sending, and lets
+        // check-quorum judge by the answers.
+        if !self
+            .active
+            .quorum_holds(|member| member == me || !silent.contains(&member))
+        {
+            silent.clear();
+        }
+        leading.silent = silent;
     }
 
     /// Whether the core's only deadline is one the host's pair heartbeat
@@ -998,7 +996,7 @@ impl<N: NodeId> Core<N> {
     /// at once, so a replica that restarted learns its leader and the
     /// commit without waiting for its own deadline.
     pub fn probe(&mut self, node: N) {
-        if self.role != Role::Leader || node == self.cfg.me {
+        if node == self.cfg.me {
             return;
         }
         let Some(leading) = self.leading.as_mut() else {

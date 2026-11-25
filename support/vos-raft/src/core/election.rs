@@ -158,7 +158,6 @@ impl<N: NodeId> Core<N> {
         self.seen_leader = None;
         self.verified = self.commit;
         self.pending_acks.clear();
-        self.leading = None;
         self.write_meta(true);
         // The requests leave, and the own vote counts, once the term and
         // vote are durable: a crash before then asked no one at this term.
@@ -285,9 +284,6 @@ impl<N: NodeId> Core<N> {
         {
             return;
         }
-        if !self.active.contains(from) {
-            return;
-        }
         self.votes.insert(from);
         self.check_election();
     }
@@ -314,8 +310,10 @@ impl<N: NodeId> Core<N> {
         if next_term <= self.term || self.role == Role::Leader {
             self.send(from, refuse);
             // A member whose deadline lapsed hears its leader at once.
-            if self.role == Role::Leader && self.active.contains(from) {
-                let round = self.leading.as_ref().map_or(0, |leading| leading.round);
+            if let Some(leading) = &self.leading
+                && self.active.contains(from)
+            {
+                let round = leading.round;
                 self.heartbeat_to(from, round);
             }
             return;
@@ -349,9 +347,6 @@ impl<N: NodeId> Core<N> {
         {
             return;
         }
-        if !self.active.contains(from) {
-            return;
-        }
         self.votes.insert(from);
         if self
             .active
@@ -364,12 +359,11 @@ impl<N: NodeId> Core<N> {
 
     /// Hand leadership to `to`, or to the most up-to-date member.
     pub fn transfer_leadership(&mut self, to: Option<N>) {
-        if self.role != Role::Leader {
+        let Some(leading) = self.leading.as_mut() else {
             return;
-        }
+        };
         let me = self.cfg.me;
         let target = to.or_else(|| {
-            let leading = self.leading.as_ref()?;
             self.active
                 .current
                 .iter()
@@ -383,10 +377,7 @@ impl<N: NodeId> Core<N> {
         if target == me || !self.active.contains(target) {
             return;
         }
-        let deadline = self.now + self.cfg.election_timeout_ms.1;
-        if let Some(leading) = self.leading.as_mut() {
-            leading.transfer = Some((target, deadline));
-        }
+        leading.transfer = Some((target, self.now + self.cfg.election_timeout_ms.1));
         self.maybe_send_timeout_now();
         self.replicate_to(target);
     }
