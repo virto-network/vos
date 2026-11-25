@@ -6,7 +6,7 @@ f37969a9fdb612449b1af7e36d9fd6bcc179ab25378bd5da1d59f4e27bafbd04  target/riscv64
 f0f8c1112a4289cc5b61d5cbed8c95ca2b01501eb83842ed6375630d394da71d  agent/programs/target/riscv64em-vos/release/vos-agent.elf
 7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 ce85389deb6cd305845aa9cf31c8e4b5ebf4ce3a20e412308d8d2202b7022fff  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
-878a39351352a2f961c8006156278b7a4437a7112df1cddc208df065b650495d  agent/programs/target/riscv64em-vos/release/vos-personal.elf
+7bbf14c4ecc6a440b02c5f7560255b867ff66eadb1f53698c0206556bbfc3fac  agent/programs/target/riscv64em-vos/release/vos-personal.elf
 6a9baab1001cf96aa1dc2c5a093fde9bdab3dfe8d8d21c4a2d3c7a0e6a143199  agent/programs/target/riscv64em-vos/release/vos-payments.elf
 55e6b14de09c001b87d032f36a7d44b2c3e138bf0e25b0b93689648026cadfa1  agent/programs/target/riscv64em-vos/release/vos-homes.elf
 6b52f19b437273a58c0cb425b8f9d91a95c7f3e6583428041ee456ff0374c0e1  agent/programs/target/riscv64em-vos/release/vos-credential-book.elf
@@ -34,7 +34,7 @@ df0144c0266bd48983afcbd8365aaa8214ccf9979cb5e443f89afddbe5e9f548  agent/test-act
 4d4140e9a92f9411735745923230ddc5004803c568065fb6e57a3d1c2e7e95ac  agent/test-actors/target/riscv64em-vos/release/lean.elf
 7fc5326b125e9da43b4cf92eb556292a41ead90f813caf6ebb3f5c2fa6de0abd  agent/test-actors/target/riscv64em-vos/release/ledger.elf
 2548eef95d33feadd0dc3f47e001c6bd45dd1f3e3b2a76f866446fa3b976d761  agent/test-actors/target/riscv64em-vos/release/notes.elf
-213324628da19d6870fd5627a07200b33f5f477f07b1400ba3810dc1eae73b23  agent/test-actors/target/riscv64em-vos/release/personal-next.elf
+129669ea687e0ac919049db9d16be794fa0019658b575874c80ffe8217875f78  agent/test-actors/target/riscv64em-vos/release/personal-next.elf
 904d501b3dc3feb060995586696f6127f27165ff603422a427170b76ce22f690  agent/test-actors/target/riscv64em-vos/release/poll.elf
 57d1df7509d1bb6371873885d703f447a1db0b141411c17ba623bca1179711fd  agent/test-actors/target/riscv64em-vos/release/reader.elf
 6b6dce7cfddd359b43e7d71811f1fb876c1cbb41fe08d72efa618bae8b9b8732  agent/test-actors/target/riscv64em-vos/release/roomy.elf
