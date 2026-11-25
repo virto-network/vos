@@ -1,8 +1,7 @@
-//! A replica's node: the author's key, sequence number and signature
-//! travel in the payload, beside the operations, and the stateless checks
-//! a node passes before any replica state is read.
+//! A node's signature, and the stateless checks a node passes before any
+//! replica state is read.
 
-use crate::{Cid, DagNode, Decode, Encode, Hasher};
+use crate::{Cid, Decode, Encode, Hasher, Node};
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
@@ -26,49 +25,6 @@ impl core::fmt::Debug for Author {
 impl From<&SigningKey> for Author {
     fn from(key: &SigningKey) -> Self {
         Author(key.verifying_key().to_bytes())
-    }
-}
-
-/// A node's payload: the operations, and who wrote them at which position
-/// of their chain, signed.
-///
-/// An author's nodes are numbered from 0, and each node after the first
-/// names its author's previous node among its parents, so an author's chain
-/// is linked and has no gaps. Two nodes of one author with one sequence
-/// number are an equivocation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Signed<O> {
-    /// The author's key.
-    pub author: Author,
-    /// The node's position in its author's chain.
-    pub seq: u64,
-    /// The author's signature over [`message`]: the author, the sequence
-    /// number, the operations and the parents.
-    pub signature: [u8; 64],
-    /// The operations.
-    pub ops: O,
-}
-
-/// A replica's node.
-pub type Node<H, O> = DagNode<H, Signed<O>>;
-
-impl<O: Encode> Encode for Signed<O> {
-    fn encode_to(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&self.author.0);
-        self.seq.encode_to(buf);
-        buf.extend_from_slice(&self.signature);
-        self.ops.encode_to(buf);
-    }
-}
-
-impl<O: Decode> Decode for Signed<O> {
-    fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
-        Some(Signed {
-            author: Author(<[u8; 32]>::decode_from(buf, pos)?),
-            seq: u64::decode_from(buf, pos)?,
-            signature: <[u8; 64]>::decode_from(buf, pos)?,
-            ops: O::decode_from(buf, pos)?,
-        })
     }
 }
 
@@ -103,7 +59,7 @@ pub fn message<H: Hasher>(
     buf
 }
 
-impl<H: Hasher, O: Encode> DagNode<H, Signed<O>> {
+impl<H: Hasher, O: Encode> Node<H, O> {
     /// A node of `ops` at `seq` in `key`'s chain of `scope`, after
     /// `parents`, signed.
     pub fn sign(
@@ -118,13 +74,11 @@ impl<H: Hasher, O: Encode> DagNode<H, Signed<O>> {
         let signature = key
             .sign(&message(scope, &author, seq, &ops.encode(), &parents))
             .to_bytes();
-        DagNode {
-            payload: Signed {
-                author,
-                seq,
-                signature,
-                ops,
-            },
+        Node {
+            author,
+            seq,
+            signature,
+            ops,
             parents,
         }
     }
@@ -134,20 +88,18 @@ impl<H: Hasher, O: Encode> DagNode<H, Signed<O>> {
     /// no third party can turn one signed node into a second that verifies
     /// and so frame its author as equivocating.
     pub fn verify(&self, scope: &Scope) -> bool {
-        let Signed {
-            author,
-            seq,
-            signature,
-            ops,
-        } = &self.payload;
-        let Ok(key) = VerifyingKey::from_bytes(&author.0) else {
+        let Ok(key) = VerifyingKey::from_bytes(&self.author.0) else {
             return false;
         };
-        key.verify_strict(
-            &message(scope, author, *seq, &ops.encode(), &self.parents),
-            &Signature::from_bytes(signature),
-        )
-        .is_ok()
+        let message = message(
+            scope,
+            &self.author,
+            self.seq,
+            &self.ops.encode(),
+            &self.parents,
+        );
+        key.verify_strict(&message, &Signature::from_bytes(&self.signature))
+            .is_ok()
     }
 }
 

@@ -118,10 +118,10 @@ impl<'a, H: Hasher, S: Store<H>> Overlay<'a, H, S> {
     ) -> Result<(), Error<S::Error, A::Error>> {
         let event = Event {
             cid,
-            author: &node.payload.author,
-            seq: node.payload.seq,
+            author: &node.author,
+            seq: node.seq,
             parents: &node.parents,
-            ops: &node.payload.ops,
+            ops: &node.ops,
             equivocation,
         };
         let result = crdt.apply(event, self);

@@ -12,11 +12,11 @@ design docs `docs/design/core-model.md` §9.4 and `docs/design/light-node.md`
 
 ## The model
 
-- **A node** (`Node<H, O>` = `DagNode<H, Signed<O>>`) is content-addressed:
-  its CID is the hash of its canonical bytes, and it names its parents by
-  theirs, at most `MAX_PARENTS` (64). The payload carries the author's
-  ed25519 key, the author's sequence number, a signature over the scope,
-  the operations and the parents, and the operations.
+- **A node** (`Node<H, O>`) is content-addressed: its CID is the hash of
+  its canonical bytes, and it names its parents by theirs, at most
+  `MAX_PARENTS` (64). It carries the author's ed25519 key, the author's
+  sequence number, a signature over the scope, the operations and the
+  parents, and the operations.
 - **Authors' chains:** an author numbers its nodes from 0; each later node
   names the author's previous one among its parents. A node that does not is
   refused, with its descendants. Two nodes at one number are an
