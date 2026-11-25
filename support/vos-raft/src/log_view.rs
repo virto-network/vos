@@ -16,15 +16,24 @@ const ENTRY_OVERHEAD: usize = 64;
 /// Keep the longest prefix of `entries` within `max_bytes`, and at least
 /// one entry.
 pub(crate) fn cap_bytes<N: NodeId>(entries: &mut Vec<LogEntry<N>>, max_bytes: usize) {
+    entries.truncate(fitting(entries.iter(), max_bytes));
+}
+
+/// How long the longest prefix of `entries` within `max_bytes` is, and at
+/// least one when there are any.
+fn fitting<'a, N: NodeId>(
+    entries: impl ExactSizeIterator<Item = &'a LogEntry<N>>,
+    max_bytes: usize,
+) -> usize {
+    let len = entries.len();
     let mut bytes = 0;
-    let keep = entries
-        .iter()
-        .position(|entry| {
+    let fit = entries
+        .take_while(|entry| {
             bytes += entry_bytes(entry);
-            bytes > max_bytes
+            bytes <= max_bytes
         })
-        .map_or(entries.len(), |at| at.max(1));
-    entries.truncate(keep);
+        .count();
+    fit.max(1).min(len)
 }
 
 pub(crate) fn entry_bytes<N: NodeId>(entry: &LogEntry<N>) -> usize {
@@ -151,20 +160,16 @@ impl<N: NodeId> LogView<N> {
     /// The last index whose entry has a term at most `term`, for a leader
     /// skipping a follower's conflicting term.
     pub(crate) fn last_index_of_term_at_most(&self, term: u64) -> u64 {
-        let mut last = self.snap_index;
-        for (position, &(first, run_term)) in self.runs.iter().enumerate() {
-            if run_term > term {
-                break;
-            }
-            let end = self
-                .runs
-                .get(position + 1)
-                .map_or(self.last, |&(next, _)| next - 1);
-            if end >= first {
-                last = end;
-            }
+        // The end of the last run before the first of a later term.
+        let at = self
+            .runs
+            .iter()
+            .position(|&(_, run_term)| run_term > term)
+            .unwrap_or(self.runs.len());
+        if at == 0 {
+            return self.snap_index;
         }
-        last
+        self.runs.get(at).map_or(self.last, |&(next, _)| next - 1)
     }
 
     /// Append `entries`, which must continue the log at `last + 1`.
@@ -273,20 +278,11 @@ impl<N: NodeId> LogView<N> {
         if from < first || to > self.last {
             return None;
         }
-        let mut out = Vec::new();
-        let mut bytes = 0;
-        for entry in self
+        let range = self
             .cache
-            .range((from - first) as usize..=(to - first) as usize)
-        {
-            let size = entry_bytes(entry);
-            if !out.is_empty() && bytes + size > max_bytes {
-                break;
-            }
-            bytes += size;
-            out.push(entry.clone());
-        }
-        Some(out)
+            .range((from - first) as usize..=(to - first) as usize);
+        let fit = fitting(range.clone(), max_bytes);
+        Some(range.take(fit).cloned().collect())
     }
 
     /// The entry at `index`, if the cache or the configuration index holds
