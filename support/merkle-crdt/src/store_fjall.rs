@@ -153,6 +153,18 @@ fn seq(bytes: &[u8]) -> Result<u64, FjallError> {
     ))
 }
 
+fn author(bytes: &[u8]) -> Result<Author, FjallError> {
+    <[u8; 32]>::try_from(bytes)
+        .map(Author)
+        .map_err(|_| FjallError::Corrupt)
+}
+
+/// `author ‖ seq (BE)`, read back.
+fn author_seq(bytes: &[u8]) -> Result<(Author, u64), FjallError> {
+    let (key, at) = bytes.split_at_checked(32).ok_or(FjallError::Corrupt)?;
+    Ok((author(key)?, seq(at)?))
+}
+
 impl<H: Hasher> Store<H> for FjallStore {
     type Error = FjallError;
 
@@ -191,9 +203,7 @@ impl<H: Hasher> Store<H> for FjallStore {
         let mut heads = BTreeMap::new();
         for row in self.meta.prefix([HEAD]) {
             let (key, value) = row.into_inner()?;
-            let (author, at) = value.split_at_checked(32).ok_or(FjallError::Corrupt)?;
-            let author = <[u8; 32]>::try_from(author).map_err(|_| FjallError::Corrupt)?;
-            heads.insert(cid(&key[1..])?, (Author(author), seq(at)?));
+            heads.insert(cid(&key[1..])?, author_seq(&value)?);
         }
         let cursor = self
             .meta
@@ -203,23 +213,17 @@ impl<H: Hasher> Store<H> for FjallStore {
         let mut latest = BTreeMap::new();
         for row in self.meta.prefix([LATEST]) {
             let (key, value) = row.into_inner()?;
-            let author = <[u8; 32]>::try_from(&key[1..]).map_err(|_| FjallError::Corrupt)?;
             let (at, node) = value.split_at_checked(8).ok_or(FjallError::Corrupt)?;
-            latest.insert(Author(author), (seq(at)?, cid(node)?));
+            latest.insert(author(&key[1..])?, (seq(at)?, cid(node)?));
         }
         let mut equivocations = BTreeSet::new();
         for row in self.meta.prefix([EQUIVOCATION]) {
-            let key = row.key()?;
-            let (author, at) = key[1..].split_at_checked(32).ok_or(FjallError::Corrupt)?;
-            let author = <[u8; 32]>::try_from(author).map_err(|_| FjallError::Corrupt)?;
-            equivocations.insert((Author(author), seq(at)?));
+            equivocations.insert(author_seq(&row.key()?[1..])?);
         }
         let mut outbox = BTreeMap::new();
         for row in self.meta.prefix([OUTBOX]) {
             let (key, value) = row.into_inner()?;
-            let (author, at) = key[1..].split_at_checked(32).ok_or(FjallError::Corrupt)?;
-            let author = <[u8; 32]>::try_from(author).map_err(|_| FjallError::Corrupt)?;
-            outbox.insert((Author(author), seq(at)?), cid(&value)?);
+            outbox.insert(author_seq(&key[1..])?, cid(&value)?);
         }
         let mut held = Vec::new();
         for row in self.held.iter() {
