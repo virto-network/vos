@@ -451,41 +451,34 @@ mod tests {
         assert_eq!(key_of(&other), None);
     }
 
+    /// The connection ids the endpoint of protocol `alpn` makes, for the
+    /// node whose secret seed is `secret`.
+    fn ids(secret: [u8; 32], alpn: &[u8]) -> MarkedIds {
+        MarkedIds {
+            key: Identity::new(&secret).keys(alpn).connection_ids,
+            random: ring::rand::SystemRandom::new(),
+        }
+    }
+
     #[test]
     fn connection_ids_are_new_and_marked() {
         use quinn_proto::ConnectionIdGenerator;
-        let identity = Identity::new(&[5; 32]);
-        let mut ids = MarkedIds {
-            key: identity.keys(ALPN).connection_ids,
-            random: ring::rand::SystemRandom::new(),
-        };
-        let first = ids.generate_cid();
-        let second = ids.generate_cid();
+        let mut ours = ids([5; 32], ALPN);
+        let first = ours.generate_cid();
+        let second = ours.generate_cid();
         assert_ne!(first, second);
         assert_eq!(first.len(), 16);
-        assert!(ids.validate(&first).is_ok());
+        assert!(ours.validate(&first).is_ok());
         // A restarted run knows them; another node's, or a forged one, not.
-        let restarted = MarkedIds {
-            key: Identity::new(&[5; 32]).keys(ALPN).connection_ids,
-            random: ring::rand::SystemRandom::new(),
-        };
-        assert!(restarted.validate(&first).is_ok());
-        let other = MarkedIds {
-            key: Identity::new(&[6; 32]).keys(ALPN).connection_ids,
-            random: ring::rand::SystemRandom::new(),
-        };
-        assert!(other.validate(&first).is_err());
+        assert!(ids([5; 32], ALPN).validate(&first).is_ok());
+        assert!(ids([6; 32], ALPN).validate(&first).is_err());
         // Nor does the node's other endpoint.
-        let api = MarkedIds {
-            key: identity.keys(crate::api::ALPN).connection_ids,
-            random: ring::rand::SystemRandom::new(),
-        };
-        assert!(api.validate(&first).is_err());
+        assert!(ids([5; 32], crate::api::ALPN).validate(&first).is_err());
         let mut forged = first.to_vec();
         forged[15] ^= 1;
-        assert!(ids.validate(&quinn::ConnectionId::new(&forged)).is_err());
+        assert!(ours.validate(&quinn::ConnectionId::new(&forged)).is_err());
         assert!(
-            ids.validate(&quinn::ConnectionId::new(&first[..8]))
+            ours.validate(&quinn::ConnectionId::new(&first[..8]))
                 .is_err()
         );
     }
@@ -520,12 +513,7 @@ mod tests {
         use quinn_proto::ConnectionIdGenerator;
 
         let secret = [5; 32];
-        let identity = Identity::new(&secret);
-        let mut ids = MarkedIds {
-            key: identity.keys(ALPN).connection_ids,
-            random: ring::rand::SystemRandom::new(),
-        };
-        let id = ids.generate_cid();
+        let id = ids(secret, ALPN).generate_cid();
         let runner = Runner::start().unwrap();
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let api = socket.local_addr().unwrap();
@@ -551,16 +539,12 @@ mod tests {
             "the API endpoint answered a peer connection's id"
         );
         // An id of its own it does answer, with that id's reset token.
-        let keys = identity.keys(crate::api::ALPN);
-        let own = MarkedIds {
-            key: keys.connection_ids,
-            random: ring::rand::SystemRandom::new(),
-        }
-        .generate_cid();
+        let own = ids(secret, crate::api::ALPN).generate_cid();
         packet[1..1 + own.len()].copy_from_slice(&own);
         anyone.send_to(&packet, api).unwrap();
         let (length, _) = anyone.recv_from(&mut answer).expect("a stateless reset");
-        let token = ring::hmac::sign(&keys.reset, &own);
+        let reset = Identity::new(&secret).keys(crate::api::ALPN).reset;
+        let token = ring::hmac::sign(&reset, &own);
         assert_eq!(&answer[length - 16..length], &token.as_ref()[..16]);
     }
 }

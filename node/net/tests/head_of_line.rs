@@ -34,10 +34,6 @@ async fn latencies(a: &Quic, b: &Arrivals, count: usize) -> Vec<Duration> {
 /// A bulk frame's bytes.
 const BULK_FRAME: usize = 4 << 20;
 
-fn percentile(sorted: &[Duration], percent: usize) -> Duration {
-    sorted[(sorted.len() * percent / 100).min(sorted.len() - 1)]
-}
-
 #[test]
 fn bulk_frames_do_not_hold_up_consensus() {
     smol::block_on(async {
