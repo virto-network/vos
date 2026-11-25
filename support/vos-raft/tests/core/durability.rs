@@ -5,7 +5,8 @@ use vos_raft::{LogEntry, Message, Role};
 
 use crate::common::{
     LEADER_A, LEADER_B, ME, append, claimed, committed, compact_bounds, config, follow, follower,
-    leader_of_two, matched, persist, persist_all, recovered, sent, snapshotted, writes,
+    leader_of_two, matched, persist, persist_all, pre_vote, recovered, sent, snapshotted, vote,
+    vote_answer, writes,
 };
 
 #[test]
@@ -65,15 +66,7 @@ fn a_commit_index_never_applies_an_unverified_entry() {
 #[test]
 fn a_vote_leaves_only_once_it_is_durable() {
     let mut core = follower(1, &[1, 1], 2);
-    core.receive(
-        LEADER_B,
-        Message::Vote {
-            term: 2,
-            candidate: LEADER_B,
-            last_index: 2,
-            last_term: 1,
-        },
-    );
+    core.receive(LEADER_B, vote(2, LEADER_B, (2, 1)));
     let actions = core.take_actions();
     assert!(
         !sent(&actions)
@@ -89,10 +82,7 @@ fn a_vote_leaves_only_once_it_is_durable() {
     );
     persist(&mut core, &write);
     let actions = core.take_actions();
-    assert!(sent(&actions).contains(&Message::VoteAnswer {
-        term: 2,
-        granted: true
-    }));
+    assert!(sent(&actions).contains(&vote_answer(2, true)));
 }
 
 #[test]
@@ -146,15 +136,7 @@ fn a_lone_member_campaigns_at_once_and_counts_its_vote_once_durable() {
 #[test]
 fn a_snapshot_switch_records_the_newest_term_and_vote() {
     let mut core = follower(1, &[1, 1], 2);
-    core.receive(
-        LEADER_B,
-        Message::Vote {
-            term: 2,
-            candidate: LEADER_B,
-            last_index: 2,
-            last_term: 1,
-        },
-    );
+    core.receive(LEADER_B, vote(2, LEADER_B, (2, 1)));
     persist_all(&mut core);
     follow(&mut core, LEADER_B, 2);
     let switch = core.snapshot_switch(10, 2, None).unwrap();
@@ -233,10 +215,7 @@ fn an_entry_waiting_for_a_lost_blob_never_stalls_an_election() {
     core.receive(LEADER_B, vote(4));
     let vote_write = writes(&core.take_actions()).last().unwrap().clone();
     core.durable(vote_write.seq);
-    assert!(sent(&core.take_actions()).contains(&Message::VoteAnswer {
-        term: 4,
-        granted: true
-    }));
+    assert!(sent(&core.take_actions()).contains(&vote_answer(4, true)));
 }
 
 #[test]
@@ -357,45 +336,18 @@ fn a_wiped_replica_votes_only_for_a_log_reaching_what_it_held() {
     };
     // A candidate whose log ends behind it, though ahead of its empty
     // log, is refused both.
-    core.receive(
-        LEADER_A,
-        Message::PreVote {
-            next_term: 4,
-            candidate: LEADER_A,
-            last_index: 30,
-            last_term: 3,
-        },
-    );
+    core.receive(LEADER_A, pre_vote(4, LEADER_A, (30, 3)));
     assert!(refused(&core.take_actions()));
-    core.receive(
-        LEADER_A,
-        Message::Vote {
-            term: 4,
-            candidate: LEADER_A,
-            last_index: 30,
-            last_term: 3,
-        },
-    );
+    core.receive(LEADER_A, vote(4, LEADER_A, (30, 3)));
     // The refusal leaves once the term it adopted is durable.
     let term = writes(&core.take_actions()).last().unwrap().clone();
     persist(&mut core, &term);
     assert!(refused(&core.take_actions()));
     // One whose log reaches it gets the vote.
-    core.receive(
-        LEADER_B,
-        Message::Vote {
-            term: 5,
-            candidate: LEADER_B,
-            last_index: 40,
-            last_term: 3,
-        },
-    );
+    core.receive(LEADER_B, vote(5, LEADER_B, (40, 3)));
     let vote = writes(&core.take_actions()).last().unwrap().clone();
     persist(&mut core, &vote);
-    assert!(sent(&core.take_actions()).contains(&Message::VoteAnswer {
-        term: 5,
-        granted: true,
-    }));
+    assert!(sent(&core.take_actions()).contains(&vote_answer(5, true)));
 }
 
 /// A wiped replica restored from a snapshot older than the log it held

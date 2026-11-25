@@ -5,9 +5,9 @@ use vos_raft::core::{Action, Answer, Core, ProposeError, ReadIndexError, Recover
 use vos_raft::{AppendResult, LogEntry, Message, Role};
 
 use crate::common::{
-    LEADER_A, LEADER_B, ME, append, appends, committed, config, entries_to, follower,
+    LEADER_A, LEADER_B, ME, acked_at, append, appends, committed, config, entries_to, follower,
     idle_leader_of_three, lead, leader_of_two, leader_of_two_with, loads, matched, persist,
-    persist_into, recovered, sent, writes,
+    persist_into, pre_vote, recovered, sent, vote_answer, writes,
 };
 
 fn proposals_refused(actions: &[Action<u16>]) -> usize {
@@ -34,16 +34,6 @@ fn reads(actions: &[Action<u16>]) -> Vec<(u64, Result<u64, ReadIndexError>)> {
             _ => None,
         })
         .collect()
-}
-
-/// An answer, in heartbeat `round`, that the peer holds through `matched`.
-fn matched_in(round: u64, matched: u64) -> Message<u16> {
-    Message::AppendAnswer {
-        term: 1,
-        round,
-        commit: 0,
-        result: AppendResult::Matched { matched },
-    }
 }
 
 #[test]
@@ -388,15 +378,7 @@ fn a_leader_refuses_pre_votes() {
     lead(&mut core, 1_000);
     core.tick(1_000 + 400);
     core.take_actions();
-    core.receive(
-        LEADER_B,
-        Message::PreVote {
-            next_term: 2,
-            candidate: LEADER_B,
-            last_index: 100,
-            last_term: 1,
-        },
-    );
+    core.receive(LEADER_B, pre_vote(2, LEADER_B, (100, 1)));
     assert!(
         sent(&core.take_actions()).contains(&Message::PreVoteAnswer {
             term: 1,
@@ -453,10 +435,10 @@ fn read_index_ignores_answers_to_heartbeats_sent_before_it() {
     };
     // Both answers to the first round land after the second read was asked.
     for peer in [LEADER_A, LEADER_B] {
-        core.receive(peer, matched_in(first, 1));
+        core.receive(peer, acked_at(1, first, 1, 0));
     }
     assert_eq!(reads(&core.take_actions()), [(1, Ok(1))]);
-    core.receive(LEADER_A, matched_in(second, 1));
+    core.receive(LEADER_A, acked_at(1, second, 1, 0));
     assert_eq!(reads(&core.take_actions()), [(2, Ok(1))]);
 }
 
@@ -471,7 +453,7 @@ fn read_index_returns_backpressure_when_queue_full() {
     assert_eq!(reads(&actions), [(3, Err(ReadIndexError::Backpressure))]);
     // A answers the latest round: the queue drains, and takes reads again.
     let (_, _, round) = *appends(&actions).last().unwrap();
-    core.receive(LEADER_A, matched_in(round, 1));
+    core.receive(LEADER_A, acked_at(1, round, 1, 0));
     assert_eq!(reads(&core.take_actions()), [(1, Ok(1)), (2, Ok(1))]);
     core.read_index(4, None);
     assert!(reads(&core.take_actions()).is_empty());
@@ -546,13 +528,7 @@ fn candidate_steps_down_on_higher_term_vote_response() {
     core.tick(1_000);
     core.take_actions();
     assert_eq!(core.role(), Role::Candidate);
-    core.receive(
-        LEADER_A,
-        Message::VoteAnswer {
-            term: 99,
-            granted: false,
-        },
-    );
+    core.receive(LEADER_A, vote_answer(99, false));
     core.take_actions();
     assert_eq!(
         (core.role(), core.status().current_term),
