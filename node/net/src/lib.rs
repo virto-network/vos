@@ -289,13 +289,13 @@ pub(crate) struct Deliver {
 const ARRIVALS: usize = 1024;
 /// Bulk frames are large: few wait.
 const BULK_ARRIVALS: usize = 16;
-/// The bytes each class's arrival queue holds, unless configured
-/// otherwise: this many of its largest frames.
-pub(crate) const WAITING: usize = 4;
+/// The bytes each class's arrival queue holds, from every peer: this many
+/// of its largest frames.
+const WAITING: usize = 4;
 
-/// Arrival queues bounded in bytes by `waiting` of each class's largest
+/// Arrival queues bounded in bytes by [`WAITING`] of each class's largest
 /// frames under `limits`.
-pub(crate) fn arrivals(limits: &Limits, waiting: usize) -> (Deliver, Arrivals) {
+pub(crate) fn arrivals(limits: &Limits) -> (Deliver, Arrivals) {
     let (liveness, liveness_rx) = smol::channel::bounded(ARRIVALS);
     let (consensus, consensus_rx) = smol::channel::bounded(ARRIVALS);
     let (requests, requests_rx) = smol::channel::bounded(ARRIVALS);
@@ -303,7 +303,7 @@ pub(crate) fn arrivals(limits: &Limits, waiting: usize) -> (Deliver, Arrivals) {
     (
         Deliver {
             queues: [liveness, consensus, requests, bulk],
-            waiting: Budgets::new(limits, waiting),
+            waiting: Budgets::new(limits, WAITING),
         },
         Arrivals {
             liveness: liveness_rx,

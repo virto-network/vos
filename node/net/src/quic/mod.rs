@@ -14,7 +14,7 @@
 //!   node spends a handshake on it. Handshakes under way are bounded per
 //!   address, and in total for addresses no configured peer has; one
 //!   that fails keeps its place a while, so the places bound handshakes a
-//!   second too; each has a deadline ([`Handshakes`]).
+//!   second too; each has a deadline.
 //! - **Restarts.** Stateless resets are keyed by the node's secret, so a
 //!   restarted node resets at once the connections its last run held. The
 //!   name a node dials with carries its incarnation: a peer dialing in as
@@ -33,7 +33,7 @@
 //!   bytes from its peer's budget for that class ([`Config::assembling`])
 //!   before it is read: past the budget, a stream waits unread, which flow
 //!   control pushes back to the sender. Frames waiting for the consumer
-//!   are bounded in bytes per class ([`Config::waiting`]).
+//!   are bounded in bytes per class.
 //! - No keepalives: the node's own liveness messages carry that. An idle
 //!   connection closes after [`IDLE`], and the next send redials.
 
@@ -51,8 +51,7 @@ use smol::future::FutureExt;
 
 use crate::tls::{ALPN, Identity, Table};
 use crate::{
-    Arrivals, Class, Deliver, Limits, Network, NodeKey, NodeNumber, Peer, Refused, WAITING,
-    arrivals,
+    Arrivals, Class, Deliver, Limits, Network, NodeKey, NodeNumber, Peer, Refused, arrivals,
 };
 
 mod admit;
@@ -141,28 +140,23 @@ pub struct Config {
     /// at once, in that class's largest frames (1 MiB at least): 4 by
     /// default. A budget under its bound takes one frame more.
     pub assembling: usize,
-    /// The bytes of one class's frames, from every peer, waiting for the
-    /// consumer, counted as `assembling` is: 4 by default (each queue also
-    /// holds 1,024 frames at most, 16 for Bulk).
-    pub waiting: usize,
-    pub handshakes: Handshakes,
 }
 
 /// How the endpoint takes handshakes, each from an address its sender
 /// proved first. An address is an IPv4 address or an IPv6 address's /64.
 #[derive(Clone, Copy, Debug)]
-pub struct Handshakes {
+struct Handshakes {
     /// Handshakes under way at once from addresses no configured peer
     /// has, in all.
-    pub total: usize,
+    total: usize,
     /// Handshakes under way at once from one address, for each
     /// configured peer at that address (one at least).
-    pub per_address: usize,
+    per_address: usize,
     /// How long a handshake may take.
-    pub deadline: Duration,
+    deadline: Duration,
     /// How long a handshake that failed keeps its place: so an address's
     /// places bound its handshakes a second, not only those under way.
-    pub failed: Duration,
+    failed: Duration,
 }
 
 impl Default for Handshakes {
@@ -188,8 +182,6 @@ impl Config {
             quiet: QUIET,
             idle: IDLE,
             assembling: ASSEMBLING,
-            waiting: WAITING,
-            handshakes: Handshakes::default(),
         }
     }
 
@@ -207,11 +199,8 @@ impl Config {
         {
             return refuse("a class's frame limit is 0");
         }
-        if self.streams == 0 || self.assembling == 0 || self.waiting == 0 {
+        if self.streams == 0 || self.assembling == 0 {
             return refuse("no stream, or no frame, a peer may send");
-        }
-        if self.handshakes.per_address == 0 {
-            return refuse("no handshake from any address");
         }
         if quinn::IdleTimeout::try_from(self.idle).is_err() {
             return refuse("an idle timeout QUIC cannot carry");
@@ -272,7 +261,7 @@ impl Quic {
         ring::rand::SystemRandom::new()
             .fill(&mut incarnation)
             .map_err(|_| io::Error::other("no randomness"))?;
-        let (deliver, arrivals) = arrivals(&config.limits, config.waiting);
+        let (deliver, arrivals) = arrivals(&config.limits);
         let inner = Arc::new(Inner {
             number: config.number,
             identity,
@@ -282,7 +271,7 @@ impl Quic {
             table,
             links: Mutex::new(HashMap::new()),
             inbound: Mutex::new(HashMap::new()),
-            admission: Arc::new(Admission::new(config.handshakes)),
+            admission: Arc::new(Admission::new(Handshakes::default())),
             deliver,
             limits: config.limits,
             quiet: config.quiet,
