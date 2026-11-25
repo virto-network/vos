@@ -38,7 +38,7 @@
 //!   connection closes after [`IDLE`], and the next send redials.
 
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -189,14 +189,7 @@ impl Config {
     fn check(&self) -> io::Result<()> {
         let refuse = |what: &str| Err(io::Error::new(io::ErrorKind::InvalidInput, what.to_owned()));
         let limits = &self.limits;
-        if [
-            limits.liveness,
-            limits.consensus,
-            limits.requests,
-            limits.bulk,
-        ]
-        .contains(&0)
-        {
+        if Class::ALL.into_iter().any(|class| limits.of(class) == 0) {
             return refuse("a class's frame limit is 0");
         }
         if self.streams == 0 || self.assembling == 0 {
@@ -318,9 +311,7 @@ impl Drop for Quic {
     fn drop(&mut self) {
         self.inner.close();
         // Let the peers hear the close, briefly, before the thread stops.
-        smol::block_on(self.inner.endpoint.wait_idle().or(async {
-            smol::Timer::after(CLOSING).await;
-        }));
+        smol::block_on(within(CLOSING, self.inner.endpoint.wait_idle()));
     }
 }
 
@@ -417,6 +408,16 @@ impl Inner {
     fn configured(&self, key: &NodeKey, from: NodeNumber) -> bool {
         self.peer_number(key) == Some(from)
     }
+}
+
+/// `future`'s output, unless `limit` passes first.
+async fn within<T>(limit: Duration, future: impl IntoFuture<Output = T>) -> Option<T> {
+    async { Some(future.await) }
+        .or(async {
+            smol::Timer::after(limit).await;
+            None
+        })
+        .await
 }
 
 fn transport(streams: u32, idle: Duration) -> quinn::TransportConfig {

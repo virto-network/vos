@@ -12,6 +12,7 @@ use smol::stream::StreamExt;
 use super::executor::{Spawner, Tasks};
 use super::{
     BULK_STREAMS, CRYPTO_ERRORS, DIAL, HEADER, Inner, MAX_BACKOFF, MIN_BACKOFF, SETTLED, code,
+    within,
 };
 use crate::{Budgets, Class, Hold, Peer};
 
@@ -90,10 +91,10 @@ impl Dialing {
         let mut backoff = MIN_BACKOFF;
         loop {
             if next.is_none() {
-                match queued.recv().await {
-                    Ok(frame) => next = Some(frame),
-                    Err(_) => return,
-                }
+                let Ok(frame) = queued.recv().await else {
+                    return;
+                };
+                next = Some(frame);
             }
             let dialed = self
                 .endpoint
@@ -105,11 +106,8 @@ impl Dialing {
                     return;
                 }
             };
-            let timeout = async {
-                smol::Timer::after(DIAL).await;
-                Err(quinn::ConnectionError::TimedOut)
-            };
-            let connection = match connecting.or(timeout).await {
+            let timed_out = Err(quinn::ConnectionError::TimedOut);
+            let connection = match within(DIAL, connecting).await.unwrap_or(timed_out) {
                 Ok(connection) => connection,
                 Err(error) => {
                     tracing::debug!(%address, %error, "dial failed");
@@ -119,7 +117,7 @@ impl Dialing {
             };
             *held.lock().expect("the connection") = Some(connection.clone());
             let connected = Instant::now();
-            self.write(&connection, &mut next, &queued).await;
+            self.write(&connection, connected, &mut next, &queued).await;
             *held.lock().expect("the connection") = None;
             if refused(&connection) {
                 // The peer took the handshake, then refused this node:
@@ -144,10 +142,10 @@ impl Dialing {
     async fn write(
         &self,
         connection: &quinn::Connection,
+        connected: Instant,
         next: &mut Option<Outgoing>,
         queued: &smol::channel::Receiver<Outgoing>,
     ) {
-        let connected = Instant::now();
         enum Event {
             Frame(Outgoing),
             Sweep,
