@@ -172,11 +172,11 @@ impl Inner {
             PeerMessage::Raft { agent, message } => {
                 // Only a node the agent's placement admits speaks for its
                 // group, as for a forwarded call: the core cannot tell a
-                // member it has not heard of from a stranger. A node that
-                // holds no placement naming the sender asks it for the
-                // record, which a newer placement may carry.
+                // member it has not heard of from a stranger. The sender is
+                // asked for the record, which a newer placement than the
+                // one held here may carry.
                 if !self.admit(agent, from) {
-                    self.ask_for_record(from, agent, self.run(agent).is_some());
+                    self.ask_about_sender(from, agent);
                     return;
                 }
                 let input = Input::Raft {

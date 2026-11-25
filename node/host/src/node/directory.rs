@@ -432,6 +432,25 @@ impl Inner {
         self.send(from, &PeerMessage::DirectoryRequest { agent });
     }
 
+    /// Ask `from`, whose Raft traffic for `agent` the placement held here
+    /// does not admit, for the agent's record, whether or not a group runs
+    /// here: a placement newer than the one held may name it, as one that
+    /// added it while this replica lagged does. At most once every
+    /// [`ASK_EVERY`] per agent and peer.
+    pub(crate) fn ask_about_sender(&self, from: NodeNumber, agent: AgentId) {
+        let now = Instant::now();
+        {
+            let mut asked = lock(&self.directory.asked);
+            let last = asked.get(&(agent, from)).copied();
+            if last.is_some_and(|last| now.saturating_duration_since(last) < ASK_EVERY) {
+                return;
+            }
+            asked.insert((agent, from), now);
+            trim_asks(&mut asked, now);
+        }
+        self.send(from, &PeerMessage::DirectoryRequest { agent });
+    }
+
     /// Answer `from`'s request for `agent`'s record with the record and
     /// placement held here, if the placement names it: an ordinary record,
     /// acknowledged as any. It is sent once; the asker asks again.
