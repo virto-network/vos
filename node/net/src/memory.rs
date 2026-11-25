@@ -14,8 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{
-    Arrivals, Class, Deliver, Incoming, Limits, Network, NodeNumber, Peer, Refused, WAITING,
-    arrivals,
+    Arrivals, Class, Deliver, Incoming, Limits, Network, NodeNumber, Peer, Refused, arrivals,
 };
 
 /// How often a frame waiting for room looks again.
@@ -97,7 +96,7 @@ impl Hub {
     pub fn join(&self, number: NodeNumber) -> (Endpoint, Arrivals) {
         let peers = Arc::new(Mutex::new(Vec::new()));
         let mut state = self.state();
-        let (deliver, arrivals) = arrivals(&state.limits, WAITING);
+        let (deliver, arrivals) = arrivals(&state.limits);
         state.generation += 1;
         let generation = state.generation;
         state.endpoints.insert(
