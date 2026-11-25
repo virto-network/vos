@@ -426,15 +426,18 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
     pub fn outbox(&self) -> Result<Vec<Outgoing<H>>, Error<S::Error>> {
         self.outbox
             .iter()
-            .map(|((author, seq), cid)| match self.store.node(cid) {
-                Ok(Some(bytes)) => Ok(Outgoing {
+            .map(|((author, seq), cid)| {
+                let bytes = self
+                    .store
+                    .node(cid)
+                    .map_err(Error::Store)?
+                    .ok_or(Error::Corrupt)?;
+                Ok(Outgoing {
                     author: *author,
                     seq: *seq,
                     cid: cid.clone(),
                     bytes,
-                }),
-                Ok(None) => Err(Error::Corrupt),
-                Err(error) => Err(Error::Store(error)),
+                })
             })
             .collect()
     }

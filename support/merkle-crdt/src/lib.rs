@@ -89,7 +89,7 @@ pub use node::{DagNode, Header, MAX_PARENTS};
 pub use replica::{
     Equivocation, Error, Ingested, MAX_HELD, MAX_HELD_BYTES, MAX_HELD_PER_AUTHOR, Outgoing, Replica,
 };
-pub use signed::{Author, Node, Refusal, Scope, Signed, message, validate};
+pub use signed::{Author, Node, Refusal, Scope, Signed, Validated, message, validate};
 pub use store::{Applied, Changes, Loaded, MemStore, Store};
 
 #[cfg(feature = "fjall")]

@@ -56,17 +56,24 @@ impl Encode for bool {
     }
 }
 
-macro_rules! impl_encode_int {
+macro_rules! impl_int {
     ($($t:ty),+) => {
         $(impl Encode for $t {
             fn encode_to(&self, buf: &mut Vec<u8>) {
                 buf.extend_from_slice(&self.to_le_bytes());
             }
+        }
+
+        impl Decode for $t {
+            fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
+                let b = take(buf, pos, core::mem::size_of::<$t>())?;
+                Some(<$t>::from_le_bytes(b.try_into().ok()?))
+            }
         })+
     };
 }
 
-impl_encode_int!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
+impl_int!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
 
 impl Encode for [u8] {
     fn encode_to(&self, buf: &mut Vec<u8>) {
@@ -123,19 +130,25 @@ impl<T: Encode> Encode for Option<T> {
     }
 }
 
-macro_rules! impl_encode_tuple {
+macro_rules! impl_tuple {
     ($($idx:tt $name:ident),+) => {
         impl<$($name: Encode),+> Encode for ($($name,)+) {
             fn encode_to(&self, buf: &mut Vec<u8>) {
                 $(self.$idx.encode_to(buf);)+
             }
         }
+
+        impl<$($name: Decode),+> Decode for ($($name,)+) {
+            fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
+                Some(($($name::decode_from(buf, pos)?,)+))
+            }
+        }
     };
 }
 
-impl_encode_tuple!(0 A, 1 B);
-impl_encode_tuple!(0 A, 1 B, 2 C);
-impl_encode_tuple!(0 A, 1 B, 2 C, 3 D);
+impl_tuple!(0 A, 1 B);
+impl_tuple!(0 A, 1 B, 2 C);
+impl_tuple!(0 A, 1 B, 2 C, 3 D);
 
 fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
     let end = pos.checked_add(n)?;
@@ -144,13 +157,8 @@ fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
     Some(s)
 }
 
-fn read_u64(buf: &[u8], pos: &mut usize) -> Option<u64> {
-    let b = take(buf, pos, 8)?;
-    Some(u64::from_le_bytes(b.try_into().ok()?))
-}
-
 fn read_len(buf: &[u8], pos: &mut usize) -> Option<usize> {
-    usize::try_from(read_u64(buf, pos)?).ok()
+    usize::try_from(u64::decode_from(buf, pos)?).ok()
 }
 
 fn read_count(buf: &[u8], pos: &mut usize) -> Option<usize> {
@@ -173,22 +181,6 @@ impl Decode for bool {
         }
     }
 }
-
-macro_rules! impl_decode_int {
-    ($($t:ty, $n:expr);+ $(;)?) => {
-        $(impl Decode for $t {
-            fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
-                let b = take(buf, pos, $n)?;
-                Some(<$t>::from_le_bytes(b.try_into().ok()?))
-            }
-        })+
-    };
-}
-
-impl_decode_int!(
-    u8, 1; u16, 2; u32, 4; u64, 8; u128, 16;
-    i8, 1; i16, 2; i32, 4; i64, 8; i128, 16;
-);
 
 impl<const N: usize> Decode for [u8; N] {
     fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
@@ -238,20 +230,6 @@ impl<T: Decode> Decode for Option<T> {
         }
     }
 }
-
-macro_rules! impl_decode_tuple {
-    ($($idx:tt $name:ident),+) => {
-        impl<$($name: Decode),+> Decode for ($($name,)+) {
-            fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
-                Some(($($name::decode_from(buf, pos)?,)+))
-            }
-        }
-    };
-}
-
-impl_decode_tuple!(0 A, 1 B);
-impl_decode_tuple!(0 A, 1 B, 2 C);
-impl_decode_tuple!(0 A, 1 B, 2 C, 3 D);
 
 #[cfg(test)]
 mod tests {

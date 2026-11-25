@@ -60,7 +60,7 @@ impl std::error::Error for FjallError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             FjallError::Fjall(error) => Some(error),
-            FjallError::Corrupt | FjallError::Name | FjallError::Row => None,
+            _ => None,
         }
     }
 }
