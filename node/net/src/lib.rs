@@ -262,7 +262,7 @@ impl std::fmt::Debug for Incoming {
             .field("from", &self.from)
             .field("stream", &self.stream)
             .field("frame", &self.frame)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

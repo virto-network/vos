@@ -317,6 +317,7 @@ impl Network for Endpoint {
             }
         }
         let delay = state.delay;
+        let budget = state.limits.queue(class);
         let deliver = state.deliver(self.number, to);
         drop(state);
         let mut delayed = self.delayed.lock().expect("the delayed links");
@@ -333,7 +334,6 @@ impl Network for Endpoint {
         // A delayed link's queue holds what it has yet to deliver, under its
         // class's budget: one under it takes one frame more.
         {
-            let budget = self.hub.state().limits.queue(class);
             let mut held = self.held.lock().expect("the held bytes");
             let held = held.entry((to, class)).or_insert(0);
             if *held >= budget {
