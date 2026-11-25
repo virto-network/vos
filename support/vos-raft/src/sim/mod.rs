@@ -12,122 +12,22 @@
 //!   every answered read index against what was committed when the read
 //!   was asked.
 
-use alloc::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
-use core::cmp::{self, Reverse};
 
 use crate::config::Config;
-use crate::core::{Action, ActiveConfigRecord, Answer, Core, Recovered, SnapshotSwitch, Write};
+use crate::core::{Action, ActiveConfigRecord, Answer, Core};
 use crate::log_entry::{EntryKind, LogEntry};
 use crate::message::Message;
-use crate::meta::Meta;
 use crate::pair::{Frame, PeerTable, Round};
 pub use crate::random::Random;
 use crate::role::Role;
 
-/// What the network does to messages.
-#[derive(Debug, Clone, Copy)]
-pub struct Faults {
-    pub drop_per_million: u64,
-    pub duplicate_per_million: u64,
-    /// Delivery takes this many milliseconds, uniformly.
-    pub delay: (u64, u64),
-}
+mod network;
+mod store;
 
-impl Default for Faults {
-    fn default() -> Self {
-        Self {
-            drop_per_million: 0,
-            duplicate_per_million: 0,
-            delay: (1, 1),
-        }
-    }
-}
-
-/// A simulated network between nodes, for any payload.
-pub struct Network<N: Ord + Copy, P> {
-    faults: Faults,
-    in_flight: BinaryHeap<Reverse<(u64, u64, N, N)>>,
-    payloads: BTreeMap<u64, P>,
-    next: u64,
-    cut: BTreeSet<(N, N)>,
-}
-
-impl<N: Ord + Copy, P: Clone> Network<N, P> {
-    pub fn new(faults: Faults) -> Self {
-        Self {
-            faults,
-            in_flight: BinaryHeap::new(),
-            payloads: BTreeMap::new(),
-            next: 0,
-            cut: BTreeSet::new(),
-        }
-    }
-
-    pub fn set_faults(&mut self, faults: Faults) {
-        self.faults = faults;
-    }
-
-    /// Queue `payload` from `from` to `to` at time `now`.
-    pub fn send(&mut self, random: &mut Random, now: u64, from: N, to: N, payload: P) {
-        if self.cut.contains(&(from, to)) || random.chance(self.faults.drop_per_million) {
-            return;
-        }
-        let copies = if random.chance(self.faults.duplicate_per_million) {
-            2
-        } else {
-            1
-        };
-        for _ in 0..copies {
-            let at = now + random.between(self.faults.delay.0, self.faults.delay.1);
-            self.next += 1;
-            self.payloads.insert(self.next, payload.clone());
-            self.in_flight.push(Reverse((at, self.next, from, to)));
-        }
-    }
-
-    /// The next delivery due at or before `now`.
-    pub fn deliver(&mut self, now: u64) -> Option<(N, N, P)> {
-        loop {
-            let Reverse((at, _, _, _)) = *self.in_flight.peek()?;
-            if at > now {
-                return None;
-            }
-            let Reverse((_, id, from, to)) = self.in_flight.pop().expect("peeked");
-            let payload = self.payloads.remove(&id).expect("queued with its payload");
-            // A partition made after sending still stops the message.
-            if !self.cut.contains(&(from, to)) {
-                return Some((from, to, payload));
-            }
-        }
-    }
-
-    /// When the next message is due.
-    pub fn next_due(&self) -> Option<u64> {
-        self.in_flight.peek().map(|Reverse((at, ..))| *at)
-    }
-
-    /// Stop messages from `from` to `to`.
-    pub fn cut(&mut self, from: N, to: N) {
-        self.cut.insert((from, to));
-    }
-
-    /// Separate `group` from everyone else, both ways.
-    pub fn isolate(&mut self, group: &[N], all: &[N]) {
-        for &inside in group {
-            for &other in all {
-                if !group.contains(&other) {
-                    self.cut.insert((inside, other));
-                    self.cut.insert((other, inside));
-                }
-            }
-        }
-    }
-
-    pub fn heal(&mut self) {
-        self.cut.clear();
-    }
-}
+pub use network::{Faults, Network};
+use store::{Op, Store};
 
 /// What travels between simulated nodes.
 #[derive(Debug, Clone)]
@@ -147,165 +47,6 @@ pub enum Packet {
         index_term: u64,
         configuration: Option<ActiveConfigRecord<u16>>,
     },
-}
-
-/// A queued store operation.
-#[derive(Debug, Clone)]
-enum Op {
-    Write(Write<u16>),
-    Compact {
-        through: u64,
-        configuration: Option<ActiveConfigRecord<u16>>,
-    },
-}
-
-/// One node's store: durable state, and operations not yet synced.
-#[derive(Debug, Clone, Default)]
-struct Store {
-    meta: Meta<u16>,
-    log: BTreeMap<u64, LogEntry<u16>>,
-    active_config: Option<ActiveConfigRecord<u16>>,
-    log_start_config: Option<ActiveConfigRecord<u16>>,
-    applied: u64,
-    unsynced: VecDeque<Op>,
-    /// The last log position held before a retirement wiped the rest.
-    vote_floor: Option<(u64, u64)>,
-}
-
-/// What one sync made durable.
-#[derive(Debug, Default)]
-struct Synced {
-    seq: Option<u64>,
-    compacted: Option<u64>,
-}
-
-impl Store {
-    fn apply(&mut self, op: &Op, synced: &mut Synced) {
-        match op {
-            Op::Write(write) => {
-                if let Some(after) = write.truncate_after {
-                    self.log.retain(|&index, _| index <= after);
-                }
-                for entry in &write.entries {
-                    self.log.insert(entry.index, entry.clone());
-                }
-                if let Some(hard) = &write.meta {
-                    self.meta.current_term = hard.current_term;
-                    self.meta.voted_for = hard.voted_for;
-                    self.meta.commit_index = hard.commit_index;
-                }
-                if let Some(record) = &write.active_config {
-                    self.active_config = Some(record.clone());
-                }
-                synced.seq = Some(write.seq);
-            }
-            Op::Compact {
-                through,
-                configuration,
-            } => {
-                let through = *through;
-                if through > self.meta.snap_last_index
-                    && let Some(term) = self.log.get(&through).map(|entry| entry.term)
-                {
-                    self.log.retain(|&index, _| index > through);
-                    self.meta.snap_last_index = through;
-                    self.meta.snap_last_term = term;
-                    self.log_start_config = configuration.clone();
-                    synced.compacted = Some(through);
-                }
-            }
-        }
-    }
-
-    /// Make every queued operation durable.
-    fn sync(&mut self) -> Synced {
-        let mut synced = Synced::default();
-        while let Some(op) = self.unsynced.pop_front() {
-            self.apply(&op, &mut synced);
-        }
-        synced
-    }
-
-    /// Lose the unsynced operations after a prefix of `keep` of them.
-    fn crash(&mut self, keep: usize) {
-        let mut synced = Synced::default();
-        for _ in 0..keep.min(self.unsynced.len()) {
-            let op = self.unsynced.pop_front().expect("counted");
-            self.apply(&op, &mut synced);
-        }
-        self.unsynced.clear();
-    }
-
-    /// Switch to a snapshot, durably.
-    fn switch(&mut self, switch: &SnapshotSwitch<u16>) {
-        if let Some(after) = switch.truncate_after {
-            self.log.retain(|&at, _| at <= after);
-        }
-        let index = switch.meta.snap_last_index;
-        self.log.retain(|&at, _| at > index);
-        self.meta = switch.meta.clone();
-        self.active_config = Some(switch.active_config.clone());
-        self.log_start_config = switch.log_start_config.clone();
-        self.applied = self.applied.max(index);
-    }
-
-    fn recovered(&self) -> Recovered<u16> {
-        Recovered {
-            meta: self.meta.clone(),
-            entries: self
-                .log
-                .range(self.meta.snap_last_index + 1..)
-                .map(|(_, entry)| entry.clone())
-                .collect(),
-            active_config: self.active_config.clone(),
-            log_start_config: self.log_start_config.clone(),
-            applied: self.applied,
-            vote_floor: self.vote_floor,
-        }
-    }
-
-    /// Retire: the log, state and configuration go; the term and vote
-    /// stay, and so does the last log position held, as the floor of
-    /// every vote it gives if it is added again.
-    fn retire(&mut self, keep_floor: bool) {
-        self.sync();
-        let last = self.log.last_key_value().map_or(
-            (self.meta.snap_last_index, self.meta.snap_last_term),
-            |(index, entry)| (*index, entry.term),
-        );
-        // The later position, by term then index.
-        self.vote_floor = keep_floor.then(|| {
-            self.vote_floor.map_or(last, |floor| {
-                cmp::max_by_key(floor, last, |&(index, term)| (term, index))
-            })
-        });
-        self.log.clear();
-        self.meta = Meta {
-            current_term: self.meta.current_term,
-            voted_for: self.meta.voted_for,
-            ..Meta::default()
-        };
-        self.active_config = None;
-        self.log_start_config = None;
-        self.applied = 0;
-    }
-
-    /// The entry at `index` as written so far, durable or not.
-    fn written(&self, index: u64) -> Option<LogEntry<u16>> {
-        let mut entry = self.log.get(&index).cloned();
-        for op in &self.unsynced {
-            let Op::Write(write) = op else {
-                continue;
-            };
-            if write.truncate_after.is_some_and(|after| after < index) {
-                entry = None;
-            }
-            if let Some(written) = write.entries.iter().find(|written| written.index == index) {
-                entry = Some(written.clone());
-            }
-        }
-        entry
-    }
 }
 
 /// A violated safety property.
