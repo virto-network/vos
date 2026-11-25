@@ -1,6 +1,6 @@
 use alloc::{string::String, vec::Vec};
 
-/// The most items a vector or a set decodes: a longer one is refused.
+/// The most items a vector decodes: a longer one is refused.
 pub const MAX_DECODE_ITEMS: usize = 1_000_000;
 
 /// The most items a vector reserves room for before decoding them: a count
@@ -17,7 +17,7 @@ const RESERVE_ITEMS: usize = 1024;
 /// Variable-length types should be length-prefixed to ensure unambiguous encoding
 /// when composed (e.g. in tuples).
 ///
-/// Encoding has no limit, decoding has: a vector or a set of more than
+/// Encoding has no limit, decoding has: a vector of more than
 /// [`MAX_DECODE_ITEMS`] items encodes and does not decode. A replica
 /// refuses to record operations whose node does not decode
 /// ([`Error::Unencodable`](crate::Error::Unencodable)).
@@ -50,12 +50,6 @@ impl Encode for () {
     fn encode_to(&self, _buf: &mut Vec<u8>) {}
 }
 
-impl Encode for bool {
-    fn encode_to(&self, buf: &mut Vec<u8>) {
-        buf.push(*self as u8);
-    }
-}
-
 macro_rules! impl_int {
     ($($t:ty),+) => {
         $(impl Encode for $t {
@@ -73,7 +67,7 @@ macro_rules! impl_int {
     };
 }
 
-impl_int!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
+impl_int!(u8, u32, u64);
 
 impl Encode for [u8] {
     fn encode_to(&self, buf: &mut Vec<u8>) {
@@ -109,46 +103,18 @@ impl<T: Encode> Encode for Vec<T> {
     }
 }
 
-impl<T: Encode + Ord> Encode for alloc::collections::BTreeSet<T> {
+impl<A: Encode, B: Encode> Encode for (A, B) {
     fn encode_to(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&(self.len() as u64).to_le_bytes());
-        for item in self {
-            item.encode_to(buf);
-        }
+        self.0.encode_to(buf);
+        self.1.encode_to(buf);
     }
 }
 
-impl<T: Encode> Encode for Option<T> {
-    fn encode_to(&self, buf: &mut Vec<u8>) {
-        match self {
-            None => buf.push(0),
-            Some(v) => {
-                buf.push(1);
-                v.encode_to(buf);
-            }
-        }
+impl<A: Decode, B: Decode> Decode for (A, B) {
+    fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
+        Some((A::decode_from(buf, pos)?, B::decode_from(buf, pos)?))
     }
 }
-
-macro_rules! impl_tuple {
-    ($($idx:tt $name:ident),+) => {
-        impl<$($name: Encode),+> Encode for ($($name,)+) {
-            fn encode_to(&self, buf: &mut Vec<u8>) {
-                $(self.$idx.encode_to(buf);)+
-            }
-        }
-
-        impl<$($name: Decode),+> Decode for ($($name,)+) {
-            fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
-                Some(($($name::decode_from(buf, pos)?,)+))
-            }
-        }
-    };
-}
-
-impl_tuple!(0 A, 1 B);
-impl_tuple!(0 A, 1 B, 2 C);
-impl_tuple!(0 A, 1 B, 2 C, 3 D);
 
 fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
     let end = pos.checked_add(n)?;
@@ -169,16 +135,6 @@ fn read_count(buf: &[u8], pos: &mut usize) -> Option<usize> {
 impl Decode for () {
     fn decode_from(_buf: &[u8], _pos: &mut usize) -> Option<Self> {
         Some(())
-    }
-}
-
-impl Decode for bool {
-    fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
-        match *take(buf, pos, 1)?.first()? {
-            0 => Some(false),
-            1 => Some(true),
-            _ => None,
-        }
     }
 }
 
@@ -208,29 +164,6 @@ impl<T: Decode> Decode for Vec<T> {
     }
 }
 
-impl<T: Decode + Ord> Decode for alloc::collections::BTreeSet<T> {
-    fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
-        let count = read_count(buf, pos)?;
-        let mut s = alloc::collections::BTreeSet::new();
-        for _ in 0..count {
-            if !s.insert(T::decode_from(buf, pos)?) {
-                return None;
-            }
-        }
-        Some(s)
-    }
-}
-
-impl<T: Decode> Decode for Option<T> {
-    fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
-        match *take(buf, pos, 1)?.first()? {
-            0 => Some(None),
-            1 => Some(Some(T::decode_from(buf, pos)?)),
-            _ => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,13 +173,6 @@ mod tests {
         let mut pos = usize::MAX;
         assert_eq!(take(&[], &mut pos, 1), None);
         assert_eq!(pos, usize::MAX);
-    }
-
-    #[test]
-    fn only_canonical_tags_decode() {
-        assert_eq!(bool::decode(&[2]), None);
-        assert_eq!(Option::<u8>::decode(&[2, 0]), None);
-        assert_eq!(Option::<u8>::decode(&[1, 7]), Some(Some(7)));
     }
 
     #[test]

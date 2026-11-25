@@ -176,11 +176,6 @@ impl<H: Hasher> MemStore<H> {
         Self::default()
     }
 
-    /// The number of applied nodes.
-    pub fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
     /// Whether no node is applied.
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()

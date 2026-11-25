@@ -39,7 +39,7 @@ const DOMAIN: &[u8] = b"merkle-crdt/node\0";
 /// The bytes an author signs: a domain tag, the scope, the author, the
 /// sequence number, the operations' bytes and the parents. The parents are
 /// signed, so the author attests to where in the DAG its operations stand.
-pub fn message<H: Hasher>(
+fn message<H: Hasher>(
     scope: &Scope,
     author: &Author,
     seq: u64,
@@ -87,7 +87,7 @@ impl<H: Hasher, O: Encode> Node<H, O> {
     /// signature with a non-canonical scalar, or a weak key, is refused, so
     /// no third party can turn one signed node into a second that verifies
     /// and so frame its author as equivocating.
-    pub fn verify(&self, scope: &Scope) -> bool {
+    fn verify(&self, scope: &Scope) -> bool {
         let Ok(key) = VerifyingKey::from_bytes(&self.author.0) else {
             return false;
         };
