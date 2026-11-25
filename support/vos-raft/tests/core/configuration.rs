@@ -7,7 +7,7 @@ use vos_raft::{ActiveConfigRecord, AppendResult, Config, EntryKind, LogEntry, Me
 use crate::common::{
     LEADER_A, LEADER_B, ME, acked_at, append, committed, compact_bounds, config, entries_to,
     follow, follower, lead, leader_of_three_with, leader_of_two, loads, matched, persist_all,
-    persist_into, persist_last, recovered, sent, snapshotted, writes,
+    persist_into, persist_last, recovered, sent, snapshotted, without_pre_votes, writes,
 };
 
 const JOINER: u16 = 4;
@@ -149,10 +149,7 @@ fn an_unknown_log_start_configuration_is_never_sent() {
 
 #[test]
 fn a_replica_given_a_joint_snapshot_finalizes_it_when_it_leads() {
-    let mut cfg = config();
-    cfg.pre_vote = false;
-    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
-    core.take_actions();
+    let mut core = without_pre_votes(Recovered::default(), |_| {});
     follow(&mut core, LEADER_B, 1);
     let (members, old) = joint();
     let carried = record(Some(15), members.clone(), Some(old));
@@ -189,10 +186,7 @@ fn a_recovered_joint_configuration_is_finalized_by_its_leader() {
         active_config: Some(record(Some(15), members.clone(), Some(old))),
         ..snapshotted(recovered(1, 20, Vec::new()), (20, 1))
     };
-    let mut cfg = config();
-    cfg.pre_vote = false;
-    let mut core = Core::new(cfg, recovered, 0, 5);
-    core.take_actions();
+    let mut core = without_pre_votes(recovered, |_| {});
     let actions = lead_with_a(&mut core, 1_000);
     assert_eq!(finals(&actions), vec![members]);
 }
@@ -252,13 +246,11 @@ fn the_next_change_starts_once_the_final_entry_commits() {
 #[test]
 fn a_load_answered_after_a_removal_sends_the_removed_voter_nothing() {
     // A leader of three whose cache holds almost nothing; B never answers.
-    let mut cfg = config();
-    cfg.pre_vote = false;
-    cfg.cache_bytes = 1;
-    cfg.resend_timeout_ms = 100;
-    cfg.check_quorum = false;
-    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
-    core.take_actions();
+    let mut core = without_pre_votes(Recovered::default(), |cfg| {
+        cfg.cache_bytes = 1;
+        cfg.resend_timeout_ms = 100;
+        cfg.check_quorum = false;
+    });
     lead_with_a(&mut core, 1_000);
     let mut store = vec![LogEntry::data(1, 1, Vec::new())];
     // B is replaced by the joiner: the joint entry at 2, the final one at 3.

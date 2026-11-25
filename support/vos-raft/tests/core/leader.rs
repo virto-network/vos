@@ -7,7 +7,8 @@ use vos_raft::{AppendResult, LogEntry, Message, Role};
 use crate::common::{
     LEADER_A, LEADER_B, ME, acked_at, append, appends, committed, config, entries_to, follower,
     idle_leader_of_three, last_write, lead, leader_of_two, leader_of_two_with, loads, matched,
-    persist, persist_into, persist_last, pre_vote, recovered, sent, vote_answer, writes,
+    persist, persist_into, persist_last, pre_vote, recovered, sent, vote_answer, without_pre_votes,
+    writes,
 };
 
 fn proposals_refused(actions: &[Action<u16>]) -> usize {
@@ -39,10 +40,7 @@ fn reads(actions: &[Action<u16>]) -> Vec<(u64, Result<u64, ReadIndexError>)> {
 #[test]
 fn a_leader_sends_each_peer_a_commit_it_has_acknowledged() {
     // A three-member group led by ME; peers A and B.
-    let mut cfg = config();
-    cfg.pre_vote = false;
-    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
-    core.take_actions();
+    let mut core = without_pre_votes(Recovered::default(), |_| {});
     lead(&mut core, 1_000);
     for n in 0..4u8 {
         core.propose(u64::from(n), vec![n]);
@@ -79,10 +77,7 @@ fn heartbeats_go_to_peers_with_an_append_in_flight() {
 #[test]
 fn followers_learn_a_commit_at_once_without_a_heartbeat() {
     // A three-member group led by ME; its no-op is in flight to A and B.
-    let mut cfg = config();
-    cfg.pre_vote = false;
-    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
-    core.take_actions();
+    let mut core = without_pre_votes(Recovered::default(), |_| {});
     let actions = lead(&mut core, 1_000);
     persist_last(&mut core, &actions);
     core.take_actions();
@@ -130,12 +125,10 @@ fn a_proposal_goes_out_at_once_unless_an_append_is_in_flight() {
 
 #[test]
 fn an_append_carries_at_most_its_byte_cap() {
-    let mut cfg = config();
-    cfg.members = vec![ME, LEADER_A];
-    cfg.pre_vote = false;
-    cfg.max_append_bytes = 100;
-    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
-    core.take_actions();
+    let mut core = without_pre_votes(Recovered::default(), |cfg| {
+        cfg.members = vec![ME, LEADER_A];
+        cfg.max_append_bytes = 100;
+    });
     lead(&mut core, 1_000);
     for n in 0..3u8 {
         core.propose(u64::from(n), vec![n; 60]);
@@ -155,16 +148,14 @@ fn an_append_carries_at_most_its_byte_cap() {
 fn a_rejection_moves_the_probe_past_the_conflicting_term() {
     // The leader holds 1..=3 at term 1 and 4..=6 at term 3; elected at
     // term 4, it appends its no-op at 7.
-    let mut cfg = config();
-    cfg.members = vec![ME, LEADER_A];
-    cfg.pre_vote = false;
     let entries = [1, 1, 1, 3, 3, 3]
         .iter()
         .enumerate()
         .map(|(at, &term)| LogEntry::data(at as u64 + 1, term, vec![at as u8]))
         .collect();
-    let mut core = Core::new(cfg, recovered(3, 3, entries), 0, 5);
-    core.take_actions();
+    let mut core = without_pre_votes(recovered(3, 3, entries), |cfg| {
+        cfg.members = vec![ME, LEADER_A]
+    });
     let (probe, _) = entries_to(&lead(&mut core, 1_000), LEADER_A)[0].clone();
     assert!(probe >= 6, "the first probe follows the leader's log");
     // A holds 4..=5 at term 2, which the leader never had: the probe
@@ -317,14 +308,12 @@ fn timeout_now_counts_only_from_the_leader() {
 fn a_follower_behind_the_cache_catches_up_from_the_store() {
     // A leader of two whose cache holds almost nothing: entries it has
     // made durable leave the cache as soon as more arrive.
-    let mut cfg = config();
-    cfg.members = vec![ME, LEADER_A];
-    cfg.pre_vote = false;
-    cfg.cache_bytes = 1;
-    // A stays silent until the resend; check-quorum would depose the leader.
-    cfg.check_quorum = false;
-    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
-    core.take_actions();
+    let mut core = without_pre_votes(Recovered::default(), |cfg| {
+        cfg.members = vec![ME, LEADER_A];
+        cfg.cache_bytes = 1;
+        // A stays silent until the resend; check-quorum would depose the leader.
+        cfg.check_quorum = false;
+    });
     // The store: every entry the leader writes, made durable at once.
     let mut store = Vec::new();
     let actions = lead(&mut core, 1_000);
@@ -370,11 +359,7 @@ fn a_follower_behind_the_cache_catches_up_from_the_store() {
 fn a_leader_refuses_pre_votes() {
     // Led for longer than the shortest election timeout: a follower that
     // stopped hearing it over a lossy link must not win its pre-vote.
-    let mut cfg = config();
-    cfg.pre_vote = false;
-    cfg.check_quorum = false;
-    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
-    core.take_actions();
+    let mut core = without_pre_votes(Recovered::default(), |cfg| cfg.check_quorum = false);
     lead(&mut core, 1_000);
     core.tick(1_000 + 400);
     core.take_actions();
@@ -390,13 +375,11 @@ fn a_leader_refuses_pre_votes() {
 
 #[test]
 fn a_load_that_starts_late_sends_nothing() {
-    let mut cfg = config();
-    cfg.members = vec![ME, LEADER_A];
-    cfg.pre_vote = false;
-    cfg.cache_bytes = 1;
-    cfg.check_quorum = false;
-    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
-    core.take_actions();
+    let mut core = without_pre_votes(Recovered::default(), |cfg| {
+        cfg.members = vec![ME, LEADER_A];
+        cfg.cache_bytes = 1;
+        cfg.check_quorum = false;
+    });
     let mut store = Vec::new();
     let actions = lead(&mut core, 1_000);
     persist_into(&mut store, &mut core, &actions);

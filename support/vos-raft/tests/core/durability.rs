@@ -6,7 +6,7 @@ use vos_raft::{LogEntry, Message, Role};
 use crate::common::{
     LEADER_A, LEADER_B, ME, append, claimed, committed, compact_bounds, config, follow, follower,
     last_write, leader_of_two, matched, persist, persist_all, persist_last, pre_vote, recovered,
-    sent, snapshotted, vote, vote_answer, writes,
+    sent, snapshotted, vote, vote_answer, without_pre_votes, writes,
 };
 
 #[test]
@@ -482,10 +482,7 @@ fn a_hosts_payload_weight_counts_toward_compaction() {
 /// term, and lead it again with another log.
 #[test]
 fn a_candidate_leads_only_once_its_term_is_durable() {
-    let mut cfg = config();
-    cfg.pre_vote = false;
-    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
-    core.take_actions();
+    let mut core = without_pre_votes(Recovered::default(), |_| {});
     core.tick(1_000);
     let actions = core.take_actions();
     assert!(
