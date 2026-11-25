@@ -8,10 +8,7 @@ pub const LEADER_B: u16 = 3;
 pub const ME: u16 = 1;
 
 pub fn config() -> Config<u16> {
-    let mut cfg = Config::new(ME, vec![ME, LEADER_A, LEADER_B]);
-    cfg.election_timeout_ms = (150, 300);
-    cfg.heartbeat_interval_ms = 50;
-    cfg
+    Config::new(ME, vec![ME, LEADER_A, LEADER_B])
 }
 
 /// What a replica at `term` recovers: `entries`, committed and applied
@@ -138,12 +135,10 @@ pub fn leader_of_two() -> Core<u16> {
 
 /// As [`leader_of_two`], with its configuration adjusted by `adjust`.
 pub fn leader_of_two_with(adjust: impl FnOnce(&mut Config<u16>)) -> Core<u16> {
-    let mut cfg = config();
-    cfg.members = vec![ME, LEADER_A];
-    cfg.pre_vote = false;
-    adjust(&mut cfg);
-    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
-    core.take_actions();
+    let mut core = without_pre_votes(Recovered::default(), |cfg| {
+        cfg.members = vec![ME, LEADER_A];
+        adjust(cfg);
+    });
     let actions = lead(&mut core, 1_000);
     persist_last(&mut core, &actions);
     core.take_actions();
@@ -160,17 +155,27 @@ pub fn idle_leader_of_three() -> Core<u16> {
 /// adjusted by `adjust`, whose followers acknowledged its no-op and the
 /// commit.
 pub fn leader_of_three_with(adjust: impl FnOnce(&mut Config<u16>)) -> Core<u16> {
-    let mut cfg = config();
-    cfg.pre_vote = false;
-    adjust(&mut cfg);
-    let mut core = Core::new(cfg, Recovered::default(), 0, 5);
-    core.take_actions();
+    let mut core = without_pre_votes(Recovered::default(), adjust);
     let actions = lead(&mut core, 1_000);
     persist_last(&mut core, &actions);
     for peer in [LEADER_A, LEADER_B] {
         core.receive(peer, acked(1, 0));
         core.receive(peer, acked(1, 1));
     }
+    core.take_actions();
+    core
+}
+
+/// A replica with pre-votes off, recovering `recovered`, its
+/// configuration adjusted by `adjust`, its first actions taken.
+pub fn without_pre_votes(
+    recovered: Recovered<u16>,
+    adjust: impl FnOnce(&mut Config<u16>),
+) -> Core<u16> {
+    let mut cfg = config();
+    cfg.pre_vote = false;
+    adjust(&mut cfg);
+    let mut core = Core::new(cfg, recovered, 0, 5);
     core.take_actions();
     core
 }
