@@ -150,15 +150,20 @@ fn pump(nodes: &mut BTreeMap<u16, Stored>, skip: &[u16]) -> Vec<(u16, u16, Messa
 /// Send `from`'s messages in `sent` to `peer`, and its answers back.
 fn exchange(nodes: &mut BTreeMap<u16, Stored>, from: u16, sent: &[(u16, Message<u16>)], peer: u16) {
     for message in to(sent, peer) {
-        nodes.get_mut(&peer).unwrap().core.receive(from, message);
+        node(nodes, peer).core.receive(from, message);
     }
-    for message in to(&nodes.get_mut(&peer).unwrap().run(true), from) {
-        nodes.get_mut(&from).unwrap().core.receive(peer, message);
+    for message in to(&node(nodes, peer).run(true), from) {
+        node(nodes, from).core.receive(peer, message);
     }
 }
 
 /// Whether two replicas applied the same entry at every index both
 /// applied.
+/// The replica `id` of `nodes`.
+fn node(nodes: &mut BTreeMap<u16, Stored>, id: u16) -> &mut Stored {
+    nodes.get_mut(&id).expect("a node")
+}
+
 fn agree(a: &[(u64, Vec<u8>)], b: &[(u64, Vec<u8>)]) -> bool {
     let b: BTreeMap<_, _> = b.iter().cloned().collect();
     a.iter()
@@ -172,8 +177,8 @@ fn agree(a: &[(u64, Vec<u8>)], b: &[(u64, Vec<u8>)]) -> bool {
 fn a_term_is_led_once_across_a_crash() {
     let (me, a, b) = (1u16, 2u16, 3u16);
     let mut nodes = group(&[me, a, b], false);
-    nodes.get_mut(&me).unwrap().core.tick(1_000);
-    let votes = nodes.get_mut(&me).unwrap().run(false);
+    node(&mut nodes, me).core.tick(1_000);
+    let votes = node(&mut nodes, me).run(false);
     exchange(&mut nodes, me, &votes, a);
     exchange(&mut nodes, me, &votes, b);
     assert!(
@@ -184,21 +189,21 @@ fn a_term_is_led_once_across_a_crash() {
     let mut led = false;
     for propose in [false, true] {
         if propose {
-            nodes.get_mut(&me).unwrap().core.propose(1, b"x".to_vec());
+            node(&mut nodes, me).core.propose(1, b"x".to_vec());
         }
         led |= nodes[&me].leads(1);
-        let sent = nodes.get_mut(&me).unwrap().run(false);
+        let sent = node(&mut nodes, me).run(false);
         exchange(&mut nodes, me, &sent, a);
     }
     // ME crashes: none of its writes was synced. It campaigns again.
-    nodes.get_mut(&me).unwrap().restart();
-    nodes.get_mut(&me).unwrap().core.tick(1_000);
-    let votes = nodes.get_mut(&me).unwrap().run(true);
+    node(&mut nodes, me).restart();
+    node(&mut nodes, me).core.tick(1_000);
+    let votes = node(&mut nodes, me).run(true);
     exchange(&mut nodes, me, &votes, a);
     exchange(&mut nodes, me, &votes, b);
     let term = nodes[&me].core.status().current_term;
     assert!(!(led && term == 1), "one node led term 1 twice");
-    nodes.get_mut(&me).unwrap().core.propose(2, b"y".to_vec());
+    node(&mut nodes, me).core.propose(2, b"y".to_vec());
     pump(&mut nodes, &[]);
     for round in 1..=4u64 {
         for node in nodes.values_mut() {
@@ -223,15 +228,11 @@ fn a_term_is_led_once_across_a_crash() {
 fn a_transfers_target_leads_its_term_once_across_a_crash() {
     let (me, a, b, c, d) = (1u16, 2u16, 3u16, 4u16, 5u16);
     let mut nodes = group(&[me, a, b, c, d], true);
-    nodes.get_mut(&a).unwrap().core.tick(1_000);
+    node(&mut nodes, a).core.tick(1_000);
     let setup = pump(&mut nodes, &[]);
     assert!(nodes[&a].leads(1));
-    nodes
-        .get_mut(&a)
-        .unwrap()
-        .core
-        .transfer_leadership(Some(me));
-    let handover = nodes.get_mut(&a).unwrap().run(true);
+    node(&mut nodes, a).core.transfer_leadership(Some(me));
+    let handover = node(&mut nodes, a).run(true);
     let late_append = setup
         .iter()
         .rev()
@@ -245,12 +246,8 @@ fn a_transfers_target_leads_its_term_once_across_a_crash() {
         .find(|message| matches!(message, Message::TimeoutNow { .. }))
         .expect("A sent ME a TimeoutNow");
     // ME campaigns at term 2: its term and vote are written, not synced.
-    nodes
-        .get_mut(&me)
-        .unwrap()
-        .core
-        .receive(a, timeout_now.clone());
-    let votes = nodes.get_mut(&me).unwrap().run(false);
+    node(&mut nodes, me).core.receive(a, timeout_now.clone());
+    let votes = node(&mut nodes, me).run(false);
     for peer in [b, c, d] {
         exchange(&mut nodes, me, &votes, peer);
     }
@@ -262,27 +259,27 @@ fn a_transfers_target_leads_its_term_once_across_a_crash() {
     let mut led = false;
     for propose in [false, true] {
         if propose {
-            nodes.get_mut(&me).unwrap().core.propose(1, b"x".to_vec());
+            node(&mut nodes, me).core.propose(1, b"x".to_vec());
         }
         for _ in 0..3 {
             led |= nodes[&me].leads(2);
-            let sent = nodes.get_mut(&me).unwrap().run(false);
+            let sent = node(&mut nodes, me).run(false);
             exchange(&mut nodes, me, &sent, b);
         }
     }
     // ME crashes; the link delivers A's old frames again.
-    nodes.get_mut(&me).unwrap().restart();
-    nodes.get_mut(&me).unwrap().core.receive(a, late_append);
-    nodes.get_mut(&me).unwrap().core.receive(a, timeout_now);
-    let votes = nodes.get_mut(&me).unwrap().run(true);
+    node(&mut nodes, me).restart();
+    node(&mut nodes, me).core.receive(a, late_append);
+    node(&mut nodes, me).core.receive(a, timeout_now);
+    let votes = node(&mut nodes, me).run(true);
     for peer in [b, c, d] {
         exchange(&mut nodes, me, &votes, peer);
     }
     assert!(!(led && nodes[&me].leads(2)), "one node led term 2 twice");
-    nodes.get_mut(&me).unwrap().core.propose(2, b"y".to_vec());
+    node(&mut nodes, me).core.propose(2, b"y".to_vec());
     pump(&mut nodes, &[a]);
     for round in 1..=4u64 {
-        nodes.get_mut(&me).unwrap().core.tick(2_000 * round);
+        node(&mut nodes, me).core.tick(2_000 * round);
         pump(&mut nodes, &[a]);
     }
     for node in [b, c, d] {
@@ -302,35 +299,35 @@ fn a_transfers_target_leads_its_term_once_across_a_crash() {
 fn a_grant_counts_only_for_the_log_it_was_made_to() {
     let (me, l) = (1u16, 2u16);
     let mut nodes = group(&[1, 2, 3, 4, 5], false);
-    nodes.get_mut(&l).unwrap().core.tick(1_000);
+    node(&mut nodes, l).core.tick(1_000);
     pump(&mut nodes, &[]);
     assert!(nodes[&l].leads(1));
     // L proposes e: 3 and 4 hold it durably, ME unsynced, 5 never. L
     // commits it with 3 and 4.
-    nodes.get_mut(&l).unwrap().core.propose(1, b"e".to_vec());
-    let appends = nodes.get_mut(&l).unwrap().run(true);
+    node(&mut nodes, l).core.propose(1, b"e".to_vec());
+    let appends = node(&mut nodes, l).run(true);
     for message in to(&appends, me) {
-        nodes.get_mut(&me).unwrap().core.receive(l, message);
+        node(&mut nodes, me).core.receive(l, message);
     }
-    nodes.get_mut(&me).unwrap().run(false);
+    node(&mut nodes, me).run(false);
     for peer in [3u16, 4] {
         exchange(&mut nodes, l, &appends, peer);
     }
-    nodes.get_mut(&l).unwrap().run(true);
+    node(&mut nodes, l).run(true);
     assert_eq!(nodes[&l].applied.last(), Some(&(2, b"e".to_vec())));
     // ME's timer fires: unsynced, it asks no one for a vote.
-    nodes.get_mut(&me).unwrap().core.tick(1_000);
-    let votes = nodes.get_mut(&me).unwrap().run(false);
+    node(&mut nodes, me).core.tick(1_000);
+    let votes = node(&mut nodes, me).run(false);
     assert!(
         to(&votes, 3).is_empty(),
         "it asks for votes before its term and log are durable: {votes:?}"
     );
     // ME crashes, and campaigns again without e: what it asks now, every
     // peer answers, and those that hold e refuse it.
-    nodes.get_mut(&me).unwrap().restart();
+    node(&mut nodes, me).restart();
     assert_eq!(nodes[&me].core.status().last_log_index, 1);
-    nodes.get_mut(&me).unwrap().core.tick(1_000);
-    let votes = nodes.get_mut(&me).unwrap().run(true);
+    node(&mut nodes, me).core.tick(1_000);
+    let votes = node(&mut nodes, me).run(true);
     for peer in [3u16, 4, 5] {
         exchange(&mut nodes, me, &votes, peer);
     }

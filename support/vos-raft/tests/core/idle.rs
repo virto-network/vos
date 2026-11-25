@@ -74,7 +74,6 @@ fn an_idle_leader_leaves_a_silent_member_without_heartbeats() {
 #[test]
 fn a_leader_that_hears_no_quorum_goes_on_sending() {
     let mut core = leader_of_two_with(|cfg| cfg.idle_heartbeats = false);
-    core.take_actions();
     // Its host hears no one: it may be the one gone deaf, so A, behind,
     // still gets heartbeats.
     core.vouch(1_000 + 40, |_, _| None, |_| None);
@@ -115,7 +114,6 @@ fn a_lost_timeout_now_to_an_idle_target_is_sent_again() {
 fn an_idle_leader_still_sends_heartbeats_to_a_lagging_follower() {
     let mut core = leader_of_two_with(|cfg| cfg.idle_heartbeats = false);
     // A holds nothing yet: each round still reaches it.
-    core.take_actions();
     core.tick(1_000 + 50);
     assert!(appends(&core.take_actions()).contains(&(LEADER_A, 0, 2)));
     core.tick(1_000 + 100);

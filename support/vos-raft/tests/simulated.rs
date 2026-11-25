@@ -146,6 +146,18 @@ struct Exercised {
     cuts: u64,
 }
 
+impl std::ops::AddAssign for Exercised {
+    fn add_assign(&mut self, run: Self) {
+        self.changes += run.changes;
+        self.installs += run.installs;
+        self.compactions += run.compactions;
+        self.loads += run.loads;
+        self.reads += run.reads;
+        self.retirements += run.retirements;
+        self.cuts += run.cuts;
+    }
+}
+
 /// What a chaos run puts the group through, besides its faults.
 #[derive(Clone, Copy)]
 struct Chaos {
@@ -243,8 +255,7 @@ fn chaos(seed: u64, run: Chaos) -> Exercised {
                 }
             }
             30..=34 => {
-                let all = nodes.to_vec();
-                cluster.network.isolate(&[node], &all);
+                cluster.network.isolate(&[node], nodes);
             }
             35..=60 => cluster.network.heal(),
             61..=500 => {
@@ -455,11 +466,7 @@ fn directory(cluster: &mut Cluster, nodes: &[u16], chance: u64) {
 fn safety_holds_under_faults() {
     let mut total = Exercised::default();
     for seed in 0..200 {
-        let run = chaos(seed, Chaos::default());
-        total.installs += run.installs;
-        total.compactions += run.compactions;
-        total.loads += run.loads;
-        total.reads += run.reads;
+        total += chaos(seed, Chaos::default());
     }
     // The runs reach every path they are meant to test.
     eprintln!(
@@ -480,15 +487,13 @@ fn safety_holds_under_faults() {
 fn safety_holds_under_faults_and_membership_changes() {
     let mut total = Exercised::default();
     for seed in 0..200 {
-        let run = chaos(
+        total += chaos(
             seed,
             Chaos {
                 churn: true,
                 ..Chaos::default()
             },
         );
-        total.changes += run.changes;
-        total.installs += run.installs;
     }
     eprintln!(
         "changes started {}, installs {}",
@@ -501,7 +506,7 @@ fn safety_holds_under_faults_and_membership_changes() {
 fn safety_holds_when_entries_wait_for_blobs() {
     let mut total = Exercised::default();
     for seed in 0..200 {
-        let run = chaos(
+        total += chaos(
             seed,
             Chaos {
                 churn: true,
@@ -509,8 +514,6 @@ fn safety_holds_when_entries_wait_for_blobs() {
                 ..Chaos::default()
             },
         );
-        total.changes += run.changes;
-        total.reads += run.reads;
     }
     eprintln!(
         "changes started {}, reads answered {}",
@@ -526,18 +529,16 @@ fn safety_holds_when_entries_wait_for_blobs() {
 /// configuration names them.
 #[test]
 fn safety_holds_with_idle_heartbeats_off_and_the_hosts_vouching() {
-    let mut total = Exercised::default();
+    let (mut total, mut churned) = (Exercised::default(), Exercised::default());
     for seed in 0..400 {
-        let run = chaos(
+        total += chaos(
             seed,
             Chaos {
                 paired: true,
                 ..Chaos::default()
             },
         );
-        total.installs += run.installs;
-        total.reads += run.reads;
-        let run = chaos(
+        churned += chaos(
             1_000 + seed,
             Chaos {
                 churn: true,
@@ -545,19 +546,17 @@ fn safety_holds_with_idle_heartbeats_off_and_the_hosts_vouching() {
                 ..Chaos::default()
             },
         );
-        total.changes += run.changes;
-        total.retirements += run.retirements;
     }
     eprintln!(
         "installs {}, reads answered {}, changes started {}, retirements {}",
-        total.installs, total.reads, total.changes, total.retirements
+        total.installs, total.reads, churned.changes, churned.retirements
     );
     assert!(total.installs >= 2_000, "installs: {}", total.installs);
-    assert!(total.changes >= 1_000, "changes: {}", total.changes);
+    assert!(churned.changes >= 1_000, "changes: {}", churned.changes);
     assert!(
-        total.retirements >= 1_000,
+        churned.retirements >= 1_000,
         "retirements: {}",
-        total.retirements
+        churned.retirements
     );
 }
 
@@ -586,7 +585,7 @@ fn safety_holds_with_pre_votes_off_and_handovers() {
 fn safety_holds_when_restarts_cut_the_log() {
     let mut total = Exercised::default();
     for seed in 0..200 {
-        let run = chaos(
+        total += chaos(
             seed,
             Chaos {
                 churn: true,
@@ -596,8 +595,6 @@ fn safety_holds_when_restarts_cut_the_log() {
                 ..Chaos::default()
             },
         );
-        total.cuts += run.cuts;
-        total.changes += run.changes;
     }
     eprintln!("cuts {}, changes started {}", total.cuts, total.changes);
     assert!(total.cuts >= 500, "cuts: {}", total.cuts);
