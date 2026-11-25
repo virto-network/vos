@@ -462,8 +462,10 @@ impl<N: NodeId> Core<N> {
     }
 
     /// Whether to take `message` from `from` at all, as the module's doc
-    /// says: a leader tracks its configuration's members only, so a late
-    /// answer from a replica a change removed draws nothing.
+    /// says, and a `TimeoutNow` from outside the configuration, which
+    /// counts only from the leader followed. A leader tracks its
+    /// configuration's members only, so a late answer from a replica a
+    /// change removed draws nothing.
     fn takes(&self, from: N, message: &Message<N>) -> bool {
         let named = match message {
             Message::PreVote { next_term, .. } => *next_term,
