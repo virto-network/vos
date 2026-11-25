@@ -9,44 +9,90 @@ messaging comes later.
 
 ## The model
 
-- **One suite:** 1, `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`. Every
-  time is in seconds since the Unix epoch, as mls-rs counts.
+- **One suite:** 1, `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`, the
+  only one RustCrypto's provider is built with: a Welcome or a stored group
+  naming another suite is refused as unsupported before any key is used.
+  Every time is in seconds since the Unix epoch, as mls-rs counts.
 - **Storage** (`storage`): mls-rs's group-state and key-package storage
   providers over one fjall keyspace, each group's rows under a namespace's
   prefix. Nothing mls-rs writes reaches the disk by itself: a namespace
   stages its writes, and `Store::commit` writes them and the caller's own
-  rows in one synced batch.
+  rows in one synced batch. Keys are bounded before they reach fjall: a
+  key package is looked up only by a 32-byte reference, a Welcome into a
+  group whose id is longer than 32 bytes is refused, and a batch holding a
+  row fjall cannot hold is an error (`Error::Unstorable`) that writes
+  nothing.
 - **Copy and swap:** mls-rs applies a received commit at once, but a commit
   is confirmed only after it is processed. So a candidate (`Mls::process`,
   `Mls::join`) is processed on a copy of the group state, which reads the
   current rows and writes to memory alone, and is swapped in on
-  confirmation (`Mls::swap`) or dropped.
+  confirmation (`Mls::swap`) or dropped. A candidate is bound to the state
+  it was made from (the group's id and epoch, and for the device's own
+  commit the commit held): swapped over any other, it is `Error::Stale`.
 - **A device's own commit** (`Mls::commit`, `Mls::renew`) is built
   detached and held, in the same batch as the state it spent a key
   generation of. On confirmation it is applied on a copy (`Mls::own`) only
   if the confirmed candidate's handshake hash is the held commit's and the
   current epoch is the one before. A restart (`Mls::restart`) makes its new
   group at once, beside the current one, and holds its commit; `Mls::own`
-  matches it by its handshake alone. A void deletes either (`Mls::void`).
+  matches it by its handshake alone. A void deletes either (`Mls::void`),
+  and so does the swap of any other candidate.
 - **The policy** (`policy`): the device group's allow-list (Add and Remove
   by value in a commit with a path, a device's update as its own commit
   with a path; no ReInit, external commit, PSK or group-context change),
   its identities (64-byte basic credentials), and a candidate checked
   against the effect its log entry declares (`Expected`): its committer,
-  and the credentials it adds and removes, exactly.
+  the credentials it adds and removes, exactly, and the credential its
+  committer's leaf takes (the expected renewal, which is then required, or
+  its own); the committer's leaf keeps its signature key.
 - **The confirmation hash** (`confirmation`): Blake2b-256 over a domain,
   the agent, the epoch and the epoch's authenticator, which each device of
   the confirming set posts, signed by its caller.
 
+- **At rest:** every row is plaintext in the caller's keyspace: the leaf's
+  signing key, the group state (the epoch's secrets and private tree), key
+  packages' private keys and a held commit (the whole next epoch). Only
+  the current epoch is kept, but deleted rows stay in fjall's journal and
+  tables until compaction. Protecting the disk is the caller's (the
+  platform's storage encryption).
+
 ## Guarantees
 
 - A failed operation writes nothing: the current state stays as the last
-  batch left it.
+  batch left it. Two exceptions, both a failing store: a batch whose sync
+  failed may be found applied after a reopen, and an operation whose batch
+  was written but whose group did not read back returns an error with the
+  batch written.
 - A candidate never writes through the current state before it is swapped
   in.
 - A held commit survives a reopen and is matched only by its own handshake.
 - A commit whose proposals are not its declared effect, or not allowed by
   the policy, is refused (`Error::Refused`).
+- No bytes from a Welcome or a handshake make a store key fjall cannot
+  hold.
+
+## Limits
+
+- **A credential is a label.** It is a device's sync key and admin key as
+  bytes; nothing binds a leaf's MLS signature or HPKE key to them. That a
+  key package is the device's it names is the caller's to establish (in
+  VOS, the key package travels with the device's keys over the pairing
+  channel), and a committer allowed to add a device is trusted for the
+  key package it adds: a compromised one can add a leaf of its own under
+  another device's credential.
+- **Clocks.** A key package is valid from an hour before its maker's clock:
+  devices whose clocks are more than an hour apart cannot add each other.
+- **A key package's year.** A key package is valid for 365 days, and a
+  joiner checks every leaf that still comes from one: a member added over
+  a year ago that has not committed since bars every new join until it
+  commits.
+- **1024 voided commits.** Each held commit spends a handshake-key
+  generation of its epoch, also when voided; a receiver ratchets at most
+  1024 ahead, so a member whose commits were voided more than 1024 times in
+  one epoch is refused until another member's commit moves the epoch.
+- **Features.** The crate's invariants assume mls-rs without `std`,
+  `prior_epoch`, `out_of_order` or `by_ref_proposal`; Cargo unifies
+  features, so no other crate of the workspace may enable them.
 
 ## Tests
 
@@ -54,11 +100,16 @@ messaging comes later.
 directory): a group of three moved through commits held and confirmed on
 copies; a copy leaving the current state as it was; a held commit across a
 reopen, matched by its handshake and deleted on a void; a candidate refused
-unless it is its logged effect exactly (committer, adds, removes); the
-policy refusing what it does not allow, from a member running other rules;
-the confirmation hash moved by each of its parts; a restart into a new
-group; a leaf's credential renewed only as expected. `just
-check` runs them.
+unless it is its logged effect exactly (committer, adds, removes, the
+renewal, the signature key); the policy refusing what it does not allow,
+from a member running other rules; the confirmation hash moved by each of
+its parts; a restart into a new group, and its group deleted when another
+candidate wins; a leaf's credential renewed only as expected; Welcomes
+naming another suite, an over-long key-package reference or an over-long
+group id refused, and rows fjall cannot hold refused without a write;
+stale candidates refused; a key package from a clock ahead added; the
+key package's year; unused key packages deleted on a join. `just check`
+runs them.
 
 ## Users
 
