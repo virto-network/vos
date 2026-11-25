@@ -247,7 +247,8 @@ fn household(agent: &[u8]) -> (Personal, Phone, Phone) {
         )
         .unwrap(),
     );
-    let (call, answer) = personal.call(&mut first.admin, "commit", prepared.arguments());
+    let arguments = personal.placed(&first.keys.sync, &prepared.arguments());
+    let (call, answer) = personal.call(&mut first.admin, "commit", arguments);
     first
         .group()
         .signed_commit(call.message(&personal.identity), call.signature)

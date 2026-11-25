@@ -18,8 +18,8 @@ use super::{
 };
 use vos_wire::personal::method;
 
-/// A commit call's arguments: its epoch, effect, handshake and Welcome's
-/// hash.
+/// A commit call's arguments after its place: its epoch, effect,
+/// handshake and Welcome's hash.
 type CommitArguments = ((u64, Effect), (Vec<u8>, Option<[u8; 32]>));
 
 /// The admin call an entry logs, if it logs one.
@@ -151,14 +151,13 @@ impl DeviceGroup {
     }
 
     /// Whether the entry at `index`, about to be read, holds where it is:
-    /// a device-set admin call names its place first, which must be at or
+    /// an admin call, a commit as a device-set call, names its place first, which must be at or
     /// after the floor (the entry after the last admin call read) and at
     /// or before `index`, its chain the one this device read there. Before
     /// a paired device's start, where it read no chain, the floor alone
     /// holds it: its pairing device read those entries.
     fn placed(&self, index: u64, body: &Body) -> Result<bool, GroupError> {
-        let Some(call) = admin_call(body).filter(|_| !matches!(body, Body::Candidate { .. }))
-        else {
+        let Some(call) = admin_call(body) else {
             return Ok(true);
         };
         let Some((place, _)) = Place::split(&call.arguments) else {
@@ -313,7 +312,8 @@ impl DeviceGroup {
             }
             self.stick(pending.epoch, pending.by, events)?;
         }
-        let decoded = CommitArguments::decode_exact(&call.arguments)
+        let decoded = Place::split(&call.arguments)
+            .and_then(|(_, arguments)| CommitArguments::decode_exact(arguments))
             .filter(|((named, _), _)| *named == epoch && call.method == method::COMMIT.0);
         let fresh = self.state.set.fresh;
         let regroup = fresh.is_some() && fresh == self.state.id && fresh == Some(by);
@@ -370,7 +370,8 @@ impl DeviceGroup {
         if let Some(own) = &mut self.state.own
             && Some(by) == self.state.id
             && own.index.is_none()
-            && own.arguments == call.arguments
+            && Place::split(&call.arguments)
+                .is_some_and(|(_, arguments)| arguments == own.arguments)
         {
             own.index = Some(index);
         }

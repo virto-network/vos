@@ -130,18 +130,25 @@ searched for the secret by its `tests/leaks.rs`.
   passed; a maturity it never supports raises `Unsigned` and moves
   nothing. A device whose candidate removes a device on a maturity this
   device does not honour is refused.
-- **A device-set call names its place:** every such call
-  names first the log's head its signer read (`Place { next, chain }`);
-  this device takes it only at a place at or after its floor (the entry
-  after the last admin call it read; a paired device starts from its
-  pairing device's) and at or before the call's own entry, the chain
-  there the one it read, and otherwise raises `Alarm::Log` and reads no
-  further. So a route forking the log cannot log a once-vetoed removal
-  again and mature it. The device reads the log to its head just before
-  each prompt and signs at most three times (`StaleHead` or `Settling`
-  each a new prompt). What is left is withholding: a device that has not
-  yet read a veto can be shown the operation without it (`light-node.md`
-  §8, B8).
+- **Every admin call names its place:** every device-set call and every
+  commit names first the log's head its signer read (`Place { next,
+  chain }`); this device takes it only at a place at or after its floor
+  (the entry after the last admin call it read; a paired device starts
+  from its pairing device's) and at or before the call's own entry, the
+  chain there the one it read, and otherwise raises `Alarm::Log` and reads
+  no further. So the home node cannot replay or reorder an admin call a
+  device read: a once-vetoed removal logged again on a forked route does
+  not mature, and a commit its set voided (timeout, nack, split, regroup)
+  logged again later, under the epoch the void left, is refused by every
+  device, not only by its committer's nack, so no vote on it exists and no
+  epoch moves, even while the committer is away for the whole window. The
+  device reads the log to its head just before each prompt and signs at
+  most three times (`StaleHead` or `Settling` each a new prompt); once the
+  log holds its commit, the call it keeps for the evidence is the one the
+  log holds. What is left is withholding: a device that has not yet read
+  a veto or a void can be shown the log without it (`light-node.md` §8,
+  B8), and a device shown a fork that hides the call it copies is the
+  writers' views' case (B4).
 - **The agent's delays are the claim's:** the claim's `Configured` sets
   the delays, the seasoning, the probation and the confirm window, which
   every device takes (a paired device from its pairing device). A later

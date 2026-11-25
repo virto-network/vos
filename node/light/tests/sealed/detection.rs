@@ -16,8 +16,8 @@ use vos_light::route::Route;
 use vos_light::sealed::{self, Body as Sealed, View};
 use vos_light::sync::Quarantine;
 use vos_wire::personal::{
-    AdminCall, Attached, Body, Entry, Op, OpState, Overview, PersonalError, Pushed, Recorded,
-    Scope, Signer, Woken, chain,
+    AdminCall, Attached, Body, Entry, Op, OpState, Overview, PersonalError, Place, Pushed,
+    Recorded, Scope, Signer, Woken, chain,
 };
 
 use super::home::{self, Home};
@@ -413,10 +413,15 @@ fn two_commits_for_one_epoch_raise_the_split_log_alarm() {
     let confirmed = a.group().confirmed();
     let candidacy = a.update(&mut home).unwrap();
 
-    // B's own commit for the epoch, never sent: the operators log it in
-    // A's place in what they show B.
+    // B's own commit for the epoch, never sent, placed where A's is: the
+    // operators log it in A's place in what they show B.
     let prepared = b.group().commit(None, home.now()).unwrap();
-    let signed = home.sign(&b.admin, "commit", prepared.arguments());
+    let Body::Candidate { call, .. } = &home.log(a.sync_key(), candidacy.index).unwrap()[0].1.body
+    else {
+        panic!("a candidate")
+    };
+    let (place, _) = Place::split(&call.arguments).unwrap();
+    let signed = home.sign_as(&b.admin, "commit", place.arguments(&prepared.arguments()));
     b.group()
         .signed_commit(signed.message.clone(), signed.signature)
         .unwrap();
@@ -424,7 +429,7 @@ fn two_commits_for_one_epoch_raise_the_split_log_alarm() {
         call: AdminCall {
             origin: b.admin.verifying_key().to_bytes(),
             method: home.method("commit").0,
-            arguments: prepared.arguments(),
+            arguments: signed.call.arguments.clone(),
         },
         by: 1,
         epoch: prepared.epoch,
@@ -474,6 +479,172 @@ fn two_commits_for_one_epoch_raise_the_split_log_alarm() {
     );
     assert_eq!(a.group().confirmed(), confirmed);
     assert_eq!(b.group().confirmed(), confirmed);
+}
+
+/// A commit by phone 0 voided by its window's end, every phone of
+/// `household(3)` having read the candidate and the void: the home, the
+/// phones, the confirmed epoch, and the candidate's log index.
+fn voided_commit() -> (Home, Vec<Phone>, u64, u64) {
+    let (mut home, mut phones) = household(3);
+    let confirmed = phones[0].group().confirmed();
+    let candidacy = phones[0].update(&mut home).unwrap();
+    phones[0].read(&mut home);
+    home.pass(policy().confirm_window_ms + 1);
+    woken(&mut home, &phones[0].sync);
+    for phone in &mut phones {
+        let events = phone.read(&mut home);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Voided { epoch, .. } if *epoch == confirmed + 1
+            )),
+            "{events:?}"
+        );
+        assert_eq!(phone.group().confirmed(), confirmed);
+    }
+    (home, phones, confirmed, candidacy.index)
+}
+
+/// The log as the agent holds it, the candidate at `candidate` and its
+/// evidence logged again at its end, the copy naming `set` its confirming
+/// set: what operators who replay a voided commit show. The copy's index.
+fn replayed(home: &Home, phone: &Phone, candidate: u64, set: Vec<u32>) -> (Vec<(u64, Entry)>, u64) {
+    let mut entries = home.log(phone.sync_key(), 0).unwrap();
+    let at = entries.last().unwrap().1.at;
+    let copy = entries.len() as u64;
+    let mut body = entries[candidate as usize].1.body.clone();
+    if let Body::Candidate { set: named, .. } = &mut body {
+        *named = set;
+    }
+    let evidence = entries
+        .iter()
+        .find_map(|(_, entry)| match &entry.body {
+            Body::Evidence {
+                index,
+                message,
+                signature,
+                welcome,
+            } if *index == candidate => Some(Body::Evidence {
+                index: copy,
+                message: message.clone(),
+                signature: *signature,
+                welcome: welcome.clone(),
+            }),
+            _ => None,
+        })
+        .expect("the candidate's evidence");
+    for body in [body, evidence] {
+        entries.push((
+            0,
+            Entry {
+                at,
+                body,
+                chain: [0; 32],
+            },
+        ));
+    }
+    (relink(entries), copy)
+}
+
+/// B6 for commits: the operators log a commit the set voided again at the
+/// log's end, its evidence with it, under the epoch the void left. The
+/// commit names the place it was signed at, before the void: every phone
+/// refuses the copy as one the agent took elsewhere, raises the log alarm
+/// and stops its reading there, voting nothing; the committer is not the
+/// only one to refuse it. The honest log read on, a commit after the void
+/// is confirmed by every phone.
+#[test]
+fn a_voided_commit_logged_again_is_refused_by_every_device() {
+    let (mut home, mut phones, confirmed, candidate) = voided_commit();
+    for phone in &mut phones {
+        let (log, copy) = replayed(&home, phone, candidate, vec![0, 1, 2]);
+        let events = follow_shown(&mut home, phone, log);
+        assert!(alarmed(&events, Alarm::Log { index: copy }), "{events:?}");
+        assert_eq!(phone.group().cursor(), copy, "it read nothing of it");
+        assert_eq!(phone.group().confirmed(), confirmed);
+    }
+    phones[1].update(&mut home).unwrap();
+    for _ in 0..2 {
+        for phone in &mut phones {
+            phone.read(&mut home);
+        }
+    }
+    for phone in &mut phones {
+        assert_eq!(phone.group().confirmed(), confirmed + 1);
+    }
+}
+
+/// The same while the committer stays away for the whole window: the
+/// operators name a confirming set without it, the devices that last
+/// called in the window. Each other phone refuses the copy, so no vote on
+/// it exists to show the others, no epoch moves and no key changes.
+#[test]
+fn a_voided_commit_logged_again_while_its_committer_is_away_moves_no_epoch() {
+    let (home, mut phones, confirmed, candidate) = voided_commit();
+    let keys: Vec<[u8; 32]> = phones
+        .iter_mut()
+        .map(|phone| {
+            let scope = scope_of(phone, NOTES);
+            phone.group().key(scope).unwrap()
+        })
+        .collect();
+    let mut votes = Vec::new();
+    let mut shown = Vec::new();
+    for (device, phone) in phones.iter_mut().enumerate().skip(1) {
+        let (log, copy) = replayed(&home, phone, candidate, vec![1, 2]);
+        let cursor = phone.group().cursor();
+        let fresh = log.iter().filter(|(index, _)| *index >= cursor).cloned();
+        let events = phone.group().follow(fresh).unwrap();
+        for event in events.iter().cloned() {
+            if let Event::Vote {
+                epoch,
+                vote,
+                message,
+            } = event
+            {
+                votes.push(Body::Vote {
+                    device: device as u32,
+                    epoch,
+                    candidate: copy,
+                    vote,
+                    signature: ed25519_dalek::Signer::sign(&phone.sync, &message).to_bytes(),
+                });
+            }
+        }
+        shown.push((log, copy, events));
+    }
+    for (phone, (mut log, copy, read)) in phones.iter_mut().skip(1).zip(shown) {
+        let at = log.last().unwrap().1.at;
+        for body in &votes {
+            log.push((
+                0,
+                Entry {
+                    at,
+                    body: body.clone(),
+                    chain: [0; 32],
+                },
+            ));
+        }
+        let log = relink(log);
+        let cursor = phone.group().cursor();
+        let events = phone
+            .group()
+            .follow(log.into_iter().filter(|(index, _)| *index >= cursor))
+            .unwrap();
+        assert!(
+            !events.contains(&Event::Confirmed {
+                epoch: confirmed + 1
+            }),
+            "{events:?}"
+        );
+        assert!(alarmed(&read, Alarm::Log { index: copy }), "{read:?}");
+    }
+    assert!(votes.is_empty(), "{votes:?}");
+    for (phone, key) in phones.iter_mut().zip(keys) {
+        assert_eq!(phone.group().confirmed(), confirmed);
+        let scope = scope_of(phone, NOTES);
+        assert_eq!(phone.group().key(scope).unwrap(), key);
+    }
 }
 
 /// Two phones syncing the notes and the other scope: A's envelopes at 1

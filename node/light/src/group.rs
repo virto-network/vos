@@ -250,7 +250,9 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    /// The commit call's arguments, as `Personal::commit` takes them.
+    /// The commit call's arguments after its place, which the call names
+    /// first ([`vos_wire::personal::Place::arguments`]), as
+    /// `Personal::commit` takes them.
     pub fn arguments(&self) -> Vec<u8> {
         let hash = self.welcome.as_deref().map(welcome_hash);
         (
@@ -1377,7 +1379,7 @@ impl DeviceGroup {
     /// (a device's keys and its key package), and carrying every matured
     /// removal; an update with neither. Held, with the record of it, before
     /// this returns: then make the admin call with
-    /// [`Prepared::arguments`], and give its log index and signed message
+    /// [`Prepared::arguments`] placed at the log's head, and give its log index and signed message
     /// to [`DeviceGroup::called_commit`], or [`DeviceGroup::abandon`] it if
     /// the agent refused it.
     pub fn commit(
@@ -1474,13 +1476,19 @@ impl DeviceGroup {
 
     /// The admin call of this device's held commit is signed, as
     /// `message` with `signature`: written before the call is made, so the
-    /// evidence survives a crash between the call and its answer.
+    /// evidence survives a crash between the call and its answer. A call
+    /// signed again replaces the one before, which the agent did not take;
+    /// once the log holds the commit, its signed call is kept, the one its
+    /// evidence carries.
     pub fn signed_commit(
         &mut self,
         message: Vec<u8>,
         signature: [u8; 64],
     ) -> Result<(), GroupError> {
         let own = self.state.own.as_mut().ok_or(GroupError::NoCommit)?;
+        if own.index.is_some() {
+            return Ok(());
+        }
         own.signed = Some((message, signature));
         self.mls.write(rows(&self.state, None))?;
         Ok(())

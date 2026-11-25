@@ -655,8 +655,11 @@ impl<H: Host> Personal<H> {
         })
     }
 
-    /// `prepared`'s commit under the admin key, its message held before
-    /// the call; its evidence posted; a refused one abandoned.
+    /// `prepared`'s commit under the admin key, placed at the log's head
+    /// this device read just before and signed there again while the agent
+    /// refuses it for a head the log moved past, as every admin call is
+    /// ([`call_placed`]), its message held before the call; its evidence
+    /// posted; a refused one abandoned.
     pub(super) fn commit(
         &self,
         held: &mut Held,
@@ -668,28 +671,32 @@ impl<H: Host> Personal<H> {
         let prompted = admin_sign(prompts, admin);
         let group_sign = |message: &[u8]| prompted(message);
         let result = self.with_link(held, Purpose::Personal, |link, held| {
-            let group = held.group.as_mut().ok_or(Error::NoSpace)?;
+            let group = std::cell::RefCell::new(held.group.as_mut().ok_or(Error::NoSpace)?);
+            let mut head =
+                |link: &mut AgentLink<'_, H>| read_to_head(link, &mut group.borrow_mut());
             // The message is held in the group before the call leaves, so a
             // restart posts the evidence of the commit it made.
             let mut hold = |message: &[u8], signature: &[u8; 64]| {
                 group
+                    .borrow_mut()
                     .signed_commit(message.to_vec(), *signature)
                     .map_err(|error| error.to_string())
             };
-            let called = link
-                .settled(
-                    &mut Key::Lent(&mut signer, &group_sign),
-                    method::COMMIT,
-                    prepared.arguments(),
-                    &mut hold,
-                )
-                .map_err(unreached)?;
+            let called = call_placed(
+                link,
+                &mut Key::Lent(&mut signer, &group_sign),
+                method::COMMIT,
+                &prepared.arguments(),
+                &mut head,
+                &mut hold,
+            )?;
+            let group = group.into_inner();
             match answer::<Candidacy>(&called.outcome).map_err(failed)? {
                 Ok(candidacy) => {
                     group.called(candidacy.at);
-                    group
-                        .made(candidacy.index, &called.message)
-                        .map_err(failed)?;
+                    // The evidence is the call the log holds: the one
+                    // signed again after a refusal the route made up of a
+                    // commit the agent took is answered as that one.
                     let Event::Evidence {
                         index,
                         message,
@@ -699,6 +706,7 @@ impl<H: Host> Personal<H> {
                     else {
                         return Err(failed("a commit's evidence"));
                     };
+                    group.made(index, &message).map_err(failed)?;
                     let arguments = ((index, message), (signature, attached)).encode();
                     answered(link.call::<Recorded>(method::EVIDENCE, arguments))?;
                     Ok(candidacy)

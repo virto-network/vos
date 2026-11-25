@@ -201,6 +201,17 @@ impl Personal {
         ))
     }
 
+    /// `arguments` placed at the log's head as `key` reads it, as an admin
+    /// call names it first.
+    pub(super) fn placed(&mut self, key: &SigningKey, arguments: &[u8]) -> Vec<u8> {
+        let overview: Overview = self.query(key, "overview", ()).unwrap();
+        Place {
+            next: overview.next,
+            chain: overview.chain,
+        }
+        .arguments(arguments)
+    }
+
     /// Wait until `signer`'s call of `name` is no longer refused for an
     /// unknown key: its replica applied the admission.
     pub(super) fn admitted<T: Decode>(
@@ -371,12 +382,16 @@ fn admin_calls_are_verified_at_ingress_and_checked_against_the_device_set() {
     personal
         .admitted::<Recorded>(&mut sync, "alive", Vec::new())
         .unwrap();
-    let update = (
-        (1u64, Effect::default()),
-        (vec![0x5a_u8; 734], None::<[u8; 32]>),
+    let update = personal.placed(
+        &phone.sync,
+        &(
+            (1u64, Effect::default()),
+            (vec![0x5a_u8; 734], None::<[u8; 32]>),
+        )
+            .encode(),
     );
     assert_eq!(
-        personal.answer::<Candidacy>(&mut sync, "commit", update.clone()),
+        outcome::<Candidacy>(personal.call(&mut sync, "commit", update.clone()).1),
         Err(PersonalError::SyncKey)
     );
     let mut admin = personal.signer(&phone.admin, 2);
@@ -387,7 +402,7 @@ fn admin_calls_are_verified_at_ingress_and_checked_against_the_device_set() {
         admin.next,
         PERSONAL,
         method("commit"),
-        update.encode(),
+        update.clone(),
     );
     forged.signature[0] ^= 1;
     assert_eq!(
@@ -399,7 +414,7 @@ fn admin_calls_are_verified_at_ingress_and_checked_against_the_device_set() {
         ),
         Response::Rejected(Rejected::BadSignature)
     );
-    let (call, answer) = personal.call(&mut admin, "commit", update.encode());
+    let (call, answer) = personal.call(&mut admin, "commit", update);
     let candidacy: Candidacy = outcome(answer).unwrap();
     assert_eq!(candidacy.set, vec![0]);
     // The evidence, posted under the sync key: the call as signed.
@@ -451,19 +466,21 @@ fn a_removed_device_keeps_its_session_and_the_agent_refuses_it() {
     let (phone, tablet) = (Keys::of(31), Keys::of(32));
     personal.home("claim", (phone.device(), kit(), policy()));
     let mut admin = personal.signer(&phone.admin, 2);
-    let add = (
-        (
-            1u64,
-            Effect {
-                add: Some(tablet.device()),
-                ..Effect::default()
-            },
-        ),
-        (vec![0x11_u8; 1374], None::<[u8; 32]>),
+    let add = personal.placed(
+        &phone.sync,
+        &(
+            (
+                1u64,
+                Effect {
+                    add: Some(tablet.device()),
+                    ..Effect::default()
+                },
+            ),
+            (vec![0x11_u8; 1374], None::<[u8; 32]>),
+        )
+            .encode(),
     );
-    let candidacy: Candidacy = personal
-        .admitted(&mut admin, "commit", add.encode())
-        .unwrap();
+    let candidacy: Candidacy = personal.admitted(&mut admin, "commit", add).unwrap();
     let mut sync = personal.signer(&phone.sync, 1);
     personal
         .admitted::<Voted>(
@@ -479,7 +496,7 @@ fn a_removed_device_keeps_its_session_and_the_agent_refuses_it() {
         .unwrap();
     assert_eq!(pushed.position, 1);
     personal.pass(60_000);
-    // Placed at the log's head, as a device-set call names it.
+    // Placed at the log's head, as every admin call names it.
     let overview: Overview = personal.query(&phone.sync, "overview", ()).unwrap();
     let place = Place {
         next: overview.next,

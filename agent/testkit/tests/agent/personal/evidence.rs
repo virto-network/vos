@@ -29,7 +29,7 @@ fn evidence_is_stored_beside_its_call_its_arguments_byte_for_byte() {
         (vec![0x22u8; 800], Some(welcome_hash(&welcome))),
     );
     let candidacy: Candidacy = home.call(admin(0), "commit", arguments.clone()).unwrap();
-    let signed = arguments.encode();
+    let signed = home.logged(candidacy.index);
     let commit = home.method("commit");
     let good = message(device(0).admin, commit, &signed);
 

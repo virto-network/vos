@@ -452,8 +452,16 @@ impl Phone {
         prepared: &vos_light::group::Prepared,
     ) {
         let candidacy = loop {
-            let (call, message) =
-                personal.sign(sockets, &mut self.admin, "commit", prepared.arguments());
+            // Placed at the log's head, as every admin call names it.
+            let overview: Overview = personal
+                .query(sockets, &self.sync.key, "overview", ())
+                .unwrap();
+            let place = Place {
+                next: overview.next,
+                chain: overview.chain,
+            };
+            let arguments = place.arguments(&prepared.arguments());
+            let (call, message) = personal.sign(sockets, &mut self.admin, "commit", arguments);
             self.group().signed_commit(message, call.signature).unwrap();
             let outcome = personal.submit(sockets, &mut self.admin, &call);
             match answer::<Candidacy, PersonalError>(&outcome) {
@@ -796,7 +804,7 @@ fn a_personal_space_is_claimed_paired_and_its_first_phone_retired() {
         .call::<Recorded>(&mut sockets, &mut second.sync, "alive", Vec::new())
         .0
         .unwrap();
-    // Placed at the log's head, as a device-set call names it.
+    // Placed at the log's head, as every admin call names it.
     let overview: Overview = personal
         .query(&mut sockets, &second.sync.key, "overview", ())
         .unwrap();

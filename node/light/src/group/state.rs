@@ -186,7 +186,8 @@ pub(crate) struct Pending {
 pub(crate) struct Own {
     pub(crate) epoch: u64,
     pub(crate) welcome: Option<Vec<u8>>,
-    /// Its call's arguments, by which the log's candidate is known as it.
+    /// Its call's arguments after its place, by which the log's
+    /// candidate is known as it.
     pub(crate) arguments: Vec<u8>,
     /// Its call's signed message and signature, written before the call
     /// is made.

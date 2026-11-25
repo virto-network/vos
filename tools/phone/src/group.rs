@@ -22,7 +22,7 @@ use vos_light::group::{Agent, DeviceGroup, Event, Prepared};
 use vos_light::{Config, Light};
 use vos_wire::ingress::call_message;
 use vos_wire::personal::{
-    AdminCall, AdminClass, Attestation, Body, DeviceId, Entry, NewDevice, chain,
+    AdminCall, AdminClass, Attestation, Body, DeviceId, Entry, NewDevice, Place, chain,
 };
 
 use crate::light::{AGENT, embedded, percentile};
@@ -136,7 +136,12 @@ fn round(
     prepared: Prepared,
     commit_us: u64,
 ) -> Round {
-    let arguments = prepared.arguments();
+    // Placed at the log's head, as the committer reads it.
+    let place = Place {
+        next: script.entries.len() as u64,
+        chain: script.chain,
+    };
+    let arguments = place.arguments(&prepared.arguments());
     let committer_admin = devices[committer].admin.verifying_key().to_bytes();
     let members: Vec<DeviceId> = devices
         .iter()

@@ -14,11 +14,11 @@
 //!   signed by a device's admin key, verified at ingress; the agent checks
 //!   the origin, `Principal::Client(key)`, against the device set and
 //!   verifies nothing. The device then posts the call's evidence, the
-//!   signed message and its signature, stored as data beside it. A
-//!   device-set call names its place first, the log's head its signer read,
-//!   and is taken only at a place no later than the head and no earlier
-//!   than the entry after the last admin call logged (`StaleHead`),
-//!   compared before what its batch settles.
+//!   signed message and its signature, stored as data beside it. Every
+//!   admin call, a commit as a device-set call, names its place first, the
+//!   log's head its signer read, and is taken only at a place no later
+//!   than the head and no earlier than the entry after the last admin call
+//!   logged (`StaleHead`), compared before what its batch settles.
 //! - **The commit log:** one candidate an epoch, the confirmed epoch plus
 //!   one; its confirming set (the devices seen by a call in the window,
 //!   less every matured removal) written into its log entry; the votes,
@@ -431,9 +431,10 @@ impl Personal {
         self.resolve_operation(now, call, by, op, upheld)
     }
 
-    /// Propose `epoch`'s commit: an admin call by an active device, taken as
-    /// the candidate when `epoch` is the confirmed epoch plus one and none
-    /// is pending, its effect carrying every matured removal, and with any
+    /// Propose `epoch`'s commit: an admin call by an active device, placed
+    /// as every admin call is ([`Personal::placed`]), taken as the
+    /// candidate when `epoch` is the confirmed epoch plus one and none is
+    /// pending, its effect carrying every matured removal, and with any
     /// removal the kit re-sealed under a new `R`, and adding inline for a
     /// strong admin or a matured add operation's device. A commit already
     /// taken answers as it did, or `Decided` once decided.
@@ -441,11 +442,13 @@ impl Personal {
     pub async fn commit(
         &mut self,
         ctx: &mut Command<Self>,
+        place: Place,
         epoch: u64,
         effect: Effect,
         handshake: Vec<u8>,
         welcome_hash: Option<[u8; 32]>,
     ) -> Result<Candidacy, PersonalError> {
+        self.placed(place)?;
         let now = self.settle(ctx.now())?;
         self.assigned()?;
         let (origin, by) = self.admin_caller(ctx.caller(), now)?;
@@ -522,6 +525,7 @@ impl Personal {
             origin,
             method: personal::Commit::ID,
             arguments: personal::Commit {
+                place,
                 epoch,
                 effect: effect.clone(),
                 handshake,

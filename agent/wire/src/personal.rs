@@ -58,9 +58,10 @@ pub mod method {
         FRONTIER = "frontier";
     }
 
-    /// The device-set calls, which name their place in the log first.
-    pub const PLACED: [vos_abi::ids::MethodId; 9] = [
-        ADD, REMOVE, REPLACE, ROTATE, REGROUP, RESTORE, VETO, COSIGN, RESOLVE,
+    /// The admin calls, the device-set calls and the commit, which name
+    /// their place in the log first.
+    pub const PLACED: [vos_abi::ids::MethodId; 10] = [
+        ADD, REMOVE, REPLACE, ROTATE, REGROUP, RESTORE, VETO, COSIGN, RESOLVE, COMMIT,
     ];
 }
 
@@ -592,16 +593,18 @@ impl core::fmt::Debug for Attached {
     }
 }
 
-/// Where a device-set admin call takes its place in the control log, the
-/// first of its arguments: the log's head as the device read it when it
-/// signed the call, the next index and the chain through the entry before
-/// it. The agent and every device take the call only at a place at or
-/// after the entry following the last admin call before it and at or
-/// before the call's own entry, its chain the one the log had there
-/// ([`PersonalError::StaleHead`]; the agent compares it before anything
-/// the call's batch settles): a call logged again on a log a route forks
-/// names a place before the call it copies, which every device that read
-/// that call has passed.
+/// Where an admin call, a device-set call or a commit, takes its place in
+/// the control log, the first of its arguments: the log's head as the
+/// device read it when it signed the call, the next index and the chain
+/// through the entry before it. The agent and every device take the call
+/// only at a place at or after the entry following the last admin call
+/// before it and at or before the call's own entry, its chain the one the
+/// log had there ([`PersonalError::StaleHead`]; the agent compares it
+/// before anything the call's batch settles). A call logged again, later
+/// on the same log or on a log a route forks, names a place before the
+/// call it copies, which every device that read that call has passed: no
+/// device that read a call takes it anywhere else, so the home node cannot
+/// replay or reorder an admin call, a commit its set voided included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Place {
     pub next: u64,

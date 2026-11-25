@@ -887,6 +887,76 @@ fn an_admin_call_is_taken_only_at_the_place_it_names() {
     );
 }
 
+/// B6 for commits: a commit names its place as every admin call does and
+/// is taken by the same rule. One behind the last admin call, on a chain
+/// the log never had or ahead of the head is refused `StaleHead` and logs
+/// nothing; one placed before entries that are no admin call is taken. A
+/// commit the window's end voided, sent again at its place, is refused:
+/// the agent takes it at no later index under the epoch the void left,
+/// while a commit placed before that batch settled the void is taken
+/// after it.
+#[test]
+fn a_commit_is_taken_only_at_the_place_it_names() {
+    let mut home = seasoned(3);
+    let epoch = home.overview().confirmed + 1;
+    let before = home.head(admin(0));
+    home.unevidenced(admin(0), "remove", 2u32).unwrap();
+    let head = home.head(admin(1));
+    let elsewhere = [
+        before,
+        Place {
+            next: head.next,
+            chain: [0xab; 32],
+        },
+        Place {
+            next: head.next + 1,
+            chain: head.chain,
+        },
+    ];
+    let first = update(epoch, 1).encode();
+    for place in elsewhere {
+        let run = home.run_as(admin(1), "commit", place.arguments(&first));
+        assert_eq!(
+            answer::<Candidacy>("commit", &run.outcome),
+            Err(PersonalError::StaleHead)
+        );
+    }
+    assert_eq!(home.head(admin(1)), head, "nothing logged");
+    let run = home.run_as(HOMES, "renew", Vec::new());
+    answer::<Recorded>("renew", &run.outcome).unwrap();
+    let run = home.run_as(admin(1), "commit", head.arguments(&first));
+    let candidacy = answer::<Candidacy>("commit", &run.outcome).unwrap();
+    assert!(candidacy.index > head.next, "{candidacy:?} after {head:?}");
+    assert_eq!(home.logged(candidacy.index), head.arguments(&first));
+
+    let place = home.head(admin(2));
+    home.pass(minutes().confirm_window_ms + 1);
+    let run = home.run_as(admin(1), "commit", head.arguments(&first));
+    assert_eq!(
+        answer::<Candidacy>("commit", &run.outcome),
+        Err(PersonalError::StaleHead)
+    );
+    let second = update(epoch, 2).encode();
+    let run = home.run_as(admin(2), "commit", place.arguments(&second));
+    let next = answer::<Candidacy>("commit", &run.outcome).unwrap();
+    assert!(next.index > place.next, "{next:?} after {place:?}");
+    assert_eq!(home.logged(next.index), place.arguments(&second));
+    let voided = (candidacy.index..next.index).any(|index| {
+        home.query::<Vec<(u64, Entry)>>(sync(0), "log", index)
+            .unwrap()
+            .iter()
+            .any(|(at, entry)| {
+                *at == index
+                    && entry.body
+                        == Body::Verdict {
+                            epoch,
+                            verdict: Verdict::Void(Void::Timeout),
+                        }
+            })
+    });
+    assert!(voided, "the first voided before the second");
+}
+
 /// B6: every operation and veto is an admin call whose evidence its
 /// signer posts, a device under its sync key and the kit under its own.
 #[test]
@@ -1179,7 +1249,11 @@ fn the_released_r2_is_deleted_at_the_restored_devices_first_commit() {
     };
     let arguments = commit(1, effect, vec![9; 600]);
     let candidacy: Candidacy = home.call(admin(5), "commit", arguments.clone()).unwrap();
-    let signed = message(device(5).admin, home.method("commit"), &arguments.encode());
+    let entries: Vec<(u64, Entry)> = home.query(sync(5), "log", candidacy.index).unwrap();
+    let Body::Candidate { call, .. } = &entries[0].1.body else {
+        panic!("{:?}", entries[0]);
+    };
+    let signed = message(device(5).admin, home.method("commit"), &call.arguments);
     assert_eq!(
         home.call::<Recorded>(
             sync(5),

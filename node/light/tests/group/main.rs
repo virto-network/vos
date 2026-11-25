@@ -148,6 +148,56 @@ fn paired_phones_confirm_one_group() {
     assert_eq!(overview(&home, &phones[0]).confirmed, 3);
 }
 
+/// A commit the agent took whose answer was lost, made again at the log's
+/// head past it: the agent answers it as the commit taken, and the
+/// evidence its committer posts is the call the log holds, not the one
+/// signed again, so every phone confirms it.
+#[test]
+fn a_commit_signed_again_once_taken_posts_the_call_the_log_holds() {
+    let (mut home, mut phones) = household(2);
+    let epoch = phones[0].group().confirmed() + 1;
+    let prepared = phones[0].group().commit(None, home.now()).unwrap();
+    let first = home.sign(&phones[0].admin, "commit", prepared.arguments());
+    let logged = first.message.clone();
+    phones[0]
+        .group()
+        .signed_commit(first.message.clone(), first.signature)
+        .unwrap();
+    let taken = home
+        .send(first)
+        .answer::<vos_wire::personal::Candidacy>()
+        .unwrap();
+    let cursor = phones[0].group().cursor();
+    let entries = home.log(phones[0].sync_key(), cursor).unwrap();
+    phones[0].group().follow(entries).unwrap();
+    let again = home.sign(&phones[0].admin, "commit", prepared.arguments());
+    assert_ne!(again.message, logged, "signed at a later place");
+    phones[0]
+        .group()
+        .signed_commit(again.message.clone(), again.signature)
+        .unwrap();
+    let answered = home
+        .send(again)
+        .answer::<vos_wire::personal::Candidacy>()
+        .unwrap();
+    assert_eq!(answered.index, taken.index);
+    let Event::Evidence {
+        index,
+        message,
+        signature,
+        attached,
+    } = phones[0].group().called_commit(answered.index).unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(message, logged);
+    phones[0].evidence(&mut home, index, message, signature, attached);
+    let events = settle(&mut home, &mut all(&mut phones));
+    for events in &events {
+        assert!(events.contains(&Event::Confirmed { epoch }), "{events:?}");
+    }
+}
+
 /// The committer's evidence, signed by its admin key, posted under its
 /// sync key: the evidence call `index`'s message and signature, and what
 /// rides beside it.
