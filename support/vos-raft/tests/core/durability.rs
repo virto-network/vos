@@ -5,8 +5,8 @@ use vos_raft::{LogEntry, Message, Role};
 
 use crate::common::{
     LEADER_A, LEADER_B, ME, append, claimed, committed, compact_bounds, config, follow, follower,
-    leader_of_two, matched, persist, persist_all, pre_vote, recovered, sent, snapshotted, vote,
-    vote_answer, writes,
+    last_write, leader_of_two, matched, persist, persist_all, persist_last, pre_vote, recovered,
+    sent, snapshotted, vote, vote_answer, writes,
 };
 
 #[test]
@@ -169,7 +169,7 @@ fn a_snapshot_switch_is_made_only_within_its_contract() {
         core.snapshot_switch(10, 1, None).is_none(),
         "an unreported write"
     );
-    persist(&mut core, writes(&unreported).last().unwrap());
+    persist_last(&mut core, &unreported);
     // A snapshot that holds index 2 at another term than the replica's
     // committed entry there.
     assert!(core.snapshot_switch(2, 4, None).is_none());
@@ -186,7 +186,7 @@ fn an_entry_waiting_for_a_lost_blob_never_stalls_an_election() {
     // reported.
     let mut core = follower(1, &[1; 10], 10);
     core.receive(LEADER_A, append(2, LEADER_A, (10, 1), 10, &[(11, 2)]));
-    let write = writes(&core.take_actions()).last().unwrap().clone();
+    let write = last_write(&mut core);
     core.durable(write.seq);
     core.take_actions();
     assert_eq!(core.status().durable_index, 10);
@@ -213,7 +213,7 @@ fn an_entry_waiting_for_a_lost_blob_never_stalls_an_election() {
     core.discard_unreported();
     assert_eq!(core.status().last_log_index, 10);
     core.receive(LEADER_B, vote(4));
-    let vote_write = writes(&core.take_actions()).last().unwrap().clone();
+    let vote_write = last_write(&mut core);
     core.durable(vote_write.seq);
     assert!(sent(&core.take_actions()).contains(&vote_answer(4, true)));
 }
@@ -227,7 +227,7 @@ fn a_discard_keeps_committed_entries() {
         LEADER_A,
         append(2, LEADER_A, (10, 1), 11, &[(11, 2), (12, 2)]),
     );
-    let write = writes(&core.take_actions()).last().unwrap().clone();
+    let write = last_write(&mut core);
     core.durable(write.seq);
     core.take_actions();
     core.discard_unreported();
@@ -239,7 +239,7 @@ fn a_leader_steps_down_before_it_discards() {
     let mut leader = leader_of_two();
     leader.receive(LEADER_A, matched(1));
     leader.propose(1, vec![1]);
-    let write = writes(&leader.take_actions()).last().unwrap().clone();
+    let write = last_write(&mut leader);
     leader.durable(write.seq);
     leader.take_actions();
     // Entry 2's blob never comes: the leader cannot count it, nor know
@@ -262,12 +262,12 @@ fn a_candidate_that_discards_ignores_grants_for_its_longer_log() {
     let mut core = Core::new(cfg, recovered(2, 10, entries), 0, 7);
     core.take_actions();
     core.receive(LEADER_A, append(2, LEADER_A, (11, 2), 10, &[(12, 2)]));
-    let write = writes(&core.take_actions()).last().unwrap().clone();
+    let write = last_write(&mut core);
     core.durable(write.seq);
     core.take_actions();
     // Its leader goes quiet: it campaigns, advertising (12, 2).
     core.tick(1_000);
-    let campaign = writes(&core.take_actions()).last().unwrap().clone();
+    let campaign = last_write(&mut core);
     core.durable(campaign.seq);
     core.take_actions();
     assert_eq!(core.role(), Role::Candidate);
@@ -295,16 +295,16 @@ fn a_report_from_before_a_discard_vouches_for_nothing_written_after() {
     let mut core = follower(1, &[1; 10], 10);
     // Entry (11, 2) is written, durable but unreported (its blob waits).
     core.receive(LEADER_A, append(2, LEADER_A, (10, 1), 10, &[(11, 2)]));
-    let first = writes(&core.take_actions()).last().unwrap().clone();
+    let first = last_write(&mut core);
     core.durable(first.seq);
     core.take_actions();
     // The host gives up, and the leader sends the same entry again.
     core.discard_unreported();
-    let cut = writes(&core.take_actions()).last().unwrap().clone();
+    let cut = last_write(&mut core);
     core.durable(cut.seq);
     core.take_actions();
     core.receive(LEADER_A, append(2, LEADER_A, (10, 1), 10, &[(11, 2)]));
-    let again = writes(&core.take_actions()).last().unwrap().clone();
+    let again = last_write(&mut core);
     // The first write's report arrives late: it wrote an entry with the
     // same index and term, but the discard removed it.
     core.entries_durable(first.seq);
@@ -340,12 +340,12 @@ fn a_wiped_replica_votes_only_for_a_log_reaching_what_it_held() {
     assert!(refused(&core.take_actions()));
     core.receive(LEADER_A, vote(4, LEADER_A, (30, 3)));
     // The refusal leaves once the term it adopted is durable.
-    let term = writes(&core.take_actions()).last().unwrap().clone();
+    let term = last_write(&mut core);
     persist(&mut core, &term);
     assert!(refused(&core.take_actions()));
     // One whose log reaches it gets the vote.
     core.receive(LEADER_B, vote(5, LEADER_B, (40, 3)));
-    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    let vote = last_write(&mut core);
     persist(&mut core, &vote);
     assert!(sent(&core.take_actions()).contains(&vote_answer(5, true)));
 }

@@ -6,7 +6,8 @@ use vos_raft::{Message, Role};
 
 use crate::common::{
     LEADER_A, LEADER_B, ME, acked, append, appends, config, entries_to, follower,
-    idle_leader_of_three, leader_of_two_with, matched, persist, pre_vote, sent, writes,
+    idle_leader_of_three, last_write, leader_of_two_with, matched, persist, persist_last, pre_vote,
+    sent,
 };
 
 /// An idle leader sends its follower the commit at once, and again each
@@ -34,7 +35,7 @@ fn an_idle_leader_sends_nothing_once_its_follower_holds_the_commit() {
     // A proposal goes out at once, and its commit after it.
     core.propose(1, vec![1]);
     let actions = core.take_actions();
-    persist(&mut core, writes(&actions).last().unwrap());
+    persist_last(&mut core, &actions);
     assert_eq!(appends(&actions), [(LEADER_A, 1, 3)]);
     core.receive(LEADER_A, matched(2));
     assert_eq!(appends(&core.take_actions()), [(LEADER_A, 2, 3)]);
@@ -47,7 +48,7 @@ fn an_idle_leader_leaves_a_silent_member_without_heartbeats() {
     // it, while B, heard, keeps the quorum.
     core.propose(1, vec![1]);
     let actions = core.take_actions();
-    persist(&mut core, writes(&actions).last().unwrap());
+    persist_last(&mut core, &actions);
     core.receive(LEADER_B, acked(2, 1));
     core.receive(LEADER_B, acked(2, 2));
     core.vouch(
@@ -182,7 +183,7 @@ fn a_solo_group_with_idle_heartbeats_off_arms_no_timer() {
     core.take_actions();
     core.tick(1_000);
     let actions = core.take_actions();
-    persist(&mut core, writes(&actions).last().unwrap());
+    persist_last(&mut core, &actions);
     core.take_actions();
     assert_eq!(core.role(), Role::Leader);
     assert_eq!(core.next_deadline(), u64::MAX);
@@ -204,7 +205,7 @@ fn a_leader_whose_appends_go_unanswered_steps_down_though_the_node_is_heard() {
     // An entry A never answers for: its node's pair heartbeat counts while
     // A answered lately, then no more, and a window deposes the leader.
     core.propose(1, vec![1]);
-    let write = writes(&core.take_actions()).last().unwrap().clone();
+    let write = last_write(&mut core);
     persist(&mut core, &write);
     core.take_actions();
     // Patience here is three election timeouts: 900 ms.
@@ -264,7 +265,7 @@ fn an_idle_leader_is_quiescent_once_every_member_is_caught_up_and_heard() {
     // An entry on its way keeps it ticking.
     core.propose(1, vec![1]);
     let actions = core.take_actions();
-    persist(&mut core, writes(&actions).last().unwrap());
+    persist_last(&mut core, &actions);
     core.take_actions();
     assert!(!core.quiescent(0));
 }

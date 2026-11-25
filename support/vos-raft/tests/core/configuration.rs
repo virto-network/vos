@@ -6,8 +6,8 @@ use vos_raft::{ActiveConfigRecord, AppendResult, Config, EntryKind, LogEntry, Me
 
 use crate::common::{
     LEADER_A, LEADER_B, ME, acked_at, append, committed, compact_bounds, config, entries_to,
-    follow, follower, lead, leader_of_three_with, leader_of_two, loads, matched, persist,
-    persist_all, persist_into, recovered, sent, snapshotted, writes,
+    follow, follower, lead, leader_of_three_with, leader_of_two, loads, matched, persist_all,
+    persist_into, persist_last, recovered, sent, snapshotted, writes,
 };
 
 const JOINER: u16 = 4;
@@ -33,7 +33,7 @@ fn record(
 /// after.
 fn lead_with_a(core: &mut Core<u16>, at: u64) -> Vec<Action<u16>> {
     let actions = lead(core, at);
-    persist(core, writes(&actions).last().unwrap());
+    persist_last(core, &actions);
     let status = core.status();
     core.receive(
         LEADER_A,
@@ -211,12 +211,12 @@ fn the_next_change_starts_once_the_final_entry_commits() {
         token: 1,
         result: Ok(2),
     })));
-    persist(&mut core, writes(&actions).last().unwrap());
+    persist_last(&mut core, &actions);
     // A acknowledges it: it commits, and the final entry follows at 3.
     core.receive(LEADER_A, matched(2));
     let actions = core.take_actions();
     assert_eq!(finals(&actions), vec![members.clone()]);
-    persist(&mut core, writes(&actions).last().unwrap());
+    persist_last(&mut core, &actions);
     // A acknowledges the final entry: it commits, and B is out. B still has
     // the joint entry's append in flight, so the append carrying the commit
     // skips it.
@@ -552,7 +552,7 @@ fn a_change_whose_joint_entry_was_cut_is_never_finalized() {
     let propose = |core: &mut Core<u16>, token: u64| {
         core.propose(token, vec![token as u8]);
         let proposed = core.take_actions();
-        persist(core, writes(&proposed).last().unwrap());
+        persist_last(core, &proposed);
         proposed
     };
     // Data at 10 and 11, committed with A.

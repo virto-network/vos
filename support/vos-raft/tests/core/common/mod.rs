@@ -78,6 +78,16 @@ pub fn persist(core: &mut Core<u16>, write: &Write<u16>) {
     core.entries_durable(write.seq);
 }
 
+/// The last write the core asks for, taking its actions.
+pub fn last_write(core: &mut Core<u16>) -> Write<u16> {
+    writes(&core.take_actions()).pop().expect("a write")
+}
+
+/// Report the last write in `actions` durable.
+pub fn persist_last(core: &mut Core<u16>, actions: &[Action<u16>]) {
+    persist(core, writes(actions).last().expect("a write"));
+}
+
 /// Report every write the core asks for durable, until it asks none.
 pub fn persist_all(core: &mut Core<u16>) {
     loop {
@@ -113,7 +123,7 @@ pub fn persist_into(store: &mut Vec<LogEntry<u16>>, core: &mut Core<u16>, action
 /// among them.
 pub fn lead(core: &mut Core<u16>, at: u64) -> Vec<Action<u16>> {
     core.tick(at);
-    let vote = writes(&core.take_actions()).last().unwrap().clone();
+    let vote = last_write(core);
     persist(core, &vote);
     let term = core.status().current_term;
     core.receive(LEADER_A, vote_answer(term, true));
@@ -135,7 +145,7 @@ pub fn leader_of_two_with(adjust: impl FnOnce(&mut Config<u16>)) -> Core<u16> {
     let mut core = Core::new(cfg, Recovered::default(), 0, 5);
     core.take_actions();
     let actions = lead(&mut core, 1_000);
-    persist(&mut core, writes(&actions).last().unwrap());
+    persist_last(&mut core, &actions);
     core.take_actions();
     core
 }
@@ -156,7 +166,7 @@ pub fn leader_of_three_with(adjust: impl FnOnce(&mut Config<u16>)) -> Core<u16> 
     let mut core = Core::new(cfg, Recovered::default(), 0, 5);
     core.take_actions();
     let actions = lead(&mut core, 1_000);
-    persist(&mut core, writes(&actions).last().unwrap());
+    persist_last(&mut core, &actions);
     for peer in [LEADER_A, LEADER_B] {
         core.receive(peer, acked(1, 0));
         core.receive(peer, acked(1, 1));
