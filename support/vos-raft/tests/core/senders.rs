@@ -6,7 +6,8 @@ use vos_raft::core::{Core, Recovered};
 use vos_raft::{AppendResult, Config, Message, Meta, Role};
 
 use crate::common::{
-    LEADER_A, LEADER_B, ME, append, config, follower, leader_of_two, matched, persist, sent, writes,
+    LEADER_A, LEADER_B, ME, acked_at, append, config, follower, leader_of_two, matched, persist,
+    pre_vote, sent, vote, vote_answer, writes,
 };
 
 /// A node the host authenticated that is in no configuration this
@@ -87,12 +88,7 @@ fn a_term_has_one_leader() {
 /// hears a leader it is ignored, and the term stays.
 #[test]
 fn an_outsider_does_not_depose_a_live_leader() {
-    let vote = Message::Vote {
-        term: 7,
-        candidate: OUTSIDER,
-        last_index: 100,
-        last_term: 6,
-    };
+    let vote = vote(7, OUTSIDER, (100, 6));
     let mut leader = leader_of_two();
     leader.receive(OUTSIDER, vote.clone());
     leader.take_actions();
@@ -114,21 +110,10 @@ fn an_outsider_does_not_depose_a_live_leader() {
 #[test]
 fn a_replica_with_no_leader_answers_a_candidate_it_does_not_know() {
     let mut core = committed_follower();
-    core.receive(
-        OUTSIDER,
-        Message::Vote {
-            term: 2,
-            candidate: OUTSIDER,
-            last_index: 5,
-            last_term: 1,
-        },
-    );
+    core.receive(OUTSIDER, vote(2, OUTSIDER, (5, 1)));
     let actions = core.take_actions();
     persist(&mut core, writes(&actions).last().unwrap());
-    assert!(sent(&core.take_actions()).contains(&Message::VoteAnswer {
-        term: 2,
-        granted: true,
-    }));
+    assert!(sent(&core.take_actions()).contains(&vote_answer(2, true)));
 }
 
 /// A replica added to a group starts from the members the group was
@@ -145,21 +130,10 @@ fn a_replica_not_yet_in_its_configuration_answers_the_members_it_does_not_know()
         3,
     );
     core.take_actions();
-    core.receive(
-        OUTSIDER,
-        Message::Vote {
-            term: 3,
-            candidate: OUTSIDER,
-            last_index: 5,
-            last_term: 2,
-        },
-    );
+    core.receive(OUTSIDER, vote(3, OUTSIDER, (5, 2)));
     let actions = core.take_actions();
     persist(&mut core, writes(&actions).last().unwrap());
-    assert!(sent(&core.take_actions()).contains(&Message::VoteAnswer {
-        term: 3,
-        granted: true,
-    }));
+    assert!(sent(&core.take_actions()).contains(&vote_answer(3, true)));
     // It never campaigns: it is no member as it knows them.
     core.tick(10_000);
     assert!(!core.campaigning());
@@ -170,21 +144,13 @@ fn a_replica_not_yet_in_its_configuration_answers_the_members_it_does_not_know()
 #[test]
 fn an_outsiders_answers_change_nothing() {
     let answers = [
-        Message::VoteAnswer {
-            term: 5,
-            granted: false,
-        },
+        vote_answer(5, false),
         Message::PreVoteAnswer {
             term: 5,
             next_term: 6,
             granted: false,
         },
-        Message::AppendAnswer {
-            term: 5,
-            round: 0,
-            commit: 0,
-            result: AppendResult::Matched { matched: 0 },
-        },
+        acked_at(5, 0, 0, 0),
     ];
     for answer in answers {
         let mut core = leader_of_two();
@@ -203,23 +169,9 @@ fn an_outsiders_answers_change_nothing() {
 #[test]
 fn a_term_without_a_successor_is_refused() {
     let mut core = committed_follower();
-    core.receive(
-        LEADER_A,
-        Message::VoteAnswer {
-            term: u64::MAX,
-            granted: false,
-        },
-    );
+    core.receive(LEADER_A, vote_answer(u64::MAX, false));
     core.receive(LEADER_A, append(u64::MAX, LEADER_A, (3, 1), 3, &[]));
-    core.receive(
-        LEADER_A,
-        Message::PreVote {
-            next_term: u64::MAX,
-            candidate: LEADER_A,
-            last_index: 9,
-            last_term: 1,
-        },
-    );
+    core.receive(LEADER_A, pre_vote(u64::MAX, LEADER_A, (9, 1)));
     let actions = core.take_actions();
     assert!(sent(&actions).is_empty(), "{actions:?}");
     assert_eq!(core.status().current_term, 1);
@@ -303,12 +255,7 @@ fn an_acknowledgement_past_the_log_counts_for_the_log() {
 #[test]
 fn a_follower_whose_leader_fell_silent_answers_a_candidate_it_does_not_know() {
     let mut core = following_a();
-    let vote = Message::Vote {
-        term: 2,
-        candidate: OUTSIDER,
-        last_index: 5,
-        last_term: 1,
-    };
+    let vote = vote(2, OUTSIDER, (5, 1));
     core.receive(OUTSIDER, vote.clone());
     core.take_actions();
     assert_eq!(core.status().current_term, 1, "a leader is heard");
@@ -317,10 +264,7 @@ fn a_follower_whose_leader_fell_silent_answers_a_candidate_it_does_not_know() {
     core.receive(OUTSIDER, vote);
     let actions = core.take_actions();
     persist(&mut core, writes(&actions).last().unwrap());
-    assert!(sent(&core.take_actions()).contains(&Message::VoteAnswer {
-        term: 2,
-        granted: true,
-    }));
+    assert!(sent(&core.take_actions()).contains(&vote_answer(2, true)));
 }
 
 /// A term far past this replica's is refused: one message cannot take a
@@ -329,15 +273,7 @@ fn a_follower_whose_leader_fell_silent_answers_a_candidate_it_does_not_know() {
 fn a_term_far_past_the_replicas_is_refused() {
     let mut core = following_a();
     core.receive(LEADER_A, append(u64::MAX - 1, LEADER_A, (3, 1), 3, &[]));
-    core.receive(
-        LEADER_B,
-        Message::PreVote {
-            next_term: 1 << 40,
-            candidate: LEADER_B,
-            last_index: 9,
-            last_term: 1,
-        },
-    );
+    core.receive(LEADER_B, pre_vote(1 << 40, LEADER_B, (9, 1)));
     let actions = core.take_actions();
     assert!(sent(&actions).is_empty(), "{actions:?}");
     assert_eq!(core.status().current_term, 1);

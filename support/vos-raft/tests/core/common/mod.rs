@@ -116,13 +116,7 @@ pub fn lead(core: &mut Core<u16>, at: u64) -> Vec<Action<u16>> {
     let vote = writes(&core.take_actions()).last().unwrap().clone();
     persist(core, &vote);
     let term = core.status().current_term;
-    core.receive(
-        LEADER_A,
-        Message::VoteAnswer {
-            term,
-            granted: true,
-        },
-    );
+    core.receive(LEADER_A, vote_answer(term, true));
     assert_eq!(core.role(), Role::Leader);
     core.take_actions()
 }
@@ -263,12 +257,44 @@ pub fn matched(matched: u64) -> Message<u16> {
 
 /// A's answer, at term 1, to an append carrying `commit`.
 pub fn acked(matched: u64, commit: u64) -> Message<u16> {
+    acked_at(1, 0, matched, commit)
+}
+
+/// An answer, at `term` in heartbeat `round`, that the peer holds through
+/// `matched`, to an append carrying `commit`.
+pub fn acked_at(term: u64, round: u64, matched: u64, commit: u64) -> Message<u16> {
     Message::AppendAnswer {
-        term: 1,
-        round: 0,
+        term,
+        round,
         commit,
         result: AppendResult::Matched { matched },
     }
+}
+
+pub fn vote(term: u64, candidate: u16, (last_index, last_term): (u64, u64)) -> Message<u16> {
+    Message::Vote {
+        term,
+        candidate,
+        last_index,
+        last_term,
+    }
+}
+
+pub fn pre_vote(
+    next_term: u64,
+    candidate: u16,
+    (last_index, last_term): (u64, u64),
+) -> Message<u16> {
+    Message::PreVote {
+        next_term,
+        candidate,
+        last_index,
+        last_term,
+    }
+}
+
+pub fn vote_answer(term: u64, granted: bool) -> Message<u16> {
+    Message::VoteAnswer { term, granted }
 }
 
 /// The loads in `actions`.

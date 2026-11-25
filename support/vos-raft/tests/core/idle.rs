@@ -6,7 +6,7 @@ use vos_raft::{Message, Role};
 
 use crate::common::{
     LEADER_A, LEADER_B, ME, acked, append, appends, config, entries_to, follower,
-    idle_leader_of_three, leader_of_two_with, matched, persist, sent, writes,
+    idle_leader_of_three, leader_of_two_with, matched, persist, pre_vote, sent, writes,
 };
 
 /// An idle leader sends its follower the commit at once, and again each
@@ -135,15 +135,7 @@ fn a_members_pre_vote_draws_a_heartbeat_from_its_leader() {
     let mut core = leader_of_two_with(|cfg| cfg.idle_heartbeats = false);
     core.receive(LEADER_A, matched(1));
     core.take_actions();
-    core.receive(
-        LEADER_A,
-        Message::PreVote {
-            next_term: 2,
-            candidate: LEADER_A,
-            last_index: 1,
-            last_term: 1,
-        },
-    );
+    core.receive(LEADER_A, pre_vote(2, LEADER_A, (1, 1)));
     let actions = core.take_actions();
     assert!(
         sent(&actions)
@@ -165,15 +157,7 @@ fn a_vouched_leader_moves_the_deadline_and_holds_stickiness() {
     assert!(core.next_deadline() >= 1_150);
     core.tick(1_100);
     assert!(sent(&core.take_actions()).is_empty());
-    core.receive(
-        LEADER_B,
-        Message::PreVote {
-            next_term: 2,
-            candidate: LEADER_B,
-            last_index: 1,
-            last_term: 1,
-        },
-    );
+    core.receive(LEADER_B, pre_vote(2, LEADER_B, (1, 1)));
     assert!(
         sent(&core.take_actions())
             .iter()

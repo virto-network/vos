@@ -5,9 +5,9 @@ use vos_raft::core::{Action, Answer, ChangeMembershipError, Core, Recovered};
 use vos_raft::{ActiveConfigRecord, AppendResult, Config, EntryKind, LogEntry, Message};
 
 use crate::common::{
-    LEADER_A, LEADER_B, ME, append, committed, compact_bounds, config, entries_to, follow,
-    follower, lead, leader_of_three_with, leader_of_two, loads, matched, persist, persist_all,
-    persist_into, recovered, sent, snapshotted, writes,
+    LEADER_A, LEADER_B, ME, acked_at, append, committed, compact_bounds, config, entries_to,
+    follow, follower, lead, leader_of_three_with, leader_of_two, loads, matched, persist,
+    persist_all, persist_into, recovered, sent, snapshotted, writes,
 };
 
 const JOINER: u16 = 4;
@@ -37,14 +37,7 @@ fn lead_with_a(core: &mut Core<u16>, at: u64) -> Vec<Action<u16>> {
     let status = core.status();
     core.receive(
         LEADER_A,
-        Message::AppendAnswer {
-            term: status.current_term,
-            round: 0,
-            commit: 0,
-            result: AppendResult::Matched {
-                matched: status.last_log_index,
-            },
-        },
+        acked_at(status.current_term, 0, status.last_log_index, 0),
     );
     core.take_actions()
 }
@@ -555,12 +548,7 @@ fn a_change_whose_joint_entry_was_cut_is_never_finalized() {
     persist_all(&mut core);
     // It leads at term 2 with A's vote; its no-op is entry 9.
     let mut actions = lead_with_a(&mut core, 1_000);
-    let held = |matched| Message::AppendAnswer {
-        term: 2,
-        round: 0,
-        commit: 0,
-        result: AppendResult::Matched { matched },
-    };
+    let held = |matched| acked_at(2, 0, matched, 0);
     let propose = |core: &mut Core<u16>, token: u64| {
         core.propose(token, vec![token as u8]);
         let proposed = core.take_actions();
