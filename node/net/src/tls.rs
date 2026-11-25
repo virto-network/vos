@@ -171,7 +171,9 @@ impl Identity {
         peers: Table,
         transport: Arc<quinn::TransportConfig>,
     ) -> quinn::ServerConfig {
-        let mut config = self.server_with(Expect::Configured(peers), ALPN, transport);
+        let configured: Expect =
+            Arc::new(move |key| peers.read().expect("the peer table").contains_key(key));
+        let mut config = self.server_with(configured, ALPN, transport);
         config.migration(false);
         config
     }
@@ -225,7 +227,7 @@ impl Identity {
         transport: Arc<quinn::TransportConfig>,
     ) -> quinn::ClientConfig {
         let verifier = Arc::new(Verifier {
-            expect: Expect::Pinned(peer),
+            expect: Arc::new(move |key| *key == peer),
             provider: Arc::clone(&self.provider),
         });
         let mut tls = rustls::ClientConfig::builder_with_provider(Arc::clone(&self.provider))
@@ -311,41 +313,22 @@ fn tls12_refused() -> Result<HandshakeSignatureValid, rustls::Error> {
 const SCHEMES: [SignatureScheme; 1] = [SignatureScheme::ED25519];
 
 /// The keys a side takes.
-pub(crate) enum Expect {
-    /// The one peer this side dialed.
-    Pinned(NodeKey),
-    /// Any configured peer.
-    Configured(Table),
-    /// Any key the check takes.
-    Listed(Arc<dyn Fn(&NodeKey) -> bool + Send + Sync>),
-}
+pub(crate) type Expect = Arc<dyn Fn(&NodeKey) -> bool + Send + Sync>;
 
-impl std::fmt::Debug for Expect {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Expect::Pinned(key) => f.debug_tuple("Pinned").field(key).finish(),
-            Expect::Configured(peers) => f.debug_tuple("Configured").field(peers).finish(),
-            Expect::Listed(_) => f.write_str("Listed"),
-        }
-    }
-}
-
-#[derive(Debug)]
 struct Verifier {
     expect: Expect,
     provider: Arc<CryptoProvider>,
 }
 
+impl std::fmt::Debug for Verifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Verifier").finish_non_exhaustive()
+    }
+}
+
 impl Verifier {
     fn check(&self, end: &CertificateDer, rest: &[CertificateDer]) -> Result<(), rustls::Error> {
-        let expected = rest.is_empty()
-            && key_of(end).is_some_and(|key| match &self.expect {
-                Expect::Pinned(pinned) => key == *pinned,
-                Expect::Configured(peers) => {
-                    peers.read().expect("the peer table").contains_key(&key)
-                }
-                Expect::Listed(listed) => listed(&key),
-            });
+        let expected = rest.is_empty() && key_of(end).is_some_and(|key| (self.expect)(&key));
         if expected {
             Ok(())
         } else {

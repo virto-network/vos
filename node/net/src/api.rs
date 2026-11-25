@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::NodeKey;
 pub use crate::quic::executor::{Runner, Runtime, Spawner};
-use crate::tls::{Expect, Identity};
+use crate::tls::Identity;
 
 /// The node API's protocol.
 pub const ALPN: &[u8] = b"vos-api/1";
@@ -20,7 +20,7 @@ pub fn server_config(
     allowed: impl Fn(&NodeKey) -> bool + Send + Sync + 'static,
     transport: Arc<quinn::TransportConfig>,
 ) -> quinn::ServerConfig {
-    Identity::new(secret).server_with(Expect::Listed(Arc::new(allowed)), ALPN, transport)
+    Identity::new(secret).server_with(Arc::new(allowed), ALPN, transport)
 }
 
 /// The dialing side, the client whose secret seed is `secret`, pinned to
