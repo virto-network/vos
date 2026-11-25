@@ -142,11 +142,11 @@ impl<N: NodeId> Core<N> {
             return Err(ChangeMembershipError::InProgress);
         }
         // A solo leader ran no check-quorum: its window starts now.
-        if self.is_solo() {
-            self.check_quorum_due = self.now + self.cfg.election_timeout_ms.1;
-            if let Some(leading) = self.leading.as_mut() {
-                leading.recent.clear();
-            }
+        if self.is_solo()
+            && let Some(leading) = self.leading.as_mut()
+        {
+            leading.check_quorum_due = self.now + self.cfg.election_timeout_ms.1;
+            leading.recent.clear();
         }
         if members.is_empty() {
             return Err(ChangeMembershipError::EmptyConfig);

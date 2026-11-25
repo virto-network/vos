@@ -314,10 +314,13 @@ struct LeaderState<N: NodeId> {
     silent: BTreeSet<N>,
     /// A leadership transfer in progress, and when it gives up.
     transfer: Option<(N, u64)>,
+    check_quorum_due: u64,
+    /// The index of this term's first entry: a read is served at no lower.
+    no_op: u64,
 }
 
 impl<N: NodeId> LeaderState<N> {
-    fn new() -> Self {
+    fn new(check_quorum_due: u64, no_op: u64) -> Self {
         Self {
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
@@ -332,6 +335,8 @@ impl<N: NodeId> LeaderState<N> {
             recent: BTreeSet::new(),
             silent: BTreeSet::new(),
             transfer: None,
+            check_quorum_due,
+            no_op,
         }
     }
 
@@ -394,7 +399,6 @@ pub struct Core<N: NodeId> {
     /// When the election timer fires; while leading, when the next
     /// heartbeat round is due (`u64::MAX` for none).
     election_deadline: u64,
-    check_quorum_due: u64,
     last_heard_leader: Option<u64>,
     votes: BTreeSet<N>,
     pre_candidate_misses: u32,
@@ -403,7 +407,6 @@ pub struct Core<N: NodeId> {
     reads: Vec<PendingRead>,
     pending_acks: Vec<PendingAck<N>>,
     seen_leader: Option<N>,
-    current_term_first_index: Option<u64>,
     writer_stalled: bool,
     /// Handovers started since the writer stalled.
     stalled_handovers: u32,
@@ -504,7 +507,6 @@ impl<N: NodeId> Core<N> {
             log,
             now,
             election_deadline: now,
-            check_quorum_due: now,
             last_heard_leader: None,
             votes: BTreeSet::new(),
             pre_candidate_misses: 0,
@@ -512,7 +514,6 @@ impl<N: NodeId> Core<N> {
             reads: Vec::new(),
             pending_acks: Vec::new(),
             seen_leader: None,
-            current_term_first_index: None,
             writer_stalled: false,
             stalled_handovers: 0,
             pending_joint_entry: None,
@@ -559,7 +560,12 @@ impl<N: NodeId> Core<N> {
         if self.role == Role::Leader {
             self.leader_timers();
         }
-        if self.role == Role::Leader && self.cfg.check_quorum && self.now >= self.check_quorum_due {
+        if self.cfg.check_quorum
+            && self
+                .leading
+                .as_ref()
+                .is_some_and(|leading| self.now >= leading.check_quorum_due)
+        {
             self.check_quorum();
         }
         if self.now >= self.election_deadline {
@@ -627,7 +633,7 @@ impl<N: NodeId> Core<N> {
                 deadline = deadline.min(at);
             }
             if self.cfg.check_quorum && !self.is_solo() {
-                deadline = deadline.min(self.check_quorum_due);
+                deadline = deadline.min(leading.check_quorum_due);
             }
         }
         deadline
@@ -744,7 +750,9 @@ impl<N: NodeId> Core<N> {
             });
             return;
         };
-        let round = leading.round + 1;
+        // A read is served at an index no lower than this term's no-op, so it
+        // never sees state a later leader could revert.
+        let (round, required_index) = (leading.round + 1, self.commit.max(leading.no_op));
         if self.reads.len() >= self.cfg.max_pending_reads {
             self.answer(Answer::ReadIndex {
                 token,
@@ -752,9 +760,6 @@ impl<N: NodeId> Core<N> {
             });
             return;
         }
-        // A read is served at an index no lower than this term's no-op, so it
-        // never sees state a later leader could revert.
-        let required_index = self.commit.max(self.current_term_first_index.unwrap_or(0));
         self.reads.push(PendingRead {
             token,
             required_index,
@@ -983,9 +988,8 @@ impl<N: NodeId> Core<N> {
     /// not those heard before the wait.
     pub fn resume(&mut self, now: u64) {
         self.now = self.now.max(now);
-        if self.role == Role::Leader
-            && self.now >= self.check_quorum_due
-            && let Some(leading) = self.leading.as_mut()
+        if let Some(leading) = self.leading.as_mut()
+            && self.now >= leading.check_quorum_due
         {
             leading.recent.clear();
         }
