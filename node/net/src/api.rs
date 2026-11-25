@@ -30,7 +30,7 @@ pub fn client_config(
     node: NodeKey,
     transport: Arc<quinn::TransportConfig>,
 ) -> quinn::ClientConfig {
-    Identity::new(secret).client_with(ALPN, node, transport)
+    client_config_for(secret, ALPN, node, transport)
 }
 
 /// The dialing side of another protocol, for tests: that a node refuses

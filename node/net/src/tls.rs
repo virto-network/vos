@@ -277,10 +277,9 @@ impl quinn_proto::ConnectionIdGenerator for MarkedIds {
     }
 
     fn validate(&self, id: &quinn::ConnectionId) -> Result<(), quinn_proto::InvalidCid> {
-        if id.len() != ID_RANDOM + ID_MARK {
-            return Err(quinn_proto::InvalidCid);
-        }
-        if equal(&self.mark(&id[..ID_RANDOM]), &id[ID_RANDOM..]) {
+        // The length first, so the slices hold.
+        if id.len() == ID_RANDOM + ID_MARK && equal(&self.mark(&id[..ID_RANDOM]), &id[ID_RANDOM..])
+        {
             Ok(())
         } else {
             Err(quinn_proto::InvalidCid)
