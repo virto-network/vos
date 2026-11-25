@@ -414,7 +414,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
         let cid = Cid(H::hash(&bytes));
         let mut rows = Overlay::new(&self.store);
         rows.apply(crdt, &cid, &node, false)?;
-        let unheaded: Vec<Cid<H>> = node
+        let unheaded: BTreeSet<Cid<H>> = node
             .parents
             .iter()
             .filter(|parent| self.heads.contains_key(*parent))
@@ -428,10 +428,10 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
                     seq,
                     bytes,
                 }],
-                heads_added: alloc::vec![(cid.clone(), author, seq)],
+                heads_added: BTreeMap::from([(cid.clone(), (author, seq))]),
                 heads_removed: unheaded.clone(),
-                latest: alloc::vec![(author, seq, cid.clone())],
-                outbox: alloc::vec![(author, seq, cid.clone())],
+                latest: BTreeMap::from([(author, (seq, cid.clone()))]),
+                outbox: BTreeMap::from([((author, seq), cid.clone())]),
                 rows: rows.into_written(),
                 ..Changes::default()
             })
@@ -502,7 +502,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
             return Ok(0);
         }
         self.store.commit(Changes {
-            released: dropped.clone(),
+            released: dropped.iter().cloned().collect(),
             ..Changes::default()
         })?;
         for cid in &dropped {
@@ -582,19 +582,11 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
         let changes = Changes {
             applied: core::mem::take(&mut batch.applied),
             held: core::mem::take(&mut batch.held),
-            released: batch.released.iter().cloned().collect(),
-            heads_added: batch
-                .heads_added
-                .iter()
-                .map(|(cid, (author, seq))| (cid.clone(), *author, *seq))
-                .collect(),
-            heads_removed: batch.heads_removed.iter().cloned().collect(),
-            latest: batch
-                .latest
-                .iter()
-                .map(|(author, (seq, cid))| (*author, *seq, cid.clone()))
-                .collect(),
-            equivocations: batch.equivocations.iter().copied().collect(),
+            released: core::mem::take(&mut batch.released),
+            heads_added: batch.heads_added.clone(),
+            heads_removed: batch.heads_removed.clone(),
+            latest: batch.latest.clone(),
+            equivocations: batch.equivocations.clone(),
             cursor: if cursor != self.cursor { cursor } else { None },
             rows: rows.into_written(),
             ..Changes::default()

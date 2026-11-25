@@ -281,11 +281,11 @@ impl FjallStore {
         for cid in changes.heads_removed {
             batch.remove(&self.meta, tagged(HEAD, &[cid.as_ref()]));
         }
-        for (cid, author, at) in changes.heads_added {
+        for (cid, (author, at)) in changes.heads_added {
             let value = [&author.0[..], &at.to_be_bytes()].concat();
             batch.insert(&self.meta, tagged(HEAD, &[cid.as_ref()]), value);
         }
-        for (author, at, cid) in changes.latest {
+        for (author, (at, cid)) in changes.latest {
             let value = [&at.to_be_bytes()[..], cid.as_ref()].concat();
             batch.insert(&self.meta, tagged(LATEST, &[&author.0]), value);
         }
@@ -296,7 +296,7 @@ impl FjallStore {
         if let Some(cursor) = changes.cursor {
             batch.insert(&self.meta, CURSOR, cursor.to_be_bytes());
         }
-        for (author, at, cid) in changes.outbox {
+        for ((author, at), cid) in changes.outbox {
             let key = tagged(OUTBOX, &[&author.0, &at.to_be_bytes()]);
             batch.insert(&self.meta, key, cid.as_ref());
         }
