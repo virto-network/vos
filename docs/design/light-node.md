@@ -1555,54 +1555,52 @@ host-verified]:
   operation's evidence is in, which its author's next pass posts. The
   operators run ingress and could append anything to the log, so a device
   trusts an operation only by its signature (§8, B6).
-- **The place** [E39, E44, built]: every admin call, the device-set
-  calls (add, remove, replace, rotate, regroup, restore, veto, cosign,
-  resolve) and the commit, names first in its arguments the log's head its signer read before the
-  prompt, `Place { next, chain }`: the next index and the chain through the
-  entry before it. The agent and every device take the call only at a
-  place at or after their floor, the entry after the last admin call
-  before it (a device's start, for one that read none; a paired device
-  takes its pairing device's), and at or before the call's own entry, the
-  chain there the log's. The agent compares it before anything the call's
-  batch settles and refuses any other `StaleHead`, logging nothing; a
-  device raises `Alarm::Log` and reads no further, as for an entry that
-  does not chain. A call logged again elsewhere names a place before the
-  call it copies, which every device that read that call has passed: a
-  route cannot log a removal once signed, vetoed or cancelled a second
-  time and mature it there unvetoed, and the home node cannot log a commit
-  its set voided (a timeout, a nack, a split, a regroup) again later under
-  the epoch the void left: every device that read it refuses the copy, so
-  none votes on it, even while its committer is away for the whole window
-  and the log names a confirming set without it. No admin call a device
-  read is replayed or reordered. Entries that are no admin call
-  (evidence, votes, `alive`, a renewal, what a batch settles) move no
-  floor, so another device's background pass between the reading and the
-  call refuses nothing; the cost is that a signed call withheld stays
-  takeable until the next admin call is logged. The device reads the log
-  to its head just before the prompt (one read, two when there is
-  something new), and signs nothing when that log stops at an entry it
-  refuses or it is out of the set. The same call made before and taken,
-  its answer lost, has its evidence posted rather than being signed again.
-  A call refused `StaleHead` (another admin call between the reading and
-  the call) or `Settling` (a wake first) is read and signed again, a
-  prompt each time, three signatures at most; a route can make up either
-  refusal, which costs at most those prompts and takes no device out, and
-  a call it forwarded before making one up stays held, its evidence
+- **The place** [E39, E44, built]: every admin call, the device-set calls
+  (add, remove, replace, rotate, regroup, restore, veto, cosign, resolve)
+  and the commit, names first in its arguments the log's head its signer
+  read before the prompt, `Place { next, chain }`: the next index and the
+  chain through the entry before it. The agent and every device take the
+  call only at a place at or after their floor, the entry after the last
+  admin call before it (a device's start, for one that read none; a paired
+  device takes its pairing device's), and at or before the call's own entry,
+  the chain there the log's. The agent compares it before anything the
+  call's batch settles and refuses any other `StaleHead`, logging nothing; a
+  device raises `Alarm::Log` and reads no further, as for an entry that does
+  not chain. A call logged again elsewhere names a place before the call it
+  copies, which every device that read that call has passed: a route cannot
+  log a removal once signed, vetoed or cancelled a second time and mature it
+  there unvetoed, and the home node cannot log a commit its set voided (a
+  timeout, a nack, a split, a regroup) again later under the epoch the void
+  left: every device that read it refuses the copy, so none votes on it,
+  even while its committer is away for the whole window and the log names a
+  confirming set without it. No admin call a device read is replayed or
+  reordered. Entries that are no admin call (evidence, votes, `alive`, a
+  renewal, what a batch settles) move no floor, so another device's
+  background pass between the reading and the call refuses nothing; the cost
+  is that a signed call withheld stays takeable until the next admin call is
+  logged. The device reads the log to its head just before the prompt (one
+  read, two when there is something new), and signs nothing when that log
+  stops at an entry it refuses or it is out of the set. The same call made
+  before and taken, its answer lost, has its evidence posted rather than
+  being signed again. A call refused `StaleHead` (another admin call between
+  the reading and the call) or `Settling` (a wake first) is read and signed
+  again, a prompt each time, three signatures at most; a route can make up
+  either refusal, which costs at most those prompts and takes no device out,
+  and a call it forwarded before making one up stays held, its evidence
   posted. The kit's and a restore's calls take the head from the log they
-  read or the agent's overview, the agent's word, which binds the place,
-  not its truth. A commit is placed as the others are, by the same rule:
-  its epoch and the votes, which bind the voters' logs, do not place it: a
-  void leaves the epoch where it was and a commit logged again later is
-  voted on afresh. A refusal a route makes up after the agent took the
-  commit costs a signature at most, answered as the commit taken: its
-  evidence carries the call the log holds. Why not the call session's `t0` with
-  a window, or the devices remembering each call's message: the evidence
-  is a separate later entry a route can withhold, so a device that read an
-  operation and its veto but never the message has nothing to recognize
-  the copy by; the place is checked at the call's own entry. What is left
-  is withholding: a device that has not read a veto yet can be shown the
-  operation without it, and its maturity at a time the route claims (B7,
-  B8).
+  read or the agent's overview, the agent's word, which binds the place, not
+  its truth. A commit is placed as the others are, by the same rule: its
+  epoch and the votes, which bind the voters' logs, do not place it: a void
+  leaves the epoch where it was and a commit logged again later is voted on
+  afresh. A refusal a route makes up after the agent took the commit costs a
+  signature at most, answered as the commit taken: its evidence carries the
+  call the log holds. Why not the call session's `t0` with a window, or the
+  devices remembering each call's message: the evidence is a separate later
+  entry a route can withhold, so a device that read an operation and its
+  veto but never the message has nothing to recognize the copy by; the place
+  is checked at the call's own entry. What is left is withholding: a device
+  that has not read a veto yet can be shown the operation without it, and
+  its maturity at a time the route claims (B7, B8).
 - Delays run on the agent's batch time alone; a device whose clock
   disagrees with the agent's by more than an hour raises an alarm and
   otherwise acts as the log says. A restored device starts from the
@@ -1877,10 +1875,10 @@ where the rules above leave a choice, this is the one taken]:
   removal's signer removed first); the operations read as the last call
   left them.
 - **The place,** each admin call's first argument, a commit's too (§3.5,
-  "Admin calls"): compared at the start of every such handler, before `settle`,
-  against the head, the log's chains and `floor`, the index after the last
-  admin call logged, so what its batch settles is logged ahead of the
-  call.
+  "Admin calls"): compared at the start of every such handler, before
+  `settle`, against the head, the log's chains and `floor`, the index after
+  the last admin call logged, so what its batch settles is logged ahead of
+  the call.
 
 **The kit and its flows as built** [built, `vos_light::kit`, the device
 group and sealed sync, tested against `Personal` in
@@ -4646,8 +4644,8 @@ nothing a device can show a third party, so an alarm is not proof
 
 **B5. The operators inject or replay.** A forged envelope fails its AEAD; a
 replayed one is a duplicate; a commit replayed for an epoch decided
-since breaks the epoch rule; a replayed admin call, a voided commit too, names a place the device has
-passed (B6).
+since breaks the epoch rule; a replayed admin call, a voided commit too,
+names a place the device has passed (B6).
 *Mitigation:* as stated.
 
 **B6. The operators forge device-set operations.** *Mitigation:* every
@@ -4656,7 +4654,7 @@ from the evidence stored beside it; an operation without evidence moves no
 device. Nor does a refusal: a removed device is out on its removal's
 evidence, which the agent serves its key (§3.6, the pass), and a refusal
 the route makes up stops a pass, never removes a device (`NotAdmitted`).
-Nor a replay: every admin call, a commit as a device-set call, names its
+Nor a replay: every admin call, a device-set call or a commit, names its
 place, the log's head its signer read, and is taken only if no admin call
 was logged between that place and the call, by the agent and by every
 device, so a signed removal once vetoed logged again on a forked log is

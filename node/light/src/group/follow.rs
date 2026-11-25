@@ -151,9 +151,9 @@ impl DeviceGroup {
     }
 
     /// Whether the entry at `index`, about to be read, holds where it is:
-    /// an admin call, a commit as a device-set call, names its place first, which must be at or
-    /// after the floor (the entry after the last admin call read) and at
-    /// or before `index`, its chain the one this device read there. Before
+    /// an admin call, a device-set call or a commit, names its place
+    /// first, which must be at or after the floor (the entry after the last
+    /// admin call read) and at or before `index`, its chain the one this device read there. Before
     /// a paired device's start, where it read no chain, the floor alone
     /// holds it: its pairing device read those entries.
     fn placed(&self, index: u64, body: &Body) -> Result<bool, GroupError> {

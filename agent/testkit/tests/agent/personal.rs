@@ -332,7 +332,7 @@ impl<W: Borrow<World>> Home<W> {
     }
 
     /// `arguments` of `name` as `caller` signs them: placed at the log's
-    /// head first for a device-set admin call.
+    /// head first for an admin call.
     pub fn placed(&self, caller: Principal, name: &str, arguments: &[u8]) -> Vec<u8> {
         if vos_wire::personal::method::PLACED.contains(&self.method(name)) {
             self.head(caller).arguments(arguments)
@@ -637,7 +637,7 @@ impl<W: BorrowMut<World>> Home<W> {
         arguments: impl Encode,
         r2: [u8; 32],
     ) -> Result<Recorded, PersonalError> {
-        // A device-set call's arguments are as the log holds them, placed.
+        // An admin call's arguments are as the log holds them, placed.
         let arguments = match vos_wire::personal::method::PLACED.contains(&self.method(name)) {
             true => self.logged(index),
             false => arguments.encode(),

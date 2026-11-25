@@ -1379,9 +1379,9 @@ impl DeviceGroup {
     /// (a device's keys and its key package), and carrying every matured
     /// removal; an update with neither. Held, with the record of it, before
     /// this returns: then make the admin call with
-    /// [`Prepared::arguments`] placed at the log's head, and give its log index and signed message
-    /// to [`DeviceGroup::called_commit`], or [`DeviceGroup::abandon`] it if
-    /// the agent refused it.
+    /// [`Prepared::arguments`] placed at the log's head, and give its log
+    /// index and signed message to [`DeviceGroup::called_commit`], or
+    /// [`DeviceGroup::abandon`] it if the agent refused it.
     pub fn commit(
         &mut self,
         add: Option<(NewDevice, Vec<u8>)>,

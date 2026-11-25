@@ -176,8 +176,8 @@ impl Home {
     }
 
     /// A call of `name` with `arguments` signed by `key`, in its session
-    /// for a call now, not yet sent: a device-set admin call placed at the
-    /// log's head first.
+    /// for a call now, not yet sent: an admin call placed at the log's
+    /// head first.
     pub fn sign(&mut self, key: &SigningKey, name: &str, arguments: Vec<u8>) -> Signed {
         let arguments = if vos_wire::personal::method::PLACED.contains(&self.method(name)) {
             self.head(key.verifying_key().to_bytes())

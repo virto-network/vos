@@ -538,7 +538,7 @@ are under "Identity and privacy" above.
   entries; the range scans of an agent's cut roots each batch opens on
   that thread.
 - **An operation withheld from a device's log** (`light-node.md` §3.5,
-  "The place"; B6): a device-set call names its place, so a route can no
+  "The place"; B6): every admin call names its place, so a route can no
   longer log a vetoed removal again and mature it; what is left is a
   route showing a device that has not yet read an operation's veto the
   operation without it, matured at a time the route claims (a clock alarm

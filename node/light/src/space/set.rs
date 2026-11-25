@@ -15,7 +15,7 @@ use super::{
     AdminKey, Approval, Error, Held, Host, Personal, Posted, Prompts, admin_sign, answered,
     entered_kit, failed, logged, new_kit, unreached,
 };
-use crate::group::{Event, Prepared};
+use crate::group::{Event, GroupError, Prepared};
 use crate::route::Purpose;
 
 /// The most signatures one admin call takes, each signed at the log's head
@@ -712,7 +712,12 @@ impl<H: Host> Personal<H> {
                     Ok(candidacy)
                 }
                 Err(error) => {
-                    group.abandon().map_err(failed)?;
+                    // A commit the log holds already is decided by its
+                    // verdict, which deletes it: the refusal is a route's.
+                    match group.abandon() {
+                        Ok(()) | Err(GroupError::Pending) => {}
+                        Err(other) => return Err(failed(other)),
+                    }
                     Err(Error::AgentRefused(error))
                 }
             }

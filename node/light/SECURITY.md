@@ -140,8 +140,9 @@ searched for the secret by its `tests/leaks.rs`.
   device read: a once-vetoed removal logged again on a forked route does
   not mature, and a commit its set voided (timeout, nack, split, regroup)
   logged again later, under the epoch the void left, is refused by every
-  device, not only by its committer's nack, so no vote on it exists and no
-  epoch moves, even while the committer is away for the whole window. The
+  device that read it, not only by its committer's nack, so no vote on it
+  exists and no epoch moves, even while the committer is away for the
+  whole window. The
   device reads the log to its head just before each prompt and signs at
   most three times (`StaleHead` or `Settling` each a new prompt); once the
   log holds its commit, the call it keeps for the evidence is the one the

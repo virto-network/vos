@@ -891,9 +891,9 @@ fn an_admin_call_is_taken_only_at_the_place_it_names() {
 /// is taken by the same rule. One behind the last admin call, on a chain
 /// the log never had or ahead of the head is refused `StaleHead` and logs
 /// nothing; one placed before entries that are no admin call is taken. A
-/// commit the window's end voided, sent again at its place, is refused:
-/// the agent takes it at no later index under the epoch the void left,
-/// while a commit placed before that batch settled the void is taken
+/// commit the window's end voided, sent again at its place, is refused
+/// `StaleHead`, and at a place it may take `Decided`: the agent takes it
+/// at no later index under the epoch the void left, while a commit placed before that batch settled the void is taken
 /// after it.
 #[test]
 fn a_commit_is_taken_only_at_the_place_it_names() {
@@ -935,6 +935,12 @@ fn a_commit_is_taken_only_at_the_place_it_names() {
     assert_eq!(
         answer::<Candidacy>("commit", &run.outcome),
         Err(PersonalError::StaleHead)
+    );
+    let run = home.run_as(admin(1), "commit", place.arguments(&first));
+    assert_eq!(
+        answer::<Candidacy>("commit", &run.outcome),
+        Err(PersonalError::Decided),
+        "at a place it may take, the voided commit is decided"
     );
     let second = update(epoch, 2).encode();
     let run = home.run_as(admin(2), "commit", place.arguments(&second));
