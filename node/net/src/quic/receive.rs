@@ -5,11 +5,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use smol::future::FutureExt;
-
 use super::admit::Place;
 use super::executor::Tasks;
-use super::{HEADER, Inner, STREAM_WINDOW, code};
+use super::{HEADER, Inner, STREAM_WINDOW, code, within};
 use crate::tls;
 use crate::{Budgets, Class, Incoming, NodeKey, NodeNumber};
 
@@ -41,27 +39,7 @@ pub(super) async fn accept(inner: Arc<Inner>) {
 /// Read a peer's connection: every stream it opens, each frame delivered
 /// with the peer its key is configured for.
 async fn serve(inner: Arc<Inner>, incoming: quinn::Incoming, place: Place) {
-    let deadline = inner.admission.deadline();
-    let handshake = async { Some(incoming.await) }.or(async {
-        smol::Timer::after(deadline).await;
-        None
-    });
-    let connection = match handshake.await {
-        Some(Ok(connection)) => connection,
-        failed => {
-            if let Some(Err(error)) = failed {
-                tracing::debug!(%error, "a peer's handshake failed");
-            }
-            place.keep().await;
-            return;
-        }
-    };
-    let Some(key) = tls::peer_key(&connection) else {
-        place.keep().await;
-        return;
-    };
-    let Some(from) = inner.dialed(key, &connection) else {
-        connection.close(code::UNCONFIGURED, b"");
+    let Some((connection, key, from)) = admitted(&inner, incoming).await else {
         place.keep().await;
         return;
     };
@@ -83,6 +61,28 @@ async fn serve(inner: Arc<Inner>, incoming: quinn::Incoming, place: Place) {
         }
     }
     peer.inner.hung_up(&key, &connection);
+}
+
+/// `incoming`'s connection, its handshake done within its deadline, with
+/// the key it was authenticated with and the number that key is configured
+/// for: a key no peer has is closed.
+async fn admitted(
+    inner: &Inner,
+    incoming: quinn::Incoming,
+) -> Option<(quinn::Connection, NodeKey, NodeNumber)> {
+    let connection = match within(inner.admission.deadline(), incoming).await? {
+        Ok(connection) => connection,
+        Err(error) => {
+            tracing::debug!(%error, "a peer's handshake failed");
+            return None;
+        }
+    };
+    let key = tls::peer_key(&connection)?;
+    let Some(from) = inner.dialed(key, &connection) else {
+        connection.close(code::UNCONFIGURED, b"");
+        return None;
+    };
+    Some((connection, key, from))
 }
 
 /// A peer's connection being read.
@@ -190,11 +190,11 @@ async fn read(peer: Arc<Reading>, mut stream: quinn::RecvStream) {
         return;
     };
     let id = u64::from_be_bytes(header[1..].try_into().expect("eight bytes"));
-    if class.stream_per_frame() {
-        frames(&peer, stream, class, id).await;
-        return;
-    }
-    let _turn = peer.turns.take((class, id)).await;
+    let _turn = if class.stream_per_frame() {
+        None
+    } else {
+        Some(peer.turns.take((class, id)).await)
+    };
     frames(&peer, stream, class, id).await;
 }
 
