@@ -21,9 +21,9 @@
 //! Who a replica takes messages from ([`Core::receive`]):
 //!
 //! - the host authenticates the sender, and passes a group only the
-//!   messages of nodes that may speak for it: on VOS, the nodes the
-//!   agent's placement names, and those of the configuration before while
-//!   it is uncommitted. The core cannot do that check: a replica that lags
+//!   messages of nodes that may speak for it: the members the host knows
+//!   the group to have, and those of the configuration before while it is
+//!   uncommitted. The core cannot do that check: a replica that lags
 //!   a membership change does not know the members it added, and one of
 //!   them may lead;
 //! - from a node outside the configuration it knows, the core takes

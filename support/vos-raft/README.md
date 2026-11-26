@@ -81,10 +81,9 @@ The host authenticates each message's sender, and passes a group only
 the messages of nodes that may speak for it. The core cannot make that
 check itself: a replica that lags a membership change does not know the
 members it added, and one of them may be the leader, or the candidate
-whose election the group needs. On VOS the host admits the nodes the
-agent's placement names, and those of the configuration it supersedes
-while that is uncommitted, as it does for forwarded calls and blob
-requests.
+whose election the group needs. The host admits the members it knows
+the group to have, from a source of its own, and those of the
+configuration it supersedes while that is uncommitted.
 
 The core then:
 
