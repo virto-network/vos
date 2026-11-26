@@ -7,8 +7,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
-use vos_net::quic::{Config, Protocol, Quic};
-use vos_net::{
+use vnet::quic::{Config, Protocol, Quic};
+use vnet::{
     Arrivals, Class, ClassSpec, Classes, Incoming, Network, NodeKey, Peer, Refused, Streams,
     public_key,
 };

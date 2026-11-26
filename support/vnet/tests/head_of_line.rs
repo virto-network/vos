@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use common::*;
-use vos_net::Arrivals;
-use vos_net::quic::Quic;
+use vnet::Arrivals;
+use vnet::quic::Quic;
 
 /// Small consensus frames' round of latencies, each the time from send to
 /// arrival.

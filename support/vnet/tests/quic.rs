@@ -5,8 +5,8 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use vos_net::quic::{Config, Quic};
-use vos_net::{Network, Peer, Refused};
+use vnet::quic::{Config, Quic};
+use vnet::{Network, Peer, Refused};
 
 #[test]
 fn three_nodes_exchange_frames_on_every_class() {
@@ -169,7 +169,7 @@ fn a_frame_younger_than_its_class_s_age_waits_for_the_connection() {
         let mut specs = specs(MAX_FRAME);
         specs[usize::from(LIVENESS)].max_age = Some(Duration::from_secs(30));
         let (a, _) = Quic::bind(Config {
-            classes: vos_net::Classes::new(specs).unwrap(),
+            classes: vnet::Classes::new(specs).unwrap(),
             ..config(1)
         })
         .unwrap();

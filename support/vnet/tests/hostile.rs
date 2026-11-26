@@ -13,8 +13,8 @@ use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, SubjectPublicKeyInfoDer, UnixTime,
 };
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use vos_net::quic::{Quic, Runner, Runtime};
-use vos_net::{Arrivals, Class, NodeKey, public_key};
+use vnet::quic::{Quic, Runner, Runtime};
+use vnet::{Arrivals, Class, NodeKey, public_key};
 
 fn endpoint(server: Option<quinn::ServerConfig>) -> quinn::Endpoint {
     quinn::Endpoint::new(
@@ -30,7 +30,7 @@ fn endpoint(server: Option<quinn::ServerConfig>) -> quinn::Endpoint {
 fn other_client(secret: [u8; 32], node: NodeKey) -> quinn::ClientConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.send_window(64 << 20);
-    vos_net::quic::client_config(&secret, ALPN, node, Arc::new(transport))
+    vnet::quic::client_config(&secret, ALPN, node, Arc::new(transport))
 }
 
 /// A connection to `node` holding node 2's key.
@@ -106,12 +106,12 @@ fn other_server(secret: [u8; 32]) -> quinn::Endpoint {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let signer = provider
         .key_provider
-        .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            vos_net::pkcs8(&secret),
-        )))
+        .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(vnet::pkcs8(
+            &secret,
+        ))))
         .unwrap();
     let certified = Arc::new(rustls::sign::CertifiedKey::new(
-        vec![CertificateDer::from(vos_net::spki(&public_key(&secret)))],
+        vec![CertificateDer::from(vnet::spki(&public_key(&secret)))],
         signer,
     ));
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
@@ -487,7 +487,7 @@ fn a_peer_that_closes_at_once_is_dialed_with_backoff() {
         });
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs(2) {
-            let _ = vos_net::Network::send(&a, key(2), CONSENSUS, 1, b"frame".to_vec());
+            let _ = vnet::Network::send(&a, key(2), CONSENSUS, 1, b"frame".to_vec());
             smol::Timer::after(Duration::from_micros(200)).await;
         }
         other.close(quinn::VarInt::from_u32(0), b"");

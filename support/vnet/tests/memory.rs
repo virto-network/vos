@@ -6,8 +6,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use common::{ALL, CONSENSUS, LIVENESS, MAX_FRAME, classes, with_frames, within};
-use vos_net::memory::{Endpoint, Hub};
-use vos_net::{Arrivals, Incoming, Network, NodeKey, Peer, Refused};
+use vnet::memory::{Endpoint, Hub};
+use vnet::{Arrivals, Incoming, Network, NodeKey, Peer, Refused};
 
 /// Node `number`'s key: the hub checks no key.
 fn k(number: u8) -> NodeKey {

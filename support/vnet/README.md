@@ -1,4 +1,4 @@
-# vos-net
+# vnet
 
 A network of nodes that know each other by their ed25519 keys:
 authenticated channels between node keys, classes of traffic the caller
@@ -104,7 +104,7 @@ Limits that stay:
 - A peer's frames of one class share that class's queue with every other
   peer's, so a peer that floods takes most of its places.
 - A configured peer can still spend the node's thread on what it sends;
-  vos-net bounds memory and handshakes, not a peer's well-formed traffic.
+  vnet bounds memory and handshakes, not a peer's well-formed traffic.
 - A frame queued before its peer was removed may still be read after.
 - Every sender's first datagram still costs the node a retry, and one
   past its address's places a refusal, on the network's thread.
@@ -115,7 +115,7 @@ Limits that stay:
 
 ## Tests
 
-`cargo test -p vos-net`, with a table of four classes like a cluster's
+`cargo test -p vnet`, with a table of four classes like a cluster's
 (heartbeats with an age, two classes of streams per id, and large frames
 a stream each): unit tests; `tests/memory.rs` (the hub: partitions,
 losses, delays, restarts, the peer list); `tests/quic.rs` (three nodes on

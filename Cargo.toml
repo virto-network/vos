@@ -2,7 +2,7 @@
 resolver = "3"
 members = [
     "support/vraft",
-    "node/net",
+    "support/vnet",
     "pvm/runtime",
     "pvm/compiler",
     "pvm/program",
@@ -125,7 +125,6 @@ vos-pvm-program = { path = "pvm/program" }
 vos-abi = { path = "pvm/abi" }
 vos-tree = { path = "pvm/tree" }
 merkle-crdt = { path = "support/merkle-crdt" }
-vos-net = { path = "node/net" }
 
 # Stwo from the fork's `vos/wrap` branch: upstream `e1286720` with dashmap
 # optional, Poseidon252 behind a feature, and upstream's `74951f79`, which

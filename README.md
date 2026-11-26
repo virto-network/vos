@@ -7,10 +7,9 @@ proved with a STARK and anchored at a venue (the JAM statements service,
 or Kreivo's spaces pallet).
 
 This tree holds the first part of VOS to land: [`pvm/`](pvm/README.md),
-the virtual machine and its prover, standalone libraries under
-`support/`, and a library the node builds on (`node/net`). The node,
-the agents and the device side follow from the `vos-core` branch, in a
-later change.
+the virtual machine and its prover, and standalone libraries under
+`support/`. The node, the agents and the device side follow from the
+`vos-core` branch, in a later change.
 
 ## What is here
 
@@ -41,7 +40,7 @@ later change.
 - [`support/vraft/`](support/vraft/README.md): Raft consensus as a
   protocol core without I/O (`no_std`), and a deterministic simulator that
   checks it under faults; the node side replicates each agent's log on it.
-- [`node/net/`](node/net/README.md): the network between nodes, QUIC
+- [`support/vnet/`](support/vnet/README.md): the network between nodes, QUIC
   with TLS 1.3 bound to node keys, classes of traffic and streams by id
   or by frame; the node side's messages between nodes travel on it.
 - `tools/gates/`: the gates' tripwires (`just check-tiers`, `just
@@ -52,7 +51,7 @@ later change.
 
 The docs here name what this tree does not hold yet:
 
-- **The node side's code:** `node/` but `node/net`, `agent/` and the rest
+- **The node side's code:** `node/`, `agent/` and the rest
   of `tools/` (the docs say "on the node side" where they mean it).
 - **Four design docs:** `core-model.md` (where a kernel, an attest and a
   window are defined in full), `identity-and-authority.md`,

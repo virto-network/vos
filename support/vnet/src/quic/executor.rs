@@ -21,7 +21,7 @@ impl Runner {
     pub fn start() -> io::Result<Self> {
         let executor = Arc::new(smol::Executor::new());
         let (stop, stopped) = smol::channel::bounded::<()>(1);
-        let thread = std::thread::Builder::new().name("vos-net".into()).spawn({
+        let thread = std::thread::Builder::new().name("vnet".into()).spawn({
             let executor = Arc::clone(&executor);
             move || {
                 let _ = smol::block_on(executor.run(stopped.recv()));

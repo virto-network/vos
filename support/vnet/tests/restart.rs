@@ -10,9 +10,9 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use common::*;
-use vos_net::quic::Quic;
+use vnet::quic::Quic;
 
-const PEER: &str = "VOS_NET_RESTARTED_PEER";
+const PEER: &str = "VNET_RESTARTED_PEER";
 
 /// Node 2, in a child process: it binds its address, knows node 1 at the
 /// other, greets node 1 on start if told to, and prints each consensus

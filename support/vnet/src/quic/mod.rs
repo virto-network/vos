@@ -275,7 +275,7 @@ impl Quic {
         let (deliver, arrivals) = arrivals(&config.classes);
         let inner = Arc::new(Inner {
             identity,
-            name: format!("vos-{:016x}", u64::from_be_bytes(incarnation)),
+            name: format!("vnet-{:016x}", u64::from_be_bytes(incarnation)),
             endpoint,
             dialing,
             table,
