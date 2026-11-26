@@ -1,4 +1,4 @@
-//! A device's own commit, held until it is confirmed, and a restart.
+//! A member's own commit, held until it is confirmed, and a restart.
 
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
@@ -14,8 +14,8 @@ use crate::{
     Writes, base, client, failure, leaves, storage,
 };
 
-/// A device's own commit, held until it is confirmed: its handshake, the
-/// Welcome for the devices it adds, and the epoch it moves to.
+/// A member's own commit, held until it is confirmed: its handshake, the
+/// Welcome for the members it adds, and the epoch it moves to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Commit {
     pub handshake: Vec<u8>,
@@ -100,10 +100,10 @@ impl Mls {
         }
     }
 
-    /// Commit adding the devices of `adds` (their key packages) and
+    /// Commit adding the members of `adds` (their key packages) and
     /// removing the members whose credentials are `removes`, with a path,
     /// at `time`, held: the current state, the held commit and the
-    /// caller's `rows` of it in one batch, written before this returns.
+    /// caller's `rows` of it in one commit, written before this returns.
     pub fn commit(
         &mut self,
         adds: &[Vec<u8>],
@@ -131,7 +131,7 @@ impl Mls {
     }
 
     /// The commit `build` makes, held: its state, the held commit and the
-    /// caller's `rows` of it in one batch, written before this returns; on
+    /// caller's `rows` of it in one commit, written before this returns; on
     /// a failure, which may have spent a generation in memory alone, the
     /// group as the store holds it again. Refused while one is held.
     fn hold(
@@ -216,7 +216,7 @@ impl Mls {
     /// Restart: a new group of this member alone at `time`, its commit
     /// applied at once and held, the current group kept until the restart
     /// is swapped in. The new group's state, the held commit and the
-    /// caller's `rows` of it in one batch, written before this returns.
+    /// caller's `rows` of it in one commit, written before this returns.
     pub fn restart(
         &mut self,
         time: u64,
@@ -285,7 +285,7 @@ impl Mls {
         })
     }
 
-    /// Delete the held commit, its candidate void, in one batch with
+    /// Delete the held commit, its candidate void, in one commit with
     /// `rows`: a held restart's new group with it.
     pub fn void(&mut self, rows: Writes) -> Result<(), Error> {
         if let Some(next) = self.namespace.get(NEXT)? {

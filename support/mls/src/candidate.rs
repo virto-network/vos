@@ -11,24 +11,24 @@ use crate::{
     Rules, SIGNER, Writes, base, credentials, signing, storage,
 };
 
-/// What a candidate is to this device.
+/// What a candidate is to this member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// Its own commit, held and applied.
     Own,
-    /// Another device's commit, processed.
+    /// Another member's commit, processed.
     Received,
-    /// A Welcome: the device joins with it, leaving any group it is in.
+    /// A Welcome: the member joins with it, leaving any group it is in.
     Joined,
     /// Its own restart: a new group it made, with the members it added.
     Started,
-    /// A commit that removes this device.
+    /// A commit that removes this member.
     Removed,
 }
 
 /// A candidate's group state, on a copy: swapped in on confirmation
 /// ([`Mls::swap`]), or dropped. It is bound to the state it was made from:
-/// the current group's id and epoch then, and, for the device's own, the
+/// the current group's id and epoch then, and, for the member's own, the
 /// commit held.
 pub struct Candidate {
     pub(crate) group: Group<Config>,
@@ -43,14 +43,14 @@ impl Candidate {
         self.kind
     }
 
-    /// The epoch it moves to; for a commit that removes this device, the
+    /// The epoch it moves to; for a commit that removes this member, the
     /// current one, which mls-rs does not advance.
     pub fn epoch(&self) -> u64 {
         self.group.current_epoch()
     }
 
     /// Its epoch's authenticator, which the confirmation hashes; none for a
-    /// commit that removes this device.
+    /// commit that removes this member.
     pub fn authenticator(&self) -> Result<Option<Vec<u8>>, Error> {
         if self.kind == Kind::Removed {
             return Ok(None);
@@ -58,14 +58,14 @@ impl Candidate {
         Ok(Some(self.group.epoch_authenticator()?.to_vec()))
     }
 
-    /// Its members' credentials; for a commit that removes this device,
+    /// Its members' credentials; for a commit that removes this member,
     /// the current ones.
     pub fn credentials(&self) -> Vec<Vec<u8>> {
         credentials(&self.group)
     }
 
     /// The MLS exporter's secret of its epoch for `label` and `context`,
-    /// `len` bytes: none for a commit that removes this device.
+    /// `len` bytes: none for a commit that removes this member.
     pub fn export(
         &self,
         label: &[u8],
@@ -98,8 +98,8 @@ fn rejected(namespace: &Namespace, error: MlsError) -> Error {
 
 impl Mls {
     /// Another member's commit `handshake` processed on a copy at `time`
-    /// (the log's batch time, so processing it again gives the same
-    /// candidate), under its logged effect [`Expected`]. A refusal is
+    /// (a time the caller fixes for it, so processing it again gives the
+    /// same candidate), under its expected effect [`Expected`]. A refusal is
     /// [`Error::Refused`].
     pub fn process(
         &self,
@@ -189,7 +189,7 @@ impl Mls {
         })
     }
 
-    /// Make `candidate` current, in one batch with `rows`: its state into
+    /// Make `candidate` current, in one commit with `rows`: its state into
     /// the current namespace, any held commit deleted (its epoch is
     /// decided), with a held restart's new group unless it is the
     /// candidate's. A candidate that removes this member deletes the group;

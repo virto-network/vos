@@ -1,18 +1,17 @@
-//! The device group's proposal policy (`light-node.md` §3.4) and its
-//! identities.
+//! The group's proposal policy and its identities.
 //!
 //! - **Allowed:** Add and Remove, by value, in a commit with a path; a
-//!   device's update is its own commit with a path and no proposals.
+//!   member's update is its own commit with a path and no proposals.
 //!   Nothing else: no ReInit, no external commit or join, no PSK, no
 //!   group-context change. Update proposals exist only by reference, which
 //!   this build does not compile, and a commit never carries its own
 //!   committer's Update by value.
-//! - **The logged effect:** handshakes are encrypted, so only devices can
-//!   check that a commit's proposals are the ones its log entry declares.
-//!   A candidate is processed under [`Expected`]: its committer's
-//!   credential, and the credentials it adds and removes, exactly; and the
-//!   committer's renewed credential when the device set replaced its
-//!   admin key, which its leaf must then take.
+//! - **The expected effect:** handshakes are encrypted, so only members
+//!   can check that a commit's proposals are the ones its committer
+//!   declared to the caller beside it. A candidate is processed under
+//!   [`Expected`]: its committer's credential, and the credentials it adds
+//!   and removes, exactly; and the committer's renewed credential when the
+//!   caller expects a renewal, which its leaf must then take.
 //! - **Handshakes** are `PrivateMessage`s, padded (Padmé); a Welcome
 //!   carries the ratchet tree, one for every new member.
 
@@ -27,8 +26,8 @@ use mls_rs::time::MlsTime;
 use mls_rs::{ExtensionList, MlsRules};
 use mls_rs_core::identity::{IdentityProvider, MemberValidationContext};
 
-/// A device's credential: its sync key and its admin key, the leaf's
-/// identity its sync key.
+/// A member's credential: two 32-byte keys of the caller's, the leaf's
+/// identity the first.
 pub(crate) const CREDENTIAL_BYTES: usize = 64;
 
 /// What the policy refused.
@@ -40,17 +39,17 @@ pub enum Refused {
     ByReference,
     /// An external commit.
     External,
-    /// The committer is not the one the log names.
+    /// The committer is not the one expected.
     Committer,
-    /// The adds or the removals are not the ones the log declares.
+    /// The adds or the removals are not the ones expected.
     Effect,
-    /// A credential that is not a device's.
+    /// A credential that is not 64 bytes.
     Credential,
 }
 
 impl mls_rs_core::error::IntoAnyError for Refused {}
 
-/// A commit's logged effect, which a received commit must be exactly: an
+/// A commit's expected effect, which a received commit must be exactly: an
 /// encrypted commit with a path by `committer`, adding and removing
 /// exactly the credentials of `adds` and `removes`, its committer's leaf
 /// taking `renewed` if one is expected and keeping `committer` otherwise,
@@ -63,8 +62,8 @@ pub struct Expected {
     pub renewed: Option<Vec<u8>>,
 }
 
-/// The device group's rules: the allow-list on what a device sends and
-/// receives, and, for a candidate, its logged effect.
+/// The group's rules: the allow-list on what a member sends and receives,
+/// and, for a candidate, its expected effect.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Rules {
     pub(crate) expected: Option<Expected>,
@@ -166,17 +165,15 @@ impl MlsRules for Rules {
     }
 }
 
-/// The device group's identities: a basic credential of a device's sync
-/// key and admin key, the leaf's identity its sync key, a successor the
-/// same credential, or the one renewal allowed: a leaf's device keys
-/// change by its device's removal and a new add, and its admin key by the
-/// renewal that follows a matured replacement. A leaf's signature key is
-/// not compared here; [`crate::Mls::process`] requires a committer to
-/// keep it. Every check against the device set is the caller's, through
+/// The group's identities: a basic credential of 64 bytes, two keys of the
+/// caller's, the leaf's identity the first; a successor the same
+/// credential, or the one renewal allowed. A leaf's signature key is not
+/// compared here; [`crate::Mls::process`] requires a committer to keep
+/// it. Every check of who may be a member is the caller's, through
 /// [`Expected`]. A credential is a label: nothing binds a leaf's MLS keys
-/// to the device keys it names, so that a key package is the device's it
-/// names is the caller's to establish, and a committer that may add a
-/// device is trusted for the key package it adds.
+/// to the keys it names, so that a key package is the member's it names
+/// is the caller's to establish, and a committer that may add a member is
+/// trusted for the key package it adds.
 #[derive(Clone, Debug, Default)]
 pub struct Identity {
     renewal: Option<(Vec<u8>, Vec<u8>)>,
