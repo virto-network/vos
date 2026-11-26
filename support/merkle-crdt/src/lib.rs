@@ -1,13 +1,21 @@
-//! # Merkle-CRDTs
+//! # merkle-crdt
 //!
-//! A `no_std` implementation of [Merkle-CRDTs](https://arxiv.org/abs/2004.00107):
+//! A `no_std` replica for operation-based Merkle-CRDTs, after Sanjuán et
+//! al., [*Merkle-CRDTs: Merkle-DAGs meet CRDTs*](https://arxiv.org/abs/2004.00107):
 //! one scope's operations as a Merkle-DAG, each node a batch of operations
 //! signed by its author, applied to a storage-backed CRDT in causal order.
+//!
+//! The DAG and the apply (each node once, after its parents) are the
+//! paper's. The authors' signed, numbered chains, the equivocations and
+//! the bounds are not in it. Its DAG-Syncer and Broadcaster, which fetch
+//! and announce nodes, are the caller's. The paper's children are the
+//! parents here, and its roots the heads.
 //!
 //! - **Nodes** ([`Node`]) are content-addressed: a node's [`Cid`] is the
 //!   hash of its bytes, and it names its parents by theirs. It carries its
 //!   author's key, the author's sequence number and an ed25519 signature
-//!   over the operations and the parents.
+//!   over the scope, the author, the number, the operations and the
+//!   parents.
 //! - **A replica** ([`Replica`]) applies only the nodes it has not applied,
 //!   in causal order, onto the rows it already has; a node whose parents
 //!   are missing is held until they arrive. A local operation is applied
@@ -19,14 +27,19 @@
 //!   the previous among its parents. Two nodes at one number are an
 //!   [`Equivocation`]: both kept, reported, and filtered by the CRDT's reads.
 //! - **Fetching** is the caller's, sans I/O: it delivers nodes' bytes to
-//!   [`Replica::ingest`] in any order and batching, and asks
-//!   [`Replica::wanted`], [`Replica::have`] or [`Replica::cursor`] what to
-//!   fetch next.
+//!   [`Replica::ingest`] in any batching. A node that arrives before its
+//!   parents is held, up to the held bounds ([`MAX_HELD`]); past them it is
+//!   dropped and must be delivered again. [`Replica::wanted`] names the
+//!   parents missing, [`Replica::have`] and [`Replica::cursor`] where to
+//!   go on from: a gap longer than the bounds is fetched oldest first, or
+//!   delivered in one batch, which orders any number of nodes itself.
 //! - **The CRDT** ([`Apply`]) writes only through [`Rows`], so its state
 //!   commits with the nodes it came from.
 //!
-//! The DAG gives causal delivery, not convergence: [`Apply`] must give the
-//! same rows for every causal order of the same nodes.
+//! Replicas that applied the same nodes have the same DAG and the same
+//! heads. Their rows are the same only if [`Apply`] gives the same rows
+//! for every causal order of the same nodes, whichever of two
+//! equivocating nodes came second.
 //!
 //! Every ed25519 key is an author: the library admits any node whose
 //! signature checks. A caller whose scope has a set of writers checks a

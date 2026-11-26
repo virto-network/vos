@@ -6,9 +6,10 @@ use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 
-/// An author: the ed25519 key its nodes are signed with. A device or node
-/// takes a fresh one on every install, start or restore, so a sequence
-/// number is never reused under one key by a backup.
+/// An author: the ed25519 key its nodes are signed with. A writer whose
+/// store may lack nodes its key already signed (a new install, a lost
+/// store, a restore from a backup) takes a fresh key, or it signs a number
+/// again: an equivocation against itself.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Author(pub [u8; 32]);
 

@@ -12,6 +12,18 @@ use ed25519_dalek::SigningKey;
 
 /// The most nodes a replica holds for missing parents. Past it a node that
 /// would be held is dropped ([`Ingested::dropped`]).
+///
+/// Delivery order matters only past the held bounds: within them a node
+/// that arrives before its parents waits for them, past them it is dropped
+/// and must be delivered again. A gap longer than the bounds is fetched
+/// oldest first, or delivered in one batch, which orders any number of
+/// nodes itself: the bounds apply only to what a batch leaves unapplied.
+///
+/// Held nodes never expire: they leave when applied, when refused, or by
+/// [`Replica::drop_held`], and stay across a restart. A caller that admits
+/// any author drops them on a policy of its own, or nodes naming parents
+/// that do not exist fill the bounds, and every node after them that
+/// arrives before its parents is dropped.
 pub const MAX_HELD: usize = 4096;
 
 /// The most nodes of one author a replica holds.
@@ -60,7 +72,8 @@ impl<S: core::fmt::Debug, A: core::fmt::Debug> std::error::Error for Error<S, A>
 
 /// Two applied nodes of one author at one sequence number. Both stay in
 /// the DAG, since other authors' nodes may name either; the CRDT's reads
-/// filter the author's operations.
+/// filter the author's operations. A compromised key can so filter its
+/// author's whole past: a second node at number 0 is an equivocation at 0.
 #[derive(Debug)]
 pub struct Equivocation<H: Hasher> {
     /// The author.
@@ -105,7 +118,10 @@ pub struct Ingested<H: Hasher> {
     /// [`MAX_HELD`] nodes, [`MAX_HELD_PER_AUTHOR`] of the author's or
     /// [`MAX_HELD_BYTES`] already. Not refused: delivered again once their
     /// parents are applied, they apply. A cursor given with the batch
-    /// passes them.
+    /// passes them, and nothing durable remembers them: a caller that must
+    /// not lose them across a crash gives the batch no cursor, keeps or
+    /// fetches again what this names, then stores the position with an
+    /// ingest of no nodes.
     pub dropped: Vec<Cid<H>>,
     /// The nodes refused, with their CIDs where they decode.
     pub refused: Vec<(Option<Cid<H>>, Refusal)>,
@@ -178,12 +194,26 @@ struct Batch<H: Hasher> {
 /// One scope's replica: its DAG applied onto its CRDT, incrementally, by
 /// [`ingest`](Self::ingest) and [`record`](Self::record).
 ///
-/// It keeps in memory the heads, each author's latest sequence number, the
+/// It keeps in memory the heads, each author's latest sequence number (a
+/// version vector, an entry for every author it has applied), the
 /// equivocations, the cursor, the outbox, the held nodes' missing parents
-/// (at most [`MAX_HELD`] nodes) and the latest refused nodes' CIDs; the
-/// nodes and the CRDT's rows stay in the store. One replica a store. Every
-/// method that writes commits one [`Changes`] batch, and moves the
-/// replica's memory only once it is committed.
+/// (at most [`MAX_HELD`] nodes) and the latest 4096 refused nodes' CIDs
+/// (a node naming one is refused at once; one naming a refusal forgotten,
+/// or made before a restart, is held); the nodes and the CRDT's rows stay
+/// in the store. Nothing is pruned: the nodes, the author index, the
+/// version vector, the equivocations and the rows grow with the history.
+/// One replica a store. Every method that writes commits one [`Changes`]
+/// batch, and moves the replica's memory only once it is committed.
+///
+/// Whether a node is applied depends only on its bytes and its ancestors
+/// (signature, chain, parents applied), never on whether a later node
+/// names it. So replicas delivered the same nodes (and delivered again
+/// those dropped at a held bound) apply the same set and have the same
+/// heads and equivocations, whichever heads their own nodes named. A head
+/// no node names converges like any other as long as it reaches every
+/// replica by delivery: a fetch that walks down from the newest nodes, or
+/// that asks by each author's highest number ([`have`](Self::have)),
+/// misses a fork no node names.
 pub struct Replica<H: Hasher, O, S: Store<H>> {
     store: S,
     heads: BTreeMap<Cid<H>, (Author, u64)>,
@@ -261,8 +291,8 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
         &self.equivocations
     }
 
-    /// Each author's highest sequence number applied: what the replica
-    /// tells a peer it has.
+    /// Each author's highest sequence number applied, a version vector:
+    /// what the replica tells a peer it has.
     pub fn have(&self) -> BTreeMap<Author, u64> {
         self.latest
             .iter()
@@ -281,7 +311,9 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
     }
 
     /// The parents the held nodes wait on that are not held themselves:
-    /// what to ask a peer for.
+    /// what to ask a peer for. A wanted node whose own parents are missing
+    /// is held too, so this closes a gap only as deep as the held bounds
+    /// ([`MAX_HELD`]).
     pub fn wanted(&self) -> Vec<Cid<H>> {
         self.waiting
             .keys()
@@ -392,7 +424,18 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
     /// ([`MAX_PARENTS`] parents in all, heads of authors that never
     /// equivocated first), applied in place and queued in the outbox, in
     /// one commit. The heads it does not name stay heads, for the next
-    /// local node.
+    /// local node, so one author's thousands of forks make the heads many
+    /// but no local node large.
+    ///
+    /// The paper's rule, a new node names every head, so holds up to
+    /// [`MAX_PARENTS`] heads. Past that a later node no longer leads to
+    /// every earlier one, and a node the replica had applied can be
+    /// concurrent with its next: a CRDT that reads from the DAG what an
+    /// operation saw (a remove covering the adds it saw) carries that in
+    /// the operation instead. A local node is after the heads it names and
+    /// concurrent with the rest; forks come last, so it names the honest
+    /// authors' latest nodes before an equivocating author's, and a CRDT
+    /// that orders by parents (a Lamport clock) puts it after them.
     pub fn record<A: Apply<H, O>>(
         &mut self,
         key: &SigningKey,

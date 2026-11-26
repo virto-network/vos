@@ -37,8 +37,10 @@ pub trait Rows {
 }
 
 /// A node being applied: its identity, its author's position, and its
-/// operations. An operation's stable id is the node's (author, seq) and
-/// the operation's index in `ops`.
+/// operations. An operation's id is the node's CID and the operation's
+/// index in `ops`, unique always; the node's (author, seq) and the index
+/// are not unique if the author equivocates, since two nodes then share
+/// (author, seq).
 pub struct Event<'a, H: Hasher, O> {
     /// The node's CID.
     pub cid: &'a Cid<H>,
@@ -60,18 +62,25 @@ pub struct Event<'a, H: Hasher, O> {
 /// through [`Rows`].
 ///
 /// Each node is applied exactly once, after all its parents, local nodes
-/// included. Concurrent nodes arrive in any order, so the result must not
-/// depend on it: that, and keeping nothing outside the rows, is the
-/// implementation's contract. Equivocating nodes are applied too; they
-/// are filtered when read, by the replica's
-/// [`equivocations`](crate::Replica::equivocations), which the second of
-/// two nodes at one number also tells its apply
-/// ([`Event::equivocation`]), so the filter's rows commit with it.
+/// included. The implementation's contract:
 ///
-/// An error aborts the whole batch: nothing it applied is committed, and a
-/// feed's page that fails stays unread. An operation the implementation
-/// cannot apply yet (a kind it does not know) is therefore kept in its own
-/// rows and applied later, never returned as an error.
+/// - **No dependence on the order of concurrent nodes**, which arrive in
+///   any order.
+/// - **No dependence on which of two equivocating nodes is told.**
+///   Equivocating nodes are applied too, and filtered when read, by the
+///   replica's [`equivocations`](crate::Replica::equivocations). The second
+///   of two nodes at one number to arrive is told so
+///   ([`Event::equivocation`]), so the filter's rows commit with it; which
+///   one that is differs between replicas, and the first one's operations
+///   were applied unmarked. A CRDT that overwrites (a last-writer
+///   register) therefore keeps enough to filter them when read.
+/// - **Never failing on a peer's content.** An error aborts the whole
+///   batch: nothing it applied is committed, and a feed's page that fails
+///   stays unread, so a node that always fails stops every batch that
+///   brings it. An operation the implementation cannot apply yet (a kind
+///   it does not know) is kept in its own rows and applied later, never
+///   returned as an error.
+/// - **Nothing kept outside the rows.**
 pub trait Apply<H: Hasher, O> {
     /// Why applying failed.
     type Error;
