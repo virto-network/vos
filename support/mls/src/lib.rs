@@ -1,18 +1,19 @@
-//! `vos-mls`: VOS's one MLS layer, over mls-rs (`light-node.md` §3.4). The
-//! user's device group is its first user; member messaging later.
+//! `vos-mls`: an MLS layer (RFC 9420) over mls-rs, for a group whose
+//! commits are confirmed by its members before they take effect.
 //!
 //! - **Storage:** a group's state and its key packages' secrets as rows
-//!   of a fjall keyspace under a [`Namespace`], written with the caller's
-//!   rows in one synced batch.
+//!   under a [`Namespace`]'s prefix of the caller's [`Store`], committed
+//!   with the caller's rows as one set of writes.
 //! - **Copy and swap:** a candidate is processed on a copy of the group
 //!   state ([`Mls::process`], [`Mls::join`]), which never writes through
 //!   the current one, and swapped in on confirmation ([`Mls::swap`]).
-//! - **A device's own commit** is built detached and held ([`Mls::commit`]),
-//!   in one batch with the state it spent a generation of; it is applied
+//! - **A member's own commit** is built detached and held ([`Mls::commit`]),
+//!   in one commit with the state it spent a generation of; it is applied
 //!   on a copy on confirmation ([`Mls::own`]) and deleted on a void
 //!   ([`Mls::void`]).
-//! - **The policy:** the device group's allow-list and identities, a
-//!   candidate checked against its logged effect ([`Expected`]).
+//! - **The policy:** an allow-list of proposals, 64-byte credentials, and
+//!   a candidate checked against the effect its caller expects
+//!   ([`Expected`]).
 //! - **The confirmation hash** ([`confirmation`]).
 //!
 //! Two limits: a member added over a year ago that has not committed since
@@ -53,7 +54,7 @@ pub use error::{Error, Refusal};
 pub use held::Commit;
 use policy::Rules;
 pub use policy::{Expected, Identity, Refused};
-pub use storage::{Namespace, Store, Writes};
+pub use storage::{MemStore, Namespace, Store, Writes};
 
 /// Ciphersuite 1: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`.
 pub const SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
@@ -63,7 +64,7 @@ pub const SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
 const EPOCH_MAX: u64 = u64::MAX / 2;
 
 /// How far a key package's lifetime starts before its maker's clock, the
-/// skew between devices this layer tolerates: an hour, so the devices that
+/// skew between members this layer tolerates: an hour, so the members that
 /// add it, process its add and join with it may be that far behind.
 const CLOCK_MARGIN: u64 = 3600;
 
@@ -73,7 +74,7 @@ fn provider() -> RustCryptoProvider {
     RustCryptoProvider::with_enabled_cipher_suites(vec![SUITE])
 }
 
-/// The client configuration: the namespace's storage, the device group's
+/// The client configuration: the namespace's storage, the policy's
 /// identities and rules, RustCrypto.
 type Config = IntoConfigOutput<
     WithMlsRules<
@@ -97,16 +98,17 @@ const GROUP: &[u8] = b"group";
 const HELD: &[u8] = b"held";
 const NEXT: &[u8] = b"next";
 
-/// The confirmation hash of an epoch: `BLAKE2b-256(domain ‖ agent ‖
-/// epoch ‖ epoch_authenticator)`, the epoch little-endian. A device posts
-/// it, signed, once it processed the epoch's candidate; one hash from
-/// every device of the confirming set confirms it. Neither `domain` nor
-/// the authenticator is framed: the input is unambiguous only for one
-/// fixed domain, and suite 1's authenticator is always 32 bytes.
-pub fn confirmation(domain: &[u8], agent: &[u8; 32], epoch: u64, authenticator: &[u8]) -> [u8; 32] {
+/// The confirmation hash of an epoch: `BLAKE2b-256(domain ‖ group ‖
+/// epoch ‖ epoch_authenticator)`, `group` the group's 32-byte id as the
+/// caller names it, the epoch little-endian. A member that processed the
+/// epoch's candidate posts it, signed; the hashes of the set of members
+/// the caller requires confirm it. Neither `domain` nor the authenticator
+/// is framed: the input is unambiguous only for one fixed domain, and
+/// suite 1's authenticator is always 32 bytes.
+pub fn confirmation(domain: &[u8], group: &[u8; 32], epoch: u64, authenticator: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2b::<U32>::new();
     hasher.update(domain);
-    hasher.update(agent);
+    hasher.update(group);
     hasher.update(epoch.to_le_bytes());
     hasher.update(authenticator);
     hasher.finalize().into()
@@ -200,8 +202,7 @@ fn client(
     }
 }
 
-/// A client signing as `signer`, under the device group's rules and
-/// identities.
+/// A client signing as `signer`, under the policy's rules and identities.
 fn signing(namespace: &Namespace, signer: &Signer) -> Client<Config> {
     client(
         namespace,
@@ -255,9 +256,9 @@ impl Mls {
         basic.map_or_else(Vec::new, |basic| basic.identifier.clone())
     }
 
-    /// Write `rows` and the rows staged in one batch, in the namespace's
-    /// store; on a failure, discard what was staged and read the group
-    /// back as the store holds it.
+    /// Commit `rows` and the rows staged to the namespace's store as one
+    /// set of writes; on a failure, discard what was staged and read the
+    /// group back as the store holds it.
     pub fn write(&mut self, rows: Writes) -> Result<(), Error> {
         match self.namespace.commit(rows) {
             Ok(()) => self.reload(),
@@ -274,7 +275,7 @@ impl Mls {
         Err(error)
     }
 
-    /// `operation`, which stages rows, and then the batch of them and of
+    /// `operation`, which stages rows, and then the commit of them and of
     /// the `rows` its outcome gives; on a failure of either, nothing.
     fn staged<T>(
         &mut self,
@@ -355,8 +356,8 @@ impl Mls {
         Ok(state.map_or(0, |state| state.len()))
     }
 
-    /// A key package for a device that adds this one, made at `time` by
-    /// this device's clock, its secrets written. It is valid from an hour
+    /// A key package for a member that adds this one, made at `time` by
+    /// this member's clock, its secrets written. It is valid from an hour
     /// before `time` and for 365 days from then.
     pub fn key_package(&mut self, time: u64) -> Result<Vec<u8>, Error> {
         let not_before = MlsTime::from(time.saturating_sub(CLOCK_MARGIN));
@@ -376,8 +377,8 @@ impl Mls {
         )
     }
 
-    /// Make a group of this member alone at epoch 0, written in one batch
-    /// with `rows`.
+    /// Make a group of this member alone at epoch 0, committed with
+    /// `rows`.
     pub fn create(&mut self, time: u64, rows: Writes) -> Result<(), Error> {
         if self.group.is_some() {
             return Err(Error::Grouped);

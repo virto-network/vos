@@ -1,5 +1,4 @@
-//! `vos-mls` over a fjall store in a temporary directory; each test's doc
-//! says what it shows.
+//! `vos-mls` over a store in memory; each test's doc says what it shows.
 
 use mls_rs::client_builder::PaddingMode;
 use mls_rs::crypto::SignatureSecretKey;
@@ -12,8 +11,8 @@ use mls_rs::mls_rules::{
 use mls_rs::{CipherSuiteProvider, Client, CryptoProvider, ExtensionList, MlsRules};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use vos_mls::{
-    Candidate, Commit, Error, Expected, Identity, Kind, Mls, Namespace, Refusal, Store, Writes,
-    confirmation,
+    Candidate, Commit, Error, Expected, Identity, Kind, MemStore, Mls, Namespace, Refusal, Store,
+    Writes, confirmation,
 };
 
 const T: u64 = 1_800_000_000;
@@ -21,9 +20,7 @@ const T: u64 = 1_800_000_000;
 struct Member {
     mls: Mls,
     namespace: Namespace,
-    store: Store,
-    keyspace: fjall::Keyspace,
-    _dir: tempfile::TempDir,
+    store: MemStore,
 }
 
 fn credential(n: u8) -> Vec<u8> {
@@ -32,26 +29,14 @@ fn credential(n: u8) -> Vec<u8> {
     credential
 }
 
-/// An empty store in a temporary directory, and its keyspace.
-fn store() -> (tempfile::TempDir, fjall::Keyspace, Store) {
-    let dir = tempfile::tempdir().unwrap();
-    let db = fjall::Database::builder(dir.path()).open().unwrap();
-    let keyspace = db
-        .keyspace("group", fjall::KeyspaceCreateOptions::default)
-        .unwrap();
-    (dir, keyspace.clone(), Store::new(db, keyspace))
-}
-
 fn member(n: u8) -> Member {
-    let (dir, keyspace, store) = store();
+    let store = MemStore::new();
     let namespace = Namespace::current(store.clone(), b"mls/".to_vec());
     let mls = Mls::open(namespace.clone(), &credential(n)).unwrap();
     Member {
         mls,
         namespace,
         store,
-        keyspace,
-        _dir: dir,
     }
 }
 
@@ -125,10 +110,13 @@ fn three() -> (Member, Member, Member) {
 
 /// Every member's current epoch and its exporter's key, the same.
 fn agree(members: &[&Member], epoch: u64) {
-    let key = members[0].mls.export(b"vos/test", b"scope", 32).unwrap();
+    let key = members[0].mls.export(b"test/export", b"scope", 32).unwrap();
     for member in members {
         assert_eq!(member.mls.epoch().unwrap(), epoch);
-        assert_eq!(member.mls.export(b"vos/test", b"scope", 32).unwrap(), key);
+        assert_eq!(
+            member.mls.export(b"test/export", b"scope", 32).unwrap(),
+            key
+        );
     }
 }
 
@@ -232,7 +220,7 @@ fn a_held_commit_survives_a_reopen_and_matches_only_its_handshake() {
     assert_eq!(
         committed(&a, b"caller/record").as_deref(),
         Some(&b"commit 2"[..]),
-        "the caller's rows are the held commit's batch"
+        "the caller's rows are committed with the held commit"
     );
     let mut reopened = reopen(&a, 1);
     assert_eq!(reopened.held().unwrap(), Some(2), "held across the reopen");
@@ -257,10 +245,10 @@ fn a_held_commit_survives_a_reopen_and_matches_only_its_handshake() {
     assert_eq!(reopened.epoch().unwrap(), 1);
 }
 
-/// The logged effect binds a candidate: a commit whose committer, adds or
+/// The expected effect binds a candidate: a commit whose committer, adds or
 /// removals are not the expected ones is refused.
 #[test]
-fn a_candidate_is_its_logged_effect_exactly() {
+fn a_candidate_is_its_expected_effect_exactly() {
     let (a, mut b, _c) = three();
     let update = b.commit(&[], &[], T + 1);
     for wrong in [
@@ -368,11 +356,11 @@ fn signer(n: u8) -> (SignatureSecretKey, SigningIdentity) {
     (secret, SigningIdentity::new(credential, public))
 }
 
-/// What the device group does not allow is refused when received: a
+/// What the policy does not allow is refused when received: a
 /// group-context change, a handshake in the clear, an add without a path;
 /// and a commit is built of key packages and members alone.
 #[test]
-fn the_policy_refuses_what_the_device_group_does_not_allow() {
+fn the_policy_refuses_what_the_group_does_not_allow() {
     let (a, mut b, _c) = three();
     let mut group = loose(&b, SEALED);
     let context = group
@@ -423,31 +411,16 @@ fn the_policy_refuses_what_the_device_group_does_not_allow() {
     ));
 }
 
-/// The confirmation hash is over its domain, the agent, the epoch and the
+/// The confirmation hash is over its domain, the group, the epoch and the
 /// authenticator, each of which moves it.
 #[test]
 fn the_confirmation_hash_binds_its_parts() {
-    let h = confirmation(b"vos/personal/confirm", &[1; 32], 7, &[9; 32]);
-    assert_eq!(
-        h,
-        confirmation(b"vos/personal/confirm", &[1; 32], 7, &[9; 32])
-    );
-    assert_ne!(
-        h,
-        confirmation(b"vos/personal/other", &[1; 32], 7, &[9; 32])
-    );
-    assert_ne!(
-        h,
-        confirmation(b"vos/personal/confirm", &[2; 32], 7, &[9; 32])
-    );
-    assert_ne!(
-        h,
-        confirmation(b"vos/personal/confirm", &[1; 32], 8, &[9; 32])
-    );
-    assert_ne!(
-        h,
-        confirmation(b"vos/personal/confirm", &[1; 32], 7, &[8; 32])
-    );
+    let h = confirmation(b"test/confirm", &[1; 32], 7, &[9; 32]);
+    assert_eq!(h, confirmation(b"test/confirm", &[1; 32], 7, &[9; 32]));
+    assert_ne!(h, confirmation(b"test/other", &[1; 32], 7, &[9; 32]));
+    assert_ne!(h, confirmation(b"test/confirm", &[2; 32], 7, &[9; 32]));
+    assert_ne!(h, confirmation(b"test/confirm", &[1; 32], 8, &[9; 32]));
+    assert_ne!(h, confirmation(b"test/confirm", &[1; 32], 7, &[8; 32]));
 }
 
 /// A restart: A starts a new group of itself alone, its commit held and
@@ -570,14 +543,7 @@ fn welcome_for(reference: &[u8]) -> Vec<u8> {
 
 /// The rows of `member`'s store, keys and values.
 fn rows(member: &Member) -> Vec<(Vec<u8>, Vec<u8>)> {
-    member
-        .keyspace
-        .iter()
-        .map(|row| {
-            let (key, value) = row.into_inner().unwrap();
-            (key.to_vec(), value.to_vec())
-        })
-        .collect()
+    member.store.rows().into_iter().collect()
 }
 
 /// How many of `member`'s rows start with `prefix`.
@@ -651,8 +617,8 @@ fn a_welcome_into_a_group_with_an_overlong_id_is_refused() {
     assert_eq!(rows(&b), before);
 }
 
-/// A row the store cannot hold (an empty key, a key over 65,535 bytes)
-/// is an error, its batch written as none, and no read of one fails.
+/// A row the store is not handed (an empty key, a key over 65,535 bytes)
+/// is an error, its commit written as none, and no read of one fails.
 #[test]
 fn a_row_the_store_cannot_hold_is_an_error() {
     let (mut a, _b, _c) = three();
@@ -720,7 +686,7 @@ fn a_key_package_names_one_suite() {
     assert!(leaf.contains("cipher_suites: [CipherSuite(1)]"), "{leaf}");
 }
 
-/// A key package made by a device whose clock is ahead of the others'
+/// A key package made by a member whose clock is ahead of the others'
 /// (within the margin) is added, processed and joined with.
 #[test]
 fn a_key_package_from_a_clock_ahead_is_added() {
@@ -845,7 +811,7 @@ fn a_candidate_of_the_group_left_is_not_swapped_in() {
     assert_eq!(a.mls.credentials().unwrap().len(), 1);
 }
 
-/// A device's own candidate kept across a void is not swapped in over the
+/// A member's own candidate kept across a void is not swapped in over the
 /// commit held after it.
 #[test]
 fn an_own_candidate_kept_across_a_void_is_not_swapped_in() {
@@ -879,9 +845,9 @@ fn a_key_package_row_that_does_not_read_is_corrupt() {
     ));
 }
 
-/// The key packages a device made and did not join with go when it joins.
+/// The key packages a member made and did not join with go when it joins.
 #[test]
-fn unused_key_packages_go_when_the_device_joins() {
+fn unused_key_packages_go_when_the_member_joins() {
     let (_a, mut d, commit) = a_adds_d();
     d.package(T);
     assert_eq!(count(&d, b"mls/package/"), 2);
@@ -890,17 +856,80 @@ fn unused_key_packages_go_when_the_device_joins() {
     assert_eq!(count(&d, b"mls/package/"), 0);
 }
 
-/// A member is made only of a device's credential, 64 bytes; nothing is
+/// A member is made only of a 64-byte credential; nothing is
 /// written for another.
 #[test]
 fn a_member_of_a_credential_of_another_length_is_not_made() {
-    let (_dir, keyspace, store) = store();
-    let namespace = Namespace::current(store, b"mls/".to_vec());
+    let store = MemStore::new();
+    let namespace = Namespace::current(store.clone(), b"mls/".to_vec());
     for length in [0, 63, 65] {
         assert!(matches!(
             Mls::open(namespace.clone(), &vec![1; length]),
             Err(Error::Credential)
         ));
     }
-    assert_eq!(keyspace.iter().count(), 0);
+    assert!(store.rows().is_empty());
+}
+
+/// A store whose commits fail while `failing` is set.
+#[derive(Clone, Default)]
+struct Failing {
+    rows: MemStore,
+    failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug)]
+struct Down;
+
+impl std::fmt::Display for Down {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("down")
+    }
+}
+
+impl std::error::Error for Down {}
+
+impl Store for Failing {
+    type Error = Down;
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Down> {
+        Ok(self.rows.get(key).unwrap())
+    }
+
+    fn keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, Down> {
+        Ok(self.rows.keys(prefix).unwrap())
+    }
+
+    fn commit(&self, writes: Writes) -> Result<(), Down> {
+        if self.failing.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Down);
+        }
+        self.rows.commit(writes).unwrap();
+        Ok(())
+    }
+}
+
+/// A store's failed commit is its own error, and the operation that met
+/// it leaves the state as the store holds it: nothing held, nothing left
+/// staged.
+#[test]
+fn a_failed_commit_leaves_the_state_as_committed() {
+    use std::sync::atomic::Ordering;
+    let store = Failing::default();
+    let namespace = Namespace::current(store.clone(), b"mls/".to_vec());
+    let mut mls = Mls::open(namespace, &credential(1)).unwrap();
+    mls.create(T, Writes::new()).unwrap();
+    let before = store.rows.rows();
+    store.failing.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        mls.commit(&[], &[], T + 1, |_| Writes::new()),
+        Err(Error::Store(error)) if error.downcast_ref::<Down>().is_some()
+    ));
+    assert_eq!(store.rows.rows(), before);
+    assert!(mls.held().unwrap().is_none());
+    store.failing.store(false, Ordering::Relaxed);
+    mls.write(Writes::new()).unwrap();
+    assert_eq!(store.rows.rows(), before, "nothing staged is left");
+    assert_eq!(mls.epoch().unwrap(), 0);
+    mls.commit(&[], &[], T + 1, |_| Writes::new()).unwrap();
 }

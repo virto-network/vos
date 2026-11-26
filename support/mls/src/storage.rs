@@ -1,28 +1,28 @@
-//! mls-rs's storage providers over fjall: a group's state and its key
-//! packages' secrets as rows of one keyspace under a namespace's prefix.
+//! mls-rs's storage providers over the caller's store: a group's state
+//! and its key packages' secrets as rows under a namespace's prefix.
 //!
-//! **Nothing mls-rs writes reaches the disk by itself.** A namespace
-//! stages its writes, and its commit writes them and the caller's
-//! own rows in one synced batch: a group's state, a held commit and the
-//! caller's record of either land together or not at all.
+//! **Nothing mls-rs writes reaches the store by itself.** A namespace
+//! stages its writes, and its commit hands them and the caller's own rows
+//! to the store as one set of writes: a group's state, a held commit and
+//! the caller's record of either land together or not at all.
 //!
 //! **A copy writes to memory alone.** A [`Namespace`] is either the current
-//! one, whose writes are staged for the next batch, or a copy over it,
+//! one, whose writes are staged for the next commit, or a copy over it,
 //! which reads through to the current rows and keeps its writes in memory:
 //! a candidate processed on a copy cannot touch the current state, and
 //! swapping it in moves the copy's writes into the current namespace's
-//! batch.
+//! staged ones.
 //!
-//! **Every key is bounded before it reaches fjall**, which takes a key of
-//! 1 to 65,535 bytes and a value under 4 GiB and panics on any other: a
-//! read of a key it cannot hold finds no row, a batch holding one is an
-//! error and writes nothing, and a key package is looked up only by a
-//! reference of the suite's hash length.
+//! **Every key is bounded before it reaches the store**, which is only
+//! handed keys of 1 to 65,535 bytes and values under 4 GiB: a read of any
+//! other key finds no row without asking the store, a commit holding one
+//! is [`Error::Unstorable`] and writes nothing, and a key package is
+//! looked up only by a reference of the suite's hash length.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use fjall::{Database, Keyspace, PersistMode};
 use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
 use mls_rs_core::group::{EpochRecord, GroupState, GroupStateStorage};
 use mls_rs_core::key_package::{KeyPackageData, KeyPackageStorage};
@@ -33,29 +33,97 @@ use crate::Error;
 /// Rows a write sets (`Some`) or deletes (`None`), by key.
 pub type Writes = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
-/// The database and the keyspace a namespace's rows are in, beside the
-/// caller's.
-#[derive(Clone)]
-pub struct Store {
-    db: Database,
-    keyspace: Keyspace,
+/// The caller's store, which a namespace's rows and the caller's own are
+/// in. It is only handed keys of 1 to 65,535 bytes and values under 4 GiB.
+pub trait Store: Send + Sync + 'static {
+    /// The error type for storage operations.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Row `key` as committed.
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    /// The keys of the committed rows that start with `prefix`.
+    fn keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, Self::Error>;
+
+    /// Write `writes`, all of them or none, durably before it returns.
+    /// After an error it is not known which until the store is opened
+    /// again: a store may have written the set before it failed, so a
+    /// caller reopens before it retries an operation.
+    fn commit(&self, writes: Writes) -> Result<(), Self::Error>;
 }
 
-impl Store {
-    pub fn new(db: Database, keyspace: Keyspace) -> Self {
-        Self { db, keyspace }
+/// A store in memory, its handles sharing one set of rows: for tests.
+#[derive(Clone, Debug, Default)]
+pub struct MemStore {
+    rows: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
+}
+
+impl MemStore {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Row `key` as committed: none for a key the store cannot hold.
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, fjall::Error> {
-        if !holds(key) {
-            return Ok(None);
+    /// Every committed row, keys and values.
+    pub fn rows(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        lock(&self.rows).clone()
+    }
+}
+
+impl Store for MemStore {
+    type Error = Infallible;
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Infallible> {
+        Ok(lock(&self.rows).get(key).cloned())
+    }
+
+    fn keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, Infallible> {
+        let rows = lock(&self.rows);
+        let keys = rows.range(prefix.to_vec()..).map(|(key, _)| key);
+        Ok(keys
+            .take_while(|key| key.starts_with(prefix))
+            .cloned()
+            .collect())
+    }
+
+    fn commit(&self, writes: Writes) -> Result<(), Infallible> {
+        let mut rows = lock(&self.rows);
+        for (key, value) in writes {
+            match value {
+                Some(value) => rows.insert(key, value),
+                None => rows.remove(&key),
+            };
         }
-        Ok(self.keyspace.get(key)?.map(|value| value.to_vec()))
+        Ok(())
     }
 }
 
-/// Whether fjall can hold `key`: 1 to 65,535 bytes.
+/// A [`Store`] with its error as this layer's [`Error::Store`]: what a
+/// namespace holds, whatever the store's type.
+trait Rows: Send + Sync {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error>;
+    fn keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, Error>;
+    fn commit(&self, writes: Writes) -> Result<(), Error>;
+}
+
+fn store_error(error: impl std::error::Error + Send + Sync + 'static) -> Error {
+    Error::Store(Box::new(error))
+}
+
+impl<S: Store> Rows for S {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        Store::get(self, key).map_err(store_error)
+    }
+
+    fn keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        Store::keys(self, prefix).map_err(store_error)
+    }
+
+    fn commit(&self, writes: Writes) -> Result<(), Error> {
+        Store::commit(self, writes).map_err(store_error)
+    }
+}
+
+/// Whether the store is handed `key`: 1 to 65,535 bytes.
 fn holds(key: &[u8]) -> bool {
     !key.is_empty() && u16::try_from(key.len()).is_ok()
 }
@@ -65,12 +133,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// mls-rs's storage, a group's state and key packages, under a prefix of
-/// a store's keyspace: the current namespace, or a copy over it.
+/// a store's keys: the current namespace, or a copy over it.
 #[derive(Clone)]
 pub struct Namespace {
-    store: Store,
+    store: Arc<dyn Rows>,
     prefix: Vec<u8>,
-    /// The current namespace's writes, staged for its next batch.
+    /// The current namespace's writes, staged for its next commit.
     staged: Arc<Mutex<Writes>>,
     /// A copy's writes, kept in memory above the current namespace's.
     copy: Option<Arc<Mutex<Writes>>>,
@@ -80,10 +148,10 @@ pub struct Namespace {
 }
 
 impl Namespace {
-    /// The current namespace under `prefix`.
-    pub fn current(store: Store, prefix: Vec<u8>) -> Self {
+    /// The current namespace under `prefix` of `store`.
+    pub fn current(store: impl Store, prefix: Vec<u8>) -> Self {
         Self {
-            store,
+            store: Arc::new(store),
             prefix,
             staged: Arc::default(),
             copy: None,
@@ -107,8 +175,9 @@ impl Namespace {
     }
 
     /// Row `name` as this namespace sees it: a copy's own write, then the
-    /// current namespace's staged write, then the committed row.
-    pub fn get(&self, name: &[u8]) -> Result<Option<Vec<u8>>, fjall::Error> {
+    /// current namespace's staged write, then the committed row; none for
+    /// a key the store is not handed.
+    pub fn get(&self, name: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let key = self.key(name);
         if let Some(copy) = &self.copy
             && let Some(value) = lock(copy).get(&key)
@@ -117,6 +186,9 @@ impl Namespace {
         }
         if let Some(value) = lock(&self.staged).get(&key) {
             return Ok(value.clone());
+        }
+        if !holds(&key) {
+            return Ok(None);
         }
         self.store.get(&key)
     }
@@ -132,9 +204,10 @@ impl Namespace {
         lock(self.target()).insert(key, value);
     }
 
-    /// Write the staged rows and `rows` in one synced batch: all of them,
-    /// or none, the staged rows kept. A row the store cannot hold is
-    /// [`Error::Unstorable`], a failed sync [`Error::Store`].
+    /// Commit the staged rows and `rows` to the store, `rows` over the
+    /// staged ones: all of them, or none, the staged rows kept. A row the
+    /// store is not handed is [`Error::Unstorable`], the store's failure
+    /// [`Error::Store`].
     pub(crate) fn commit(&self, rows: Writes) -> Result<(), Error> {
         let mut staged = lock(&self.staged);
         let fits = |(key, value): (&Vec<u8>, &Option<Vec<u8>>)| {
@@ -146,30 +219,23 @@ impl Namespace {
         if !staged.iter().chain(&rows).all(fits) {
             return Err(Error::Unstorable);
         }
-        let mut batch = self.store.db.batch();
-        for (key, value) in staged.iter().chain(&rows) {
-            match value {
-                Some(value) => batch.insert(&self.store.keyspace, key, value),
-                None => batch.remove(&self.store.keyspace, key),
-            }
-        }
-        batch.durability(Some(PersistMode::SyncAll)).commit()?;
+        let mut writes = staged.clone();
+        writes.extend(rows);
+        self.store.commit(writes)?;
         staged.clear();
         Ok(())
     }
 
     /// Delete every row whose name starts with `name`, committed or
-    /// staged: on the current namespace, staged for its next batch.
-    pub(crate) fn delete_all(&self, name: &[u8]) -> Result<(), fjall::Error> {
+    /// staged: on the current namespace, staged for its next commit.
+    pub(crate) fn delete_all(&self, name: &[u8]) -> Result<(), Error> {
         let prefix = self.key(name);
         let mut keys: Vec<Vec<u8>> = lock(&self.staged)
             .keys()
             .filter(|key| key.starts_with(&prefix))
             .cloned()
             .collect();
-        for row in self.store.keyspace.prefix(&prefix) {
-            keys.push(row.into_inner()?.0.to_vec());
-        }
+        keys.extend(self.store.keys(&prefix)?);
         let mut target = lock(self.target());
         for key in keys {
             target.insert(key, None);
@@ -193,7 +259,7 @@ impl Namespace {
     }
 
     /// Discard the staged writes: an operation that failed before its
-    /// batch leaves the current rows as they were.
+    /// commit leaves the current rows as they were.
     pub(crate) fn unstage(&self) {
         lock(&self.staged).clear();
     }
@@ -233,12 +299,12 @@ fn failed(namespace: &Namespace, error: Error) -> StorageError {
 fn read(namespace: &Namespace, name: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
     namespace
         .get(name)
-        .map_err(|error| failed(namespace, Error::Store(error)))
+        .map_err(|error| failed(namespace, error))
 }
 
-/// The group state alone: the device group keeps no prior epoch's secrets
-/// (its data keys are exported and archived by the caller), so mls-rs's
-/// epoch records, which only `prior_epoch` writes, are none.
+/// The group state alone: this layer keeps no prior epoch's secrets (a
+/// caller that needs an epoch's keys later exports and keeps them), so
+/// mls-rs's epoch records, which only `prior_epoch` writes, are none.
 impl GroupStateStorage for Namespace {
     type Error = StorageError;
 

@@ -1,6 +1,6 @@
 [package]
 name = "vos-mls"
-description = "VOS's MLS layer over mls-rs: fjall storage, candidates on a copy, held commits, the device group's policy."
+description = "An MLS layer over mls-rs: storage in the caller's store, candidates on a copy until confirmed, held commits, a proposal policy."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,19 +11,16 @@ authors.workspace = true
 [dependencies]
 # Encrypted handshakes alone: no std, rayon, x509, psk, by-reference
 # proposals, out-of-order or prior-epoch secrets, custom proposals or tree
-# index. The one pinned mls-rs for VOS. Cargo unifies features: no other
-# crate of the workspace may enable these (with `std` a missing time is
-# "now", with `prior_epoch` the storage here would drop epoch records).
+# index. Cargo unifies features: no other crate of the workspace may
+# enable these (with `std` a missing time is "now", with `prior_epoch`
+# the storage here would drop epoch records).
 mls-rs = { version = "=0.57.0", default-features = false, features = ["private_message"] }
 mls-rs-core = { version = "=0.27.0", default-features = false }
 # 0.22, on curve25519-dalek 4 (0.23 takes 5 and p256 0.14). Built with
 # suite 1 alone (`src/lib.rs`), its P-256/P-384 code (elliptic-curve 0.13,
 # crypto-bigint 0.5) is compiled in and not reached from this crate.
 mls-rs-crypto-rustcrypto = { version = "=0.22.1", default-features = false }
-fjall = { workspace = true }
 # The confirmation hash and a held commit's handshake hash.
 blake2 = "0.10"
 zeroize = "1"
 
-[dev-dependencies]
-tempfile = "3"
