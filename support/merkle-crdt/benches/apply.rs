@@ -1,10 +1,9 @@
 //! The cost of applying a node onto a history of 1k, 100k and 1M
 //! operations: one node fetched alone, a batch of 100, and a local
-//! operation, each signed and checked, on the in-memory store and on fjall.
+//! operation, each signed and checked, on the in-memory store.
 //! The CRDT is a last-writer-wins map over 100,000 keys.
 //!
-//! `cargo bench -p merkle-crdt --bench apply [-- SIZES...]`; the fjall runs
-//! write under `$TMPDIR`.
+//! `cargo bench -p merkle-crdt --bench apply [-- SIZES...]`.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -14,8 +13,7 @@ use std::time::{Duration, Instant};
 
 use common::{H, SCOPE, key};
 use ed25519_dalek::SigningKey;
-use fjall::Database;
-use merkle_crdt::{Cid, Event, FjallStore, Hasher, MemStore, Node, Replica, Rows, Store, validate};
+use merkle_crdt::{Cid, Event, Hasher, MemStore, Node, Replica, Rows, Store, validate};
 
 type Op = (u64, u64);
 
@@ -178,30 +176,17 @@ fn main() {
         "store", "history", "bulk/node", "sync 1", "sync 100 /node", "checks", "local op"
     );
 
-    let dir = tempfile::tempdir().unwrap();
     for history in sizes {
         let nodes = Writer::new().history(history);
-        let mut rows = vec![measure(
+        let row = measure(
             "memory",
             history,
             &nodes,
             Replica::open(MemStore::new(), SCOPE).unwrap(),
-        )];
-        let db = Database::builder(dir.path().join(history.to_string()))
-            .open()
-            .unwrap();
-        let store = FjallStore::open(&db, "bench").unwrap();
-        rows.push(measure(
-            "fjall",
-            history,
-            &nodes,
-            Replica::open(store, SCOPE).unwrap(),
-        ));
-        for row in rows {
-            println!(
-                "{:>7} {:>9} {:>11.1} µs {:>11.1} µs {:>13.1} µs {:>11.1} µs {:>11.1} µs",
-                row.store, row.history, row.bulk, row.one, row.hundred, row.checks, row.local
-            );
-        }
+        );
+        println!(
+            "{:>7} {:>9} {:>11.1} µs {:>11.1} µs {:>13.1} µs {:>11.1} µs {:>11.1} µs",
+            row.store, row.history, row.bulk, row.one, row.hundred, row.checks, row.local
+        );
     }
 }

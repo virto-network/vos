@@ -36,7 +36,7 @@ pub enum Error<S, A = Infallible> {
     Apply(A),
     /// A node the store holds is missing, or does not validate.
     Corrupt,
-    /// The CRDT wrote a row no store takes ([`Rows::write`](crate::Rows::write)).
+    /// The CRDT wrote a row past the row bounds ([`Rows::write`](crate::Rows::write)).
     Row,
     /// The operations make a node that does not decode: their [`Encode`]
     /// writes what their [`Decode`] refuses.
@@ -49,7 +49,7 @@ impl<S: core::fmt::Debug, A: core::fmt::Debug> core::fmt::Display for Error<S, A
             Error::Store(error) => write!(f, "the store failed: {error:?}"),
             Error::Apply(error) => write!(f, "applying a node failed: {error:?}"),
             Error::Corrupt => f.write_str("a stored node is missing or does not validate"),
-            Error::Row => f.write_str("a row's key or value is past what a store takes"),
+            Error::Row => f.write_str("a row's key or value is past the row bounds"),
             Error::Unencodable => f.write_str("the operations make a node that does not decode"),
         }
     }

@@ -12,6 +12,9 @@
 //!   in causal order, onto the rows it already has; a node whose parents
 //!   are missing is held until they arrive. A local operation is applied
 //!   in place. Each batch is one atomic [`Store`] commit.
+//! - **Storage** is the caller's: it implements [`Store`] over its own
+//!   database, and may carry its own writes in the same commit.
+//!   [`MemStore`] keeps a scope in memory, for tests.
 //! - **Authors' chains**: an author numbers its nodes from 0, each naming
 //!   the previous among its parents. Two nodes at one number are an
 //!   [`Equivocation`]: both kept, reported, and filtered by the CRDT's reads.
@@ -78,9 +81,6 @@ mod replica;
 mod signed;
 mod store;
 
-#[cfg(feature = "fjall")]
-mod store_fjall;
-
 pub use apply::{Apply, Event, MAX_ROW_KEY, MAX_ROW_VALUE, Rows};
 pub use cid::Cid;
 pub use encode::{Decode, Encode, MAX_DECODE_ITEMS};
@@ -91,6 +91,3 @@ pub use replica::{
 };
 pub use signed::{Author, Refusal, Scope, Validated, validate};
 pub use store::{Applied, Changes, Loaded, MemStore, Store};
-
-#[cfg(feature = "fjall")]
-pub use store_fjall::{FjallError, FjallStore};

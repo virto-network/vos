@@ -3,13 +3,17 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-/// The longest row key a replica writes: fjall's limit.
+/// The longest row key a replica writes. A [`Store`] is handed only row
+/// keys of 1 to this many bytes, so a store whose keys are bounded by a
+/// 16-bit length takes every row.
 pub const MAX_ROW_KEY: usize = 65_535;
 
-/// The longest row value a replica writes: fjall's limit.
+/// The longest row value a replica writes. A [`Store`] is handed only
+/// values of at most this many bytes, so a store whose values are bounded
+/// by a 32-bit length takes every row.
 pub const MAX_ROW_VALUE: usize = u32::MAX as usize;
 
-/// Whether a store takes a row with this key and value.
+/// Whether a row with this key and value is within the row bounds.
 pub(crate) fn row_fits(key: &[u8], value: Option<&[u8]>) -> bool {
     !key.is_empty()
         && key.len() <= MAX_ROW_KEY
@@ -84,12 +88,12 @@ impl<H: Hasher, O, F: FnMut(Event<'_, H, O>, &mut dyn Rows)> Apply<H, O> for F {
 }
 
 /// Rows over a store under a batch's writes. A read the store fails is
-/// kept, and fails the batch; so does a write no store takes.
+/// kept, and fails the batch; so does a write past the row bounds.
 pub(crate) struct Overlay<'a, H: Hasher, S: Store<H>> {
     store: &'a S,
     written: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     error: Option<S::Error>,
-    /// Whether a write was past a store's limits.
+    /// Whether a write was past the row bounds.
     unfit: bool,
     hasher: PhantomData<H>,
 }
@@ -106,8 +110,8 @@ impl<'a, H: Hasher, S: Store<H>> Overlay<'a, H, S> {
     }
 
     /// Apply `node` to `crdt` through these rows. The store's error comes
-    /// first, which the CRDT may have seen as a missing row, then a row no
-    /// store takes (whose write the CRDT may have read back as missing),
+    /// first, which the CRDT may have seen as a missing row, then a row past
+    /// the bounds (whose write the CRDT may have read back as missing),
     /// then the CRDT's.
     pub(crate) fn apply<O, A: Apply<H, O>>(
         &mut self,

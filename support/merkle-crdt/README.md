@@ -1,14 +1,11 @@
 # merkle-crdt
 
 One sync scope's operations as a Merkle-DAG of signed nodes, applied
-incrementally to a storage-backed CRDT. `no_std`; the fjall store is behind
-the default `fjall` feature.
+incrementally to a storage-backed CRDT. `no_std` (the default `std` feature
+adds `std::error::Error`); the storage is the caller's.
 
 Based on H. Sanjuán, S. Pöyhtäri, P. Teixeira, I. Psaras, *"Merkle-CRDTs:
 Merkle-DAGs meet CRDTs"*, 2020 ([arXiv:2004.00107](https://arxiv.org/abs/2004.00107)).
-VOS uses it for the Merge lane and the light node's sealed scopes (its
-design docs `docs/design/core-model.md` §9.4 and `docs/design/light-node.md`
-§3.6, which land with the light node).
 
 ## The model
 
@@ -94,34 +91,32 @@ costing a replica without limit.
 - A compromised author key can filter that author's whole past: a second
   node at its number 0 is an equivocation at 0.
 - A store error leaves it unknown whether the batch was written until the
-  store is opened again (fjall may have written its journal): a caller
-  reopens before it retries an operation.
+  store is opened again (a store may have written the batch before it
+  reported the failure): a caller reopens before it retries an operation.
 - One replica a store.
 
-## Stores
+## Storage
 
-The layout is not versioned.
-
-| Store | |
-|---|---|
-| `MemStore` | in memory: tests, benchmarks |
-| `FjallStore` | one scope in keyspaces `<name>.*` of a fjall database the caller opens and may share; its rows in `<name>.rows` or a keyspace the caller names; each commit one synced batch |
-
-After a crash the caller mends the fjall database before it opens it: a
-database whose creation was cut short is cleared, and the journals are
-synced, so a batch the killed process left in the page cache is durable
-before the replica relies on it (on VOS, `vos_exec::store::recover`).
+The caller implements `Store` over its own database: point reads of a
+node, a held node, the author index and a row; `load`, what a replica keeps
+in memory, read once when it opens; and `commit`, which writes one
+`Changes` atomically and durably, so a crash leaves the store before the
+batch or after it. The store chooses its layout, and may write its own rows
+in the same commit. It is handed only row keys of 1 to `MAX_ROW_KEY`
+(65,535) bytes and values of at most `MAX_ROW_VALUE` (4 GiB - 1): a CRDT
+write past either fails the batch with `Error::Row` before the store sees
+it. `MemStore` keeps a scope in memory, for tests and benchmarks.
 
 ## Tests
 
 `cargo test -p merkle-crdt`: the incremental replica against a full replay
 of its nodes over random DAGs, deliveries, duplicates and batchings
 (property tests), equivocations, refusals, a cursor read out of causal
-order, the parent and held-node bounds, failed commits and reads, and the
-fjall store reopened and killed mid-write.
+order, the parent and held-node bounds, failed commits and reads, and a
+replica reopened from its store.
 
 ## Cost
 
 `cargo bench -p merkle-crdt --bench apply` measures applying one node, a
-batch of 100 and a local operation onto 1k, 100k and 1M operations; the
-results are recorded in `docs/design/core-model.md` §9.4.
+batch of 100 and a local operation onto 1k, 100k and 1M operations, on
+`MemStore`.

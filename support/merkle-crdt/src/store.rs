@@ -38,9 +38,10 @@ pub trait Store<H: Hasher> {
     /// What a replica keeps in memory, read once when it opens.
     fn load(&self) -> Result<Loaded<H>, Self::Error>;
 
-    /// Write `changes`, all of them or none. After an error it is not
+    /// Write `changes`, all of them or none, durably: once it returns
+    /// `Ok`, a crash leaves the batch written. After an error it is not
     /// known which until the store is opened again: a store may have
-    /// written the batch before it failed (fjall's journal does), so a
+    /// written the batch durably before it reported the failure, so a
     /// caller reopens before it retries an operation.
     fn commit(&mut self, changes: Changes<H>) -> Result<(), Self::Error>;
 }
@@ -110,7 +111,9 @@ pub struct Changes<H: Hasher> {
     pub outbox: BTreeMap<(Author, u64), Cid<H>>,
     /// Local nodes pushed, by author and sequence number.
     pub pushed: Vec<(Author, u64)>,
-    /// Rows written (`Some`) or deleted (`None`).
+    /// Rows written (`Some`) or deleted (`None`): each key 1 to
+    /// [`MAX_ROW_KEY`](crate::MAX_ROW_KEY) bytes, each value at most
+    /// [`MAX_ROW_VALUE`](crate::MAX_ROW_VALUE).
     pub rows: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
 }
 

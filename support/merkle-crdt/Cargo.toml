@@ -1,7 +1,7 @@
 [package]
 name = "merkle-crdt"
-description = "Generic no_std Merkle-CRDTs: a DAG of signed, authored nodes per sync scope, applied incrementally in causal order onto a storage-backed CRDT, from batches the caller fetches in any order. Used by VOS for the Merge lane."
-keywords = ["crdt", "merkle", "no-std", "p2p", "vos"]
+description = "Generic no_std Merkle-CRDTs: a DAG of signed, authored nodes per sync scope, applied incrementally in causal order onto a storage-backed CRDT, from batches the caller fetches in any order."
+keywords = ["crdt", "merkle", "no-std", "p2p"]
 categories = ["data-structures", "no-std", "algorithms"]
 version.workspace = true
 edition.workspace = true
@@ -11,20 +11,17 @@ homepage.workspace = true
 authors.workspace = true
 
 [features]
-default = ["fjall"]
+default = ["std"]
+# `std::error::Error` for `Error`, and ed25519-dalek's std.
 std = ["ed25519-dalek/std"]
-# The `Store` over fjall, the light node's database.
-fjall = ["std", "dep:fjall"]
 
 [dependencies]
 # Each node's author signature.
 ed25519-dalek = { version = "2", default-features = false, features = ["fast", "zeroize"] }
-fjall = { workspace = true, optional = true }
 
 [dev-dependencies]
 blake2 = "0.10"
 proptest = "1"
-tempfile = "3"
 
 [[bench]]
 name = "apply"

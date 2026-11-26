@@ -498,7 +498,7 @@ check-no-debug-internals: (_forbidden "debug-internals")
 
 # The builds without std, for an embedded target on core and alloc
 # alone, built from the toolchain's source. merkle-crdt, without its
-# fjall store. The proof verifier, which reads every admitted format, with
+# `std` feature. The proof verifier, which reads every admitted format, with
 # the proof crate's verifier path under it: both are `no_std` crates, so a
 # `std` path in either fails the build. The verifier builds for
 # the same embedded target, where no dependency has std either, and for
@@ -726,7 +726,6 @@ check: fmt-check check-tiers check-layers check-device-verifier build-final-veri
 gate: check doc-check deny check-locks check-venue-rules check-no-std check-no-leaks check-kit fuzz-replay fuzz-reach
     cargo clippy -p vos-pvm-recair --no-default-features --lib --quiet -- -D warnings
     cargo clippy -p merkle-crdt --no-default-features --lib --quiet -- -D warnings
-    cargo clippy -p merkle-crdt --no-default-features --features std --lib --quiet -- -D warnings
     cargo test {{core_crates}} --doc
     cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py heavy -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4 --skip wrap_files::
 
