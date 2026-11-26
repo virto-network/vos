@@ -1,15 +1,18 @@
 //! The incremental replica against the full replay, over random DAGs and
-//! random deliveries; equivocations, refusals, a cursor, the bounds on
+//! random deliveries, within the held bounds and past them; equivocations,
+//! a CRDT that filters them, refusals, a cursor, the bounds on
 //! parents and held nodes, and failed commits.
 
 mod common;
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use common::{
     H, Ops, Rng, SCOPE, Server, Step, crdt, deliveries, generate, key, node, read, replay, wide_key,
 };
+use ed25519_dalek::SigningKey;
 use merkle_crdt::{
     Author, Changes, Cid, Error, Event, Loaded, MAX_HELD, MAX_HELD_PER_AUTHOR, MAX_PARENTS,
     MemStore, Node, Refusal, Replica, Rows, Scope, Store,
@@ -100,6 +103,87 @@ proptest! {
         prop_assert_eq!(replica.store().rows(), &rebuilt.rows);
         prop_assert_eq!(replica.heads(), &rebuilt.heads);
         prop_assert_eq!(replica.heads().len(), 1);
+    }
+}
+
+/// One author's chain past its held bound, oldest first: the nodes the
+/// bound-reaching tests deliver.
+fn long_chain() -> &'static [Node<H, Ops>] {
+    static CHAIN: OnceLock<Vec<Node<H, Ops>>> = OnceLock::new();
+    CHAIN.get_or_init(|| chain(&key(80), MAX_HELD_PER_AUTHOR as u64 + 44))
+}
+
+/// `len` nodes of `author`'s chain, oldest first.
+fn chain(author: &SigningKey, len: u64) -> Vec<Node<H, Ops>> {
+    let mut nodes: Vec<Node<H, Ops>> = Vec::new();
+    for seq in 0..len {
+        let parents = nodes.last().map(Node::cid);
+        nodes.push(node(author, seq, vec![(seq % 8, seq)], parents));
+    }
+    nodes
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
+    /// Deliveries past a held bound: one author's chain longer than
+    /// [`MAX_HELD_PER_AUTHOR`] + 1, its first node delivered last, among a
+    /// random DAG in random batches with duplicates. The nodes dropped,
+    /// delivered again in one batch, end in the full replay's rows, heads
+    /// and equivocations, and two delivery orders agree.
+    #[test]
+    fn nodes_dropped_at_a_held_bound_converge_once_delivered_again(
+        steps in prop::collection::vec(step(), 1..40),
+        extra in 2usize..44,
+        first in any::<u64>(),
+        second in any::<u64>(),
+    ) {
+        let dag = generate(3, &steps);
+        let chain = &long_chain()[..MAX_HELD_PER_AUTHOR + extra];
+        let all: BTreeMap<Cid<H>, Vec<u8>> = dag
+            .nodes
+            .iter()
+            .cloned()
+            .chain(chain.iter().map(|node| (node.cid(), node.to_bytes())))
+            .collect();
+        let early: Vec<Vec<u8>> = dag
+            .nodes
+            .iter()
+            .map(|(_, bytes)| bytes.clone())
+            .chain(chain[1..].iter().map(Node::to_bytes))
+            .collect();
+        let mut replicas = Vec::new();
+        for seed in [first, second] {
+            let mut replica = replica();
+            let mut refused = BTreeSet::new();
+            let mut dropped = BTreeSet::new();
+            let mut batches = deliveries(&early, seed);
+            batches.push(vec![chain[0].to_bytes()]);
+            for batch in batches {
+                let report = replica.ingest(batch, None, &mut crdt).unwrap();
+                refused.extend(report.refused.into_iter().map(|(cid, _)| cid.unwrap()));
+                dropped.extend(report.dropped);
+                for cid in &report.applied {
+                    dropped.remove(cid);
+                }
+            }
+            prop_assert!(!dropped.is_empty());
+            let again = dropped.iter().map(|cid| all[cid].clone());
+            let report = replica.ingest(again, None, &mut crdt).unwrap();
+            prop_assert!(report.dropped.is_empty());
+            prop_assert_eq!(replica.held(), 0);
+            prop_assert_eq!(&refused, &dag.refused);
+            let rebuilt = replay(replica.store().nodes().clone(), &mut crdt);
+            prop_assert_eq!(replica.store().rows(), &rebuilt.rows);
+            prop_assert_eq!(replica.heads(), &rebuilt.heads);
+            prop_assert_eq!(replica.equivocations(), &dag.equivocations);
+            prop_assert_eq!(&replica.have(), &rebuilt.latest);
+            prop_assert!(replica.wanted().is_empty());
+            prop_assert_eq!(rebuilt.nodes, all.len() - dag.refused.len());
+            replicas.push(replica);
+        }
+        prop_assert_eq!(replicas[0].store().rows(), replicas[1].store().rows());
+        prop_assert_eq!(replicas[0].heads(), replicas[1].heads());
     }
 }
 
@@ -670,6 +754,193 @@ fn a_dropped_node_applies_when_delivered_again() {
         .ingest([parent.to_bytes(), child.to_bytes()], None, &mut crdt)
         .unwrap();
     assert_eq!(report.applied, vec![parent.cid(), child.cid()]);
+}
+
+/// A replica that walks down from a head, one wanted node an ingest, holds
+/// what it fetches up to its author's held bound; past it the next node is
+/// dropped and still wanted, every time it comes. The gap closes fed oldest
+/// first, or delivered as one batch in any order.
+#[test]
+fn a_walk_down_from_a_head_stops_at_the_held_bound() {
+    let nodes = long_chain();
+    let by_cid: BTreeMap<Cid<H>, &Node<H, Ops>> =
+        nodes.iter().map(|node| (node.cid(), node)).collect();
+    let stalled = || {
+        let mut walker = replica();
+        let mut next = nodes.last().unwrap().cid();
+        for _ in 0..MAX_HELD_PER_AUTHOR {
+            let report = walker
+                .ingest([by_cid[&next].to_bytes()], None, &mut crdt)
+                .unwrap();
+            assert_eq!(report.held, vec![next.clone()]);
+            let wanted = walker.wanted();
+            assert_eq!(wanted.len(), 1);
+            next = wanted[0].clone();
+        }
+        for _ in 0..2 {
+            let report = walker
+                .ingest([by_cid[&next].to_bytes()], None, &mut crdt)
+                .unwrap();
+            assert_eq!(report.dropped, vec![next.clone()]);
+            assert_eq!(walker.wanted(), vec![next.clone()]);
+        }
+        assert_eq!(walker.held(), MAX_HELD_PER_AUTHOR);
+        walker
+    };
+    let missing = nodes.len() - MAX_HELD_PER_AUTHOR;
+    let author = Author::from(&key(80));
+    let caught_up = |walker: &Mem| {
+        assert_eq!(walker.held(), 0);
+        assert!(walker.wanted().is_empty());
+        assert_eq!(walker.have()[&author], nodes.len() as u64 - 1);
+        let rebuilt = replay(walker.store().nodes().clone(), &mut crdt);
+        assert_eq!(walker.store().rows(), &rebuilt.rows);
+        assert_eq!(rebuilt.nodes, nodes.len());
+    };
+
+    let mut oldest_first = stalled();
+    for node in &nodes[..missing] {
+        let report = oldest_first
+            .ingest([node.to_bytes()], None, &mut crdt)
+            .unwrap();
+        assert!(report.dropped.is_empty());
+    }
+    caught_up(&oldest_first);
+
+    let mut one_batch = stalled();
+    let walk = nodes[..missing].iter().rev().map(Node::to_bytes);
+    let report = one_batch.ingest(walk, None, &mut crdt).unwrap();
+    assert!(report.dropped.is_empty());
+    assert_eq!(report.applied.len(), nodes.len());
+    caught_up(&one_batch);
+}
+
+/// A batch given no cursor leaves the stored one where it was, and an
+/// ingest of no nodes stores a position: a caller ingests a page, keeps
+/// what it dropped, then stores the page's position.
+#[test]
+fn a_cursor_is_stored_after_what_a_batch_dropped() {
+    let one = key(66);
+    let parent = node(&key(5), 0, vec![(5, 5)], []);
+    let child = node(&one, 0, vec![], [parent.cid()]);
+    let mut local = replica();
+    local
+        .ingest(
+            (0..MAX_HELD_PER_AUTHOR as u32).map(|i| orphan(&one, i, vec![]).to_bytes()),
+            Some(1),
+            &mut crdt,
+        )
+        .unwrap();
+    let report = local.ingest([child.to_bytes()], None, &mut crdt).unwrap();
+    assert_eq!(report.dropped, vec![child.cid()]);
+    assert_eq!(local.cursor(), Some(1));
+    local.ingest([], Some(2), &mut crdt).unwrap();
+    let mut local = Mem::open(local.into_store(), SCOPE).unwrap();
+    assert_eq!(local.cursor(), Some(2));
+    let report = local
+        .ingest([parent.to_bytes(), child.to_bytes()], None, &mut crdt)
+        .unwrap();
+    assert_eq!(report.applied, vec![parent.cid(), child.cid()]);
+}
+
+/// A CRDT that filters an equivocating author's operations: a row per
+/// operation, by its node's CID and its index (unique where (author, seq)
+/// is not), holding its author, number and value; and per author the
+/// lowest number it equivocated at, written when an apply is told.
+fn filtering(event: Event<'_, H, Ops>, rows: &mut dyn Rows) {
+    if event.equivocation {
+        let row = [b"e/".as_slice(), &event.author.0].concat();
+        let from = rows.read(&row).map_or(u64::MAX, |bytes| {
+            u64::from_be_bytes(bytes.try_into().unwrap())
+        });
+        rows.write(&row, Some(&from.min(event.seq).to_be_bytes()));
+    }
+    for (index, (key, value)) in event.ops.iter().enumerate() {
+        let row = [
+            b"o/".as_slice(),
+            &key.to_be_bytes(),
+            event.cid.as_ref(),
+            &(index as u64).to_be_bytes(),
+        ]
+        .concat();
+        let op = [
+            event.author.0.as_slice(),
+            &event.seq.to_be_bytes(),
+            &value.to_be_bytes(),
+        ]
+        .concat();
+        rows.write(&row, Some(&op));
+    }
+}
+
+/// The filtering CRDT's read: per key, the value of the highest (seq,
+/// author, value) among the operations not filtered.
+fn filtered(rows: &BTreeMap<Vec<u8>, Vec<u8>>) -> BTreeMap<u64, u64> {
+    let be = |bytes: &[u8]| u64::from_be_bytes(bytes.try_into().unwrap());
+    let mut best: BTreeMap<u64, (u64, &[u8], u64)> = BTreeMap::new();
+    for (row, op) in rows.range(b"o/".to_vec()..b"o0".to_vec()) {
+        let (author, seq, value) = (&op[..32], be(&op[32..40]), be(&op[40..]));
+        let from = rows.get(&[b"e/".as_slice(), author].concat());
+        if from.is_some_and(|from| seq >= be(from)) {
+            continue;
+        }
+        let entry = (seq, author, value);
+        let at = best.entry(be(&row[2..10])).or_insert(entry);
+        *at = (*at).max(entry);
+    }
+    best.into_iter()
+        .map(|(key, (_, _, value))| (key, value))
+        .collect()
+}
+
+/// A CRDT that filters an equivocating author from the number it forked
+/// at reads the same whichever twin arrives second, with a node after one
+/// twin applied before the other arrives; an honest node after the fork
+/// stays.
+#[test]
+fn a_crdt_filters_an_equivocating_author_whichever_twin_comes_second() {
+    let (honest, forker) = (key(1), key(2));
+    let a0 = node(&honest, 0, vec![(1, 10)], []);
+    let e0 = node(&forker, 0, vec![(1, 20)], []);
+    let e1 = node(&forker, 1, vec![(2, 30)], [e0.cid()]);
+    let twin = node(&forker, 1, vec![(2, 40)], [e0.cid()]);
+    let a1 = node(&honest, 1, vec![(3, 50)], [a0.cid(), e1.cid()]);
+    let orders = [
+        vec![vec![&a0], vec![&e0], vec![&e1], vec![&a1], vec![&twin]],
+        vec![vec![&a0], vec![&e0], vec![&twin], vec![&e1], vec![&a1]],
+        vec![vec![&a1, &twin, &e1, &e0, &a0]],
+    ];
+    let mut reads = Vec::new();
+    for order in orders {
+        let mut local = replica();
+        for batch in order {
+            local
+                .ingest(
+                    batch.iter().map(|node| node.to_bytes()),
+                    None,
+                    &mut filtering,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            local.equivocations(),
+            &BTreeSet::from([(Author::from(&forker), 1)])
+        );
+        let rows = local.store().rows();
+        let filter = [b"e/".as_slice(), &Author::from(&forker).0].concat();
+        assert_eq!(rows.get(&filter), Some(&1u64.to_be_bytes().to_vec()));
+        reads.push((filtered(rows), rows.clone()));
+    }
+    let higher = if Author::from(&forker) > Author::from(&honest) {
+        20
+    } else {
+        10
+    };
+    let expected = BTreeMap::from([(1, higher), (3, 50)]);
+    for (read, rows) in &reads {
+        assert_eq!(read, &expected);
+        assert_eq!(rows, &reads[0].1);
+    }
 }
 
 /// A row key past the row bounds fails the batch, before anything is
