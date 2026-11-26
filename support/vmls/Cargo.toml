@@ -20,7 +20,7 @@ mls-rs-core = { version = "=0.27.0", default-features = false }
 # suite 1 alone (`src/lib.rs`), its P-256/P-384 code (elliptic-curve 0.13,
 # crypto-bigint 0.5) is compiled in and not reached from this crate.
 mls-rs-crypto-rustcrypto = { version = "=0.22.1", default-features = false }
-# The confirmation hash and a held commit's handshake hash.
+# A held commit's handshake hash.
 blake2 = "0.10"
 zeroize = "1"
 

@@ -41,9 +41,10 @@ AES-128-GCM, SHA-256, Ed25519), with no external commits, PSKs or ReInit.
   (`Expected`: who commits, who is added and removed, any new credential)
   and use only Add, Remove or the committer's own update. Otherwise it is
   `Error::Refused`.
-- **Confirming:** `confirmation` hashes the group id, the epoch and the
-  epoch's authenticator. Members who processed the same commit get the same
-  hash, which they can sign and compare.
+- **Confirming** is yours: members who processed the same commit get the
+  same `Candidate::authenticator`. It names no group or epoch, so sign it
+  under your own domain together with the group id and the epoch. A member
+  the commit removes gets none.
 - **Storage:** you implement `Store` (read a row, list a prefix, write a
   batch atomically), or use `MemStore` in tests. Each group lives under a
   `Namespace` prefix, and every call that changes state writes your rows

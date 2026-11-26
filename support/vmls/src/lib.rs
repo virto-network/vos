@@ -14,7 +14,9 @@
 //! - **The policy:** an allow-list of proposals, 64-byte credentials, and
 //!   a candidate checked against the effect its caller expects
 //!   ([`Expected`]).
-//! - **The confirmation hash** ([`confirmation`]).
+//! - **Confirming** is the caller's: the members that processed a
+//!   candidate compare its epoch's authenticator
+//!   ([`Candidate::authenticator`]), by a protocol of the caller's.
 //!
 //! Two limits: a member added over a year ago that has not committed since
 //! bars new joins until it commits (a key package's lifetime, which a
@@ -33,8 +35,6 @@ mod held;
 mod policy;
 mod storage;
 
-use blake2::digest::consts::U32;
-use blake2::{Blake2b, Digest};
 use mls_rs::client_builder::{
     BaseConfig, IntoConfigOutput, WithCryptoProvider, WithGroupStateStorage, WithIdentityProvider,
     WithKeyPackageRepo, WithMlsRules,
@@ -97,22 +97,6 @@ const RENEWED: &[u8] = b"renewed";
 const GROUP: &[u8] = b"group";
 const HELD: &[u8] = b"held";
 const NEXT: &[u8] = b"next";
-
-/// The confirmation hash of an epoch: `BLAKE2b-256(domain ‖ group ‖
-/// epoch ‖ epoch_authenticator)`, `group` the group's 32-byte id as the
-/// caller names it, the epoch little-endian. A member that processed the
-/// epoch's candidate posts it, signed; the hashes of the set of members
-/// the caller requires confirm it. Neither `domain` nor the authenticator
-/// is framed: the input is unambiguous only for one fixed domain, and
-/// suite 1's authenticator is always 32 bytes.
-pub fn confirmation(domain: &[u8], group: &[u8; 32], epoch: u64, authenticator: &[u8]) -> [u8; 32] {
-    let mut hasher = Blake2b::<U32>::new();
-    hasher.update(domain);
-    hasher.update(group);
-    hasher.update(epoch.to_le_bytes());
-    hasher.update(authenticator);
-    hasher.finalize().into()
-}
 
 fn credentials(group: &Group<Config>) -> Vec<Vec<u8>> {
     leaves(group)

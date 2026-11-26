@@ -52,6 +52,24 @@ pub trait Store: Send + Sync + 'static {
     fn commit(&self, writes: Writes) -> Result<(), Self::Error>;
 }
 
+/// A shared store: one store behind several namespaces and the caller's
+/// own rows.
+impl<S: Store + ?Sized> Store for Arc<S> {
+    type Error = S::Error;
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        (**self).get(key)
+    }
+
+    fn keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, Self::Error> {
+        (**self).keys(prefix)
+    }
+
+    fn commit(&self, writes: Writes) -> Result<(), Self::Error> {
+        (**self).commit(writes)
+    }
+}
+
 /// A store in memory, its handles sharing one set of rows: for tests. It
 /// panics on a key or value outside the bounds a store is handed, so a
 /// test finds any that reaches it.

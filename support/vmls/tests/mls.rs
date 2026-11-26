@@ -12,7 +12,7 @@ use mls_rs::{CipherSuiteProvider, Client, CryptoProvider, ExtensionList, MlsRule
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use vmls::{
     Candidate, Commit, Error, Expected, Identity, Kind, MemStore, Mls, Namespace, Refusal, Store,
-    Writes, confirmation,
+    Writes,
 };
 
 const T: u64 = 1_800_000_000;
@@ -169,6 +169,30 @@ fn commits_move_every_member_only_when_swapped() {
     assert!(!c.mls.grouped(), "the removed member keeps no group");
     agree(&[&a, &b], 3);
     assert_eq!(a.mls.credentials().unwrap().len(), 2);
+}
+
+/// One store shared behind an `Arc` holds two members' namespaces and the
+/// caller's own rows: each member reopens to its own group, and the
+/// caller's row is in the store beside them.
+#[test]
+fn one_shared_store_holds_two_namespaces() {
+    let store = std::sync::Arc::new(MemStore::new());
+    let a = Namespace::current(store.clone(), b"a/".to_vec());
+    let b = Namespace::current(store.clone(), b"b/".to_vec());
+    let mut mls_a = Mls::open(a.clone(), &credential(1)).unwrap();
+    let mut mls_b = Mls::open(b.clone(), &credential(2)).unwrap();
+    let rows = Writes::from([(b"caller".to_vec(), Some(b"row".to_vec()))]);
+    mls_a.create(T, rows).unwrap();
+    mls_b.create(T, Writes::new()).unwrap();
+    assert_eq!(store.get(b"caller").unwrap(), Some(b"row".to_vec()));
+    assert!(!store.keys(b"a/").unwrap().is_empty());
+    assert!(!store.keys(b"b/").unwrap().is_empty());
+    let (mls_a, mls_b) = (
+        Mls::open(a, &credential(1)).unwrap(),
+        Mls::open(b, &credential(2)).unwrap(),
+    );
+    assert_eq!(mls_a.credentials().unwrap(), vec![credential(1)]);
+    assert_eq!(mls_b.credentials().unwrap(), vec![credential(2)]);
 }
 
 /// A candidate processed on a copy leaves the current state's rows and
@@ -409,18 +433,6 @@ fn the_policy_refuses_what_the_group_does_not_allow() {
             .commit(&[b"no key package".to_vec()], &[], T + 1, |_| Writes::new()),
         Err(Error::Mls(_))
     ));
-}
-
-/// The confirmation hash is over its domain, the group, the epoch and the
-/// authenticator, each of which moves it.
-#[test]
-fn the_confirmation_hash_binds_its_parts() {
-    let h = confirmation(b"test/confirm", &[1; 32], 7, &[9; 32]);
-    assert_eq!(h, confirmation(b"test/confirm", &[1; 32], 7, &[9; 32]));
-    assert_ne!(h, confirmation(b"test/other", &[1; 32], 7, &[9; 32]));
-    assert_ne!(h, confirmation(b"test/confirm", &[2; 32], 7, &[9; 32]));
-    assert_ne!(h, confirmation(b"test/confirm", &[1; 32], 8, &[9; 32]));
-    assert_ne!(h, confirmation(b"test/confirm", &[1; 32], 7, &[8; 32]));
 }
 
 /// A restart: A starts a new group of itself alone, its commit held and

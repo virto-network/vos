@@ -8,6 +8,7 @@ use mls_rs::error::MlsError;
 /// a reopen, and an error reading the group back after a written commit
 /// leaves that commit written.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The store failed: its own error, boxed (`downcast_ref` recovers
     /// the store's type).
@@ -73,6 +74,7 @@ impl std::error::Error for Error {
 
 /// Why a candidate was refused.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Refusal {
     /// Not an MLS message.
     Malformed,

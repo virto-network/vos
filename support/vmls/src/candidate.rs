@@ -49,8 +49,11 @@ impl Candidate {
         self.group.current_epoch()
     }
 
-    /// Its epoch's authenticator, which the confirmation hashes; none for a
-    /// commit that removes this member.
+    /// Its epoch's authenticator, which the members that processed it
+    /// compare to confirm it; none for a commit that removes this member,
+    /// which so takes no part in confirming it. It names neither a domain,
+    /// the group nor the epoch: a caller signs it under a domain of its
+    /// own, with the group's id and the epoch.
     pub fn authenticator(&self) -> Result<Option<Vec<u8>>, Error> {
         if self.kind == Kind::Removed {
             return Ok(None);

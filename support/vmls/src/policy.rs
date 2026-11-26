@@ -32,6 +32,7 @@ pub(crate) const CREDENTIAL_BYTES: usize = 64;
 
 /// What the policy refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Refused {
     /// A proposal other than Add or Remove.
     Proposal,
