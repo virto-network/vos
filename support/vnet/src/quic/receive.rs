@@ -180,7 +180,7 @@ async fn read(peer: Arc<Reading>, mut stream: quinn::RecvStream) {
     if stream.read_exact(&mut header).await.is_err() {
         return;
     }
-    let class = header[0];
+    let class = Class(header[0]);
     let Some(spec) = peer.inner.classes.get(class) else {
         let _ = stream.stop(code::MALFORMED);
         peer.violated(None);
@@ -248,7 +248,7 @@ mod tests {
     fn a_turn_goes_to_the_stream_that_waited() {
         let executor = smol::LocalExecutor::new();
         let turns = Rc::new(Turns::default());
-        let key = (2, 5);
+        let key = (Class(2), 5);
         let order = Rc::new(RefCell::new(Vec::new()));
         let (release, released) = smol::channel::bounded::<()>(1);
         let reader = |name: &'static str| {

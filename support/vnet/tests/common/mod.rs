@@ -15,10 +15,10 @@ use vnet::{
 
 /// The tests' four classes: pair heartbeats, sent first and dropped once
 /// stale; two classes of streams per id; and large frames, a stream each.
-pub const LIVENESS: Class = 0;
-pub const CONSENSUS: Class = 1;
-pub const REQUESTS: Class = 2;
-pub const BULK: Class = 3;
+pub const LIVENESS: Class = Class(0);
+pub const CONSENSUS: Class = Class(1);
+pub const REQUESTS: Class = Class(2);
+pub const BULK: Class = Class(3);
 pub const ALL: [Class; 4] = [LIVENESS, CONSENSUS, REQUESTS, BULK];
 
 /// How long a liveness frame may wait to be sent: long, so no test that

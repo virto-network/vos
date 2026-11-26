@@ -50,7 +50,15 @@ pub struct Peer {
 
 /// A class of traffic: its index in the [`Classes`] table. It travels as
 /// the byte that opens each stream.
-pub type Class = u8;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct Class(pub u8);
+
+impl From<Class> for usize {
+    fn from(class: Class) -> Self {
+        usize::from(class.0)
+    }
+}
 
 /// The most classes a table holds.
 pub const MAX_CLASSES: usize = 16;
@@ -115,8 +123,8 @@ impl std::fmt::Display for InvalidClasses {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Count(count) => write!(f, "{count} classes, not 1 to {MAX_CLASSES}"),
-            Self::NoFrame(class) => write!(f, "class {class}'s frame bound is 0"),
-            Self::NoArrival(class) => write!(
+            Self::NoFrame(Class(class)) => write!(f, "class {class}'s frame bound is 0"),
+            Self::NoArrival(Class(class)) => write!(
                 f,
                 "class {class}'s arrival queue holds no frame, or more than {MAX_ARRIVALS}"
             ),
@@ -134,7 +142,7 @@ impl Classes {
         if classes.is_empty() || classes.len() > MAX_CLASSES {
             return Err(InvalidClasses::Count(classes.len()));
         }
-        for (class, spec) in (0..).zip(&classes) {
+        for (class, spec) in (0..).map(Class).zip(&classes) {
             if spec.max_frame == 0 {
                 return Err(InvalidClasses::NoFrame(class));
             }
@@ -160,7 +168,7 @@ impl Classes {
 
     /// Each class with its definition.
     pub fn iter(&self) -> impl Iterator<Item = (Class, &ClassSpec)> {
-        (0..).zip(self.0.iter())
+        (0..).map(Class).zip(self.0.iter())
     }
 
     /// The bound on a frame of `class`, which the table holds.
@@ -308,7 +316,7 @@ mod tests {
         };
         assert_eq!(
             Classes::new([spec(), no_frame]),
-            Err(InvalidClasses::NoFrame(1))
+            Err(InvalidClasses::NoFrame(Class(1)))
         );
         let no_arrival = ClassSpec {
             arrivals: 0,
@@ -316,16 +324,19 @@ mod tests {
         };
         assert_eq!(
             Classes::new([no_arrival]),
-            Err(InvalidClasses::NoArrival(0))
+            Err(InvalidClasses::NoArrival(Class(0)))
         );
         let too_many = ClassSpec {
             arrivals: MAX_ARRIVALS + 1,
             ..spec()
         };
-        assert_eq!(Classes::new([too_many]), Err(InvalidClasses::NoArrival(0)));
+        assert_eq!(
+            Classes::new([too_many]),
+            Err(InvalidClasses::NoArrival(Class(0)))
+        );
         let classes = Classes::new([spec(); MAX_CLASSES]).unwrap();
         assert_eq!(classes.len(), MAX_CLASSES);
-        assert!(classes.get(MAX_CLASSES as Class).is_none());
+        assert!(classes.get(Class(MAX_CLASSES as u8)).is_none());
     }
 
     #[test]
@@ -335,6 +346,6 @@ mod tests {
             ..spec()
         }])
         .unwrap();
-        assert_eq!(classes.max_frame(0), u32::MAX as usize);
+        assert_eq!(classes.max_frame(Class(0)), u32::MAX as usize);
     }
 }

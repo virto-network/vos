@@ -27,7 +27,7 @@ fn three_nodes_exchange_frames_on_every_class() {
         for ((quic, _), number) in nodes.iter().zip(1..) {
             for to in others(number) {
                 for class in ALL {
-                    let frame = format!("{class} to {to}").into_bytes();
+                    let frame = format!("{class:?} to {to}").into_bytes();
                     send(quic, key(to), class, u64::from(to) * 10, frame).await;
                 }
             }
@@ -37,14 +37,17 @@ fn three_nodes_exchange_frames_on_every_class() {
                 let mut from = Vec::new();
                 for _ in 0..2 {
                     let incoming = next(arrivals.queue(class)).await;
-                    assert_eq!(incoming.frame, format!("{class} to {number}").into_bytes());
+                    assert_eq!(
+                        incoming.frame,
+                        format!("{class:?} to {number}").into_bytes()
+                    );
                     assert_eq!(incoming.stream, u64::from(number) * 10);
                     from.push(incoming.from);
                 }
                 from.sort();
                 let mut others: Vec<_> = others(number).map(key).collect();
                 others.sort();
-                assert_eq!(from, others, "node {number}, class {class}");
+                assert_eq!(from, others, "node {number}, class {class:?}");
             }
         }
     });
@@ -64,7 +67,7 @@ fn frames_keep_their_order_within_a_stream() {
         for class in [CONSENSUS, REQUESTS] {
             for i in 0..FRAMES {
                 let incoming = next(b.queue(class)).await;
-                assert_eq!(incoming.frame, i.to_be_bytes().to_vec(), "class {class}");
+                assert_eq!(incoming.frame, i.to_be_bytes().to_vec(), "class {class:?}");
             }
         }
     });

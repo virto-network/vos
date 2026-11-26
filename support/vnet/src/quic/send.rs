@@ -348,7 +348,7 @@ async fn open(
     let mut send = connection.open_uni().await.ok()?;
     send.set_priority(priority).ok()?;
     let mut header = [0u8; HEADER];
-    header[0] = class;
+    header[0] = class.0;
     header[1..].copy_from_slice(&stream.to_be_bytes());
     send.write_all(&header).await.ok()?;
     Some(send)

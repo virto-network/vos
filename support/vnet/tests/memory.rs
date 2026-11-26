@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use common::{ALL, CONSENSUS, LIVENESS, MAX_FRAME, classes, with_frames, within};
 use vnet::memory::{Endpoint, Hub};
-use vnet::{Arrivals, Incoming, Network, NodeKey, Peer, Refused};
+use vnet::{Arrivals, Class, Incoming, Network, NodeKey, Peer, Refused};
 
 /// Node `number`'s key: the hub checks no key.
 fn k(number: u8) -> NodeKey {
@@ -56,13 +56,13 @@ fn frames_arrive_with_their_sender_and_stream() {
     let hub = hub(1);
     let nodes = join(&hub, &[1, 2, 3]);
     for class in ALL {
-        nodes[0].0.send(k(2), class, 5, vec![class]).unwrap();
+        nodes[0].0.send(k(2), class, 5, vec![class.0]).unwrap();
     }
     for class in ALL {
         let incoming = nodes[1].1.queue(class).try_recv().unwrap();
         assert_eq!(
             (incoming.from, incoming.stream, incoming.frame),
-            (k(1), 5, vec![class])
+            (k(1), 5, vec![class.0])
         );
     }
     assert!(nodes[2].1.queue(CONSENSUS).try_recv().is_err());
@@ -85,7 +85,7 @@ fn sends_are_refused_with_a_reason() {
         Err(Refused::TooLarge)
     );
     assert_eq!(
-        a.send(k(2), ALL.len() as u8, 0, Vec::new()),
+        a.send(k(2), Class(ALL.len() as u8), 0, Vec::new()),
         Err(Refused::UnknownClass)
     );
     let mut sent = 0;

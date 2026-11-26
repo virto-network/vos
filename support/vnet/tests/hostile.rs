@@ -50,7 +50,7 @@ async fn dial_as_2(node: &Quic) -> (quinn::Endpoint, quinn::Connection) {
 
 fn header(class: Class, id: u64) -> [u8; 9] {
     let mut header = [0u8; 9];
-    header[0] = class;
+    header[0] = class.0;
     header[1..].copy_from_slice(&id.to_be_bytes());
     header
 }
@@ -195,7 +195,7 @@ fn a_stream_of_a_class_past_the_table_is_stopped() {
         let (_client, connection) = dial_as_2(&a).await;
         let mut unknown = connection.open_uni().await.unwrap();
         unknown
-            .write_all(&header(ALL.len() as Class, 1))
+            .write_all(&header(Class(ALL.len() as u8), 1))
             .await
             .unwrap();
         unknown.write_all(&2u32.to_be_bytes()).await.unwrap();
