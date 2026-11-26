@@ -1,12 +1,12 @@
 //! Groups of protocol cores over a simulated network and stores
-//! (`vos_raft::sim`), checked for Raft's safety properties under faults:
+//! (`vraft::sim`), checked for Raft's safety properties under faults:
 //! one leadership per term, one entry per committed index (configuration
 //! entries compared whole), no commit past a replica's log, no compaction
 //! past its commit, no configuration without its entry. Every run is
 //! seeded; a failing seed replays exactly.
 
-use vos_raft::Role;
-use vos_raft::sim::{Cluster, Faults};
+use vraft::Role;
+use vraft::sim::{Cluster, Faults};
 
 const NODES: [u16; 3] = [1, 2, 3];
 

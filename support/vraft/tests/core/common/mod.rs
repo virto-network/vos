@@ -1,7 +1,7 @@
 //! Building replicas and reading what they do.
 
-use vos_raft::core::{Action, Core, Load, Recovered, Write};
-use vos_raft::{AppendResult, Config, LogEntry, Message, Meta, Role};
+use vraft::core::{Action, Core, Load, Recovered, Write};
+use vraft::{AppendResult, Config, LogEntry, Message, Meta, Role};
 
 pub const LEADER_A: u16 = 2;
 pub const LEADER_B: u16 = 3;

@@ -1,5 +1,5 @@
 [package]
-name = "vos-raft"
+name = "vraft"
 description = "Raft consensus as a protocol core without I/O (no_std + alloc), with a deterministic simulator."
 keywords = ["raft", "consensus", "no-std", "distributed-systems"]
 categories = ["network-programming", "no-std"]

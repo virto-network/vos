@@ -2,8 +2,8 @@
 //! it: an append that would replace a committed entry, a second leader of
 //! one term, a term without a successor, and numbers past its own log.
 
-use vos_raft::core::{Core, Recovered};
-use vos_raft::{AppendResult, Config, Message, Role};
+use vraft::core::{Core, Recovered};
+use vraft::{AppendResult, Config, Message, Role};
 
 use crate::common::{
     LEADER_A, LEADER_B, ME, acked_at, append, config, follower, leader_of_two, matched,

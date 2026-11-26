@@ -2302,13 +2302,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vos-raft"
-version = "0.1.0"
-dependencies = [
- "proptest",
-]
-
-[[package]]
 name = "vos-statement"
 version = "0.1.0"
 dependencies = [
@@ -2339,6 +2332,13 @@ dependencies = [
  "proptest",
  "vos-pvm-codec",
  "vos-pvm-precompiles",
+]
+
+[[package]]
+name = "vraft"
+version = "0.1.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]

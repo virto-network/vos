@@ -1,8 +1,8 @@
 //! Membership: changes, the configuration a replica follows, recovers and
 //! keeps with its log's start, and what a snapshot carries.
 
-use vos_raft::core::{Action, Answer, ChangeMembershipError, Core, Recovered};
-use vos_raft::{ActiveConfigRecord, AppendResult, Config, EntryKind, LogEntry, Message};
+use vraft::core::{Action, Answer, ChangeMembershipError, Core, Recovered};
+use vraft::{ActiveConfigRecord, AppendResult, Config, EntryKind, LogEntry, Message};
 
 use crate::common::{
     LEADER_A, LEADER_B, ME, acked_at, append, append_entries, committed, compact_bounds, config,

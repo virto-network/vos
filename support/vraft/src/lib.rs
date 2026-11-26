@@ -1,4 +1,4 @@
-//! # vos-raft
+//! # vraft
 //!
 //! Raft consensus as a protocol core without I/O, on `core + alloc`.
 //!
@@ -16,8 +16,8 @@
 //! ## A group of one
 //!
 //! ```
-//! use vos_raft::core::{Action, Core, Recovered};
-//! use vos_raft::{Config, Role};
+//! use vraft::core::{Action, Core, Recovered};
+//! use vraft::{Config, Role};
 //!
 //! // A lone member campaigns at its first tick, and leads once its term
 //! // and vote are durable.

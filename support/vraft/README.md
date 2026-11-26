@@ -1,4 +1,4 @@
-# vos-raft
+# vraft
 
 Raft consensus as a protocol core without I/O, on `core + alloc`
 (`no_std`).

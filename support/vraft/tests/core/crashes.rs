@@ -4,8 +4,8 @@
 
 use std::collections::BTreeMap;
 
-use vos_raft::core::{Action, Core, Recovered};
-use vos_raft::{Config, EntryKind, LogEntry, Message, Meta, Role};
+use vraft::core::{Action, Core, Recovered};
+use vraft::{Config, EntryKind, LogEntry, Message, Meta, Role};
 
 /// A replica and what its host made durable, restartable from it.
 struct Stored {

@@ -1,7 +1,7 @@
 //! What a replica claims and applies, and what waits for its writes.
 
-use vos_raft::core::{Action, Core, Recovered};
-use vos_raft::{LogEntry, Message, Role};
+use vraft::core::{Action, Core, Recovered};
+use vraft::{LogEntry, Message, Role};
 
 use crate::common::{
     LEADER_A, LEADER_B, ME, append, claimed, committed, compact_bounds, config, follow, follower,

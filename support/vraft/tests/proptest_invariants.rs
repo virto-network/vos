@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use vos_raft::core::{Action, Core, Recovered};
-use vos_raft::{AppendResult, Config, LogEntry, Message};
+use vraft::core::{Action, Core, Recovered};
+use vraft::{AppendResult, Config, LogEntry, Message};
 
 const ME: u16 = 0xAAAA;
 const PEERS: [u16; 2] = [0xBBBB, 0xCCCC];

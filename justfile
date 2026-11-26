@@ -43,7 +43,7 @@ default:
 # (`vendor-verifier`).
 
 # The fast suites' crates, which `check` and `gate` run.
-core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-pvm-codec-derive -p vos-pvm-proof-derive -p merkle-crdt -p vmls -p vos-raft -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-abi -p vos-tree -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
+core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-pvm-codec-derive -p vos-pvm-proof-derive -p merkle-crdt -p vmls -p vraft -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-abi -p vos-tree -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
 
 # A guest build for the PVM: the statement's target, its standard library
 # built from source. Every guest and blob build sets `CARGO_INCREMENTAL` to
@@ -498,7 +498,7 @@ check-no-debug-internals: (_forbidden "debug-internals")
 
 # The builds without std, for an embedded target on core and alloc
 # alone, built from the toolchain's source. merkle-crdt, without its
-# `std` feature. vos-raft, the Raft core. The proof verifier, which reads
+# `std` feature. vraft, the Raft core. The proof verifier, which reads
 # every admitted format, with the proof crate's verifier path under it:
 # both are `no_std` crates, so a `std` path in either fails the build. The
 # verifier builds for
@@ -521,7 +521,7 @@ check-no-debug-internals: (_forbidden "debug-internals")
 # `blobs.lock` (`check-blobs`).
 check-no-std:
     cargo build -p merkle-crdt --no-default-features --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
-    cargo build -p vos-raft --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
+    cargo build -p vraft --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target wasm32-unknown-unknown
     cargo build -p vos-pvm-final-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc

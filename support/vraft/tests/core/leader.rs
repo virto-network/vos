@@ -1,8 +1,8 @@
 //! A leader: what it sends, commits and reads, how it hands over, and
 //! when it, or a candidate, steps down.
 
-use vos_raft::core::{Action, Answer, Core, ProposeError, ReadIndexError, Recovered};
-use vos_raft::{AppendResult, LogEntry, Message, Role};
+use vraft::core::{Action, Answer, Core, ProposeError, ReadIndexError, Recovered};
+use vraft::{AppendResult, LogEntry, Message, Role};
 
 use crate::common::{
     LEADER_A, LEADER_B, ME, acked_at, append, appends, committed, config, entries_to, follower,

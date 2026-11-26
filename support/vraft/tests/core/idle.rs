@@ -1,8 +1,8 @@
 //! A group with idle heartbeats off: a leader sends nothing to members
 //! caught up, and the hosts' pair heartbeats vouch for it instead.
 
-use vos_raft::core::{Core, Recovered};
-use vos_raft::{Message, Role};
+use vraft::core::{Core, Recovered};
+use vraft::{Message, Role};
 
 use crate::common::{
     LEADER_A, LEADER_B, ME, acked, append, appends, config, entries_to, follower,
