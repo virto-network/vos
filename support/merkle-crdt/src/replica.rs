@@ -427,7 +427,7 @@ impl<H: Hasher, O: Encode + Decode, S: Store<H>> Replica<H, O, S> {
     /// local node, so one author's thousands of forks make the heads many
     /// but no local node large.
     ///
-    /// The paper's rule, a new node names every head, so holds up to
+    /// So the paper's rule, that a new node names every head, holds up to
     /// [`MAX_PARENTS`] heads. Past that a later node no longer leads to
     /// every earlier one, and a node the replica had applied can be
     /// concurrent with its next: a CRDT that reads from the DAG what an

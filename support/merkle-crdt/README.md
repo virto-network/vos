@@ -11,17 +11,16 @@ concurrent edits end equal. The storage and the network are yours.
 
 Use it when many writers edit one data set, offline or not, and nodes may
 pass relays you do not trust and arrive in any order (within bounds, below).
-Not for a single
-writer (a log is simpler), nor where writers need one total order or a check
-across them (balances, unique names: a log or consensus), nor for large blobs
-(store them apart and put their hashes in the operations).
+Not for a single writer (a log is simpler), nor where writers need one total
+order or a check across them (balances, unique names: a log or consensus),
+nor for large blobs (keep them apart, their hashes in the operations).
 
 ## How it works
 
 ```text
-  alice   a0 <-- a1 <-- a2
+  alice   a0 <-- a1 <-- a2   [head]
                        /
-  bob     b0 <-- b1 <-- b2          x <-- y : y names x as a parent
+  bob          b0 <-- b1 <-- b2   [head]        x <-- y : y names x as a parent
 ```
 
 - A **node** is a batch of operations by one **author** (an ed25519 key).
@@ -53,6 +52,7 @@ across them (balances, unique names: a log or consensus), nor for large blobs
 ## Using it
 
 1. Pick a `Hasher` for the CIDs; write an `Apply` over an `Event` and `Rows`.
+   A `Scope` names one data set; a replica is opened for one.
 2. Implement `Store` over your database (point reads, `load` at open, one
    atomic and durable `commit`), or take `MemStore` for tests.
 3. `record` local operations; send `outbox()`'s bytes and mark them `pushed`.
@@ -91,26 +91,31 @@ assert_eq!(phone.heads(), laptop.heads());
 
 ## Guarantees and limits
 
-It promises: each node applied once, after its parents; one atomic commit of
-nodes and rows for each `ingest` or `record`; forged, malformed or
-chain-breaking nodes refused with their descendants, alike everywhere;
-equivocations kept and reported; bounded cost (64 parents a node, 4096 held).
+It promises: each node applied once, after its parents; one atomic commit
+per `ingest` or `record`; forged, malformed or chain-breaking nodes refused
+with their descendants, alike everywhere; equivocations kept and reported;
+bounded cost (64 parents a node, 4096 held).
 
 It leaves to you: who may write (any key that signs is an author: check
 authors before `ingest`); the transport; your CRDT's convergence (no
 dependence on order, nor on which of two equivocating nodes is flagged;
 never failing on a peer's content); and a history that only grows (no
-compaction yet). Past the held bounds a node is dropped and must come again:
-fetch a long gap oldest first, or deliver it in one batch (see `MAX_HELD`).
+compaction yet). `cargo test -p merkle-crdt` checks this against a full
+replay over random DAGs, orders and batchings, past the held bounds too;
+`cargo bench -p merkle-crdt --bench apply` times it.
 
-## The paper and the tests
+## Relation to the paper
 
-After *Merkle-CRDTs: Merkle-DAGs meet CRDTs* (Sanjuán et al., 2020,
-[arXiv:2004.00107](https://arxiv.org/abs/2004.00107)): its DAG of operations
-applied in causal order, with nodes signed and numbered by their author
-added, and fetching and announcing left to the caller. Its "children" are
-the parents here, its "roots" the heads.
-
-`cargo test -p merkle-crdt` checks the replica against a full replay over
-random DAGs, orders, duplicates and batchings, within the held bounds and past
-them; `cargo bench -p merkle-crdt --bench apply` times it on 1k to 1M operations.
+It is the replica of *Merkle-CRDTs: Merkle-DAGs meet CRDTs* (Sanjuán et al.,
+2020, [arXiv:2004.00107](https://arxiv.org/abs/2004.00107)): the Merkle-Clock
+DAG, operations as the payload, each node applied once after its parents,
+heads kept. The paper's network parts, the DAG-Syncer (fetch a node by CID)
+and the Broadcaster (announce new heads), are defined abstractly there and
+supplied by you here. You can sync two ways: the paper's walk down from an
+announced head, a round trip a level and within the held bounds unless you
+collect the walk and ingest it as one batch; or a feed read oldest first (a
+relay's log), with no depth limit but a relay that keeps the log. Added:
+signed, numbered author chains, equivocations, bounds and a durable
+incremental apply. Relaxed: a node names at most 64 parents, so past 64
+concurrent heads one head no longer names the whole state. Its "children"
+are the parents here, its "roots" the heads.
