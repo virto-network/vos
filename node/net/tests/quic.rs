@@ -6,47 +6,45 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use vos_net::quic::{Config, Quic};
-use vos_net::{Class, Limits, Network, NodeNumber, Peer, Refused, public_key};
+use vos_net::{Network, Peer, Refused};
 
 #[test]
 fn three_nodes_exchange_frames_on_every_class() {
     smol::block_on(async {
         let nodes = cluster(3);
-        let others = |number: NodeNumber| (1..=3).filter(move |other| *other != number);
+        let others = |number: u8| (1..=3).filter(move |other| *other != number);
         // A liveness frame never waits for a connection: connect first.
         for ((quic, _), number) in nodes.iter().zip(1..) {
             for to in others(number) {
-                send(quic, to, Class::Consensus, 0, b"hello".to_vec()).await;
+                send(quic, key(to), CONSENSUS, 0, b"hello".to_vec()).await;
             }
         }
         for (_, arrivals) in &nodes {
             for _ in 0..2 {
-                assert_eq!(next(&arrivals.consensus).await.frame, b"hello");
+                assert_eq!(next(arrivals.queue(CONSENSUS)).await.frame, b"hello");
             }
         }
         for ((quic, _), number) in nodes.iter().zip(1..) {
             for to in others(number) {
-                for class in Class::ALL {
-                    let frame = format!("{class:?} to {to}").into_bytes();
-                    send(quic, to, class, u64::from(to) * 10, frame).await;
+                for class in ALL {
+                    let frame = format!("{class} to {to}").into_bytes();
+                    send(quic, key(to), class, u64::from(to) * 10, frame).await;
                 }
             }
         }
         for ((_, arrivals), number) in nodes.iter().zip(1u8..) {
-            for class in Class::ALL {
-                let mut from: Vec<NodeNumber> = Vec::new();
+            for class in ALL {
+                let mut from = Vec::new();
                 for _ in 0..2 {
-                    let incoming = next(queue(arrivals, class)).await;
-                    assert_eq!(
-                        incoming.frame,
-                        format!("{class:?} to {number}").into_bytes()
-                    );
+                    let incoming = next(arrivals.queue(class)).await;
+                    assert_eq!(incoming.frame, format!("{class} to {number}").into_bytes());
                     assert_eq!(incoming.stream, u64::from(number) * 10);
                     from.push(incoming.from);
                 }
                 from.sort();
-                let others: Vec<_> = others(number).collect();
-                assert_eq!(from, others, "node {number}, {class:?}");
+                let mut others: Vec<_> = others(number).map(key).collect();
+                others.sort();
+                assert_eq!(from, others, "node {number}, class {class}");
             }
         }
     });
@@ -60,13 +58,13 @@ fn frames_keep_their_order_within_a_stream() {
         let (_, b) = &nodes[1];
         const FRAMES: u32 = 2000;
         for i in 0..FRAMES {
-            send(a, 2, Class::Consensus, 7, i.to_be_bytes().to_vec()).await;
-            send(a, 2, Class::Requests, 8, i.to_be_bytes().to_vec()).await;
+            send(a, key(2), CONSENSUS, 7, i.to_be_bytes().to_vec()).await;
+            send(a, key(2), REQUESTS, 8, i.to_be_bytes().to_vec()).await;
         }
-        for class in [Class::Consensus, Class::Requests] {
+        for class in [CONSENSUS, REQUESTS] {
             for i in 0..FRAMES {
-                let incoming = next(queue(b, class)).await;
-                assert_eq!(incoming.frame, i.to_be_bytes().to_vec(), "{class:?}");
+                let incoming = next(b.queue(class)).await;
+                assert_eq!(incoming.frame, i.to_be_bytes().to_vec(), "class {class}");
             }
         }
     });
@@ -82,27 +80,19 @@ fn a_key_not_configured_is_refused_on_either_side() {
         let (b, b_arrivals) = &nodes[1];
         // Node 9 knows node 2, but node 2 does not know node 9's key.
         let (stranger, _) = bind(9);
-        stranger.set_peers(vec![peer_of(2, b)]);
-        send(&stranger, 2, Class::Consensus, 1, b"let me in".to_vec()).await;
-        // Nor does it take a configured number with another node's key:
-        // node 1 configured with node 9's key.
-        let (impostor, _) = Quic::bind(Config {
-            peers: vec![peer_of(2, b)],
-            ..Config::new(1, secret(9), any_port())
-        })
-        .unwrap();
-        send(&impostor, 2, Class::Consensus, 1, b"I am node 1".to_vec()).await;
+        stranger.set_peers(vec![peer_of(b)]);
+        send(&stranger, key(2), CONSENSUS, 1, b"let me in".to_vec()).await;
         assert!(silent(b_arrivals, Duration::from_millis(500)).await);
         // Node 1 itself still gets through.
-        send(a, 2, Class::Consensus, 1, b"node 1".to_vec()).await;
-        assert_eq!(next(&b_arrivals.consensus).await.frame, b"node 1");
-        // Node 1 believes node 2 has node 3's key, at node 2's address:
-        // node 2 would take node 1, but node 1 refuses node 2.
+        send(a, key(2), CONSENSUS, 1, b"node 1".to_vec()).await;
+        assert_eq!(next(b_arrivals.queue(CONSENSUS)).await.frame, b"node 1");
+        // Node 1 believes node 3 is at node 2's address: node 2 would take
+        // node 1, but node 1 refuses node 2's key.
         a.set_peers(vec![Peer {
-            key: public_key(&secret(3)),
+            key: key(3),
             ..peer_at(2, b.local_addr())
         }]);
-        send(a, 2, Class::Consensus, 1, b"for node 3".to_vec()).await;
+        send(a, key(3), CONSENSUS, 1, b"for node 3".to_vec()).await;
         assert!(silent(b_arrivals, Duration::from_millis(500)).await);
     });
 }
@@ -114,20 +104,23 @@ fn a_peer_shut_down_and_started_again_is_reachable_at_once() {
         let (b, _) = nodes.pop().unwrap();
         let (a, _) = nodes.pop().unwrap();
         let address = b.local_addr();
-        send(&a, 2, Class::Consensus, 1, b"before".to_vec()).await;
+        send(&a, key(2), CONSENSUS, 1, b"before".to_vec()).await;
         drop(b);
 
         // Node 1 sends first: its old connection is closed, or reset, and
         // it redials.
         let (b, b_arrivals) = rebind(2, address).await;
-        b.set_peers(vec![peer_of(1, &a)]);
+        b.set_peers(vec![peer_of(&a)]);
         let started = Instant::now();
         let mut sent = 0u32;
         let arrived = loop {
-            send(&a, 2, Class::Consensus, 1, sent.to_be_bytes().to_vec()).await;
+            send(&a, key(2), CONSENSUS, 1, sent.to_be_bytes().to_vec()).await;
             sent += 1;
-            if let Some(incoming) =
-                within(Duration::from_millis(20), b_arrivals.consensus.recv()).await
+            if let Some(incoming) = within(
+                Duration::from_millis(20),
+                b_arrivals.queue(CONSENSUS).recv(),
+            )
+            .await
             {
                 break incoming.unwrap();
             }
@@ -147,57 +140,54 @@ fn a_peer_shut_down_and_started_again_is_reachable_at_once() {
 }
 
 /// Frames queued for a peer not yet reachable wait for its connection,
-/// but a liveness frame among them is dropped: it would say, late, that
-/// its sender was alive when it was queued.
+/// but one of a class with an age, waiting longer, is dropped: a liveness
+/// frame would say, late, that its sender was alive when it was queued.
 #[test]
-fn a_liveness_frame_is_not_held_for_a_later_connection() {
+fn a_frame_older_than_its_class_s_age_is_dropped() {
     smol::block_on(async {
         let (a, _) = bind(1);
         // Node 2's address, nothing listening there yet.
         let address = vacant_address();
         a.set_peers(vec![peer_at(2, address)]);
-        send(&a, 2, Class::Liveness, 1, b"alive before".to_vec()).await;
-        send(&a, 2, Class::Consensus, 1, b"held".to_vec()).await;
-        smol::Timer::after(Duration::from_millis(200)).await;
+        send(&a, key(2), LIVENESS, 1, b"alive before".to_vec()).await;
+        send(&a, key(2), CONSENSUS, 1, b"held".to_vec()).await;
+        smol::Timer::after(LIVENESS_AGE + Duration::from_millis(500)).await;
         let (b, b_arrivals) = rebind(2, address).await;
-        b.set_peers(vec![peer_of(1, &a)]);
-        assert_eq!(next(&b_arrivals.consensus).await.frame, b"held");
-        send(&a, 2, Class::Liveness, 1, b"alive now".to_vec()).await;
-        assert_eq!(next(&b_arrivals.liveness).await.frame, b"alive now");
+        b.set_peers(vec![peer_of(&a)]);
+        assert_eq!(next(b_arrivals.queue(CONSENSUS)).await.frame, b"held");
+        send(&a, key(2), LIVENESS, 1, b"alive now".to_vec()).await;
+        assert_eq!(next(b_arrivals.queue(LIVENESS)).await.frame, b"alive now");
     });
 }
 
 #[test]
 fn an_oversized_frame_is_refused() {
     smol::block_on(async {
-        let small = Limits {
-            consensus: 1 << 20,
-            ..Limits::default()
-        };
-        let large = Limits {
-            consensus: 8 << 20,
-            ..Limits::default()
+        let consensus = |bound| {
+            let mut max_frame = MAX_FRAME;
+            max_frame[usize::from(CONSENSUS)] = bound;
+            with_frames(max_frame)
         };
         let ((a, _), (b, b_arrivals)) = pair(
             Config {
-                limits: large,
+                classes: consensus(8 << 20),
                 ..config(1)
             },
             Config {
-                limits: small,
+                classes: consensus(1 << 20),
                 ..config(2)
             },
         );
         // The sender refuses what its own limits refuse.
         assert_eq!(
-            b.send(1, Class::Consensus, 1, vec![0; (1 << 20) + 1]),
+            b.send(key(1), CONSENSUS, 1, vec![0; (1 << 20) + 1]),
             Err(Refused::TooLarge)
         );
         // The receiver stops a stream whose frame is over its bound, and
         // reads the others on.
-        send(&a, 2, Class::Consensus, 1, vec![1; 2 << 20]).await;
-        send(&a, 2, Class::Consensus, 2, b"small".to_vec()).await;
-        let incoming = next(&b_arrivals.consensus).await;
+        send(&a, key(2), CONSENSUS, 1, vec![1; 2 << 20]).await;
+        send(&a, key(2), CONSENSUS, 2, b"small".to_vec()).await;
+        let incoming = next(b_arrivals.queue(CONSENSUS)).await;
         assert_eq!((incoming.stream, incoming.frame), (2, b"small".to_vec()));
         assert!(silent(&b_arrivals, Duration::from_millis(300)).await);
     });
@@ -209,13 +199,13 @@ fn a_removed_peer_is_cut_off() {
         let nodes = cluster(2);
         let (a, _) = &nodes[0];
         let (b, b_arrivals) = &nodes[1];
-        send(a, 2, Class::Consensus, 1, b"before".to_vec()).await;
-        assert_eq!(next(&b_arrivals.consensus).await.frame, b"before");
+        send(a, key(2), CONSENSUS, 1, b"before".to_vec()).await;
+        assert_eq!(next(b_arrivals.queue(CONSENSUS)).await.frame, b"before");
         b.set_peers(Vec::new());
-        send(a, 2, Class::Consensus, 1, b"after".to_vec()).await;
+        send(a, key(2), CONSENSUS, 1, b"after".to_vec()).await;
         assert!(silent(b_arrivals, Duration::from_millis(500)).await);
         assert_eq!(
-            b.send(1, Class::Consensus, 1, Vec::new()),
+            b.send(key(1), CONSENSUS, 1, Vec::new()),
             Err(Refused::UnknownPeer)
         );
     });
@@ -230,21 +220,21 @@ fn a_queue_to_an_unreachable_peer_fills() {
         a.set_peers(vec![peer_at(2, silent.local_addr().unwrap())]);
         let frame = vec![0; 64 << 10];
         let mut queued = 0;
-        while a.send(2, Class::Consensus, 1, frame.clone()).is_ok() {
+        while a.send(key(2), CONSENSUS, 1, frame.clone()).is_ok() {
             queued += frame.len();
             assert!(
-                queued <= 4 * Limits::default().consensus + frame.len(),
+                queued <= 4 * MAX_FRAME[usize::from(CONSENSUS)] + frame.len(),
                 "the queue is unbounded"
             );
         }
         assert_eq!(
-            a.send(2, Class::Consensus, 1, frame.clone()),
+            a.send(key(2), CONSENSUS, 1, frame.clone()),
             Err(Refused::Full)
         );
         // Another class has its own queue.
-        assert_eq!(a.send(2, Class::Liveness, 1, b"alive".to_vec()), Ok(()));
+        assert_eq!(a.send(key(2), LIVENESS, 1, b"alive".to_vec()), Ok(()));
         assert!(
-            within(Duration::from_millis(100), a.ready(2, Class::Consensus))
+            within(Duration::from_millis(100), a.ready(key(2), CONSENSUS))
                 .await
                 .is_none()
         );
@@ -257,12 +247,7 @@ fn a_queue_to_an_unreachable_peer_fills() {
 #[test]
 fn each_class_s_queue_to_a_peer_holds_its_budget() {
     let (a, _) = Quic::bind(Config {
-        limits: Limits {
-            liveness: 1000,
-            consensus: 2000,
-            requests: 3000,
-            bulk: 4000,
-        },
+        classes: with_frames([1000, 2000, 3000, 4000]),
         ..config(1)
     })
     .unwrap();
@@ -271,11 +256,11 @@ fn each_class_s_queue_to_a_peer_holds_its_budget() {
     a.set_peers(vec![peer_at(2, silent.local_addr().unwrap())]);
     let taken = |class| {
         (0..)
-            .take_while(|_| a.send(2, class, 1, vec![0; 100]).is_ok())
+            .take_while(|_| a.send(key(2), class, 1, vec![0; 100]).is_ok())
             .count()
     };
     // A frame costs 164: 4,000, 8,000, 12,000 and 4,000 bytes' budgets.
-    assert_eq!(Class::ALL.map(taken), [25, 49, 74, 25]);
+    assert_eq!(ALL.map(taken), [25, 49, 74, 25]);
 }
 
 #[test]
@@ -294,18 +279,18 @@ fn quiet_streams_finish_so_others_can_open() {
             },
         );
         for id in 0..8 {
-            send(&a, 2, Class::Consensus, id, b"busy".to_vec()).await;
-            assert_eq!(next(&b_arrivals.consensus).await.stream, id);
+            send(&a, key(2), CONSENSUS, id, b"busy".to_vec()).await;
+            assert_eq!(next(b_arrivals.queue(CONSENSUS)).await.stream, id);
         }
         // A ninth stream opens once the first eight have gone quiet.
         let started = Instant::now();
-        send(&a, 2, Class::Consensus, 8, b"ninth".to_vec()).await;
-        let incoming = next(&b_arrivals.consensus).await;
+        send(&a, key(2), CONSENSUS, 8, b"ninth".to_vec()).await;
+        let incoming = next(b_arrivals.queue(CONSENSUS)).await;
         assert_eq!((incoming.stream, incoming.frame), (8, b"ninth".to_vec()));
         println!("the ninth stream opened after {:?}", started.elapsed());
         // A quiet stream's id opens a new stream when it is used again.
-        send(&a, 2, Class::Consensus, 0, b"again".to_vec()).await;
-        assert_eq!(next(&b_arrivals.consensus).await.frame, b"again");
+        send(&a, key(2), CONSENSUS, 0, b"again".to_vec()).await;
+        assert_eq!(next(b_arrivals.queue(CONSENSUS)).await.frame, b"again");
     });
 }
 
@@ -325,14 +310,14 @@ fn a_quiet_stream_s_successor_keeps_its_order() {
         const BURST: u32 = 1500;
         for burst in 0..3 {
             for i in burst * BURST..(burst + 1) * BURST {
-                send(&a, 2, Class::Requests, 5, i.to_be_bytes().to_vec()).await;
+                send(&a, key(2), REQUESTS, 5, i.to_be_bytes().to_vec()).await;
             }
             smol::Timer::after(Duration::from_millis(200)).await;
         }
         // A slow consumer frees one place at a time, which the waiting
         // readers would take in turns.
         for i in 0..3 * BURST {
-            let incoming = next(&b_arrivals.requests).await;
+            let incoming = next(b_arrivals.queue(REQUESTS)).await;
             assert_eq!(incoming.frame, i.to_be_bytes().to_vec());
             smol::Timer::after(Duration::from_micros(50)).await;
         }

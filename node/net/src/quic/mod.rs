@@ -26,8 +26,8 @@
 //!   peer's budget for its class ([`Config::assembling`]) before it is
 //!   read: past it, a stream waits unread, which flow control pushes back
 //!   to the sender.
-//! - No keepalives: the node's own liveness messages carry that. An idle
-//!   connection closes after [`IDLE`], and the next send redials.
+//! - No keepalives: a connection is kept up by what is sent on it. An
+//!   idle connection closes after [`IDLE`], and the next send redials.
 
 use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
@@ -41,18 +41,16 @@ use quinn::VarInt;
 use ring::rand::SecureRandom;
 use smol::future::FutureExt;
 
-use crate::tls::{ALPN, Identity, Table};
-use crate::{
-    Arrivals, Class, Deliver, Limits, Network, NodeKey, NodeNumber, Peer, Refused, arrivals,
-};
+use crate::tls::{Identity, Table};
+use crate::{Arrivals, Class, Classes, Deliver, Network, NodeKey, Peer, Refused, arrivals};
 
 mod admit;
-pub(crate) mod executor;
+mod executor;
 mod receive;
 mod send;
 
 use admit::Admission;
-use executor::{Runner, Runtime, Spawner};
+pub use executor::{Runner, Runtime, Spawner};
 use receive::accept;
 use send::{Link, Outgoing};
 
@@ -61,10 +59,12 @@ pub const IDLE: Duration = Duration::from_secs(30);
 /// What one stream may have in flight unread.
 const STREAM_WINDOW: u32 = 1 << 20;
 /// What a connection may have in flight unacknowledged, for every stream:
-/// well above the bulk streams' share, so they never fill it.
+/// well above the share of the streams of single frames, so they never
+/// fill it.
 const SEND_WINDOW: u64 = 16 << 20;
-/// Bulk frames in flight at once on one connection.
-const BULK_STREAMS: usize = 4;
+/// Frames of classes of streams per frame in flight at once on one
+/// connection, of every such class together.
+const FRAME_STREAMS: usize = 4;
 /// The round trip assumed before one is measured: a cluster's, not the
 /// internet's, so a lost first packet is sent again soon.
 const INITIAL_RTT: Duration = Duration::from_millis(100);
@@ -110,18 +110,45 @@ mod code {
     pub const REPLACED: VarInt = VarInt::from_u32(5);
 }
 
+/// The protocol an endpoint speaks, the caller's: its name, and the
+/// domain its keys are derived under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Protocol {
+    /// The ALPN protocol name, 1 to 255 bytes: an endpoint takes only a
+    /// connection that names it.
+    pub alpn: Vec<u8>,
+    /// What the endpoint's stateless-reset key and the mark on its
+    /// connection ids are derived under, from the node's secret, before a
+    /// label of each key's and the ALPN name: so the keys of one secret's
+    /// endpoints differ by protocol, and an application's differ from
+    /// every other use of the secret it makes.
+    pub domain: Vec<u8>,
+}
+
+impl Protocol {
+    fn check(&self) -> io::Result<()> {
+        if self.alpn.is_empty() || self.alpn.len() > 255 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an ALPN name of 1 to 255 bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A node's endpoint.
 pub struct Config {
-    pub number: NodeNumber,
     /// The node's secret seed: its key, and what its stateless-reset and
     /// connection-id keys are derived from.
     pub secret: [u8; 32],
     pub listen: SocketAddr,
+    pub protocol: Protocol,
+    pub classes: Classes,
     pub peers: Vec<Peer>,
-    pub limits: Limits,
     /// Streams a peer may hold open at once on its connection to this
-    /// node: a long-lived stream per busy id and class, and the bulk
-    /// streams. More wait for one to finish. Times a stream's window, it
+    /// node: a long-lived stream per busy id and class, and the streams of
+    /// single frames. More wait for one to finish. Times a stream's window, it
     /// bounds what a peer's streams not being read hold.
     pub streams: u32,
     /// A long-lived stream quiet for this long is finished, so streams
@@ -164,13 +191,13 @@ impl Default for Handshakes {
 }
 
 impl Config {
-    pub fn new(number: NodeNumber, secret: [u8; 32], listen: SocketAddr) -> Self {
+    pub fn new(secret: [u8; 32], listen: SocketAddr, protocol: Protocol, classes: Classes) -> Self {
         Self {
-            number,
             secret,
             listen,
+            protocol,
+            classes,
             peers: Vec::new(),
-            limits: Limits::default(),
             streams: STREAMS,
             quiet: QUIET,
             idle: IDLE,
@@ -181,10 +208,7 @@ impl Config {
     /// Refuse what would panic, stall or never take a frame.
     fn check(&self) -> io::Result<()> {
         let refuse = |what: &str| Err(io::Error::new(io::ErrorKind::InvalidInput, what.to_owned()));
-        let limits = &self.limits;
-        if Class::ALL.into_iter().any(|class| limits.of(class) == 0) {
-            return refuse("a class's frame limit is 0");
-        }
+        self.protocol.check()?;
         if self.streams == 0 || self.assembling == 0 {
             return refuse("no stream, or no frame, a peer may send");
         }
@@ -206,7 +230,6 @@ pub struct Quic {
 }
 
 struct Inner {
-    number: NodeNumber,
     identity: Identity,
     /// The name this run dials with: its incarnation.
     name: String,
@@ -214,13 +237,13 @@ struct Inner {
     /// What this node dials with: the dialed side may open no stream.
     dialing: Arc<quinn::TransportConfig>,
     table: Table,
-    links: Mutex<HashMap<NodeNumber, Link>>,
-    /// Each configured key's connection into this node, and the number it
-    /// had then.
-    inbound: Mutex<HashMap<NodeKey, (NodeNumber, quinn::Connection)>>,
+    links: Mutex<HashMap<NodeKey, Link>>,
+    /// Each configured key's connection into this node.
+    inbound: Mutex<HashMap<NodeKey, quinn::Connection>>,
     admission: Arc<Admission>,
     deliver: Deliver,
-    limits: Limits,
+    classes: Classes,
+    alpn: Vec<u8>,
     quiet: Duration,
     assembling: usize,
     spawner: Spawner,
@@ -234,11 +257,11 @@ impl Quic {
         let accepting = Arc::new(transport(config.streams, config.idle));
         let dialing = Arc::new(transport(0, config.idle));
         let table = Table::default();
-        let server = identity.server(Arc::clone(&table), accepting);
+        let server = identity.server(Arc::clone(&table), &config.protocol.alpn, accepting);
         let socket = std::net::UdpSocket::bind(config.listen)?;
         let runner = Runner::start()?;
         let endpoint = quinn::Endpoint::new(
-            identity.endpoint(ALPN),
+            identity.endpoint(&config.protocol),
             Some(server),
             socket,
             Arc::new(Runtime(runner.spawner())),
@@ -247,9 +270,8 @@ impl Quic {
         ring::rand::SystemRandom::new()
             .fill(&mut incarnation)
             .map_err(|_| io::Error::other("no randomness"))?;
-        let (deliver, arrivals) = arrivals(&config.limits);
+        let (deliver, arrivals) = arrivals(&config.classes);
         let inner = Arc::new(Inner {
-            number: config.number,
             identity,
             name: format!("vos-{:016x}", u64::from_be_bytes(incarnation)),
             endpoint,
@@ -259,7 +281,8 @@ impl Quic {
             inbound: Mutex::new(HashMap::new()),
             admission: Arc::new(Admission::new(Handshakes::default())),
             deliver,
-            limits: config.limits,
+            classes: config.classes,
+            alpn: config.protocol.alpn,
             quiet: config.quiet,
             assembling: config.assembling,
             spawner: runner.spawner(),
@@ -292,9 +315,11 @@ impl Quic {
         self.inner.identity.key
     }
 
-    /// Replace the peer table, without a restart: a peer changed or gone
-    /// loses its connections, both ways. Frames it sent that are already
-    /// in the arrival queues stay there.
+    /// Replace the peer table, without a restart: a peer gone loses its
+    /// connections, both ways, and one at a new address the connection
+    /// this node dialed. Frames it sent that are already in the arrival
+    /// queues stay there. Of peers listed twice under one key, the last
+    /// counts; this node's own key is left out.
     pub fn set_peers(&self, peers: Vec<Peer>) {
         self.inner.set_peers(peers);
     }
@@ -318,34 +343,36 @@ impl Inner {
     }
 
     fn set_peers(&self, peers: Vec<Peer>) {
-        let peers: Vec<Peer> = peers
+        let own = self.identity.key;
+        let peers: HashMap<NodeKey, Peer> = peers
             .into_iter()
-            .filter(|peer| peer.number != self.number)
+            .filter(|peer| peer.key != own)
+            .map(|peer| (peer.key, peer))
             .collect();
         let mut links = self.links.lock().expect("the links");
-        let table: HashMap<NodeKey, NodeNumber> =
-            peers.iter().map(|peer| (peer.key, peer.number)).collect();
-        self.admission.set_peers(&peers);
+        let table: std::collections::HashSet<NodeKey> = peers.keys().copied().collect();
+        let listed: Vec<Peer> = peers.values().cloned().collect();
+        self.admission.set_peers(&listed);
         *self.table.write().expect("the peer table") = table.clone();
-        // A key gone, or under another number, loses its connection into
-        // this node, and what its readers hold.
+        // A key gone loses its connection into this node, and what its
+        // readers hold.
         self.inbound
             .lock()
             .expect("the inbound connections")
-            .retain(|key, (number, connection)| {
-                let kept = table.get(key) == Some(number);
+            .retain(|key, connection| {
+                let kept = table.contains(key);
                 if !kept {
                     connection.close(code::UNCONFIGURED, b"");
                 }
                 kept
             });
         let mut kept = HashMap::new();
-        for peer in peers {
-            let link = match links.remove(&peer.number) {
+        for (key, peer) in peers {
+            let link = match links.remove(&key) {
                 Some(link) if link.peer == peer && !link.task.is_finished() => link,
-                _ => Link::spawn(self, peer.clone()),
+                _ => Link::spawn(self, peer),
             };
-            kept.insert(peer.number, link);
+            kept.insert(key, link);
         }
         // Dropping a link stops its task, which closes its connection.
         *links = kept;
@@ -353,9 +380,9 @@ impl Inner {
 
     /// Peer `from` dialed in with `name`: if that is a new incarnation,
     /// this node's connection to it reached the old one.
-    fn dialed_in(&self, from: NodeNumber, name: Option<String>) {
+    fn dialed_in(&self, from: &NodeKey, name: Option<String>) {
         let mut links = self.links.lock().expect("the links");
-        let Some(link) = links.get_mut(&from) else {
+        let Some(link) = links.get_mut(from) else {
             return;
         };
         if link.incarnation.is_some()
@@ -367,18 +394,20 @@ impl Inner {
         link.incarnation = name;
     }
 
-    /// `connection`, just authenticated as `key`'s: the number the key is
-    /// configured for, and the connection takes the place of the key's
+    /// `connection`, just authenticated as `key`'s: whether the key is
+    /// configured, and then the connection takes the place of the key's
     /// earlier one into this node, which closes. The table is read under
     /// the inbound connections' lock, so a removal that comes meanwhile
     /// finds the connection and closes it.
-    fn dialed(&self, key: NodeKey, connection: &quinn::Connection) -> Option<NodeNumber> {
+    fn dialed(&self, key: NodeKey, connection: &quinn::Connection) -> bool {
         let mut inbound = self.inbound.lock().expect("the inbound connections");
-        let from = self.peer_number(&key)?;
-        if let Some((_, earlier)) = inbound.insert(key, (from, connection.clone())) {
+        if !self.configured(&key) {
+            return false;
+        }
+        if let Some(earlier) = inbound.insert(key, connection.clone()) {
             earlier.close(code::REPLACED, b"");
         }
-        Some(from)
+        true
     }
 
     /// `connection`, `key`'s, ended: forget it, unless a newer one took
@@ -387,19 +416,15 @@ impl Inner {
         let mut inbound = self.inbound.lock().expect("the inbound connections");
         if inbound
             .get(key)
-            .is_some_and(|(_, held)| held.stable_id() == connection.stable_id())
+            .is_some_and(|held| held.stable_id() == connection.stable_id())
         {
             inbound.remove(key);
         }
     }
 
-    /// The configured peer whose key is `key`.
-    fn peer_number(&self, key: &NodeKey) -> Option<NodeNumber> {
-        self.table.read().expect("the peer table").get(key).copied()
-    }
-
-    fn configured(&self, key: &NodeKey, from: NodeNumber) -> bool {
-        self.peer_number(key) == Some(from)
+    /// Whether a configured peer has `key`.
+    fn configured(&self, key: &NodeKey) -> bool {
+        self.table.read().expect("the peer table").contains(key)
     }
 }
 
@@ -430,14 +455,11 @@ fn transport(streams: u32, idle: Duration) -> quinn::TransportConfig {
 }
 
 impl Network for Quic {
-    fn send(
-        &self,
-        to: NodeNumber,
-        class: Class,
-        stream: u64,
-        frame: Vec<u8>,
-    ) -> Result<(), Refused> {
-        if frame.len() > self.inner.limits.of(class) {
+    fn send(&self, to: NodeKey, class: Class, stream: u64, frame: Vec<u8>) -> Result<(), Refused> {
+        if self.inner.classes.get(class).is_none() {
+            return Err(Refused::UnknownClass);
+        }
+        if frame.len() > self.inner.classes.max_frame(class) {
             return Err(Refused::TooLarge);
         }
         let links = self.inner.links.lock().expect("the links");
@@ -456,17 +478,18 @@ impl Network for Quic {
         link.frames.try_send(outgoing).map_err(|_| Refused::Closed)
     }
 
-    fn limits(&self) -> Limits {
-        self.inner.limits
+    fn classes(&self) -> Classes {
+        self.inner.classes.clone()
     }
 
-    fn ready(&self, to: NodeNumber, class: Class) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn ready(&self, to: NodeKey, class: Class) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let queued = self
             .inner
             .links
             .lock()
             .expect("the links")
             .get(&to)
+            .filter(|_| self.inner.classes.get(class).is_some())
             .map(|link| Arc::clone(&link.queued));
         Box::pin(async move {
             if let Some(queued) = queued {
@@ -476,13 +499,66 @@ impl Network for Quic {
     }
 }
 
+/// The accepting side of protocol `alpn` for the node whose secret seed
+/// is `secret`, taking a dialing side whose key `allowed` takes, with TLS
+/// 1.3 bound to node keys as between peers. No session resumes: every
+/// handshake checks the key. Address validation, bounds on handshakes and
+/// connections, and migration are the caller's.
+pub fn server_config(
+    secret: &[u8; 32],
+    alpn: &[u8],
+    allowed: impl Fn(&NodeKey) -> bool + Send + Sync + 'static,
+    transport: Arc<quinn::TransportConfig>,
+) -> quinn::ServerConfig {
+    Identity::new(secret).server_with(Arc::new(allowed), alpn, transport)
+}
+
+/// The dialing side of protocol `alpn` for the node whose secret seed is
+/// `secret`, pinned to the accepting side whose key is `server`.
+pub fn client_config(
+    secret: &[u8; 32],
+    alpn: &[u8],
+    server: NodeKey,
+    transport: Arc<quinn::TransportConfig>,
+) -> quinn::ClientConfig {
+    Identity::new(secret).client_with(alpn, server, transport)
+}
+
+/// The endpoint's configuration of `protocol` for the node whose secret
+/// seed is `secret`, as a [`Quic`] endpoint's: QUIC version 1, its
+/// stateless resets and connection ids keyed by the secret and the
+/// protocol, apart from the secret's endpoints of other protocols.
+pub fn endpoint_config(secret: &[u8; 32], protocol: &Protocol) -> quinn::EndpointConfig {
+    Identity::new(secret).endpoint(protocol)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ClassSpec, Streams};
 
     #[test]
     fn configuration_that_takes_no_frame_is_refused() {
-        let config = || Config::new(1, [1; 32], "127.0.0.1:0".parse().unwrap());
+        let classes = Classes::new([ClassSpec {
+            priority: 0,
+            max_frame: 1,
+            arrivals: 1,
+            streams: Streams::PerId,
+            max_age: None,
+        }])
+        .unwrap();
+        let protocol = Protocol {
+            alpn: b"test/1".to_vec(),
+            domain: b"test/".to_vec(),
+        };
+        let config = || {
+            Config::new(
+                [1; 32],
+                "127.0.0.1:0".parse().unwrap(),
+                protocol.clone(),
+                classes.clone(),
+            )
+        };
         let refused = |config: Config| {
             Quic::bind(config).err().map(|error| error.kind()) == Some(io::ErrorKind::InvalidInput)
         };
@@ -495,16 +571,18 @@ mod tests {
             ..config()
         }));
         assert!(refused(Config {
-            limits: Limits {
-                liveness: 0,
-                ..Limits::default()
-            },
-            ..config()
-        }));
-        assert!(refused(Config {
             idle: Duration::from_secs(u64::MAX / 2),
             ..config()
         }));
+        for alpn in [Vec::new(), vec![b'a'; 256]] {
+            assert!(refused(Config {
+                protocol: Protocol {
+                    alpn,
+                    ..protocol.clone()
+                },
+                ..config()
+            }));
+        }
         assert!(Quic::bind(config()).is_ok());
     }
 }

@@ -11,10 +11,10 @@ use smol::stream::StreamExt;
 
 use super::executor::{Spawner, Tasks};
 use super::{
-    BULK_STREAMS, CRYPTO_ERRORS, DIAL, HEADER, Inner, MAX_BACKOFF, MIN_BACKOFF, SETTLED, code,
+    CRYPTO_ERRORS, DIAL, FRAME_STREAMS, HEADER, Inner, MAX_BACKOFF, MIN_BACKOFF, SETTLED, code,
     within,
 };
-use crate::{Budgets, Class, Hold, Peer};
+use crate::{Budgets, Class, Classes, Hold, Peer, Streams};
 
 /// A frame on its way, holding its bytes in its peer's queue until it is
 /// written or lost.
@@ -44,12 +44,15 @@ impl Link {
     pub(super) fn spawn(inner: &Inner, peer: Peer) -> Self {
         let connection = Arc::default();
         let (frames, queued) = smol::channel::unbounded();
-        let client = inner.identity.client(peer.key, Arc::clone(&inner.dialing));
+        let client = inner
+            .identity
+            .client_with(&inner.alpn, peer.key, Arc::clone(&inner.dialing));
         let dialing = Dialing {
             endpoint: inner.endpoint.clone(),
             client,
             address: peer.address,
             name: inner.name.clone(),
+            classes: inner.classes.clone(),
             quiet: inner.quiet,
             spawner: inner.spawner.clone(),
         };
@@ -60,7 +63,13 @@ impl Link {
         Self {
             peer,
             frames,
-            queued: Budgets::with(Class::ALL.map(|class| inner.limits.queue(class))),
+            queued: Budgets::with(
+                inner
+                    .classes
+                    .iter()
+                    .map(|(class, _)| inner.classes.queue(class))
+                    .collect(),
+            ),
             connection,
             incarnation: None,
             task,
@@ -74,6 +83,7 @@ struct Dialing {
     client: quinn::ClientConfig,
     address: SocketAddr,
     name: String,
+    classes: Classes,
     quiet: Duration,
     spawner: Spawner,
 }
@@ -117,7 +127,7 @@ impl Dialing {
             };
             *held.lock().expect("the connection") = Some(connection.clone());
             let connected = Instant::now();
-            self.write(&connection, connected, &mut next, &queued).await;
+            self.write(&connection, &mut next, &queued).await;
             *held.lock().expect("the connection") = None;
             if refused(&connection) {
                 // The peer took the handshake, then refused this node:
@@ -135,14 +145,13 @@ impl Dialing {
 
     /// Write queued frames on `connection`, just made, until it closes. A
     /// frame taken but not yet handed to a stream stays in `next`, for the
-    /// next connection. A liveness frame queued before the connection was
-    /// made is dropped: it would say, late, that its sender was alive
-    /// then. One handed to a connection that outlives a cut is QUIC's to
-    /// deliver, and may still arrive late, after the cut heals.
+    /// next connection. A frame of a class with an age, taken once it has
+    /// waited longer, is dropped. One handed to a connection that outlives
+    /// a cut is QUIC's to deliver, and may still arrive late, after the
+    /// cut heals.
     async fn write(
         &self,
         connection: &quinn::Connection,
-        connected: Instant,
         next: &mut Option<Outgoing>,
         queued: &smol::channel::Receiver<Outgoing>,
     ) {
@@ -159,7 +168,7 @@ impl Dialing {
         let every = (self.quiet / 2).max(Duration::from_millis(1));
         let mut sweep = smol::Timer::interval(every);
         let mut swept = Instant::now();
-        let bulk = Arc::new(smol::lock::Semaphore::new(BULK_STREAMS));
+        let single = Arc::new(smol::lock::Semaphore::new(FRAME_STREAMS));
         let mut sending = Tasks::default();
         loop {
             // Swept on time even while frames never stop coming.
@@ -191,19 +200,24 @@ impl Dialing {
                     }
                 }
             };
-            if frame.class == Class::Liveness && frame.queued < connected {
+            let spec = self
+                .classes
+                .get(frame.class)
+                .expect("a class `send` checked");
+            if spec.max_age.is_some_and(|age| frame.queued.elapsed() > age) {
                 continue;
             }
             if connection.close_reason().is_some() {
                 *next = Some(frame);
                 return;
             }
-            if frame.class.stream_per_frame() {
+            let priority = spec.priority;
+            if spec.streams == Streams::PerFrame {
                 let connection = connection.clone();
-                let bulk = Arc::clone(&bulk);
+                let single = Arc::clone(&single);
                 let sent = async move {
-                    let _permit = bulk.acquire().await;
-                    let _ = write_bulk(&connection, frame).await;
+                    let _permit = single.acquire().await;
+                    let _ = write_single(&connection, frame, priority).await;
                 };
                 if !sending.spawn(&self.spawner, sent) {
                     return;
@@ -226,7 +240,7 @@ impl Dialing {
             let Some(writer) = Writer::spawn(
                 &self.spawner,
                 connection.clone(),
-                frame.class,
+                (frame.class, priority),
                 frame.stream,
                 previous,
             ) else {
@@ -282,10 +296,11 @@ struct Writer {
 impl Writer {
     /// A writer for a new stream, opened once `previous`, the last stream
     /// for the same id, is finished and all acknowledged.
+    /// `class` is the stream's class and its priority.
     fn spawn(
         spawner: &Spawner,
         connection: quinn::Connection,
-        class: Class,
+        class: (Class, i32),
         stream: u64,
         previous: Option<smol::Task<()>>,
     ) -> Option<Self> {
@@ -318,17 +333,17 @@ impl Writer {
     }
 }
 
-/// A new stream for frames of `class` with id `stream`: sent by its
+/// A new stream for frames of `class` with id `stream`: sent by the
 /// class's priority, its header written.
 async fn open(
     connection: &quinn::Connection,
-    class: Class,
+    (class, priority): (Class, i32),
     stream: u64,
 ) -> Option<quinn::SendStream> {
     let mut send = connection.open_uni().await.ok()?;
-    send.set_priority(class.priority()).ok()?;
+    send.set_priority(priority).ok()?;
     let mut header = [0u8; HEADER];
-    header[0] = class as u8;
+    header[0] = class;
     header[1..].copy_from_slice(&stream.to_be_bytes());
     send.write_all(&header).await.ok()?;
     Some(send)
@@ -340,9 +355,14 @@ async fn write_frame(send: &mut quinn::SendStream, frame: &[u8]) -> Result<(), q
     send.write_all(frame).await
 }
 
-/// A bulk frame on a stream of its own, held until the peer has it all.
-async fn write_bulk(connection: &quinn::Connection, frame: Outgoing) -> Option<()> {
-    let mut send = open(connection, frame.class, frame.stream).await?;
+/// A frame on a stream of its own, sent by `priority`, held until the peer
+/// has it all.
+async fn write_single(
+    connection: &quinn::Connection,
+    frame: Outgoing,
+    priority: i32,
+) -> Option<()> {
+    let mut send = open(connection, (frame.class, priority), frame.stream).await?;
     write_frame(&mut send, &frame.frame).await.ok()?;
     send.finish().ok()?;
     drop(frame);

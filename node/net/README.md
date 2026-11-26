@@ -1,23 +1,30 @@
 # vos-net
 
-The network between VOS nodes: authenticated channels between node keys,
-classes of traffic, and streams by id or by frame. It knows nothing of
-consensus; frames are bytes, and their meaning belongs to the layer above.
+A network of nodes that know each other by their ed25519 keys:
+authenticated channels between node keys, classes of traffic the caller
+defines, and streams by id or by frame. Frames are bytes, and their
+meaning belongs to the layer above.
 
 ## The model
 
-- **A node is its ed25519 key.** Every arrival carries the authenticated
-  peer it came from, and a node takes frames only from the peers it lists.
-- **Classes of traffic** (`Class`): Liveness (pair heartbeats), Consensus,
-  Requests and Bulk, each with its priority, its own arrival queue and its
-  own bound on a frame's size (`Limits`).
-- **Streams.** Liveness, Consensus and Requests frames travel on a
-  long-lived stream per id, which the caller chooses, so one id's large
-  frame never delays another's; Bulk opens a stream per frame.
+- **A peer is its ed25519 key and its address.** Every arrival carries the
+  authenticated key it came from, and a node takes frames only from the
+  keys it lists. Naming peers otherwise (by a number, a role) is the
+  caller's, over the keys.
+- **Classes of traffic** are a table the caller supplies (`Classes`, at
+  most `MAX_CLASSES`); a class is its index in it, and the byte that opens
+  each stream. Each class (`ClassSpec`) has a priority (a stream of a
+  higher one is sent first), a bound on a frame's size, a bound on its
+  arrival queue in frames, its streams (`Streams::PerId` or
+  `Streams::PerFrame`), and an optional age past which a frame waiting to
+  be sent is dropped, for frames that say something only while fresh.
+- **Streams.** A class of streams per id sends on a long-lived stream per
+  id, which the caller chooses, so one id's large frame never delays
+  another's; a class of streams per frame opens a stream per frame.
 - **The interface** is the `Network` trait: `send` refuses with a reason
-  (`Refused`: a full queue, an unknown peer, an oversized frame, a link
-  down for good), and arrivals come in a bounded queue per class
-  (`Arrivals`), which a consumer drains Liveness and Consensus first.
+  (`Refused`: a full queue, an unknown peer or class, an oversized frame, a
+  link down for good), and arrivals come in a bounded queue per class
+  (`Arrivals`), which the consumer drains in an order of its own.
 
 Two implementations:
 
@@ -28,16 +35,21 @@ Two implementations:
   open no stream on it. A dropped connection is redialed on the next frame
   sent, with backoff when it was refused or closed soon after it was made;
   frames sent meanwhile wait in a bounded queue per peer and class, and
-  those already handed to the dropped connection are lost with it.
-  Stateless resets are keyed by the node's secret and the endpoint's
-  protocol, so a restarted node resets at once the connections its last
-  run held, and the node API's endpoint gives out no reset token of a
-  peer connection.
+  those already handed to the dropped connection are lost with it. The
+  caller names the protocol (`quic::Protocol`): its ALPN name, and the
+  domain the endpoint's keys are derived under. Stateless resets are
+  keyed by the node's secret, the domain and the ALPN name, so a restarted
+  node resets at once the connections its last run held, and an endpoint
+  of one protocol gives out no reset token of another's connections.
 - `memory::Hub`: endpoints in one process, for tests, with links that can
-  be cut, lose frames at a rate and delay them.
+  be cut, lose frames at a rate and delay them. It drops no frame for its
+  age.
 
-`api` holds the TLS configuration of the node API's QUIC endpoint (its own
-protocol, `vos-api/1`, its own allowlist, keys and executor); address
+For a QUIC endpoint of the caller's own (a client-server protocol over the
+same keys), `quic::server_config`, `quic::client_config` and
+`quic::endpoint_config` build its TLS and endpoint configurations (an
+allowlist of keys on the accepting side, one pinned key on the dialing
+side), and `quic::Runner` gives it an executor of its own; address
 validation and bounds on its handshakes and connections are its caller's.
 
 ## Guarantees
@@ -49,8 +61,9 @@ validation and bounds on its handshakes and connections are its caller's.
 - A send never waits: a queue past its budget refuses, and `ready` says
   when it has room again. A full arrival queue holds its stream's reader,
   and so the sender, as flow control.
-- No age bound but Liveness's: a frame queued through an outage is sent
-  when the peer is reached again, however late.
+- No age bound but a class's own: a frame of a class without an age,
+  queued through an outage, is sent when the peer is reached again,
+  however late.
 
 ## Bounds against peers
 
@@ -67,16 +80,15 @@ What a sender can make a node spend, over QUIC:
   address's places; a peer that dials from an address other than its
   configured one competes with strangers for the 64.
 - **One inbound connection per key:** a newer one replaces the older.
-  A peer removed from the table, or given another number, loses it at
-  once.
+  A peer removed from the table loses it at once.
 - **Frames being assembled:** each class's frames from one peer take
   their bytes from a budget of 4 of that class's largest frames (1 MiB
   at least; a budget under its bound takes one frame more) before they
   are read; past it a stream waits unread.
 - **Frames waiting for the consumer:** each class's queue holds, from
   every peer, the bytes of 4 of its largest frames, counted the same
-  way (and 1,024 frames, 16 for Bulk); a frame counts until the consumer
-  drops it.
+  way (and the class's own bound in frames); a frame counts until the
+  consumer drops it.
 - **Protocol violations:** the first is logged; at the 16th on one
   connection, it is closed.
 
@@ -84,9 +96,9 @@ Limits that stay:
 
 - What quinn buffers for a peer's streams not being read is bounded by
   `quic::Config::streams` times a stream's window (1 MiB): 8 GiB at the
-  default of 8,192 streams, 4 GiB at the 4,096 a VOS node sets. A finite connection window would bound it
-  lower but would let unread streams of one class stall a peer's
-  heartbeats; a node sets `streams` to what its traffic needs.
+  default of 8,192 streams. A finite connection window would bound it
+  lower but would let unread streams of one class stall a peer's other
+  classes; a node sets `streams` to what its traffic needs.
 - A peer's frames of one class share that class's queue with every other
   peer's, so a peer that floods takes most of its places.
 - A configured peer can still spend the node's thread on what it sends;
@@ -101,21 +113,14 @@ Limits that stay:
 
 ## Tests
 
-`cargo test -p vos-net`: unit tests; `tests/memory.rs` (the hub:
-partitions, losses, delays, restarts, the peer list); `tests/quic.rs`
-(three nodes on localhost: every class, order within a stream, keys not
-configured refused on either side, oversized frames, removed and
-unreachable peers, each class's send queue budget, quiet streams); `tests/restart.rs` (a peer killed and
-started again in a child process); `tests/head_of_line.rs` (consensus
-frames' latency beside bulk frames to the same peer); `tests/hostile.rs`
-(the bounds above, against peers and strangers running code of their
-own).
-
-## Users
-
-Built for the VOS node (`node/host`: `src/peer.rs`,
-`src/liveness.rs`, `src/dispatch.rs`, `src/api/quic.rs`, `src/tls.rs`,
-`src/client/api.rs`), the HTTP front (`node/http/src/tls.rs`), the
-gateway (`node/gateway/src/upstream.rs`), the scale harness
-(`tools/scale`) and the carrier audit's capture of the hub's frames
-(`node/checker/src/carriers/capture.rs`).
+`cargo test -p vos-net`, with a table of four classes like a cluster's
+(heartbeats with an age, two classes of streams per id, and large frames
+a stream each): unit tests; `tests/memory.rs` (the hub: partitions,
+losses, delays, restarts, the peer list); `tests/quic.rs` (three nodes on
+localhost: every class, order within a stream, keys not configured
+refused on either side, a frame past its class's age, oversized frames,
+removed and unreachable peers, each class's send queue budget, quiet
+streams); `tests/restart.rs` (a peer killed and started again in a child
+process); `tests/head_of_line.rs` (small frames' latency beside large
+frames to the same peer); `tests/hostile.rs` (the bounds above, against
+peers and strangers running code of their own).

@@ -13,12 +13,8 @@ use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, SubjectPublicKeyInfoDer, UnixTime,
 };
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use vos_net::api::{Runner, Runtime};
-use vos_net::quic::Quic;
-use vos_net::{Arrivals, Class, Limits, NodeKey, public_key};
-
-/// The peers' protocol.
-const ALPN: &[u8] = b"vos/1";
+use vos_net::quic::{Quic, Runner, Runtime};
+use vos_net::{Arrivals, Class, NodeKey, public_key};
 
 fn endpoint(server: Option<quinn::ServerConfig>) -> quinn::Endpoint {
     quinn::Endpoint::new(
@@ -34,7 +30,7 @@ fn endpoint(server: Option<quinn::ServerConfig>) -> quinn::Endpoint {
 fn other_client(secret: [u8; 32], node: NodeKey) -> quinn::ClientConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.send_window(64 << 20);
-    vos_net::api::client_config_for(&secret, ALPN, node, Arc::new(transport))
+    vos_net::quic::client_config(&secret, ALPN, node, Arc::new(transport))
 }
 
 /// A connection to `node` holding node 2's key.
@@ -54,7 +50,7 @@ async fn dial_as_2(node: &Quic) -> (quinn::Endpoint, quinn::Connection) {
 
 fn header(class: Class, id: u64) -> [u8; 9] {
     let mut header = [0u8; 9];
-    header[0] = class as u8;
+    header[0] = class;
     header[1..].copy_from_slice(&id.to_be_bytes());
     header
 }
@@ -142,7 +138,7 @@ fn a_dialed_peer_is_granted_no_streams() {
         let (a, _a_arrivals) = bind(1);
         let other = other_server(secret(2));
         a.set_peers(vec![peer_at(2, other.local_addr().unwrap())]);
-        send(&a, 2, Class::Consensus, 1, b"hello".to_vec()).await;
+        send(&a, key(2), CONSENSUS, 1, b"hello".to_vec()).await;
         let connection = other.accept().await.unwrap().await.unwrap();
         let opened = within(Duration::from_millis(500), connection.open_uni()).await;
         assert!(
@@ -162,13 +158,10 @@ fn a_peer_holds_one_inbound_connection() {
         for _ in 0..8 {
             let (client, connection) = dial_as_2(&a).await;
             let mut stream = connection.open_uni().await.unwrap();
-            stream
-                .write_all(&header(Class::Consensus, 1))
-                .await
-                .unwrap();
+            stream.write_all(&header(CONSENSUS, 1)).await.unwrap();
             stream.write_all(&2u32.to_be_bytes()).await.unwrap();
             stream.write_all(b"hi").await.unwrap();
-            assert_eq!(next(&a_arrivals.consensus).await.frame, b"hi");
+            assert_eq!(next(a_arrivals.queue(CONSENSUS)).await.frame, b"hi");
             held.push((client, connection, stream));
         }
         // The earlier seven close as the later ones are taken.
@@ -193,6 +186,34 @@ fn a_peer_holds_one_inbound_connection() {
     });
 }
 
+/// A stream that opens with a class the table does not hold is stopped,
+/// and the connection's other streams are read on.
+#[test]
+fn a_stream_of_a_class_past_the_table_is_stopped() {
+    smol::block_on(async {
+        let (a, a_arrivals, _) = node_1();
+        let (_client, connection) = dial_as_2(&a).await;
+        let mut unknown = connection.open_uni().await.unwrap();
+        unknown
+            .write_all(&header(ALL.len() as Class, 1))
+            .await
+            .unwrap();
+        unknown.write_all(&2u32.to_be_bytes()).await.unwrap();
+        unknown.write_all(b"no").await.unwrap();
+        let stopped = within(Duration::from_secs(5), unknown.stopped()).await;
+        assert!(
+            matches!(stopped, Some(Ok(Some(_)))),
+            "the stream was not stopped: {stopped:?}"
+        );
+        let mut known = connection.open_uni().await.unwrap();
+        known.write_all(&header(CONSENSUS, 1)).await.unwrap();
+        known.write_all(&3u32.to_be_bytes()).await.unwrap();
+        known.write_all(b"yes").await.unwrap();
+        assert_eq!(next(a_arrivals.queue(CONSENSUS)).await.frame, b"yes");
+        assert!(silent(&a_arrivals, Duration::from_millis(200)).await);
+    });
+}
+
 /// Frames a peer began and never finished: what one peer may have the
 /// node assemble at once is a few of its class's largest frames, not a
 /// frame per stream it may open.
@@ -201,7 +222,7 @@ fn unfinished_frames_from_one_peer_are_bounded() {
     smol::block_on(async {
         let (a, a_arrivals, _) = node_1();
         let (_client, connection) = dial_as_2(&a).await;
-        let limit = Limits::default().consensus;
+        let limit = MAX_FRAME[usize::from(CONSENSUS)];
         const STREAMS: u64 = 12;
         let taken = Arc::new(AtomicUsize::new(0));
         let mut writers = Vec::new();
@@ -209,10 +230,7 @@ fn unfinished_frames_from_one_peer_are_bounded() {
             let mut stream = connection.open_uni().await.unwrap();
             let taken = Arc::clone(&taken);
             writers.push(smol::spawn(async move {
-                stream
-                    .write_all(&header(Class::Consensus, id))
-                    .await
-                    .unwrap();
+                stream.write_all(&header(CONSENSUS, id)).await.unwrap();
                 stream
                     .write_all(&u32::try_from(limit).unwrap().to_be_bytes())
                     .await
@@ -254,27 +272,27 @@ fn unfinished_frames_from_one_peer_are_bounded() {
 fn an_arrival_queue_is_bounded_in_bytes() {
     smol::block_on(async {
         let nodes = Arc::new(cluster(2));
-        let limit = Limits::default().requests;
+        let limit = MAX_FRAME[usize::from(REQUESTS)];
         // Sixteen of the largest frames, each on an id of its own: the
         // sender waits as the receiver pushes back.
         let sending = smol::spawn({
             let nodes = Arc::clone(&nodes);
             async move {
                 for id in 0..16 {
-                    send(&nodes[0].0, 2, Class::Requests, id, vec![7; limit]).await;
+                    send(&nodes[0].0, key(2), REQUESTS, id, vec![7; limit]).await;
                 }
             }
         });
         let b_arrivals = &nodes[1].1;
         smol::Timer::after(Duration::from_millis(1000)).await;
-        let waiting = b_arrivals.requests.len();
+        let waiting = b_arrivals.queue(REQUESTS).len();
         assert!(
             waiting <= 5,
             "{waiting} of the largest frames wait for the consumer"
         );
         // They are delivered all the same, as the consumer takes them.
         for _ in 0..16 {
-            assert_eq!(next(&b_arrivals.requests).await.frame.len(), limit);
+            assert_eq!(next(b_arrivals.queue(REQUESTS)).await.frame.len(), limit);
         }
         sending.await;
     });
@@ -290,23 +308,23 @@ fn a_full_queue_of_one_class_does_not_hold_another() {
         for i in 0..1500u32 {
             send(
                 a,
-                2,
-                Class::Requests,
+                key(2),
+                REQUESTS,
                 u64::from(i % 8),
                 i.to_be_bytes().to_vec(),
             )
             .await;
         }
         let started = Instant::now();
-        while !b_arrivals.requests.is_full() {
+        while !b_arrivals.queue(REQUESTS).is_full() {
             assert!(started.elapsed() < Duration::from_secs(30), "never full");
             smol::Timer::after(Duration::from_millis(10)).await;
         }
-        send(a, 2, Class::Consensus, 1, b"consensus".to_vec()).await;
-        send(a, 2, Class::Liveness, 1, b"alive".to_vec()).await;
+        send(a, key(2), CONSENSUS, 1, b"consensus".to_vec()).await;
+        send(a, key(2), LIVENESS, 1, b"alive".to_vec()).await;
         let started = Instant::now();
-        assert_eq!(next(&b_arrivals.consensus).await.frame, b"consensus");
-        assert_eq!(next(&b_arrivals.liveness).await.frame, b"alive");
+        assert_eq!(next(b_arrivals.queue(CONSENSUS)).await.frame, b"consensus");
+        assert_eq!(next(b_arrivals.queue(LIVENESS)).await.frame, b"alive");
         assert!(started.elapsed() < Duration::from_secs(5));
     });
 }
@@ -317,8 +335,8 @@ async fn latencies(a: &Quic, arrivals: &Arrivals, samples: usize) -> Vec<Duratio
     let mut taken = Vec::new();
     for i in 0..samples {
         let sent = Instant::now();
-        send(a, 2, Class::Consensus, 1, (i as u32).to_be_bytes().to_vec()).await;
-        next(&arrivals.consensus).await;
+        send(a, key(2), CONSENSUS, 1, (i as u32).to_be_bytes().to_vec()).await;
+        next(arrivals.queue(CONSENSUS)).await;
         taken.push(sent.elapsed());
         smol::Timer::after(Duration::from_millis(5)).await;
     }
@@ -433,10 +451,7 @@ fn a_removed_peer_s_inbound_connection_closes() {
         let (a, a_arrivals, _) = node_1();
         let (_client, connection) = dial_as_2(&a).await;
         let mut stream = connection.open_uni().await.unwrap();
-        stream
-            .write_all(&header(Class::Consensus, 1))
-            .await
-            .unwrap();
+        stream.write_all(&header(CONSENSUS, 1)).await.unwrap();
         stream.write_all(&(4u32 << 20).to_be_bytes()).await.unwrap();
         stream.write_all(&vec![0u8; 2 << 20]).await.unwrap();
         a.set_peers(Vec::new());
@@ -472,7 +487,7 @@ fn a_peer_that_closes_at_once_is_dialed_with_backoff() {
         });
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs(2) {
-            let _ = vos_net::Network::send(&a, 2, Class::Consensus, 1, b"frame".to_vec());
+            let _ = vos_net::Network::send(&a, key(2), CONSENSUS, 1, b"frame".to_vec());
             smol::Timer::after(Duration::from_micros(200)).await;
         }
         other.close(quinn::VarInt::from_u32(0), b"");

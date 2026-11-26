@@ -128,7 +128,6 @@ mod tests {
 
     fn peer_at(address: &str) -> Peer {
         Peer {
-            number: 1,
             key: [0; 32],
             address: address.parse().unwrap(),
         }

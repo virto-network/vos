@@ -4,7 +4,7 @@
 //! dialing side against the one peer it dialed, the accepting side against
 //! every configured peer's.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use ring::signature::KeyPair;
@@ -18,10 +18,8 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
-use crate::{NodeKey, NodeNumber};
-
-/// The peers' protocol.
-pub(crate) const ALPN: &[u8] = b"vos/1";
+use crate::NodeKey;
+use crate::quic::Protocol;
 
 /// An ed25519 key's SubjectPublicKeyInfo, before the key.
 const SPKI_PREFIX: [u8; 12] = [
@@ -33,19 +31,18 @@ const PKCS8_PREFIX: [u8; 16] = [
     0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
 ];
 
-/// What an endpoint's stateless-reset key is derived under, apart from
-/// every other use of the node's secret, followed by the endpoint's
-/// protocol.
-const RESET_DOMAIN: &[u8] = b"vos/net/stateless-reset/v2/";
+/// What an endpoint's stateless-reset key is derived under, after the
+/// caller's domain and before the endpoint's protocol.
+const RESET_LABEL: &[u8] = b"stateless-reset/v2/";
 /// What the key that marks an endpoint's connection ids is derived under,
-/// followed by the endpoint's protocol.
-const CONNECTION_IDS_DOMAIN: &[u8] = b"vos/net/connection-ids/v2/";
+/// after the caller's domain and before the endpoint's protocol.
+const CONNECTION_IDS_LABEL: &[u8] = b"connection-ids/v2/";
 /// A connection id's random bytes, then its mark's.
 const ID_RANDOM: usize = 8;
 const ID_MARK: usize = 8;
 
-/// The configured peers, by key: what the accepting side takes.
-pub(crate) type Table = Arc<RwLock<HashMap<NodeKey, NodeNumber>>>;
+/// The configured peers' keys: what the accepting side takes.
+pub(crate) type Table = Arc<RwLock<HashSet<NodeKey>>>;
 
 /// The public key of the node whose secret seed is `secret`.
 pub fn public_key(secret: &[u8; 32]) -> NodeKey {
@@ -100,9 +97,9 @@ pub(crate) struct Identity {
     derive: ring::hmac::Key,
 }
 
-/// An endpoint's keys: each of a node's endpoints has its own, so neither
-/// takes the other's connection ids for its own, nor gives out their
-/// reset tokens.
+/// An endpoint's keys: each protocol a node's secret serves has its own,
+/// so no endpoint takes another's connection ids for its own, nor gives
+/// out their reset tokens.
 struct EndpointKeys {
     reset: ring::hmac::Key,
     connection_ids: ring::hmac::Key,
@@ -129,29 +126,29 @@ impl Identity {
         }
     }
 
-    /// The keys of the endpoint of protocol `alpn`.
-    fn keys(&self, alpn: &[u8]) -> EndpointKeys {
-        let key = |domain: &[u8]| {
-            let label = [domain, alpn].concat();
+    /// The keys of the endpoint of `protocol`.
+    fn keys(&self, protocol: &Protocol) -> EndpointKeys {
+        let key = |label: &[u8]| {
+            let label = [&protocol.domain[..], label, &protocol.alpn[..]].concat();
             ring::hmac::Key::new(
                 ring::hmac::HMAC_SHA256,
                 ring::hmac::sign(&self.derive, &label).as_ref(),
             )
         };
         EndpointKeys {
-            reset: key(RESET_DOMAIN),
-            connection_ids: key(CONNECTION_IDS_DOMAIN),
+            reset: key(RESET_LABEL),
+            connection_ids: key(CONNECTION_IDS_LABEL),
         }
     }
 
-    /// The configuration of the endpoint of protocol `alpn`, QUIC version
-    /// 1 only. A restarted node resets at once the connections its last
-    /// run held: its stateless resets are keyed by the node's secret and
-    /// the protocol, and so is the mark on its connection ids, which it
-    /// checks before resetting (a packet for an id it never made, or the
-    /// node's other endpoint made, is dropped).
-    pub fn endpoint(&self, alpn: &[u8]) -> quinn::EndpointConfig {
-        let keys = self.keys(alpn);
+    /// The configuration of the endpoint of `protocol`, QUIC version 1
+    /// only. A restarted node resets at once the connections its last run
+    /// held: its stateless resets are keyed by the node's secret and the
+    /// protocol, and so is the mark on its connection ids, which it checks
+    /// before resetting (a packet for an id it never made, or an endpoint
+    /// of another protocol made, is dropped).
+    pub fn endpoint(&self, protocol: &Protocol) -> quinn::EndpointConfig {
+        let keys = self.keys(protocol);
         let mut config = quinn::EndpointConfig::new(Arc::new(keys.reset));
         let key = keys.connection_ids;
         config.cid_generator(move || {
@@ -164,16 +161,17 @@ impl Identity {
         config
     }
 
-    /// The accepting side: any configured peer. Peers have configured
-    /// addresses, so a connection never moves to another.
+    /// The accepting side of protocol `alpn`: any configured peer. Peers
+    /// have configured addresses, so a connection never moves to another.
     pub fn server(
         &self,
         peers: Table,
+        alpn: &[u8],
         transport: Arc<quinn::TransportConfig>,
     ) -> quinn::ServerConfig {
         let configured: Expect =
-            Arc::new(move |key| peers.read().expect("the peer table").contains_key(key));
-        let mut config = self.server_with(configured, ALPN, transport);
+            Arc::new(move |key| peers.read().expect("the peer table").contains(key));
+        let mut config = self.server_with(configured, alpn, transport);
         config.migration(false);
         config
     }
@@ -207,15 +205,6 @@ impl Identity {
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         config.transport_config(transport);
         config
-    }
-
-    /// The dialing side, pinned to the one peer it dials.
-    pub fn client(
-        &self,
-        peer: NodeKey,
-        transport: Arc<quinn::TransportConfig>,
-    ) -> quinn::ClientConfig {
-        self.client_with(ALPN, peer, transport)
     }
 
     /// The dialing side of protocol `alpn`, pinned to the one key it
@@ -451,11 +440,19 @@ mod tests {
         assert_eq!(key_of(&other), None);
     }
 
-    /// The connection ids the endpoint of protocol `alpn` makes, for the
-    /// node whose secret seed is `secret`.
-    fn ids(secret: [u8; 32], alpn: &[u8]) -> MarkedIds {
+    /// Two protocols one node's secret may serve.
+    fn protocol(alpn: &[u8]) -> Protocol {
+        Protocol {
+            alpn: alpn.to_vec(),
+            domain: b"test/".to_vec(),
+        }
+    }
+
+    /// The connection ids the endpoint of `protocol` makes, for the node
+    /// whose secret seed is `secret`.
+    fn ids(secret: [u8; 32], protocol: &Protocol) -> MarkedIds {
         MarkedIds {
-            key: Identity::new(&secret).keys(alpn).connection_ids,
+            key: Identity::new(&secret).keys(protocol).connection_ids,
             random: ring::rand::SystemRandom::new(),
         }
     }
@@ -463,23 +460,55 @@ mod tests {
     #[test]
     fn connection_ids_are_new_and_marked() {
         use quinn_proto::ConnectionIdGenerator;
-        let mut ours = ids([5; 32], ALPN);
+        let (one, other) = (protocol(b"one"), protocol(b"other"));
+        let mut ours = ids([5; 32], &one);
         let first = ours.generate_cid();
         let second = ours.generate_cid();
         assert_ne!(first, second);
         assert_eq!(first.len(), 16);
         assert!(ours.validate(&first).is_ok());
         // A restarted run knows them; another node's, or a forged one, not.
-        assert!(ids([5; 32], ALPN).validate(&first).is_ok());
-        assert!(ids([6; 32], ALPN).validate(&first).is_err());
-        // Nor does the node's other endpoint.
-        assert!(ids([5; 32], crate::api::ALPN).validate(&first).is_err());
+        assert!(ids([5; 32], &one).validate(&first).is_ok());
+        assert!(ids([6; 32], &one).validate(&first).is_err());
+        // Nor does the node's endpoint of another protocol, or of another
+        // domain.
+        assert!(ids([5; 32], &other).validate(&first).is_err());
+        let elsewhere = Protocol {
+            domain: b"elsewhere/".to_vec(),
+            ..one.clone()
+        };
+        assert!(ids([5; 32], &elsewhere).validate(&first).is_err());
         let mut forged = first.to_vec();
         forged[15] ^= 1;
         assert!(ours.validate(&quinn::ConnectionId::new(&forged)).is_err());
         assert!(
             ours.validate(&quinn::ConnectionId::new(&first[..8]))
                 .is_err()
+        );
+    }
+
+    /// An endpoint's keys are derived under the domain, the key's label and
+    /// the protocol, in that order.
+    #[test]
+    fn the_endpoint_keys_are_derived_under_domain_label_and_protocol() {
+        let secret = [4; 32];
+        let identity = Identity::new(&secret);
+        let keys = identity.keys(&Protocol {
+            alpn: b"p/1".to_vec(),
+            domain: b"d/".to_vec(),
+        });
+        let tag = |key: &ring::hmac::Key| ring::hmac::sign(key, b"x").as_ref().to_vec();
+        let derived = |label: &[u8]| {
+            let derive = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &secret);
+            ring::hmac::Key::new(
+                ring::hmac::HMAC_SHA256,
+                ring::hmac::sign(&derive, label).as_ref(),
+            )
+        };
+        assert_eq!(tag(&keys.reset), tag(&derived(b"d/stateless-reset/v2/p/1")));
+        assert_eq!(
+            tag(&keys.connection_ids),
+            tag(&derived(b"d/connection-ids/v2/p/1"))
         );
     }
 
@@ -496,29 +525,32 @@ mod tests {
         let identity = Identity::new(&secret);
         let tag = |key: &ring::hmac::Key| ring::hmac::sign(key, b"x").as_ref().to_vec();
         let raw = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &secret);
-        let reset = identity.keys(ALPN).reset;
+        let one = protocol(b"one");
+        let reset = identity.keys(&one).reset;
         assert_ne!(tag(&reset), tag(&raw));
         // It is the same across runs, so resets survive a restart; and
-        // each endpoint has its own.
-        assert_eq!(tag(&reset), tag(&Identity::new(&secret).keys(ALPN).reset));
-        assert_ne!(tag(&reset), tag(&identity.keys(crate::api::ALPN).reset));
+        // each protocol's endpoint has its own.
+        assert_eq!(tag(&reset), tag(&Identity::new(&secret).keys(&one).reset));
+        assert_ne!(tag(&reset), tag(&identity.keys(&protocol(b"other")).reset));
     }
 
-    /// The node API's endpoint, sent a packet bearing a connection id the
-    /// peers' endpoint made, takes it for no id of its own: it answers
-    /// nothing, so it gives out no reset token of a peer connection.
+    /// An endpoint, sent a packet bearing a connection id the same node's
+    /// endpoint of another protocol made, takes it for no id of its own:
+    /// it answers nothing, so it gives out no reset token of the other's
+    /// connections.
     #[test]
-    fn the_api_endpoint_gives_out_no_peer_connection_s_reset_token() {
-        use crate::quic::executor::{Runner, Runtime};
+    fn an_endpoint_gives_out_no_reset_token_of_another_protocol_s_connection() {
+        use crate::quic::{Runner, Runtime, endpoint_config};
         use quinn_proto::ConnectionIdGenerator;
 
         let secret = [5; 32];
-        let id = ids(secret, ALPN).generate_cid();
+        let (peers, other) = (protocol(b"peers"), protocol(b"other"));
+        let id = ids(secret, &peers).generate_cid();
         let runner = Runner::start().unwrap();
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let api = socket.local_addr().unwrap();
+        let address = socket.local_addr().unwrap();
         let _endpoint = quinn::Endpoint::new(
-            crate::api::endpoint_config(&secret),
+            endpoint_config(&secret, &other),
             None,
             socket,
             Arc::new(Runtime(runner.spawner())),
@@ -532,18 +564,18 @@ mod tests {
         anyone
             .set_read_timeout(Some(std::time::Duration::from_millis(500)))
             .unwrap();
-        anyone.send_to(&packet, api).unwrap();
+        anyone.send_to(&packet, address).unwrap();
         let mut answer = [0u8; 128];
         assert!(
             anyone.recv_from(&mut answer).is_err(),
-            "the API endpoint answered a peer connection's id"
+            "the endpoint answered another protocol's connection id"
         );
         // An id of its own it does answer, with that id's reset token.
-        let own = ids(secret, crate::api::ALPN).generate_cid();
+        let own = ids(secret, &other).generate_cid();
         packet[1..1 + own.len()].copy_from_slice(&own);
-        anyone.send_to(&packet, api).unwrap();
+        anyone.send_to(&packet, address).unwrap();
         let (length, _) = anyone.recv_from(&mut answer).expect("a stateless reset");
-        let reset = Identity::new(&secret).keys(crate::api::ALPN).reset;
+        let reset = Identity::new(&secret).keys(&other).reset;
         let token = ring::hmac::sign(&reset, &own);
         assert_eq!(&answer[length - 16..length], &token.as_ref()[..16]);
     }

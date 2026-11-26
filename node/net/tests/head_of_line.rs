@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use common::*;
+use vos_net::Arrivals;
 use vos_net::quic::Quic;
-use vos_net::{Arrivals, Class};
 
 /// Small consensus frames' round of latencies, each the time from send to
 /// arrival.
@@ -21,8 +21,8 @@ async fn latencies(a: &Quic, b: &Arrivals, count: usize) -> Vec<Duration> {
         let sent = started.elapsed().as_nanos() as u64;
         let mut frame = sent.to_be_bytes().to_vec();
         frame.resize(200, 0);
-        send(a, 2, Class::Consensus, i as u64 % 16, frame).await;
-        let incoming = next(&b.consensus).await;
+        send(a, key(2), CONSENSUS, i as u64 % 16, frame).await;
+        let incoming = next(b.queue(CONSENSUS)).await;
         let sent = u64::from_be_bytes(incoming.frame[..8].try_into().unwrap());
         latencies.push(started.elapsed() - Duration::from_nanos(sent));
         smol::Timer::after(Duration::from_millis(1)).await;
@@ -51,14 +51,14 @@ fn bulk_frames_do_not_hold_up_consensus() {
             async move {
                 let mut sent = 0usize;
                 loop {
-                    send(&*a, 2, Class::Bulk, sent as u64, vec![7; BULK_FRAME]).await;
+                    send(&*a, key(2), BULK, sent as u64, vec![7; BULK_FRAME]).await;
                     sent += 1;
                 }
             }
         });
         let moved = Arc::new(AtomicUsize::new(0));
         let drain = smol::spawn({
-            let bulk = b.bulk.clone();
+            let bulk = b.queue(BULK).clone();
             let moved = Arc::clone(&moved);
             async move {
                 while let Ok(incoming) = bulk.recv().await {

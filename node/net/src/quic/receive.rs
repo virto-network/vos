@@ -8,8 +8,7 @@ use std::sync::{Arc, Mutex};
 use super::admit::Place;
 use super::executor::Tasks;
 use super::{HEADER, Inner, STREAM_WINDOW, code, within};
-use crate::tls;
-use crate::{Budgets, Class, Incoming, NodeKey, NodeNumber};
+use crate::{Budgets, Class, Incoming, NodeKey, Streams, short, tls};
 
 /// Streams of one connection that may break the protocol before it is
 /// closed: limits may differ between nodes while a configuration changes,
@@ -37,20 +36,19 @@ pub(super) async fn accept(inner: Arc<Inner>) {
 }
 
 /// Read a peer's connection: every stream it opens, each frame delivered
-/// with the peer its key is configured for.
+/// with the key it was authenticated with.
 async fn serve(inner: Arc<Inner>, incoming: quinn::Incoming, place: Place) {
-    let Some((connection, key, from)) = admitted(&inner, incoming).await else {
+    let Some((connection, key)) = admitted(&inner, incoming).await else {
         place.keep().await;
         return;
     };
     drop(place);
-    inner.dialed_in(from, tls::server_name(&connection));
+    inner.dialed_in(&key, tls::server_name(&connection));
     let peer = Arc::new(Reading {
-        assembling: Budgets::new(&inner.limits, inner.assembling),
+        assembling: Budgets::new(&inner.classes, inner.assembling),
         inner,
         connection: connection.clone(),
         key,
-        from,
         turns: Turns::default(),
         violations: AtomicU32::new(0),
     });
@@ -64,12 +62,11 @@ async fn serve(inner: Arc<Inner>, incoming: quinn::Incoming, place: Place) {
 }
 
 /// `incoming`'s connection, its handshake done within its deadline, with
-/// the key it was authenticated with and the number that key is configured
-/// for: a key no peer has is closed.
+/// the key it was authenticated with: a key no peer has is closed.
 async fn admitted(
     inner: &Inner,
     incoming: quinn::Incoming,
-) -> Option<(quinn::Connection, NodeKey, NodeNumber)> {
+) -> Option<(quinn::Connection, NodeKey)> {
     let connection = match within(inner.admission.deadline(), incoming).await? {
         Ok(connection) => connection,
         Err(error) => {
@@ -78,11 +75,11 @@ async fn admitted(
         }
     };
     let key = tls::peer_key(&connection)?;
-    let Some(from) = inner.dialed(key, &connection) else {
+    if !inner.dialed(key, &connection) {
         connection.close(code::UNCONFIGURED, b"");
         return None;
-    };
-    Some((connection, key, from))
+    }
+    Some((connection, key))
 }
 
 /// A peer's connection being read.
@@ -90,7 +87,6 @@ struct Reading {
     inner: Arc<Inner>,
     connection: quinn::Connection,
     key: NodeKey,
-    from: NodeNumber,
     /// The bytes of the frames being read, per class.
     assembling: Arc<Budgets>,
     turns: Turns,
@@ -106,7 +102,7 @@ impl Reading {
         let count = self.violations.fetch_add(1, Ordering::Relaxed);
         if count == 0 {
             tracing::warn!(
-                from = self.from,
+                from = short(&self.key),
                 class = ?broken.map(|(class, _)| class),
                 length = ?broken.map(|(_, length)| length),
                 "a stream broke the protocol"
@@ -184,23 +180,23 @@ async fn read(peer: Arc<Reading>, mut stream: quinn::RecvStream) {
     if stream.read_exact(&mut header).await.is_err() {
         return;
     }
-    let Some(class) = Class::from_u8(header[0]) else {
+    let class = header[0];
+    let Some(spec) = peer.inner.classes.get(class) else {
         let _ = stream.stop(code::MALFORMED);
         peer.violated(None);
         return;
     };
     let id = u64::from_be_bytes(header[1..].try_into().expect("eight bytes"));
-    let _turn = if class.stream_per_frame() {
-        None
-    } else {
-        Some(peer.turns.take((class, id)).await)
+    let _turn = match spec.streams {
+        Streams::PerFrame => None,
+        Streams::PerId => Some(peer.turns.take((class, id)).await),
     };
     frames(&peer, stream, class, id).await;
 }
 
 /// Deliver a stream's frames until it ends.
 async fn frames(peer: &Reading, mut stream: quinn::RecvStream, class: Class, id: u64) {
-    let limit = peer.inner.limits.of(class);
+    let limit = peer.inner.classes.max_frame(class);
     loop {
         let mut length = [0u8; 4];
         if stream.read_exact(&mut length).await.is_err() {
@@ -217,11 +213,11 @@ async fn frames(peer: &Reading, mut stream: quinn::RecvStream, class: Class, id:
         let Some(frame) = read_frame(&mut stream, length).await else {
             return;
         };
-        if !peer.inner.configured(&peer.key, peer.from) {
+        if !peer.inner.configured(&peer.key) {
             peer.connection.close(code::UNCONFIGURED, b"");
             return;
         }
-        let incoming = Incoming::new(peer.from, id, frame);
+        let incoming = Incoming::new(peer.key, id, frame);
         if !peer.inner.deliver.deliver(class, incoming).await {
             return;
         }
@@ -252,7 +248,7 @@ mod tests {
     fn a_turn_goes_to_the_stream_that_waited() {
         let executor = smol::LocalExecutor::new();
         let turns = Rc::new(Turns::default());
-        let key = (Class::Requests, 5);
+        let key = (2, 5);
         let order = Rc::new(RefCell::new(Vec::new()));
         let (release, released) = smol::channel::bounded::<()>(1);
         let reader = |name: &'static str| {

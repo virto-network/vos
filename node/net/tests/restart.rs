@@ -10,7 +10,6 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use common::*;
-use vos_net::Class;
 use vos_net::quic::Quic;
 
 const PEER: &str = "VOS_NET_RESTARTED_PEER";
@@ -27,10 +26,10 @@ fn peer(spec: &str) {
         let (b, arrivals) = rebind(2, own.parse().unwrap()).await;
         b.set_peers(vec![peer_at(1, other.parse().unwrap())]);
         if greet == "greet" {
-            send(&b, 1, Class::Consensus, 1, b"hello".to_vec()).await;
+            send(&b, key(1), CONSENSUS, 1, b"hello".to_vec()).await;
         }
         println!("ready");
-        while let Ok(incoming) = arrivals.consensus.recv().await {
+        while let Ok(incoming) = arrivals.queue(CONSENSUS).recv().await {
             println!("got {}", String::from_utf8_lossy(&incoming.frame));
         }
     });
@@ -100,7 +99,7 @@ fn a_killed_peer_resets_the_old_connection_on_its_return() {
     let (a, _arrivals, address) = node_1();
     smol::block_on(async {
         let first = Run::start(TEST, address, &a, false);
-        send(&a, 2, Class::Consensus, 1, b"first run".to_vec()).await;
+        send(&a, key(2), CONSENSUS, 1, b"first run".to_vec()).await;
         assert_eq!(
             first.got(Duration::from_secs(10)).as_deref(),
             Some("first run")
@@ -111,7 +110,7 @@ fn a_killed_peer_resets_the_old_connection_on_its_return() {
         let mut sent = 0;
         let arrived = loop {
             let frame = format!("frame {sent}").into_bytes();
-            send(&a, 2, Class::Consensus, 1, frame).await;
+            send(&a, key(2), CONSENSUS, 1, frame).await;
             sent += 1;
             if let Some(frame) = second.got(Duration::from_millis(20)) {
                 break frame;
@@ -141,16 +140,16 @@ fn a_peer_dialing_in_as_a_new_run_ends_the_connection_to_the_old() {
     let (a, arrivals, address) = node_1();
     smol::block_on(async {
         let first = Run::start(TEST, address, &a, true);
-        assert_eq!(next(&arrivals.consensus).await.frame, b"hello");
-        send(&a, 2, Class::Consensus, 1, b"first run".to_vec()).await;
+        assert_eq!(next(arrivals.queue(CONSENSUS)).await.frame, b"hello");
+        send(&a, key(2), CONSENSUS, 1, b"first run".to_vec()).await;
         assert_eq!(
             first.got(Duration::from_secs(10)).as_deref(),
             Some("first run")
         );
         drop(first);
         let second = Run::start(TEST, address, &a, true);
-        assert_eq!(next(&arrivals.consensus).await.frame, b"hello");
-        send(&a, 2, Class::Consensus, 1, b"welcome".to_vec()).await;
+        assert_eq!(next(arrivals.queue(CONSENSUS)).await.frame, b"hello");
+        send(&a, key(2), CONSENSUS, 1, b"welcome".to_vec()).await;
         assert_eq!(
             second.got(Duration::from_secs(1)).as_deref(),
             Some("welcome"),

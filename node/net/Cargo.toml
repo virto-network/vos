@@ -3,7 +3,7 @@ name = "vos-net"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The network between VOS nodes: channels authenticated by node keys, classes of traffic, and streams by id or by frame."
+description = "A network of nodes known by their ed25519 keys: QUIC channels authenticated by those keys, classes of traffic the caller defines, and streams by id or by frame."
 
 [dependencies]
 event-listener = "5"
