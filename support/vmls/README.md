@@ -1,4 +1,4 @@
-# vos-mls
+# vmls
 
 An MLS layer ([RFC 9420](https://www.rfc-editor.org/rfc/rfc9420)) over
 [mls-rs](https://github.com/awslabs/mls-rs) 0.57 built with encrypted
@@ -101,5 +101,5 @@ processed on a copy, and only a confirmed one becomes the group's state.
 
 ## Tests
 
-`cargo test -p vos-mls` (`tests/mls.rs`, over `MemStore` and a store whose
+`cargo test -p vmls` (`tests/mls.rs`, over `MemStore` and a store whose
 commits fail; each test's doc says what it shows). `just check` runs it.

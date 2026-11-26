@@ -2071,6 +2071,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vmls"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+ "mls-rs",
+ "mls-rs-core",
+ "mls-rs-crypto-rustcrypto",
+ "zeroize",
+]
+
+[[package]]
 name = "vos-abi"
 version = "0.1.0"
 dependencies = [
@@ -2089,17 +2100,6 @@ dependencies = [
  "blake2",
  "curve25519-dalek",
  "ed25519-dalek",
-]
-
-[[package]]
-name = "vos-mls"
-version = "0.1.0"
-dependencies = [
- "blake2",
- "mls-rs",
- "mls-rs-core",
- "mls-rs-crypto-rustcrypto",
- "zeroize",
 ]
 
 [[package]]

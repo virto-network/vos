@@ -22,7 +22,7 @@ members = [
     "pvm/proof/verifier",
     "pvm/bench",
     "support/merkle-crdt",
-    "support/mls",
+    "support/vmls",
 ]
 exclude = [
     # Built with `cargo fuzz` (nightly flags, panic = abort).
@@ -123,7 +123,6 @@ vos-pvm-program = { path = "pvm/program" }
 vos-abi = { path = "pvm/abi" }
 vos-tree = { path = "pvm/tree" }
 merkle-crdt = { path = "support/merkle-crdt" }
-vos-mls = { path = "support/mls" }
 
 # Stwo from the fork's `vos/wrap` branch: upstream `e1286720` with dashmap
 # optional, Poseidon252 behind a feature, and upstream's `74951f79`, which

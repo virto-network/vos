@@ -13,7 +13,7 @@ yanked = "warn"
 # crate that pulls it accepts. Reviewed 2026-11-24.
 ignore = [
     { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained: heapless 0.7 under postcard 1; no code path on a target without atomics." },
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 (timing): through elliptic-curve 0.13 under mls-rs-crypto-rustcrypto's P-256/P-384 code, compiled in and not reached: vos-mls builds the provider with suite 1 (X25519, Ed25519) alone, so a message naming another suite is refused before any key is used (`support/mls/src/lib.rs`). Also in the lock under starknet-ff (Stwo's `poseidon252`), which no workspace feature builds. Fixed in 0.7 only, which elliptic-curve 0.13 does not take." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 (timing): through elliptic-curve 0.13 under mls-rs-crypto-rustcrypto's P-256/P-384 code, compiled in and not reached: vmls builds the provider with suite 1 (X25519, Ed25519) alone, so a message naming another suite is refused before any key is used (`support/vmls/src/lib.rs`). Also in the lock under starknet-ff (Stwo's `poseidon252`), which no workspace feature builds. Fixed in 0.7 only, which elliptic-curve 0.13 does not take." },
 ]
 
 [licenses]

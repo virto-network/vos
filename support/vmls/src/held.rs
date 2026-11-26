@@ -26,7 +26,7 @@ pub struct Commit {
 /// A handshake's hash, which a held commit is matched by.
 fn handshake_hash(handshake: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2b::<U32>::new();
-    hasher.update(b"vos/mls/handshake");
+    hasher.update(b"vmls/handshake");
     hasher.update(handshake);
     hasher.finalize().into()
 }

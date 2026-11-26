@@ -27,7 +27,7 @@ the virtual machine and its prover, and standalone libraries under
   replica for operation-based Merkle-CRDTs, after Sanjuán et al.: a DAG of
   signed, authored nodes per sync scope, applied incrementally in causal
   order, over a store the caller implements. The node side builds on it.
-- [`support/mls/`](support/mls/README.md): `vos-mls`, an MLS layer over
+- [`support/vmls/`](support/vmls/README.md): `vmls`, an MLS layer over
   mls-rs, with storage in the caller's store (committed with the caller's
   own rows), candidates processed on a copy and swapped in on
   confirmation, and a proposal policy.

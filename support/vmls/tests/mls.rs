@@ -1,4 +1,4 @@
-//! `vos-mls` over a store in memory; each test's doc says what it shows.
+//! `vmls` over a store in memory; each test's doc says what it shows.
 
 use mls_rs::client_builder::PaddingMode;
 use mls_rs::crypto::SignatureSecretKey;
@@ -10,7 +10,7 @@ use mls_rs::mls_rules::{
 };
 use mls_rs::{CipherSuiteProvider, Client, CryptoProvider, ExtensionList, MlsRules};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-use vos_mls::{
+use vmls::{
     Candidate, Commit, Error, Expected, Identity, Kind, MemStore, Mls, Namespace, Refusal, Store,
     Writes, confirmation,
 };
@@ -349,7 +349,7 @@ fn loose(
 /// member.
 fn signer(n: u8) -> (SignatureSecretKey, SigningIdentity) {
     let suite = RustCryptoProvider::default()
-        .cipher_suite_provider(vos_mls::SUITE)
+        .cipher_suite_provider(vmls::SUITE)
         .unwrap();
     let (secret, public) = suite.signature_key_generate().unwrap();
     let credential = BasicCredential::new(credential(n)).into_credential();
@@ -589,7 +589,7 @@ fn a_welcome_into_a_group_with_an_overlong_id_is_refused() {
         .identity_provider(Identity::default())
         .crypto_provider(RustCryptoProvider::default())
         .mls_rules(SEALED)
-        .signing_identity(identity, secret, vos_mls::SUITE)
+        .signing_identity(identity, secret, vmls::SUITE)
         .build();
     let mut group = creator
         .create_group_with_id(

@@ -1,5 +1,5 @@
 [package]
-name = "vos-mls"
+name = "vmls"
 description = "An MLS layer over mls-rs: storage in the caller's store, candidates on a copy until confirmed, held commits, a proposal policy."
 version.workspace = true
 edition.workspace = true

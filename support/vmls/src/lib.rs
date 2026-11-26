@@ -1,4 +1,4 @@
-//! `vos-mls`: an MLS layer (RFC 9420) over mls-rs, for a group whose
+//! `vmls`: an MLS layer (RFC 9420) over mls-rs, for a group whose
 //! commits are confirmed by its members before they take effect.
 //!
 //! - **Storage:** a group's state and its key packages' secrets as rows
