@@ -11,9 +11,9 @@ authors.workspace = true
 [dependencies]
 # Encrypted handshakes alone: no std, rayon, x509, psk, by-reference
 # proposals, out-of-order or prior-epoch secrets, custom proposals or tree
-# index. Cargo unifies features: no other crate of the workspace may
-# enable these (with `std` a missing time is "now", with `prior_epoch`
-# the storage here would drop epoch records).
+# index. Cargo unifies features: no other crate in a build that uses this
+# one may enable these (with `std` a missing time is "now", with
+# `prior_epoch` the storage here would drop epoch records).
 mls-rs = { version = "=0.57.0", default-features = false, features = ["private_message"] }
 mls-rs-core = { version = "=0.27.0", default-features = false }
 # 0.22, on curve25519-dalek 4 (0.23 takes 5 and p256 0.14). Built with

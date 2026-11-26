@@ -45,20 +45,23 @@ pub trait Store: Send + Sync + 'static {
     /// The keys of the committed rows that start with `prefix`.
     fn keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, Self::Error>;
 
-    /// Write `writes`, all of them or none, durably before it returns.
-    /// After an error it is not known which until the store is opened
-    /// again: a store may have written the set before it failed, so a
-    /// caller reopens before it retries an operation.
+    /// Write `writes`, all of them or none, durably before it returns. On
+    /// an error, reads through this store still return the rows as they
+    /// were before; the set may be found written only once the store is
+    /// opened again. A caller reopens before it retries an operation.
     fn commit(&self, writes: Writes) -> Result<(), Self::Error>;
 }
 
-/// A store in memory, its handles sharing one set of rows: for tests.
+/// A store in memory, its handles sharing one set of rows: for tests. It
+/// panics on a key or value outside the bounds a store is handed, so a
+/// test finds any that reaches it.
 #[derive(Clone, Debug, Default)]
 pub struct MemStore {
     rows: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
 }
 
 impl MemStore {
+    /// A store of no rows.
     pub fn new() -> Self {
         Self::default()
     }
@@ -73,10 +76,12 @@ impl Store for MemStore {
     type Error = Infallible;
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Infallible> {
+        assert!(holds(key), "a key the store is not handed");
         Ok(lock(&self.rows).get(key).cloned())
     }
 
     fn keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, Infallible> {
+        assert!(holds(prefix), "a prefix the store is not handed");
         let rows = lock(&self.rows);
         let keys = rows.range(prefix.to_vec()..).map(|(key, _)| key);
         Ok(keys
@@ -88,6 +93,13 @@ impl Store for MemStore {
     fn commit(&self, writes: Writes) -> Result<(), Infallible> {
         let mut rows = lock(&self.rows);
         for (key, value) in writes {
+            assert!(holds(&key), "a key the store is not handed");
+            assert!(
+                value
+                    .as_ref()
+                    .is_none_or(|value| u32::try_from(value.len()).is_ok()),
+                "a value the store is not handed"
+            );
             match value {
                 Some(value) => rows.insert(key, value),
                 None => rows.remove(&key),

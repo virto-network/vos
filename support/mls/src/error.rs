@@ -9,7 +9,8 @@ use mls_rs::error::MlsError;
 /// leaves that commit written.
 #[derive(Debug)]
 pub enum Error {
-    /// The store failed: its own error, boxed.
+    /// The store failed: its own error, boxed (`downcast_ref` recovers
+    /// the store's type).
     Store(Box<dyn std::error::Error + Send + Sync>),
     /// A row the store is not handed: an empty key, a key over 65,535
     /// bytes or a value of 4 GiB or more.
@@ -61,7 +62,14 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Store(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// Why a candidate was refused.
 #[derive(Debug)]

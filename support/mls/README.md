@@ -76,8 +76,8 @@ processed on a copy, and only a confirmed one becomes the group's state.
 
 ## Limits
 
-- **A credential is a label.** It is two 32-byte keys of the caller's as
-  bytes; nothing binds a leaf's MLS signature or HPKE key to them. That a
+- **A credential is a label.** It is 64 bytes whose meaning is the
+  caller's; nothing binds a leaf's MLS signature or HPKE key to them. That a
   key package is the member's it names is the caller's to establish, and a
   committer allowed to add a member is trusted for the key package it
   adds: a compromised one can add a leaf of its own under another
@@ -96,7 +96,8 @@ processed on a copy, and only a confirmed one becomes the group's state.
   one epoch is refused until another member's commit moves the epoch.
 - **Features.** The crate's invariants assume mls-rs without `std`,
   `prior_epoch`, `out_of_order` or `by_ref_proposal`; Cargo unifies
-  features, so no other crate of the workspace may enable them.
+  features, so no other crate in a build that uses this one may enable
+  them.
 
 ## Tests
 

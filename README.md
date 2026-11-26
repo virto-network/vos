@@ -28,9 +28,9 @@ the virtual machine and its prover, and standalone libraries under
   signed, authored nodes per sync scope, applied incrementally in causal
   order, over a store the caller implements. The node side builds on it.
 - [`support/mls/`](support/mls/README.md): `vos-mls`, an MLS layer over
-  mls-rs, with storage in the caller's store, committed with the caller's
-  rows, candidates processed on a copy and swapped in on confirmation, and
-  a proposal policy.
+  mls-rs, with storage in the caller's store (committed with the caller's
+  own rows), candidates processed on a copy and swapped in on
+  confirmation, and a proposal policy.
 - The design: [`docs/design/proving.md`](docs/design/proving.md) (the
   proof layers, formats, masking, verifiers, roots and anchors, and the
   mobile device profile), [`docs/design/recursion-air.md`](docs/design/recursion-air.md)

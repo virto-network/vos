@@ -26,8 +26,8 @@ use mls_rs::time::MlsTime;
 use mls_rs::{ExtensionList, MlsRules};
 use mls_rs_core::identity::{IdentityProvider, MemberValidationContext};
 
-/// A member's credential: two 32-byte keys of the caller's, the leaf's
-/// identity the first.
+/// A member's credential: 64 bytes, the leaf's identity its first 32;
+/// what the bytes are is the caller's.
 pub(crate) const CREDENTIAL_BYTES: usize = 64;
 
 /// What the policy refused.
@@ -43,7 +43,7 @@ pub enum Refused {
     Committer,
     /// The adds or the removals are not the ones expected.
     Effect,
-    /// A credential that is not 64 bytes.
+    /// A credential that is not a 64-byte basic credential.
     Credential,
 }
 
@@ -165,10 +165,10 @@ impl MlsRules for Rules {
     }
 }
 
-/// The group's identities: a basic credential of 64 bytes, two keys of the
-/// caller's, the leaf's identity the first; a successor the same
-/// credential, or the one renewal allowed. A leaf's signature key is not
-/// compared here; [`crate::Mls::process`] requires a committer to keep
+/// The group's identities: a 64-byte basic credential, the leaf's identity
+/// its first 32 bytes (what the bytes are is the caller's); a successor the
+/// same credential, or the one renewal allowed. A leaf's signature key is
+/// not compared here; [`crate::Mls::process`] requires a committer to keep
 /// it. Every check of who may be a member is the caller's, through
 /// [`Expected`]. A credential is a label: nothing binds a leaf's MLS keys
 /// to the keys it names, so that a key package is the member's it names

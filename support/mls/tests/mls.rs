@@ -620,7 +620,7 @@ fn a_welcome_into_a_group_with_an_overlong_id_is_refused() {
 /// A row the store is not handed (an empty key, a key over 65,535 bytes)
 /// is an error, its commit written as none, and no read of one fails.
 #[test]
-fn a_row_the_store_cannot_hold_is_an_error() {
+fn a_row_the_store_is_not_handed_is_an_error() {
     let (mut a, _b, _c) = three();
     let before = rows(&a);
     for key in [Vec::new(), vec![0x6b; 70_000]] {
