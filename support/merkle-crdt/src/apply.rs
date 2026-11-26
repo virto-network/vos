@@ -3,14 +3,14 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-/// The longest row key a replica writes. A [`Store`] is handed only row
-/// keys of 1 to this many bytes, so a store whose keys are bounded by a
-/// 16-bit length takes every row.
+/// The longest row key a replica writes. A [`Store`] commits only row keys
+/// of 1 to this many bytes, so a store whose keys are bounded by a 16-bit
+/// length takes every row it is given; a read may ask for any key.
 pub const MAX_ROW_KEY: usize = 65_535;
 
-/// The longest row value a replica writes. A [`Store`] is handed only
-/// values of at most this many bytes, so a store whose values are bounded
-/// by a 32-bit length takes every row.
+/// The longest row value a replica writes. A [`Store`] commits only values
+/// of at most this many bytes, so a store whose values are bounded by a
+/// 32-bit length takes every row it is given.
 pub const MAX_ROW_VALUE: usize = u32::MAX as usize;
 
 /// Whether a row with this key and value is within the row bounds.

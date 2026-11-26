@@ -102,10 +102,10 @@ node, a held node, the author index and a row; `load`, what a replica keeps
 in memory, read once when it opens; and `commit`, which writes one
 `Changes` atomically and durably, so a crash leaves the store before the
 batch or after it. The store chooses its layout, and may write its own rows
-in the same commit. It is handed only row keys of 1 to `MAX_ROW_KEY`
+in the same commit. Its commits carry only row keys of 1 to `MAX_ROW_KEY`
 (65,535) bytes and values of at most `MAX_ROW_VALUE` (4 GiB - 1): a CRDT
 write past either fails the batch with `Error::Row` before the store sees
-it. `MemStore` keeps a scope in memory, for tests and benchmarks.
+it. A read (`Store::row`) may ask for any key. `MemStore` keeps a scope in memory, for tests and benchmarks.
 
 ## Tests
 

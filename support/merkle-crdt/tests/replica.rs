@@ -672,10 +672,10 @@ fn a_dropped_node_applies_when_delivered_again() {
     assert_eq!(report.applied, vec![parent.cid(), child.cid()]);
 }
 
-/// A row key no store takes fails the batch in every store, before
-/// anything is committed.
+/// A row key past the row bounds fails the batch, before anything is
+/// committed.
 #[test]
-fn a_row_no_store_takes_fails_the_batch() {
+fn a_row_past_the_bounds_fails_the_batch() {
     let long = vec![1; merkle_crdt::MAX_ROW_KEY + 1];
     for bad in [Vec::new(), long] {
         let mut write = |_: Event<'_, H, Ops>, rows: &mut dyn Rows| rows.write(&bad, Some(b"x"));

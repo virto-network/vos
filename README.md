@@ -26,7 +26,7 @@ the virtual machine and its prover, and standalone libraries under
 - [`support/merkle-crdt/`](support/merkle-crdt/README.md): Merkle-CRDTs, a
   `no_std` DAG of signed, authored nodes per sync scope, applied
   incrementally in causal order, over a store the caller implements. The
-  node side's Merge lane builds on it.
+  node side builds on it.
 - The design: [`docs/design/proving.md`](docs/design/proving.md) (the
   proof layers, formats, masking, verifiers, roots and anchors, and the
   mobile device profile), [`docs/design/recursion-air.md`](docs/design/recursion-air.md)
