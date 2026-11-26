@@ -89,6 +89,8 @@ What a sender can make a node spend, over QUIC:
   every peer, the bytes of 4 of its largest frames, counted the same
   way (and the class's own bound in frames); a frame counts until the
   consumer drops it.
+- These budgets are per class, so what a peer can make a node hold
+  grows with the number of classes in the table (at least 1 MiB each).
 - **Protocol violations:** the first is logged; at the 16th on one
   connection, it is closed.
 

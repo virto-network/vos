@@ -62,8 +62,8 @@ const STREAM_WINDOW: u32 = 1 << 20;
 /// well above the share of the streams of single frames, so they never
 /// fill it.
 const SEND_WINDOW: u64 = 16 << 20;
-/// Frames of classes of streams per frame in flight at once on one
-/// connection, of every such class together.
+/// Frames of one class of streams per frame in flight at once on one
+/// connection.
 const FRAME_STREAMS: usize = 4;
 /// The round trip assumed before one is measured: a cluster's, not the
 /// internet's, so a lost first packet is sent again soon.
@@ -121,7 +121,9 @@ pub struct Protocol {
     /// connection ids are derived under, from the node's secret, before a
     /// label of each key's and the ALPN name: so the keys of one secret's
     /// endpoints differ by protocol, and an application's differ from
-    /// every other use of the secret it makes.
+    /// every other use of the secret it makes. The three are joined
+    /// without framing, so a domain should end in a separator (`/`) and
+    /// one application's domains not be prefixes of each other.
     pub domain: Vec<u8>,
 }
 
@@ -502,8 +504,9 @@ impl Network for Quic {
 /// The accepting side of protocol `alpn` for the node whose secret seed
 /// is `secret`, taking a dialing side whose key `allowed` takes, with TLS
 /// 1.3 bound to node keys as between peers. No session resumes: every
-/// handshake checks the key. Address validation, bounds on handshakes and
-/// connections, and migration are the caller's.
+/// handshake checks the key. `alpn` is 1 to 255 bytes, which TLS carries.
+/// Address validation, bounds on handshakes and connections, and
+/// migration are the caller's.
 pub fn server_config(
     secret: &[u8; 32],
     alpn: &[u8],
@@ -514,7 +517,8 @@ pub fn server_config(
 }
 
 /// The dialing side of protocol `alpn` for the node whose secret seed is
-/// `secret`, pinned to the accepting side whose key is `server`.
+/// `secret`, pinned to the accepting side whose key is `server`. `alpn` is
+/// 1 to 255 bytes, which TLS carries.
 pub fn client_config(
     secret: &[u8; 32],
     alpn: &[u8],

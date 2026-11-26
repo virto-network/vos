@@ -160,6 +160,52 @@ fn a_frame_older_than_its_class_s_age_is_dropped() {
     });
 }
 
+/// A frame of a class with an age, queued before its peer is reachable,
+/// still goes once it is, while younger than its age: the age counts the
+/// wait, not whether a connection was there.
+#[test]
+fn a_frame_younger_than_its_class_s_age_waits_for_the_connection() {
+    smol::block_on(async {
+        let mut specs = specs(MAX_FRAME);
+        specs[usize::from(LIVENESS)].max_age = Some(Duration::from_secs(30));
+        let (a, _) = Quic::bind(Config {
+            classes: vos_net::Classes::new(specs).unwrap(),
+            ..config(1)
+        })
+        .unwrap();
+        let address = vacant_address();
+        a.set_peers(vec![peer_at(2, address)]);
+        send(&a, key(2), LIVENESS, 1, b"alive, queued".to_vec()).await;
+        smol::Timer::after(Duration::from_millis(200)).await;
+        let (b, b_arrivals) = rebind(2, address).await;
+        b.set_peers(vec![peer_of(&a)]);
+        assert_eq!(
+            next(b_arrivals.queue(LIVENESS)).await.frame,
+            b"alive, queued"
+        );
+    });
+}
+
+/// Of a key listed twice, the last counts; the node's own key is left out.
+#[test]
+fn peers_are_keys_the_last_listing_counting() {
+    smol::block_on(async {
+        let nodes = cluster(2);
+        let (a, _) = &nodes[0];
+        let (b, b_arrivals) = &nodes[1];
+        a.set_peers(vec![peer_of(a), peer_at(2, vacant_address()), peer_of(b)]);
+        assert_eq!(
+            a.send(a.key(), CONSENSUS, 1, Vec::new()),
+            Err(Refused::UnknownPeer)
+        );
+        send(a, key(2), CONSENSUS, 1, b"to the last".to_vec()).await;
+        assert_eq!(
+            next(b_arrivals.queue(CONSENSUS)).await.frame,
+            b"to the last"
+        );
+    });
+}
+
 #[test]
 fn an_oversized_frame_is_refused() {
     smol::block_on(async {

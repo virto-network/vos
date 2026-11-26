@@ -168,7 +168,12 @@ impl Dialing {
         let every = (self.quiet / 2).max(Duration::from_millis(1));
         let mut sweep = smol::Timer::interval(every);
         let mut swept = Instant::now();
-        let single = Arc::new(smol::lock::Semaphore::new(FRAME_STREAMS));
+        // Per class, so one class's large frames never hold another's.
+        let singles: Vec<Arc<smol::lock::Semaphore>> = self
+            .classes
+            .iter()
+            .map(|_| Arc::new(smol::lock::Semaphore::new(FRAME_STREAMS)))
+            .collect();
         let mut sending = Tasks::default();
         loop {
             // Swept on time even while frames never stop coming.
@@ -214,7 +219,7 @@ impl Dialing {
             let priority = spec.priority;
             if spec.streams == Streams::PerFrame {
                 let connection = connection.clone();
-                let single = Arc::clone(&single);
+                let single = Arc::clone(&singles[usize::from(frame.class)]);
                 let sent = async move {
                     let _permit = single.acquire().await;
                     let _ = write_single(&connection, frame, priority).await;

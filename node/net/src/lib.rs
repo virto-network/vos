@@ -62,8 +62,8 @@ pub enum Streams {
     /// A peer's send queue of the class holds four of its largest frames.
     PerId,
     /// A stream per frame. A peer's send queue of the class holds one of
-    /// its largest frames, and a connection has four such frames in
-    /// flight at once, of every class of streams per frame together.
+    /// its largest frames, and a connection has four of its frames in
+    /// flight at once.
     PerFrame,
 }
 
@@ -81,9 +81,12 @@ pub struct ClassSpec {
     pub arrivals: usize,
     pub streams: Streams,
     /// A frame that has waited in its peer's send queue longer than this
-    /// when it is taken to be written is dropped: for frames that say
-    /// something only while they are fresh. `None` keeps every frame,
-    /// however late.
+    /// when the connection takes it is dropped: for frames that say
+    /// something only while they are fresh. A live connection takes each
+    /// frame at once, so the age counts only a wait for a connection (a
+    /// dial, a backoff, a redial); a frame the connection holds is not
+    /// aged. `None` keeps every frame, however late; a zero age drops
+    /// every frame that waited at all.
     pub max_age: Option<Duration>,
 }
 
@@ -91,14 +94,20 @@ pub struct ClassSpec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Classes(Arc<[ClassSpec]>);
 
+/// The most frames a class's arrival queue may hold, which is allocated
+/// when the queue is made.
+pub const MAX_ARRIVALS: usize = 1 << 20;
+
 /// Why a table of classes was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InvalidClasses {
     /// No class, or more than [`MAX_CLASSES`].
     Count(usize),
     /// A class whose frames may hold no byte.
     NoFrame(Class),
-    /// A class whose arrival queue holds no frame.
+    /// A class whose arrival queue holds no frame, or more than
+    /// [`MAX_ARRIVALS`].
     NoArrival(Class),
 }
 
@@ -107,7 +116,10 @@ impl std::fmt::Display for InvalidClasses {
         match self {
             Self::Count(count) => write!(f, "{count} classes, not 1 to {MAX_CLASSES}"),
             Self::NoFrame(class) => write!(f, "class {class}'s frame bound is 0"),
-            Self::NoArrival(class) => write!(f, "class {class}'s arrival queue holds no frame"),
+            Self::NoArrival(class) => write!(
+                f,
+                "class {class}'s arrival queue holds no frame, or more than {MAX_ARRIVALS}"
+            ),
         }
     }
 }
@@ -126,7 +138,7 @@ impl Classes {
             if spec.max_frame == 0 {
                 return Err(InvalidClasses::NoFrame(class));
             }
-            if spec.arrivals == 0 {
+            if spec.arrivals == 0 || spec.arrivals > MAX_ARRIVALS {
                 return Err(InvalidClasses::NoArrival(class));
             }
         }
@@ -236,6 +248,7 @@ impl Arrivals {
 
 /// Why a frame was not queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Refused {
     /// The peer's queue is full: wait for [`Network::ready`], or drop.
     Full,
@@ -305,6 +318,11 @@ mod tests {
             Classes::new([no_arrival]),
             Err(InvalidClasses::NoArrival(0))
         );
+        let too_many = ClassSpec {
+            arrivals: MAX_ARRIVALS + 1,
+            ..spec()
+        };
+        assert_eq!(Classes::new([too_many]), Err(InvalidClasses::NoArrival(0)));
         let classes = Classes::new([spec(); MAX_CLASSES]).unwrap();
         assert_eq!(classes.len(), MAX_CLASSES);
         assert!(classes.get(MAX_CLASSES as Class).is_none());
