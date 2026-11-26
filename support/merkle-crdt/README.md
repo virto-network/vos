@@ -1,122 +1,116 @@
 # merkle-crdt
 
-One sync scope's operations as a Merkle-DAG of signed nodes, applied
-incrementally to a storage-backed CRDT. `no_std` (the default `std` feature
-adds `std::error::Error`); the storage is the caller's.
+Several replicas edit the same data, often offline, and must end up equal
+with no server deciding who wins. This crate is a `no_std` replica for
+operation-based Merkle-CRDTs, after Sanjuán et al. (below): it keeps the
+edits as a DAG of signed nodes, the way git keeps commits, and applies each
+to your data after the edits it follows; your CRDT makes every order of
+concurrent edits end equal. The storage and the network are yours.
 
-Based on H. Sanjuán, S. Pöyhtäri, P. Teixeira, I. Psaras, *"Merkle-CRDTs:
-Merkle-DAGs meet CRDTs"*, 2020 ([arXiv:2004.00107](https://arxiv.org/abs/2004.00107)).
+## When to use it
 
-## The model
+Use it when many writers edit one data set, offline or not, and nodes may
+pass relays you do not trust and arrive in any order (within bounds, below).
+Not for a single
+writer (a log is simpler), nor where writers need one total order or a check
+across them (balances, unique names: a log or consensus), nor for large blobs
+(store them apart and put their hashes in the operations).
 
-- **A node** (`Node<H, O>`) is content-addressed: its CID is the hash of
-  its canonical bytes, and it names its parents by theirs, at most
-  `MAX_PARENTS` (64). It carries the author's ed25519 key, the author's
-  sequence number, a signature over the scope, the operations and the
-  parents, and the operations.
-- **Authors' chains:** an author numbers its nodes from 0; each later node
-  names the author's previous one among its parents. A node that does not is
-  refused, with its descendants. Two nodes at one number are an
-  equivocation: both applied, reported once, and listed for the CRDT's reads
-  to filter.
-- **A replica** (`Replica`) keeps in memory the heads, each author's latest
-  number, the equivocations, the cursor, the outbox, the held nodes'
-  missing parents and the latest refused CIDs (at most 4096). `ingest`
-  checks each node statelessly (`validate`: canonical bytes, CID, at most
-  `MAX_PARENTS` parents, strict signature), then applies only the new
-  nodes, in causal order, onto the current rows, holding (durably) those
-  whose parents have not arrived. `record` applies a local operation in
-  place. Each is one atomic `Store` commit: nodes, index, heads, cursor,
-  outbox and the CRDT's rows together.
-- **The CRDT** (`Apply`) reads and writes rows through `Rows` only, so its
-  state commits with the nodes it came from. Its result must not depend on
-  the order of concurrent nodes, nor on which of two equivocating nodes is
-  told it equivocates (the one that arrives second). A row key is 1 to
-  65,535 bytes: a write past that fails the batch (`Error::Row`) in every
-  store.
-- **Fetching** is the caller's, sans I/O: it hands nodes' bytes to
-  `ingest` in any order and batching, with the feed position they were read
-  to; `Replica::wanted`, `Replica::have` and `Replica::cursor` say what to
-  fetch next.
+## How it works
 
-## Who may write
+```text
+  alice   a0 <-- a1 <-- a2
+                       /
+  bob     b0 <-- b1 <-- b2          x <-- y : y names x as a parent
+```
 
-Every ed25519 key is an author: the library admits any node whose signature
-checks. A caller whose scope has a set of writers checks each node's author
-before `ingest` (`validate`, then `Header::read`). The bounds below hold for
-any author; they are what keeps a writer that is admitted and hostile from
-costing a replica without limit.
+- A **node** is a batch of operations by one **author** (an ed25519 key).
+  Its **CID** is the hash of its bytes; it names its **parents** by CID, the
+  nodes its author had seen (alice wrote `a2` after seeing `b1`).
+- The **heads** are the nodes no node names (`a2`, `b2`). A new node names
+  the heads, so a node written after seeing both is the only head.
+- An author's nodes form a numbered **chain**, each naming the one before.
+  Two at one number are an **equivocation**: kept, and reported so your
+  reads can filter that author.
+- A `Replica` applies each node once, after all its parents, and **holds** a
+  node whose parents have not arrived (`b2` before `b1`).
+- What a node does to your data is your **`Apply`**, a CRDT over rows.
+  Concurrent nodes (`a2`, `b2`) arrive in different orders at different
+  replicas, so its result must not depend on the order.
 
-## Bounds
+## Compared with git
 
-- **Parents.** A node names at most `MAX_PARENTS`; one naming more does not
-  decode. `record` names the author's previous node, then heads of authors
-  that never equivocated, then the other heads, up to the bound. The heads it
-  leaves stay heads, and later local nodes may name them, up to
-  `MAX_PARENTS - 1` a node. So an author that signs thousands of forks makes the heads many but
-  no local node large.
-- **Forks and convergence.** Whether a node is applied depends only on its
-  bytes and its ancestors (signature, chain, parents applied), never on
-  whether a later node names it. Every replica that is delivered the same
-  nodes (and delivered again any it dropped at a held bound) applies the
-  same set and so has the same heads, rows and equivocations, whichever
-  heads its own nodes named. A head no node names converges like any
-  other, as long as every node reaches every replica by delivery (a feed of
-  all of them): a fetch that follows only the heads, or each author's
-  highest number (`have`), misses a fork no node names. What naming changes is causal order: a local node
-  is after the heads it names and concurrent with the rest, and a CRDT must
-  accept either. Forks come last, so a local node names the other honest
-  authors' latest nodes before an equivocating author's, and a CRDT that
-  orders by parents (a Lamport clock) puts it after them.
-- **Held nodes.** At most `MAX_HELD` (4096) in all, `MAX_HELD_PER_AUTHOR`
-  (256) of one author, and `MAX_HELD_BYTES` (32 MiB). A node past a bound is
-  dropped (`Ingested::dropped`): not refused, so delivered again once its
-  parents are applied it applies; a cursor given with the batch passes it.
-  `drop_held` drops one author's held nodes, or all. `open` reads held
-  nodes one at a time, for their headers.
-- **Refused nodes** are remembered in memory only, the latest 4096: a node
-  naming one is refused at once, a node naming one forgotten or refused
-  before a restart is held, within the bounds above.
-- **Local operations** whose node does not decode (an `Encode` past what
-  `Decode` takes, such as a vector past 1,000,000 items) are refused by
-  `record` (`Error::Unencodable`) before anything is written.
+| | git | merkle-crdt |
+|---|---|---|
+| a unit | a commit: content-addressed, names its parents | a node: the same, holding operations instead of a snapshot |
+| the tips | branch tips | heads, unnamed |
+| concurrent work | a merge commit, conflicts resolved by hand | nothing to resolve: the CRDT gives one state for every order |
+| who wrote it | an optional signature | every node signed and numbered in its author's chain; a fork of a chain is an equivocation |
+| fetching | parents first, from one remote | from anyone, in any order within the held bounds: a node waits for its parents |
+| the state | a snapshot checked out | applied node by node into a store, one atomic commit a batch |
+| history | rewritable (rebase, force push) | only grows |
 
-## Limits
+## Using it
 
-- Nothing is pruned: applied nodes, the author index, each author's latest
-  number, the equivocations and the CRDT's rows grow with the history, and
-  in memory so do the heads (with forks, or new authors) and the
-  equivocations. A
-  caller bounds what its writers may send.
-- A compromised author key can filter that author's whole past: a second
-  node at its number 0 is an equivocation at 0.
-- A store error leaves it unknown whether the batch was written until the
-  store is opened again (a store may have written the batch before it
-  reported the failure): a caller reopens before it retries an operation.
-- One replica a store.
+1. Pick a `Hasher` for the CIDs; write an `Apply` over an `Event` and `Rows`.
+2. Implement `Store` over your database (point reads, `load` at open, one
+   atomic and durable `commit`), or take `MemStore` for tests.
+3. `record` local operations; send `outbox()`'s bytes and mark them `pushed`.
+4. `ingest` what arrives, in any batching, with its feed position; `wanted()`,
+   `have()` and `cursor()` say what to fetch next.
 
-## Storage
+```rust
+use blake2::{Blake2b, Digest, digest::consts::U32};
+use ed25519_dalek::SigningKey;
+use merkle_crdt::{Event, Hasher, MemStore, Replica, Rows, Scope};
 
-The caller implements `Store` over its own database: point reads of a
-node, a held node, the author index and a row; `load`, what a replica keeps
-in memory, read once when it opens; and `commit`, which writes one
-`Changes` atomically and durably, so a crash leaves the store before the
-batch or after it. The store chooses its layout, and may write its own rows
-in the same commit. Its commits carry only row keys of 1 to `MAX_ROW_KEY`
-(65,535) bytes and values of at most `MAX_ROW_VALUE` (4 GiB - 1): a CRDT
-write past either fails the batch with `Error::Row` before the store sees
-it. A read (`Store::row`) may ask for any key. `MemStore` keeps a scope in memory, for tests and benchmarks.
+struct Blake2b256;
+impl Hasher for Blake2b256 {
+    type Output = [u8; 32];
+    fn hash(data: &[u8]) -> [u8; 32] { Blake2b::<U32>::digest(data).into() }
+}
 
-## Tests
+// A grow-only set of strings, one row an element.
+fn add(event: Event<'_, Blake2b256, String>, rows: &mut dyn Rows) {
+    rows.write(event.ops.as_bytes(), Some(&[]));
+}
 
-`cargo test -p merkle-crdt`: the incremental replica against a full replay
-of its nodes over random DAGs, deliveries, duplicates and batchings
-(property tests), equivocations, refusals, a cursor read out of causal
-order, the parent and held-node bounds, failed commits and reads, and a
-replica reopened from its store.
+let open = || Replica::<Blake2b256, String, _>::open(MemStore::new(), Scope([1; 16])).unwrap();
+let (mut phone, mut laptop) = (open(), open());
+// Offline, each records an operation.
+phone.record(&SigningKey::from_bytes(&[1; 32]), "eggs".into(), &mut add).unwrap();
+laptop.record(&SigningKey::from_bytes(&[2; 32]), "milk".into(), &mut add).unwrap();
+// Online, each ingests the other's outbox.
+let to_laptop = phone.outbox().unwrap().into_iter().map(|node| node.bytes);
+laptop.ingest(to_laptop, None, &mut add).unwrap();
+let to_phone = laptop.outbox().unwrap().into_iter().map(|node| node.bytes);
+phone.ingest(to_phone, None, &mut add).unwrap();
+assert_eq!(phone.store().rows(), laptop.store().rows());
+assert_eq!(phone.heads(), laptop.heads());
+```
 
-## Cost
+## Guarantees and limits
 
-`cargo bench -p merkle-crdt --bench apply` measures applying one node, a
-batch of 100 and a local operation onto 1k, 100k and 1M operations, on
-`MemStore`.
+It promises: each node applied once, after its parents; one atomic commit of
+nodes and rows for each `ingest` or `record`; forged, malformed or
+chain-breaking nodes refused with their descendants, alike everywhere;
+equivocations kept and reported; bounded cost (64 parents a node, 4096 held).
+
+It leaves to you: who may write (any key that signs is an author: check
+authors before `ingest`); the transport; your CRDT's convergence (no
+dependence on order, nor on which of two equivocating nodes is flagged;
+never failing on a peer's content); and a history that only grows (no
+compaction yet). Past the held bounds a node is dropped and must come again:
+fetch a long gap oldest first, or deliver it in one batch (see `MAX_HELD`).
+
+## The paper and the tests
+
+After *Merkle-CRDTs: Merkle-DAGs meet CRDTs* (Sanjuán et al., 2020,
+[arXiv:2004.00107](https://arxiv.org/abs/2004.00107)): its DAG of operations
+applied in causal order, with nodes signed and numbered by their author
+added, and fetching and announcing left to the caller. Its "children" are
+the parents here, its "roots" the heads.
+
+`cargo test -p merkle-crdt` checks the replica against a full replay over
+random DAGs, orders, duplicates and batchings, within the held bounds and past
+them; `cargo bench -p merkle-crdt --bench apply` times it on 1k to 1M operations.
