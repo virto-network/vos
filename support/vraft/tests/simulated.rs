@@ -233,6 +233,8 @@ impl std::ops::AddAssign for Exercised {
 struct Chaos {
     /// A fourth node, and membership changes between three-node subsets.
     churn: bool,
+    /// A group of five, members 1–5, in place of three (no churn).
+    five: bool,
     /// How long after its write an entry is reported durable, as when it
     /// waits for its blobs; followers give up on such entries at random.
     entry_lag: (u64, u64),
@@ -250,6 +252,7 @@ impl Default for Chaos {
     fn default() -> Self {
         Self {
             churn: false,
+            five: false,
             entry_lag: (0, 0),
             paired: false,
             pre_vote: true,
@@ -275,6 +278,7 @@ impl Default for Chaos {
 fn chaos(seed: u64, run: Chaos) -> Exercised {
     let Chaos {
         churn,
+        five,
         entry_lag,
         paired,
         pre_vote,
@@ -283,14 +287,21 @@ fn chaos(seed: u64, run: Chaos) -> Exercised {
     } = run;
     // With churn, a fourth node waits outside the group, and the group's
     // membership moves between three-node subsets of the four.
-    let nodes: &[u16] = if churn { &[1, 2, 3, 4] } else { &NODES };
+    assert!(!(five && churn), "a group of five does not churn");
+    let nodes: &[u16] = if five {
+        &[1, 2, 3, 4, 5]
+    } else if churn {
+        &[1, 2, 3, 4]
+    } else {
+        &NODES
+    };
     let faults = Faults {
         drop_per_million: 50_000,
         duplicate_per_million: 50_000,
         delay: (1, 15),
     };
     let mut cluster = Cluster::with_config(nodes, seed, faults, |cfg| {
-        cfg.members = NODES.to_vec();
+        cfg.members = if five { nodes.to_vec() } else { NODES.to_vec() };
         cfg.election_timeout_ms = (60, 120);
         cfg.heartbeat_interval_ms = 20;
         cfg.resend_timeout_ms = 40;
@@ -560,6 +571,35 @@ fn safety_holds_under_faults() {
         total.compactions
     );
     assert!(total.loads >= 10_000, "loads: {}", total.loads);
+    assert!(total.reads >= 5_000, "reads: {}", total.reads);
+    assert!(total.one_way >= 1_000, "one-way cuts: {}", total.one_way);
+}
+
+/// The plain chaos runs over a group of five: quorums of three, and two
+/// replicas down or cut off at once.
+#[test]
+fn safety_holds_under_faults_in_a_group_of_five() {
+    let mut total = Exercised::default();
+    for seed in 0..200 {
+        total += chaos(
+            seed,
+            Chaos {
+                five: true,
+                ..Chaos::default()
+            },
+        );
+    }
+    eprintln!(
+        "installs {}, compactions {}, loads {}, reads answered {}, one-way cuts {}",
+        total.installs, total.compactions, total.loads, total.reads, total.one_way
+    );
+    assert!(total.installs >= 2_000, "installs: {}", total.installs);
+    assert!(
+        total.compactions >= 20_000,
+        "compactions: {}",
+        total.compactions
+    );
+    assert!(total.loads >= 20_000, "loads: {}", total.loads);
     assert!(total.reads >= 5_000, "reads: {}", total.reads);
     assert!(total.one_way >= 1_000, "one-way cuts: {}", total.one_way);
 }

@@ -142,10 +142,10 @@ durability, membership, who it listens to, idle groups, and several
 replicas crashing between a write and its sync);
 `tests/proptest_invariants.rs` feeds one replica random messages,
 terms and indexes up to `u64::MAX` included, against Raft's invariants;
-`tests/simulated.rs` runs the simulator's chaos seeds, with and without
-membership changes, entries waiting for blobs, pre-votes off and
-leadership handovers, pair heartbeats in place of idle heartbeats, and
-restarts that cut the log.
+`tests/simulated.rs` runs the simulator's chaos seeds over three nodes
+and over five, with and without membership changes, entries waiting for
+blobs, pre-votes off and leadership handovers, pair heartbeats in place
+of idle heartbeats, and restarts that cut the log.
 
 `just check-no-std` builds the crate for an embedded target, with and
 without the `sim` feature. The crate's tests turn the feature on
