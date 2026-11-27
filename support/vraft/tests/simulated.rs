@@ -75,6 +75,74 @@ fn isolated_follower_does_not_inflate_term_under_pre_vote() {
     assert!(cluster.violations.is_empty(), "{:?}", cluster.violations);
 }
 
+/// A link cut one way between the leader and a follower, with pre-votes
+/// and check-quorum on, `deaf` hearing nothing from `speaker`. Over many
+/// election timeouts the leader keeps its term and leadership, and
+/// proposals still commit.
+fn one_way_cut_keeps_the_leader(seed: u64, leader_deaf: bool) {
+    let mut cluster = Cluster::new(&NODES, seed, Faults::default());
+    let leader = cluster.settle();
+    let follower = NODES.into_iter().find(|&node| node != leader).unwrap();
+    let term = cluster.core(leader).unwrap().status().current_term;
+    let (speaker, deaf) = if leader_deaf {
+        (follower, leader)
+    } else {
+        (leader, follower)
+    };
+    cluster.network.cut(speaker, deaf);
+    let before = cluster.committed_index();
+    for round in 0..30u8 {
+        cluster.propose(leader, vec![round]);
+        // Over an election timeout at each round.
+        cluster.run(400);
+        assert_eq!(cluster.leader(), Some(leader), "seed {seed}: round {round}");
+        let status = cluster.core(leader).unwrap().status();
+        assert_eq!(status.current_term, term, "seed {seed}: round {round}");
+    }
+    assert_eq!(
+        cluster.committed_index(),
+        before + 30,
+        "seed {seed}: every proposal commits"
+    );
+    if !leader_deaf {
+        // The cut holds: the deaf follower received none of the entries.
+        let held = cluster.core(deaf).unwrap().status().last_log_index;
+        assert!(held <= before, "seed {seed}: {deaf} heard the leader");
+    }
+    // No node's term moved.
+    for node in NODES {
+        assert_eq!(
+            cluster.core(node).unwrap().status().current_term,
+            term,
+            "seed {seed}: node {node}"
+        );
+    }
+    assert!(
+        cluster.violations.is_empty(),
+        "seed {seed}: {:?}",
+        cluster.violations
+    );
+}
+
+/// A follower that hears nothing from its leader, while its own messages
+/// still arrive, asks for pre-votes the others refuse while they hear the
+/// leader: the leader keeps its term.
+#[test]
+fn a_follower_deaf_to_its_leader_does_not_depose_it() {
+    for seed in 0..20 {
+        one_way_cut_keeps_the_leader(seed, false);
+    }
+}
+
+/// A leader that hears nothing from one follower still hears a quorum
+/// with the other: check-quorum keeps it leading.
+#[test]
+fn a_leader_deaf_to_one_follower_keeps_leading() {
+    for seed in 0..20 {
+        one_way_cut_keeps_the_leader(seed, true);
+    }
+}
+
 /// A voter removed while it is down holds nothing up: the next change
 /// starts once the final entry commits, and the voter, restarted with the
 /// log it had and never told of its removal, never leads.
@@ -144,6 +212,7 @@ struct Exercised {
     reads: u64,
     retirements: u64,
     cuts: u64,
+    one_way: u64,
 }
 
 impl std::ops::AddAssign for Exercised {
@@ -155,6 +224,7 @@ impl std::ops::AddAssign for Exercised {
         self.reads += run.reads;
         self.retirements += run.retirements;
         self.cuts += run.cuts;
+        self.one_way += run.one_way;
     }
 }
 
@@ -192,7 +262,8 @@ impl Default for Chaos {
 /// A run under harsh faults: short election timeouts, so leaders change
 /// often; slow syncs, so writes wait unsynced; crashes every few hundred
 /// milliseconds that lose those writes after a random prefix; quick
-/// restarts; drops, duplicates, delays and partitions. The cache holds
+/// restarts; drops, duplicates, delays, partitions, and links cut one
+/// way. The cache holds
 /// almost nothing and the log compacts every few entries, so lagging
 /// replicas load from the store or install snapshots. Reads are asked
 /// throughout. Then everything heals, and the group must still make
@@ -240,6 +311,7 @@ fn chaos(seed: u64, run: Chaos) -> Exercised {
     cluster.entry_lag = entry_lag;
     let lagging = entry_lag.1 > 0;
     let mut proposals = 0u32;
+    let mut one_way = 0u64;
     let mut down: Vec<(u16, u64)> = Vec::new();
     for _ in 0..2_000 {
         let roll = cluster.random.next_u64() % 1_000;
@@ -258,6 +330,13 @@ fn chaos(seed: u64, run: Chaos) -> Exercised {
                 cluster.network.isolate(&[node], nodes);
             }
             35..=60 => cluster.network.heal(),
+            611..=615 => {
+                // One direction of a link: `node` stops hearing `from`.
+                let others: Vec<u16> = nodes.iter().copied().filter(|&n| n != node).collect();
+                let from = others[(cluster.random.next_u64() % others.len() as u64) as usize];
+                cluster.network.cut(from, node);
+                one_way += 1;
+            }
             61..=500 => {
                 if let Some(leader) = cluster.leader() {
                     proposals += 1;
@@ -425,6 +504,7 @@ fn chaos(seed: u64, run: Chaos) -> Exercised {
     );
     Exercised {
         cuts: cluster.cuts,
+        one_way,
         retirements: cluster.retirements,
         changes: cluster.changes_started,
         installs: cluster.installs,
@@ -470,8 +550,8 @@ fn safety_holds_under_faults() {
     }
     // The runs reach every path they are meant to test.
     eprintln!(
-        "installs {}, compactions {}, loads {}, reads answered {}",
-        total.installs, total.compactions, total.loads, total.reads
+        "installs {}, compactions {}, loads {}, reads answered {}, one-way cuts {}",
+        total.installs, total.compactions, total.loads, total.reads, total.one_way
     );
     assert!(total.installs >= 1_000, "installs: {}", total.installs);
     assert!(
@@ -481,6 +561,7 @@ fn safety_holds_under_faults() {
     );
     assert!(total.loads >= 10_000, "loads: {}", total.loads);
     assert!(total.reads >= 5_000, "reads: {}", total.reads);
+    assert!(total.one_way >= 1_000, "one-way cuts: {}", total.one_way);
 }
 
 #[test]
