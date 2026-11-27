@@ -224,12 +224,14 @@ fmt-check:
         | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
 
 # The docs' links: none broken, and none from a public doc to a private
-# item; and the proof docs' tripwire (`tools/gates/docs.py`): no doc names
-# deleted code as built, every path the audit map names exists, and
-# SECURITY.md names every fuzz target.
+# item (vraft's with its simulator too, the `sim` feature); and the proof
+# docs' tripwire (`tools/gates/docs.py`): no doc names deleted code as
+# built, every path the audit map names exists, and SECURITY.md names
+# every fuzz target.
 doc-check:
     python3 -I tools/gates/docs.py
     with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc --workspace --no-deps --quiet }
+    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc -p vraft --features sim --no-deps --quiet }
 
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
@@ -499,9 +501,9 @@ check-no-debug-internals: (_forbidden "debug-internals")
 # The builds without std, for an embedded target on core and alloc
 # alone, built from the toolchain's source. merkle-crdt, without its
 # `std` feature. vraft, the Raft core, with and without its simulator
-# (the `sim` feature). The proof verifier, which reads
-# every admitted format, with the proof crate's verifier path under it:
-# both are `no_std` crates, so a `std` path in either fails the build. The
+# (the `sim` feature). The proof verifier, which reads every admitted
+# format, with the proof crate's verifier path under it: both are
+# `no_std` crates, so a `std` path in either fails the build. The
 # verifier builds for
 # the same embedded target, where no dependency has std either, and for
 # wasm32, the target of an on-chain verifier; the workspace's toolchain file
@@ -730,6 +732,7 @@ check: fmt-check check-tiers check-layers check-device-verifier build-final-veri
 gate: check doc-check deny check-locks check-venue-rules check-no-std check-no-leaks check-kit fuzz-replay fuzz-reach
     cargo clippy -p vos-pvm-recair --no-default-features --lib --quiet -- -D warnings
     cargo clippy -p merkle-crdt --no-default-features --lib --quiet -- -D warnings
+    cargo clippy -p vraft --lib --quiet -- -D warnings
     cargo test {{core_crates}} ...(python3 -I tools/gates/tiers.py heavy {{core_crates}} | split row ' ')
     cargo test {{core_crates}} --doc
     cargo test -p vos-pvm-recair -p vos-pvm-device ...(python3 -I tools/gates/tiers.py heavy -p vos-pvm-recair -p vos-pvm-device | split row ' ') -- --test-threads=4 --skip wrap_files::

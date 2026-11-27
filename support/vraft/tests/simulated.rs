@@ -90,7 +90,8 @@ fn one_way_cut_keeps_the_leader(seed: u64, leader_deaf: bool) {
         (leader, follower)
     };
     cluster.network.cut(speaker, deaf);
-    let before = cluster.committed_index();
+    let held_at_cut = cluster.core(deaf).unwrap().status().last_log_index;
+    let speaker_at_cut = cluster.core(speaker).unwrap().status().last_log_index;
     for round in 0..30u8 {
         cluster.propose(leader, vec![round]);
         // Over an election timeout at each round.
@@ -99,15 +100,29 @@ fn one_way_cut_keeps_the_leader(seed: u64, leader_deaf: bool) {
         let status = cluster.core(leader).unwrap().status();
         assert_eq!(status.current_term, term, "seed {seed}: round {round}");
     }
-    assert_eq!(
-        cluster.committed_index(),
-        before + 30,
+    let rounds: Vec<Vec<u8>> = (0..30u8).map(|round| vec![round]).collect();
+    assert!(
+        cluster.committed_payloads().ends_with(&rounds),
         "seed {seed}: every proposal commits"
     );
-    if !leader_deaf {
+    let leading = cluster.core(leader).unwrap().status().last_log_index;
+    let held = |node: u16| cluster.core(node).unwrap().status().last_log_index;
+    if leader_deaf {
+        // The cut holds: the follower takes the leader's entries, but the
+        // leader, never hearing what it holds, resends the one append it
+        // has in flight to it and sends nothing past it.
+        let last = held(speaker);
+        assert!(
+            speaker_at_cut < last && last < leading,
+            "seed {seed}: {speaker} holds {last}"
+        );
+    } else {
         // The cut holds: the deaf follower received none of the entries.
-        let held = cluster.core(deaf).unwrap().status().last_log_index;
-        assert!(held <= before, "seed {seed}: {deaf} heard the leader");
+        assert_eq!(
+            held(deaf),
+            held_at_cut,
+            "seed {seed}: {deaf} heard the leader"
+        );
     }
     // No node's term moved.
     for node in NODES {
@@ -211,8 +226,10 @@ struct Exercised {
     loads: u64,
     reads: u64,
     retirements: u64,
+    /// Log cuts at restart.
     cuts: u64,
-    one_way: u64,
+    /// Links cut one way.
+    one_way_cuts: u64,
 }
 
 impl std::ops::AddAssign for Exercised {
@@ -224,17 +241,26 @@ impl std::ops::AddAssign for Exercised {
         self.reads += run.reads;
         self.retirements += run.retirements;
         self.cuts += run.cuts;
-        self.one_way += run.one_way;
+        self.one_way_cuts += run.one_way_cuts;
     }
+}
+
+/// The nodes of a chaos run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Group {
+    /// Members 1–3.
+    Three,
+    /// Members 1–3, a fourth node, and membership changes between
+    /// three-node subsets of the four.
+    Churn,
+    /// Members 1–5.
+    Five,
 }
 
 /// What a chaos run puts the group through, besides its faults.
 #[derive(Clone, Copy)]
 struct Chaos {
-    /// A fourth node, and membership changes between three-node subsets.
-    churn: bool,
-    /// A group of five, members 1–5, in place of three (no churn).
-    five: bool,
+    group: Group,
     /// How long after its write an entry is reported durable, as when it
     /// waits for its blobs; followers give up on such entries at random.
     entry_lag: (u64, u64),
@@ -251,8 +277,7 @@ struct Chaos {
 impl Default for Chaos {
     fn default() -> Self {
         Self {
-            churn: false,
-            five: false,
+            group: Group::Three,
             entry_lag: (0, 0),
             paired: false,
             pre_vote: true,
@@ -266,19 +291,17 @@ impl Default for Chaos {
 /// often; slow syncs, so writes wait unsynced; crashes every few hundred
 /// milliseconds that lose those writes after a random prefix; quick
 /// restarts; drops, duplicates, delays, partitions, and links cut one
-/// way. The cache holds
-/// almost nothing and the log compacts every few entries, so lagging
-/// replicas load from the store or install snapshots. Reads are asked
-/// throughout. Then everything heals, and the group must still make
-/// progress.
+/// way. The cache holds almost nothing and the log compacts every few
+/// entries, so lagging replicas load from the store or install
+/// snapshots. Reads are asked throughout. Then everything heals, and the
+/// group must still make progress.
 ///
 /// `paired` turns idle heartbeats off and the hosts' pair heartbeats on:
 /// crashes then last long enough for deadlines to lapse unvouched, and
 /// after healing the group must also go quiet.
 fn chaos(seed: u64, run: Chaos) -> Exercised {
     let Chaos {
-        churn,
-        five,
+        group,
         entry_lag,
         paired,
         pre_vote,
@@ -287,13 +310,11 @@ fn chaos(seed: u64, run: Chaos) -> Exercised {
     } = run;
     // With churn, a fourth node waits outside the group, and the group's
     // membership moves between three-node subsets of the four.
-    assert!(!(five && churn), "a group of five does not churn");
-    let nodes: &[u16] = if five {
-        &[1, 2, 3, 4, 5]
-    } else if churn {
-        &[1, 2, 3, 4]
-    } else {
-        &NODES
+    let churn = group == Group::Churn;
+    let nodes: &[u16] = match group {
+        Group::Three => &NODES,
+        Group::Churn => &[1, 2, 3, 4],
+        Group::Five => &[1, 2, 3, 4, 5],
     };
     let faults = Faults {
         drop_per_million: 50_000,
@@ -301,7 +322,11 @@ fn chaos(seed: u64, run: Chaos) -> Exercised {
         delay: (1, 15),
     };
     let mut cluster = Cluster::with_config(nodes, seed, faults, |cfg| {
-        cfg.members = if five { nodes.to_vec() } else { NODES.to_vec() };
+        cfg.members = if churn {
+            NODES.to_vec()
+        } else {
+            nodes.to_vec()
+        };
         cfg.election_timeout_ms = (60, 120);
         cfg.heartbeat_interval_ms = 20;
         cfg.resend_timeout_ms = 40;
@@ -322,7 +347,7 @@ fn chaos(seed: u64, run: Chaos) -> Exercised {
     cluster.entry_lag = entry_lag;
     let lagging = entry_lag.1 > 0;
     let mut proposals = 0u32;
-    let mut one_way = 0u64;
+    let mut one_way_cuts = 0u64;
     let mut down: Vec<(u16, u64)> = Vec::new();
     for _ in 0..2_000 {
         let roll = cluster.random.next_u64() % 1_000;
@@ -341,13 +366,6 @@ fn chaos(seed: u64, run: Chaos) -> Exercised {
                 cluster.network.isolate(&[node], nodes);
             }
             35..=60 => cluster.network.heal(),
-            611..=615 => {
-                // One direction of a link: `node` stops hearing `from`.
-                let others: Vec<u16> = nodes.iter().copied().filter(|&n| n != node).collect();
-                let from = others[(cluster.random.next_u64() % others.len() as u64) as usize];
-                cluster.network.cut(from, node);
-                one_way += 1;
-            }
             61..=500 => {
                 if let Some(leader) = cluster.leader() {
                     proposals += 1;
@@ -365,6 +383,13 @@ fn chaos(seed: u64, run: Chaos) -> Exercised {
                     let to = nodes[(cluster.random.next_u64() % nodes.len() as u64) as usize];
                     cluster.transfer_leadership(leader, Some(to));
                 }
+            }
+            611..=615 => {
+                // One direction of a link: `node` stops hearing `from`.
+                let others: Vec<u16> = nodes.iter().copied().filter(|&n| n != node).collect();
+                let from = others[(cluster.random.next_u64() % others.len() as u64) as usize];
+                cluster.network.cut(from, node);
+                one_way_cuts += 1;
             }
             591..=600 if paired => {
                 let millis = 100 + cluster.random.next_u64() % 400;
@@ -515,7 +540,7 @@ fn chaos(seed: u64, run: Chaos) -> Exercised {
     );
     Exercised {
         cuts: cluster.cuts,
-        one_way,
+        one_way_cuts,
         retirements: cluster.retirements,
         changes: cluster.changes_started,
         installs: cluster.installs,
@@ -562,7 +587,7 @@ fn safety_holds_under_faults() {
     // The runs reach every path they are meant to test.
     eprintln!(
         "installs {}, compactions {}, loads {}, reads answered {}, one-way cuts {}",
-        total.installs, total.compactions, total.loads, total.reads, total.one_way
+        total.installs, total.compactions, total.loads, total.reads, total.one_way_cuts
     );
     assert!(total.installs >= 1_000, "installs: {}", total.installs);
     assert!(
@@ -572,11 +597,14 @@ fn safety_holds_under_faults() {
     );
     assert!(total.loads >= 10_000, "loads: {}", total.loads);
     assert!(total.reads >= 5_000, "reads: {}", total.reads);
-    assert!(total.one_way >= 1_000, "one-way cuts: {}", total.one_way);
+    assert!(
+        total.one_way_cuts >= 1_000,
+        "one-way cuts: {}",
+        total.one_way_cuts
+    );
 }
 
-/// The plain chaos runs over a group of five: quorums of three, and two
-/// replicas down or cut off at once.
+/// The plain chaos runs over a group of five: quorums of three.
 #[test]
 fn safety_holds_under_faults_in_a_group_of_five() {
     let mut total = Exercised::default();
@@ -584,14 +612,14 @@ fn safety_holds_under_faults_in_a_group_of_five() {
         total += chaos(
             seed,
             Chaos {
-                five: true,
+                group: Group::Five,
                 ..Chaos::default()
             },
         );
     }
     eprintln!(
         "installs {}, compactions {}, loads {}, reads answered {}, one-way cuts {}",
-        total.installs, total.compactions, total.loads, total.reads, total.one_way
+        total.installs, total.compactions, total.loads, total.reads, total.one_way_cuts
     );
     assert!(total.installs >= 2_000, "installs: {}", total.installs);
     assert!(
@@ -601,7 +629,11 @@ fn safety_holds_under_faults_in_a_group_of_five() {
     );
     assert!(total.loads >= 20_000, "loads: {}", total.loads);
     assert!(total.reads >= 5_000, "reads: {}", total.reads);
-    assert!(total.one_way >= 1_000, "one-way cuts: {}", total.one_way);
+    assert!(
+        total.one_way_cuts >= 1_000,
+        "one-way cuts: {}",
+        total.one_way_cuts
+    );
 }
 
 #[test]
@@ -611,7 +643,7 @@ fn safety_holds_under_faults_and_membership_changes() {
         total += chaos(
             seed,
             Chaos {
-                churn: true,
+                group: Group::Churn,
                 ..Chaos::default()
             },
         );
@@ -630,7 +662,7 @@ fn safety_holds_when_entries_wait_for_blobs() {
         total += chaos(
             seed,
             Chaos {
-                churn: true,
+                group: Group::Churn,
                 entry_lag: (1, 60),
                 ..Chaos::default()
             },
@@ -662,7 +694,7 @@ fn safety_holds_with_idle_heartbeats_off_and_the_hosts_vouching() {
         churned += chaos(
             1_000 + seed,
             Chaos {
-                churn: true,
+                group: Group::Churn,
                 paired: true,
                 ..Chaos::default()
             },
@@ -690,7 +722,11 @@ fn safety_holds_with_pre_votes_off_and_handovers() {
         chaos(
             seed,
             Chaos {
-                churn: seed.is_multiple_of(2),
+                group: if seed.is_multiple_of(2) {
+                    Group::Churn
+                } else {
+                    Group::Three
+                },
                 pre_vote: false,
                 transfers: true,
                 ..Chaos::default()
@@ -709,7 +745,7 @@ fn safety_holds_when_restarts_cut_the_log() {
         total += chaos(
             seed,
             Chaos {
-                churn: true,
+                group: Group::Churn,
                 entry_lag: (1, 60),
                 transfers: true,
                 cuts: true,
