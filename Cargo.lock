@@ -2339,6 +2339,7 @@ name = "vraft"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "vraft",
 ]
 
 [[package]]

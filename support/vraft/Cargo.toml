@@ -10,7 +10,16 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 
+[features]
+# The deterministic simulator, `vraft::sim`.
+sim = []
+
+[package.metadata.docs.rs]
+features = ["sim"]
+
 [dev-dependencies]
+# The crate's own tests run the simulator.
+vraft = { path = ".", features = ["sim"] }
 # Property-based testing — random message sequences vs. Raft safety
 # invariants.
 proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }

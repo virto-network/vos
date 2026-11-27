@@ -7,15 +7,17 @@ Raft consensus as a protocol core without I/O, on `core + alloc`
   feeds it events and carries out the actions it returns. It reads no
   clock, spawns nothing and does no I/O, so one host can drive thousands
   of groups on whatever executor it has.
-- **`sim`**: a deterministic simulator — groups of cores over a simulated
-  network and stores with drops, duplicates, delays, partitions, crashes
-  that lose unsynced writes, and restarts whose host cuts the log at an
-  entry it never reported durable — checked as it runs: one leadership
-  per term (by two nodes, or one node in two runs), one entry per
-  committed index (configuration entries compared whole), no commit past
-  a replica's log, no compaction past its commit, no read below what was
-  committed when it was asked, and no configuration naming an entry its
-  replica's log does not hold. Every run is seeded and replays exactly.
+- **`sim`** (the `sim` feature, off by default; `no_std` too): a
+  deterministic simulator — groups of cores over a simulated network and
+  stores with drops, duplicates, delays, partitions (both ways or one),
+  crashes that lose unsynced writes, and restarts whose host cuts the
+  log at an entry it never reported durable — checked as it runs: one
+  leadership per term (by two nodes, or one node in two runs), one entry
+  per committed index (configuration entries compared whole), no commit
+  past a replica's log, no compaction past its commit, no read below
+  what was committed when it was asked, and no configuration naming an
+  entry its replica's log does not hold. Every run is seeded and replays
+  exactly.
 - **`pair`**: the pair heartbeat between two nodes, telling each other
   which groups they lead, so idle groups send nothing. A `PeerTable` holds
   at most a bounded number of groups per peer (`LISTED` by default); a
@@ -145,4 +147,7 @@ membership changes, entries waiting for blobs, pre-votes off and
 leadership handovers, pair heartbeats in place of idle heartbeats, and
 restarts that cut the log.
 
-`just check-no-std` builds the crate for an embedded target.
+`just check-no-std` builds the crate for an embedded target, with and
+without the `sim` feature. The crate's tests turn the feature on
+themselves (a dev-dependency on the crate with `sim`), so `cargo test`
+needs no flag.

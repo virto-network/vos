@@ -19,11 +19,13 @@ impl Random {
     }
 
     /// True with probability `per_million` / 1,000,000.
+    #[cfg(any(test, feature = "sim"))]
     pub fn chance(&mut self, per_million: u64) -> bool {
         self.next_u64() % 1_000_000 < per_million
     }
 
     /// Uniform in `low..=high`.
+    #[cfg(any(test, feature = "sim"))]
     pub fn between(&mut self, low: u64, high: u64) -> u64 {
         low + self.next_u64() % (high - low + 1)
     }

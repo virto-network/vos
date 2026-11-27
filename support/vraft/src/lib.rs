@@ -10,8 +10,8 @@
 //!   commit notifications, answers). It reads no clock and does no I/O, so
 //!   one host can drive thousands of groups.
 //! - [`Message`]: the one-way protocol messages between replicas.
-//! - [`sim`]: groups of cores over a simulated network and stores, checked
-//!   for Raft's safety properties under faults.
+//! - `sim` (the `sim` feature): groups of cores over a simulated network
+//!   and stores, checked for Raft's safety properties under faults.
 //!
 //! ## A group of one
 //!
@@ -48,6 +48,7 @@ pub mod meta;
 pub mod pair;
 mod random;
 pub mod role;
+#[cfg(feature = "sim")]
 pub mod sim;
 
 pub use crate::core::ActiveConfigRecord;

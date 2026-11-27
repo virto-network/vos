@@ -498,7 +498,8 @@ check-no-debug-internals: (_forbidden "debug-internals")
 
 # The builds without std, for an embedded target on core and alloc
 # alone, built from the toolchain's source. merkle-crdt, without its
-# `std` feature. vraft, the Raft core. The proof verifier, which reads
+# `std` feature. vraft, the Raft core, with and without its simulator
+# (the `sim` feature). The proof verifier, which reads
 # every admitted format, with the proof crate's verifier path under it:
 # both are `no_std` crates, so a `std` path in either fails the build. The
 # verifier builds for
@@ -522,6 +523,7 @@ check-no-debug-internals: (_forbidden "debug-internals")
 check-no-std:
     cargo build -p merkle-crdt --no-default-features --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vraft --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
+    cargo build -p vraft --features sim --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target wasm32-unknown-unknown
     cargo build -p vos-pvm-final-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
